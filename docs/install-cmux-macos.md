@@ -49,7 +49,7 @@ needed for `hatter backup`, but you want that.
 ## 4. Install hatter
 
 ```sh
-git clone https://github.com/smcdrmtt/hatter ~/src/hatter
+git clone https://github.com/smcd-personal/hatter ~/src/hatter
 install -m 755 ~/src/hatter/bin/hatter ~/.local/bin/hatter
 ```
 

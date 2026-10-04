@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         **Redact your hostnames and usernames** before pasting config or output.
-        Security problems go to [SECURITY.md](https://github.com/smcdrmtt/hatter/blob/main/SECURITY.md), not here.
+        Security problems go to [SECURITY.md](https://github.com/smcd-personal/hatter/blob/main/SECURITY.md), not here.
   - type: input
     id: command
     attributes:

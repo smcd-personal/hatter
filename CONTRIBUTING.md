@@ -23,12 +23,12 @@ By contributing you agree that your work is licensed under the project's
 workspace on any client. Today cmux is the only client it drives, so the
 contribution that matters most is the adapter seam and the adapters behind it:
 
-- [#2 — the client adapter interface](https://github.com/smcdrmtt/hatter/issues/2):
+- [#2 — the client adapter interface](https://github.com/smcd-personal/hatter/issues/2):
   the twelve functions that are the whole cmux surface, and the capability
   flags (`CanMirrorTmux`, `CanGroup`, `CanStyle`) an adapter declares
-- [#4 — WezTerm](https://github.com/smcdrmtt/hatter/issues/4), which also brings
+- [#4 — WezTerm](https://github.com/smcd-personal/hatter/issues/4), which also brings
   Windows and Linux
-- [#6 — headless](https://github.com/smcdrmtt/hatter/issues/6), tmux and ssh
+- [#6 — headless](https://github.com/smcd-personal/hatter/issues/6), tmux and ssh
   only
 
 The rule for an adapter: **it must not need changes to the core.** If yours
@@ -37,7 +37,7 @@ working around it.
 
 The wider plan, and the order it should happen in, is in [EPIC.md](EPIC.md).
 Issues labelled
-[`good first issue`](https://github.com/smcdrmtt/hatter/labels/good%20first%20issue)
+[`good first issue`](https://github.com/smcd-personal/hatter/labels/good%20first%20issue)
 are a good place to start.
 
 ## Running from a clone
@@ -45,7 +45,7 @@ are a good place to start.
 hatter is one bash script with no build step:
 
 ```sh
-git clone https://github.com/smcdrmtt/hatter
+git clone https://github.com/smcd-personal/hatter
 cd hatter
 bin/hatter --help
 ```

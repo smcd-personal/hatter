@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 **Do not open a public issue.** Use GitHub's private reporting instead:
-[Report a vulnerability](https://github.com/smcdrmtt/hatter/security/advisories/new).
+[Report a vulnerability](https://github.com/smcd-personal/hatter/security/advisories/new).
 Only the maintainer sees it. Expect a first reply within a week.
 
 Worth reporting: anything that writes a credential to disk, exposes one in a

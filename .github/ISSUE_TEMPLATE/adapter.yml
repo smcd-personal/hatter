@@ -5,7 +5,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Read [#2, the adapter interface](https://github.com/smcdrmtt/hatter/issues/2) first.
+        Read [#2, the adapter interface](https://github.com/smcd-personal/hatter/issues/2) first.
         An adapter must not need changes to the core.
   - type: input
     id: client
