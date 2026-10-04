@@ -1,0 +1,45 @@
+name: Bug
+description: Something hatter did that it should not have.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Redact your hostnames and usernames** before pasting config or output.
+        Security problems go to [SECURITY.md](https://github.com/smcdrmtt/hatter/blob/main/SECURITY.md), not here.
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      description: What you ran.
+      placeholder: hatter restore
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: hatter commit
+      description: "`git -C <your clone> rev-parse --short HEAD`"
+  - type: input
+    id: client
+    attributes:
+      label: Client OS and terminal
+      placeholder: macOS 26, cmux 0.64
+    validations:
+      required: true
+  - type: input
+    id: server
+    attributes:
+      label: Server OS and tmux version
+      placeholder: Ubuntu 24.04, tmux 3.4
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      render: text

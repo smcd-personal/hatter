@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS runs the system bash 3.2 - the one hatter has to work on.
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Syntax
+        run: /bin/bash -n bin/hatter
+
+      - name: shellcheck
+        run: |
+          command -v shellcheck >/dev/null || brew install shellcheck
+          shellcheck --severity=error bin/hatter file-issues.sh
+
+      - name: Help runs with no config and no cmux
+        run: |
+          HOME="$(mktemp -d)"; export HOME
+          /bin/bash bin/hatter --help >/dev/null
+          /bin/bash bin/hatter help provision >/dev/null
+
+      - name: Python tools compile
+        run: python3 -m py_compile tools/*.py

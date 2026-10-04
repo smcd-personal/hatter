@@ -111,6 +111,13 @@ hatter restore
 
 `hatter --help` explains every command; `hatter help <command>` goes deeper.
 
+## Contributing
+
+Pull requests are welcome. Small fixes can go straight to a PR; for anything
+bigger, open an issue first. The contribution that matters most is a new
+client adapter — see [CONTRIBUTING.md](CONTRIBUTING.md). Report security
+problems privately, as described in [SECURITY.md](SECURITY.md).
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
