@@ -1,0 +1,47 @@
+name: New client adapter
+description: Propose driving hatter from another terminal.
+labels: [adapter]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read [#2, the adapter interface](https://github.com/smcd-personal/hatter/issues/2) first.
+        An adapter must not need changes to the core.
+  - type: input
+    id: client
+    attributes:
+      label: Terminal
+      placeholder: kitty
+    validations:
+      required: true
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Platforms
+      multiple: true
+      options: [macOS, Linux, Windows]
+    validations:
+      required: true
+  - type: textarea
+    id: readback
+    attributes:
+      label: Can it be read back?
+      description: "`hatter sync` needs to list windows and tabs with stable ids. Which command does that?"
+    validations:
+      required: true
+  - type: textarea
+    id: capabilities
+    attributes:
+      label: Capabilities
+      description: Which of these can it do, and how?
+      value: |
+        - CanMirrorTmux (mirror a remote tmux server's sessions):
+        - CanGroup (group workspaces inside a window):
+        - CanStyle (colour, icon, pin):
+    validations:
+      required: true
+  - type: textarea
+    id: mapping
+    attributes:
+      label: Mapping
+      description: What do hat, group, workspace and tab become in this terminal?

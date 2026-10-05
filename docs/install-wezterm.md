@@ -3,8 +3,8 @@
 **Read this first.** WezTerm is the intended second client, and it is the only
 one on Windows that hatter can both drive *and* read back — which is what
 `hatter sync` needs. But the WezTerm backend is not built yet: it is
-[issue #4](https://github.com/smcd/hatter/issues/4), on top of the adapter seam
-in [issue #2](https://github.com/smcd/hatter/issues/2).
+[issue #4](https://github.com/smcd-personal/hatter/issues/4), on top of the adapter seam
+in [issue #2](https://github.com/smcd-personal/hatter/issues/2).
 
 So this guide gets you to a machine where:
 
@@ -103,7 +103,7 @@ ssh you@shell.example.com true && echo "ssh works"
 ## 3. Install hatter
 
 ```sh
-git clone https://github.com/smcd/hatter ~/src/hatter
+git clone https://github.com/smcd-personal/hatter ~/src/hatter
 install -m 755 ~/src/hatter/bin/hatter ~/.local/bin/hatter
 export PATH="$HOME/.local/bin:$PATH"      # add to ~/.bashrc or ~/.zshrc
 hatter --help
@@ -199,9 +199,9 @@ reports it correctly from Windows.
 
 ## Following the backend work
 
-- [#2 — the client adapter interface](https://github.com/smcd/hatter/issues/2),
+- [#2 — the client adapter interface](https://github.com/smcd-personal/hatter/issues/2),
   the seam every backend plugs into
-- [#4 — the WezTerm adapter](https://github.com/smcd/hatter/issues/4), including
+- [#4 — the WezTerm adapter](https://github.com/smcd-personal/hatter/issues/4), including
   the verified CLI surface and the hat/group/workspace/tab mapping
-- [#6 — the headless adapter](https://github.com/smcd/hatter/issues/6), which is
+- [#6 — the headless adapter](https://github.com/smcd-personal/hatter/issues/6), which is
   what you are using today without knowing it
