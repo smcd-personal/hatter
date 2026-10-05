@@ -64,8 +64,10 @@ branch names, issues, PRs and comments alike.
 - The private patterns live in `~/.config/hatter/leak-patterns` and in
   hatter's config, never in the repo. Add a pattern there when a new private
   name appears.
-- Never bypass a check (`--no-verify`, editing the patterns, adding a private
-  name to `.leakcheck-allow`). If it fires, remove the detail. If you think it
+- Details the maintainer has deliberately kept public are listed in a private
+  accept-list, `~/.config/hatter/leak-accept`. Only the maintainer adds to it.
+- Never bypass a check (`--no-verify`, editing the patterns or the
+  accept-list, adding a private name to `.leakcheck-allow`). If it fires, remove the detail. If you think it
   is a false positive, stop and ask.
 - Write bodies to a file, check them, then post with `--body-file`.
 
