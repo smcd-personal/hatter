@@ -89,12 +89,12 @@ Two guides, depending on which terminal you have:
 - **[macOS with cmux](docs/install-cmux-macos.md)** — the full-feature path.
   cmux is the only client hatter drives end-to-end today, and it is macOS-only.
 - **[macOS or Windows with WezTerm](docs/install-wezterm.md)** — the server half
-  works today; the client backend is [#4](https://github.com/smcd/hatter/issues/4).
+  works today; the client backend is [#4](https://github.com/smcd-personal/hatter/issues/4).
 
 The short version, once your terminal is sorted:
 
 ```sh
-git clone https://github.com/smcd/hatter
+git clone https://github.com/smcd-personal/hatter
 install -m 755 hatter/bin/hatter ~/.local/bin/hatter
 
 hatter hat add dev --ssh you@shell.work.com
@@ -110,6 +110,13 @@ hatter restore
 ```
 
 `hatter --help` explains every command; `hatter help <command>` goes deeper.
+
+## Contributing
+
+Pull requests are welcome. Small fixes can go straight to a PR; for anything
+bigger, open an issue first. The contribution that matters most is a new
+client adapter — see [CONTRIBUTING.md](CONTRIBUTING.md). Report security
+problems privately, as described in [SECURITY.md](SECURITY.md).
 
 ## Licence
 
