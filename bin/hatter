@@ -3903,6 +3903,14 @@ cmd_help() {
 
 # -------------------------------------------------------------------- main
 
+# Everything from here to the end is one brace group that ends in `exit`. bash
+# reads a script as it runs it, keeping a byte offset into the file; if the file
+# is rewritten while a hatter is open - an editor saving over it - the running
+# one would resume at that offset in the new file and die on a bogus syntax
+# error. A brace group is parsed whole before any of it runs, and the `exit`
+# means bash never reads past it.
+{
+
 need jq
 seed_config
 
@@ -3963,3 +3971,6 @@ esac
 # A snapshot after every run. This is only a cmp plus, at most, a file copy -
 # the expensive sync belongs to the timer, not to every command.
 autosave_snapshot >/dev/null 2>&1 || true
+
+exit
+}
