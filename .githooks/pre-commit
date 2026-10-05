@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Refuse a commit whose added lines carry private details. See tools/leakcheck.
+exec "$(git rev-parse --show-toplevel)/tools/leakcheck" --staged

@@ -1,0 +1,9 @@
+# Known-fake examples that tools/leakcheck may ignore. Each line is a regex
+# matched against the flagged text (an email address, a path, an IP).
+# Only generic matches can be allowed - never private patterns.
+#
+# Prefer example.com for anything new. These are the fakes already in the
+# docs and in tools/screenshot.py, which draws rack.svg.
+^you@
+^claude-[0-9]+@work\.com$
+^you\.example@gmail\.com$

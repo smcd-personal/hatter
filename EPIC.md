@@ -1,7 +1,7 @@
 # Epic: turn hatter (→ hatter) into a client-agnostic, multi-host workspace orchestrator
 
 **Status:** proposal
-**Owner:** @smcdermott
+**Owner:** @smcd-personal
 **Created:** 2026-09-06
 
 ## Summary
