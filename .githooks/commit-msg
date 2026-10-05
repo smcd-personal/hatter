@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Refuse a commit message that carries private details. Comment lines are
+# dropped first, the same as git does.
+msg=$(grep -v '^#' "$1")
+printf '%s\n' "$msg" | "$(git rev-parse --show-toplevel)/tools/leakcheck" --text -

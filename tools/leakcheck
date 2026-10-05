@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+#
+# leakcheck - stop private details reaching a public repo.
+#
+#   leakcheck --staged          lines added in the index         (pre-commit)
+#   leakcheck --range A..B      diffs, messages and authors      (pre-push)
+#   leakcheck --text [FILE|-]   any text: a commit message, an issue body
+#   leakcheck --all             every tracked file               (CI, audits)
+#
+# Two kinds of pattern:
+#
+#   generic  built in: personal email addresses, home directories, IPv4
+#            addresses, tokens and private keys. Safe to publish, so CI runs
+#            these too.
+#   private  your hostnames, usernames, project names. They must never be in
+#            the repo - a list of them would be the leak - so they are read
+#            from outside it:
+#              $HATTER_LEAK_PATTERNS (default ~/.config/hatter/leak-patterns),
+#              one case-insensitive extended regex per line, # for comments
+#            plus the ssh destinations and hat names in hatter's own config.
+#
+# Exit 0 when clean, 1 when something matched, 2 on a usage error.
+# --locations-only prints where a match is but not what it is, for logs that
+# other people can read.
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hatter"
+PRIVATE="${HATTER_LEAK_PATTERNS:-$CONFIG_DIR/leak-patterns}"
+CONFIG="$CONFIG_DIR/config.json"
+
+# Generic matches that are fine to publish. A repo can add its own known-fake
+# examples, one regex per line, in .leakcheck-allow at its root. Private
+# patterns can never be allowed this way.
+ALLOW_BUILTIN='@([a-z0-9-]+\.)*(example\.(com|org|net)|users\.noreply\.github\.com|anthropic\.com)$
+^/(Users|home)/(you|runner|user|username)$
+^(127\.0\.0\.1|0\.0\.0\.0)$'
+# Words too common to block when they turn up as a hat name.
+HAT_NAME_OK='^(personal|work|dev|ops|test|main|home)$'
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/leakcheck.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+LOCATIONS_ONLY=0
+FOUND=0
+
+usage() { sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+
+# ---------------------------------------------------------------- patterns
+
+# One "class<TAB>regex" per line.
+build_patterns() {
+    local out="$TMP/patterns"
+    {
+        printf 'email\t%s\n'  '[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}'
+        printf 'home\t%s\n'   '/(Users|home)/[a-z][a-z0-9._-]*'
+        printf 'ipv4\t%s\n'   '(^|[^0-9.])([0-9]{1,3}\.){3}[0-9]{1,3}([^0-9.]|$)'
+        printf 'token\t%s\n'  '(gh[opsu]_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{16})'
+        printf 'key\t%s\n'    '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+
+        if [[ -f "$PRIVATE" ]]; then
+            grep -vE '^[[:space:]]*(#|$)' "$PRIVATE" | sed 's/^/private\t/'
+        fi
+
+        if [[ -f "$CONFIG" ]] && command -v jq >/dev/null 2>&1; then
+            # ssh destinations: the user, the full host, and the domain.
+            jq -r '.. | objects | .ssh? // empty' "$CONFIG" 2>/dev/null |
+                sort -u | while IFS= read -r dest; do
+                    local user="${dest%@*}" host="${dest#*@}"
+                    [[ "$dest" == *@* ]] || user=""
+                    [[ -n "$user" ]] && printf 'private\t(^|[^a-z0-9])%s([^a-z0-9]|$)\n' "$user"
+                    printf 'private\t%s\n' "${host//./\\.}"
+                    case "$host" in
+                        *.*.*) local dom="${host#*.}"; printf 'private\t%s\n' "${dom//./\\.}" ;;
+                    esac
+                done
+            jq -r '.hats | keys[]?' "$CONFIG" 2>/dev/null |
+                grep -viE "$HAT_NAME_OK" |
+                sed 's/^/private\t(^|[^a-z0-9])/; s/$/([^a-z0-9]|$)/' || true
+        fi
+    } | sort -u > "$out"
+}
+
+# --------------------------------------------------------------- scanning
+
+# Input: "location<TAB>text" lines. Prints each match, sets FOUND.
+# Patterns are matched against the text only, never the location.
+scan() {
+    local input="$1" class re n loc text
+    cut -f2- "$input" > "$TMP/text"
+    while IFS=$'\t' read -r class re; do
+        [[ -n "$re" ]] || continue
+        for n in $(grep -niE -- "$re" "$TMP/text" 2>/dev/null | cut -d: -f1); do
+            text=$(sed -n "${n}p" "$TMP/text")
+            # A generic hit counts only if some match on the line is not allowed.
+            if [[ "$class" != private ]]; then
+                printf '%s\n' "$text" | grep -oiE -- "$re" |
+                    if [[ "$class" == ipv4 ]]; then
+                        sed -E 's/^[^0-9.]*([0-9.]+)[^0-9.]*$/\1/'
+                    else cat; fi |
+                    grep -viqEf "$TMP/allow" || continue
+            fi
+            loc=$(sed -n "${n}p" "$input" | cut -f1)
+            FOUND=1
+            if [[ $LOCATIONS_ONLY -eq 1 ]]; then
+                printf '%s: %s\n' "$loc" "$class"
+            else
+                printf '%s: %s: %s\n' "$loc" "$class" "$(printf '%s' "$text" | cut -c1-160)"
+            fi
+        done
+    done < "$TMP/patterns" > "$TMP/found"
+    # One report per line, however many patterns it tripped.
+    awk -F': ' '!seen[$1]++' "$TMP/found"
+}
+
+# A unified diff on stdin -> "file:line<TAB>added text" for every added line.
+added_lines() {
+    awk '
+        /^\+\+\+ / { f = substr($0, 5); sub(/^b\//, "", f); next }
+        /^@@ /     { split($3, a, ","); n = substr(a[1], 2) + 0; next }
+        /^\+/      { print f ":" n "\t" substr($0, 2); n++; next }
+        /^ /       { n++ }
+    '
+}
+
+text_lines() { awk -v l="$1" '{ print l ":" NR "\t" $0 }'; }
+
+# ---------------------------------------------------------------- modes
+
+mode=""; arg=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --staged|--all) mode="$1" ;;
+        --range)  mode="$1"; arg="${2:?--range needs A..B}"; shift ;;
+        --text)   mode="$1"; arg="${2:--}"; [[ $# -gt 1 ]] && shift ;;
+        --locations-only) LOCATIONS_ONLY=1 ;;
+        -h|--help) usage ;;
+        *) usage ;;
+    esac
+    shift
+done
+[[ -n "$mode" ]] || usage
+
+build_patterns
+printf '%s\n' "$ALLOW_BUILTIN" > "$TMP/allow"
+root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [[ -n "$root" && -f "$root/.leakcheck-allow" ]]; then
+    grep -vE '^[[:space:]]*(#|$)' "$root/.leakcheck-allow" >> "$TMP/allow" || true
+fi
+in="$TMP/input"
+
+case "$mode" in
+    --staged)
+        git diff --cached -U0 --no-color --no-ext-diff | added_lines > "$in" ;;
+    --range)
+        {
+            git diff -U0 --no-color --no-ext-diff "${arg%%..*}" "${arg##*..}" | added_lines
+            for c in $(git rev-list "$arg"); do
+                h=$(git rev-parse --short "$c")
+                git log -1 --format='%an <%ae>%n%cn <%ce>%n%B' "$c" |
+                    awk -v l="commit $h" '{ print l "\t" $0 }'
+            done
+        } > "$in" ;;
+    --text)
+        if [[ "$arg" == - ]]; then text_lines text < /dev/stdin > "$in"
+        else text_lines "$arg" < "$arg" > "$in"; fi ;;
+    --all)
+        git ls-files -z | while IFS= read -r -d '' f; do
+            [[ -f "$f" ]] && grep -Iq . "$f" 2>/dev/null || continue
+            awk -v f="$f" '{ print f ":" NR "\t" $0 }' "$f"
+        done > "$in" ;;
+esac
+
+scan "$in"
+
+if [[ $FOUND -eq 1 ]]; then
+    echo "leakcheck: private details found - remove them before this goes public." >&2
+    exit 1
+fi
+exit 0
