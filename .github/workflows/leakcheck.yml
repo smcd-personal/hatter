@@ -1,0 +1,28 @@
+name: leakcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  leakcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # Generic patterns only - the private list never leaves the maintainer's
+      # machine. Locations only, so the log does not repeat what it found.
+      - name: Whole tree
+        run: tools/leakcheck --all --locations-only
+
+      - name: Commits in this pull request
+        if: github.event_name == 'pull_request'
+        run: |
+          tools/leakcheck --locations-only \
+            --range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
