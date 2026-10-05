@@ -25,6 +25,14 @@ export CMUX_QUIET=1
 # any command without an explicit --window/--workspace. This script drives
 # windows other than the one it was launched from, so drop them and rely on
 # explicit flags plus focus-window instead.
+#
+# The workspace id is kept first, in a name of our own. As an implicit target it
+# is wrong; as the answer to "which hat am I wearing right now" it is exactly
+# right, and current_hat is its only reader. It is deliberately not exported: a
+# mirrored pane on a shell server never sees these vars (ssh does not forward
+# them, and the cmux CLI is macOS-only), so every use of it degrades to the old
+# behaviour off the Mac rather than guessing.
+HATTER_LAUNCH_WORKSPACE="${CMUX_WORKSPACE_ID:-}"
 unset CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID
 
 # ---------------------------------------------------------------- utilities
@@ -397,6 +405,35 @@ ensure_remote_session() {
 # the window column empty instead of printing "command not found" per hat.
 have_cmux() { command -v cmux >/dev/null 2>&1; }
 
+# Being installed is not the same as being reachable. The CLI talks to the cmux
+# app over a unix socket, and when the app is down - or the socket has gone
+# stale, which it does on its own - every call exits non-zero with an empty
+# stdout and "Socket not found" on stderr. Empty stdout is indistinguishable
+# from an honest "this window holds nothing", so without this probe a whole run
+# reports "no window open" for every hat, leaves the config untouched, and
+# still exits 0. Probe once; the commands that drive cmux fail loudly instead.
+CMUX_ALIVE=""
+cmux_alive() {
+    if [[ -z "$CMUX_ALIVE" ]]; then
+        if have_cmux && cmux list-windows --json >/dev/null 2>&1; then
+            CMUX_ALIVE=yes
+        else
+            CMUX_ALIVE=no
+        fi
+    fi
+    [[ "$CMUX_ALIVE" == yes ]]
+}
+
+# <what> names the command for the error message, e.g. require_cmux sync
+require_cmux() {
+    cmux_alive && return 0
+    have_cmux || die "the cmux CLI is not on PATH, and '$1' needs it"
+    die "cmux is not answering on its control socket, so the live layout cannot be
+  read. Nothing was changed. Start or restart the cmux app, confirm with
+    cmux list-windows --json
+  and run 'hatter $1' again."
+}
+
 # Refs like workspace:3 are window-scoped and collide across windows, so every
 # id this script stores or passes around is a UUID.
 cmux_json() { have_cmux || return 1; cmux --id-format both "$@" --json; }
@@ -469,6 +506,46 @@ find_hat_window() {
     done
 
     printf '%s' "$best"
+}
+
+# "Which hat am I wearing right now", answered from the launch context: find the
+# window holding the workspace this hatter was started in, then map that window
+# back to a hat. Empty when hatter was not started inside a cmux terminal, when
+# it is running on a shell server, or when cmux is not answering - callers treat
+# that as "no default given" and carry on, never as an error. Probed once; the
+# answer cannot change while a run is in flight.
+CURRENT_HAT_CACHE=""
+current_hat() {
+    if [[ -n "$CURRENT_HAT_CACHE" ]]; then
+        [[ "$CURRENT_HAT_CACHE" == "-" ]] && return 1
+        printf '%s' "$CURRENT_HAT_CACHE"
+        return 0
+    fi
+    CURRENT_HAT_CACHE="-"
+
+    [[ -n "$HATTER_LAUNCH_WORKSPACE" ]] || return 1
+    cmux_alive || return 1
+
+    local w mine="" hat
+    for w in $(window_ids); do
+        if cmux_json workspace list --window "$w" 2>/dev/null \
+             | jq -e --arg id "$HATTER_LAUNCH_WORKSPACE" \
+                   '.workspaces[]? | select(.id == $id)' >/dev/null 2>&1; then
+            mine="$w"
+            break
+        fi
+    done
+    [[ -n "$mine" ]] || return 1
+
+    while IFS= read -r hat; do
+        [[ -z "$hat" ]] && continue
+        if [[ "$(find_hat_window "$hat")" == "$mine" ]]; then
+            CURRENT_HAT_CACHE="$hat"
+            printf '%s' "$hat"
+            return 0
+        fi
+    done < <(hat_names)
+    return 1
 }
 
 # Set by ensure_hat_window when it opens a window: the placeholder workspace
@@ -902,6 +979,493 @@ if __name__ == "__main__":
 HATCREDS
 chmod +x "$HOME/.local/bin/hat-creds"
 
+# ---------------------------------------------------------------------------
+# Boot-time recovery, server-side.
+#
+# `hatter restore` runs from the Mac and additionally re-mirrors into cmux. This
+# is the half that needs no Mac at all: the server rebuilds its own tmux and
+# resumes its own agents at boot, so the sessions are already standing by the
+# time anything connects.
+#
+# It works because a pane declares what it is at birth instead of being guessed
+# at afterwards. tmux-resurrect cannot do this job - its default process list
+# brings panes back as bare shells - and `claude --continue` cannot tell
+# concurrent conversations apart when a dozen panes share one directory.
+
+cat > "$HOME/.local/bin/hat-launch" <<'HATLAUNCH'
+#!/usr/bin/env bash
+# hat-launch - the command every pane runs.
+#
+# A pane declares what it is at birth instead of being guessed at afterwards.
+# The launcher picks the kind, mints the agent's session id BEFORE starting it,
+# and records the pane in a registry that outlives a reboot. "Which conversation
+# was in this tab" then becomes something the tab wrote down, not something
+# anything has to infer from hundreds of transcripts in one project directory.
+#
+#   hat-launch                        the hat's default kind
+#   hat-launch --kind claude|codex|shell
+#   hat-launch --resume claude <session-id>
+#
+# Two contracts inherited from the default-command this replaces, both
+# load-bearing:
+#   - the login shell runs in a loop, so `exit` and stray ctrl-D hand back a
+#     fresh prompt instead of destroying the tab
+#   - `exit 99` is the sentinel that actually closes it (99 and not 1 because
+#     bare `exit` returns the last command's status)
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+PANES="$STATE/panes"
+mkdir -p "$PANES" 2>/dev/null || true
+
+kind="" sid=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --kind)   kind="${2:-}"; shift 2 || shift ;;
+        --resume) kind="${2:-claude}"; sid="${3:-}"; shift 3 || shift $# ;;
+        *) shift ;;
+    esac
+done
+
+# A hat chooses its own default through a tmux option; absent that it is a
+# plain shell, which is exactly what panes did before this existed.
+if [ -z "$kind" ] && [ -n "${TMUX:-}" ]; then
+    kind=$(tmux show-options -gv @hat_default_kind 2>/dev/null) || kind=""
+fi
+[ -n "$kind" ] || kind=shell
+
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+
+# Never write stdout from here: nothing downstream expects it, and the hook
+# sibling of this script shares the rule for a harder reason.
+record() {
+    [ -n "${TMUX:-}" ] || return 0
+    command -v tmux >/dev/null 2>&1 || return 0
+    command -v jq   >/dev/null 2>&1 || return 0
+    local meta s w n rest f
+    meta=$(tmux display-message -p -t "${TMUX_PANE:-}" \
+            '#{session_name}	#{window_index}	#{window_name}' 2>/dev/null) || return 0
+    s=${meta%%	*}; rest=${meta#*	}; w=${rest%%	*}; n=${rest#*	}
+    [ -n "$s" ] || return 0
+    f="$PANES/$(slug "$s")@$w.json"
+    jq -n --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$PWD" \
+          --arg k "$1" --arg i "${2:-}" --arg p "${3:-}" \
+          --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{session:$s, window:($w|tonumber), name:$n, cwd:$c,
+        kind:$k, session_id:$i, pid:$p, recorded:$t}' > "$f.tmp" 2>/dev/null \
+      && mv "$f.tmp" "$f" 2>/dev/null
+    rm -f "$f.tmp" 2>/dev/null
+    return 0
+}
+
+run_agent() {
+    local bin="$HOME/.local/bin/$kind"
+    command -v "$kind" >/dev/null 2>&1 && bin="$(command -v "$kind")"
+    [ -x "$bin" ] || { printf 'hat-launch: %s is not installed - falling back to a shell\n' "$kind" >&2; return 1; }
+
+    case "$kind" in
+        claude)
+            if [ -n "$sid" ]; then
+                record claude "$sid" "$$"
+                "$bin" --resume "$sid"
+            else
+                # Minting the id here is the whole point: it is known before the
+                # agent starts, so a reboot never has to work out which session
+                # this pane held.
+                sid=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
+                record claude "$sid" "$$"
+                "$bin" --session-id "$sid"
+            fi ;;
+        *)
+            record "$kind" "${sid:-}" "$$"
+            "$bin" ;;
+    esac
+}
+
+[ "$kind" != shell ] && { run_agent || true; }
+
+# Whatever happened above, the pane ends up here: a login shell in the loop the
+# tab's survival depends on.
+record shell "" "$$"
+while :; do
+    "${SHELL:-/bin/bash}" -l
+    [ $? -eq 99 ] && break
+    sleep 0.3
+done
+HATLAUNCH
+chmod +x "$HOME/.local/bin/hat-launch"
+
+cat > "$HOME/.local/bin/hat-record" <<'HATRECORD'
+#!/usr/bin/env bash
+# hat-record - Claude Code SessionStart/SessionEnd hook.
+#
+# hat-launch records the panes it starts itself. This records every OTHER way a
+# session begins: `claude` typed at a prompt, `claude --resume` picked from the
+# list, a session forked. Without it the registry would quietly miss exactly the
+# sessions that were started by hand, which are most of them.
+#
+# Two rules, both inherited from the hooks already on this box and both
+# load-bearing:
+#   - never write stdout: it is the hook JSON channel
+#   - never exit non-zero: a failing hook breaks the session
+set -uo pipefail
+
+payload=$(cat 2>/dev/null) || payload=""
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+PANES="$STATE/panes"
+mkdir -p "$PANES" 2>/dev/null || true
+
+# No tmux is a silent no-op: claude runs outside tmux on some servers, and a
+# hook that assumed $TMUX_PANE would break every session on that box.
+[ -n "${TMUX:-}" ] || exit 0
+[ -n "${TMUX_PANE:-}" ] || exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+command -v jq   >/dev/null 2>&1 || exit 0
+
+sid=$(printf '%s' "$payload" | jq -r '.session_id // ""' 2>/dev/null) || sid=""
+cwd=$(printf '%s' "$payload" | jq -r '.cwd // ""' 2>/dev/null) || cwd=""
+ev=$(printf '%s' "$payload"  | jq -r '.hook_event_name // ""' 2>/dev/null) || ev=""
+[ -n "$sid" ] || exit 0
+[ -n "$cwd" ] || cwd="$PWD"
+
+meta=$(tmux display-message -p -t "$TMUX_PANE" \
+        '#{session_name}	#{window_index}	#{window_name}' 2>/dev/null) || exit 0
+s=${meta%%	*}; rest=${meta#*	}; w=${rest%%	*}; n=${rest#*	}
+[ -n "$s" ] || exit 0
+
+slug=$(printf '%s' "$s" | tr -c 'A-Za-z0-9_.@-' '_')
+f="$PANES/$slug@$w.json"
+
+# SessionEnd keeps the entry and marks it ended: a tab whose agent exited before
+# the power went out should come back as the shell it was, not as a resumed
+# conversation nobody asked for.
+state=live
+[ "$ev" = SessionEnd ] && state=ended
+
+jq -n --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$cwd" \
+      --arg i "$sid" --arg st "$state" \
+      --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '{session:$s, window:($w|tonumber), name:$n, cwd:$c,
+    kind:"claude", session_id:$i, state:$st, recorded:$t}' > "$f.tmp" 2>/dev/null \
+  && mv "$f.tmp" "$f" 2>/dev/null
+rm -f "$f.tmp" 2>/dev/null
+exit 0
+HATRECORD
+chmod +x "$HOME/.local/bin/hat-record"
+
+cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
+#!/usr/bin/env bash
+# hat-restore - rebuild tmux from the durable registry, with the agents resumed.
+#
+# This is the half of restore that does not need the Mac. hatter restore drives
+# the same rebuild from the client and additionally re-mirrors into cmux; this
+# one runs on the server at boot, so the sessions are already standing by the
+# time anything connects.
+#
+#   hat-restore            rebuild whatever is missing, print what it did
+#   hat-restore --boot     the same, quietly, for the systemd unit
+#   hat-restore --dry-run  print the tmux commands without running them
+#   hat-restore --no-agents  rebuild the panes as plain shells
+#   hat-restore --backfill   record the agents running RIGHT NOW
+#   hat-restore --prune      forget entries whose tmux window is gone
+#   hat-restore --no-prune   with --backfill, keep the orphans
+#
+# --backfill exists because the hook only fires when a session starts. On a box
+# that was already running agents when hatter arrived, the registry would stay
+# empty until every one of them happened to restart - and the first reboot would
+# restore nothing. `claude agents --json` knows each agent's pid, cwd and
+# session id but not its pane, so each pid is walked up its parent chain until
+# it lands on a tmux pane. That is the same join bin/unfleet does.
+#
+# A backfill overwrites the entries it matches but knows nothing about the ones
+# it does not, so closed tabs - and any tab dragged to another workspace, which
+# changes the very key an entry is filed under - accumulate as orphans that a
+# reboot would faithfully resurrect. --prune drops them, and --backfill runs it
+# afterwards by default.
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+PANES="$STATE/panes"
+LAUNCH="$HOME/.local/bin/hat-launch"
+
+dry=0 quiet=0 agents=1 backfill=0 prune=0 no_prune=0
+for a in "$@"; do
+    case "$a" in
+        --dry-run) dry=1 ;;
+        --boot) quiet=1 ;;
+        --no-agents) agents=0 ;;
+        --backfill) backfill=1 ;;
+        --prune) prune=1 ;;
+        --no-prune) no_prune=1 ;;
+    esac
+done
+say() { [ "$quiet" = 1 ] || printf '%s\n' "$*"; }
+
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+
+do_backfill() {
+    command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; return 0; }
+    command -v jq   >/dev/null 2>&1 || { say "hat-restore: no jq"; return 0; }
+    mkdir -p "$PANES" 2>/dev/null || true
+
+    local claude_bin
+    claude_bin=$(command -v claude 2>/dev/null) || claude_bin="$HOME/.local/bin/claude"
+    [ -x "$claude_bin" ] || { say "hat-restore: no claude binary"; return 0; }
+    # Asked outside a login shell, `claude agents --json` answers [] rather than
+    # failing, so the query goes through one. A backfill that silently found
+    # nothing would look exactly like a box with no agents on it.
+
+    # pane_pid -> session/window/name/cwd
+    local panes
+    panes=$(tmux list-panes -a -F '#{pane_pid}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_path}' 2>/dev/null) || panes=""
+    [ -n "$panes" ] || { say "hat-restore: no tmux panes"; return 0; }
+
+    local n=0 miss=0 pid cwd sid owner line ppid hops f
+    while IFS=$'\t' read -r pid cwd sid; do
+        [ -n "$sid" ] || continue
+
+        # Walk up the parent chain: the agent is a grandchild of the pane's
+        # shell, and how many levels deep depends on how it was started.
+        owner=""; ppid="$pid"; hops=0
+        while [ -n "$ppid" ] && [ "$ppid" != 1 ] && [ "$hops" -lt 12 ]; do
+            line=$(printf '%s\n' "$panes" | awk -v p="$ppid" -F'\t' '$1==p {print; exit}')
+            [ -n "$line" ] && { owner="$line"; break; }
+            ppid=$(awk '{print $4}' "/proc/$ppid/stat" 2>/dev/null)
+            hops=$((hops+1))
+        done
+        [ -n "$owner" ] || { miss=$((miss+1)); continue; }
+
+        local _pp s w nm pcwd
+        IFS=$'\t' read -r _pp s w nm pcwd <<EOT
+$owner
+EOT
+        [ -n "$cwd" ] || cwd="$pcwd"
+        f="$PANES/$(slug "$s")@$w.json"
+        if [ "$dry" = 1 ]; then
+            printf '  would record: %s:%s (%s) -> %s\n' "$s" "$w" "${nm:-unnamed}" "$sid"
+        else
+            jq -n --arg s "$s" --arg w "$w" --arg n "$nm" --arg c "$cwd" \
+                  --arg i "$sid" \
+                  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{session:$s, window:($w|tonumber), name:$n, cwd:$c,
+                kind:"claude", session_id:$i, state:"live", recorded:$t,
+                source:"backfill"}' > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+            rm -f "$f.tmp" 2>/dev/null
+        fi
+        n=$((n+1))
+    done <<EOT
+$("${SHELL:-/bin/bash}" -lc "$(printf '%q' "$claude_bin") agents --json" 2>/dev/null | jq -r '.[]? | select((.sessionId // "") != "") | [(.pid|tostring), (.cwd // ""), .sessionId] | @tsv' 2>/dev/null)
+EOT
+
+    say "hat-restore: backfilled $n agent(s); $miss not traceable to a tmux pane"
+    return 0
+}
+
+do_prune() {
+    command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; return 0; }
+    command -v jq   >/dev/null 2>&1 || { say "hat-restore: no jq"; return 0; }
+    [ -d "$PANES" ] || return 0
+
+    local live
+    live=$(tmux list-windows -a -F '#{session_name}@#{window_index}' 2>/dev/null) || live=""
+
+    # The one rule that matters: at boot the registry IS the truth, and tmux is
+    # empty precisely because the thing we are recovering from happened. Pruning
+    # against an empty window list would erase everything there is to restore.
+    if [ -z "$live" ]; then
+        say "hat-restore: tmux has no windows - refusing to prune"
+        return 0
+    fi
+
+    local f s w gone=0
+    for f in "$PANES"/*.json; do
+        [ -e "$f" ] || continue
+        s=$(jq -r '.session // ""' "$f" 2>/dev/null) || continue
+        w=$(jq -r '.window // ""'  "$f" 2>/dev/null) || continue
+        [ -n "$s" ] || continue
+        printf '%s\n' "$live" | grep -qxF "$s@$w" && continue
+        if [ "$dry" = 1 ]; then
+            printf '  would forget: %s:%s  (%s)\n' "$s" "$w" \
+                "$(jq -r '.name // ""' "$f" 2>/dev/null)"
+        else
+            rm -f "$f"
+        fi
+        gone=$((gone+1))
+    done
+    say "hat-restore: pruned $gone entry(ies) whose window is gone"
+    return 0
+}
+
+if [ "$backfill" = 1 ]; then
+    do_backfill
+    [ "$no_prune" = 1 ] || do_prune
+    exit 0
+fi
+
+if [ "$prune" = 1 ]; then
+    do_prune
+    exit 0
+fi
+
+command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; exit 0; }
+command -v jq   >/dev/null 2>&1 || { say "hat-restore: no jq"; exit 0; }
+[ -d "$PANES" ] || { say "hat-restore: nothing recorded in $PANES"; exit 0; }
+
+# One line per pane, ordered so that window 0 of each session comes first - the
+# session has to be created by its own first window.
+entries=$(cat "$PANES"/*.json 2>/dev/null \
+    | jq -rs 'map(select(.session != null))
+              | sort_by(.session, .window)
+              | .[] | [.session, (.window|tostring), .name, .cwd,
+                       (.kind // "shell"), (.session_id // ""), (.state // "live")]
+              | @tsv' 2>/dev/null) || entries=""
+[ -n "$entries" ] || { say "hat-restore: no usable entries"; exit 0; }
+
+run() {
+    if [ "$dry" = 1 ]; then printf '  would: %s\n' "$*"; else "$@"; fi
+}
+
+# Sessions this run has created. A dry run executes nothing, so without this
+# every window of a session reports itself as a new-session and the preview
+# describes a rebuild that would never happen that way.
+seen=""
+have_session() {
+    case " $seen " in *" $1 "*) return 0 ;; esac
+    tmux has-session -t "=$1" 2>/dev/null
+}
+
+made=0 skipped=0
+while IFS=$'\t' read -r s w n cwd kind sid state; do
+    [ -n "$s" ] || continue
+    [ -d "$cwd" ] || cwd="$HOME"
+
+    # A pane whose agent had already exited comes back as the shell it was.
+    cmd="$LAUNCH --kind shell"
+    if [ "$agents" = 1 ] && [ "$kind" != shell ] && [ "$state" = live ] && [ -n "$sid" ]; then
+        cmd="$LAUNCH --resume $kind $sid"
+    elif [ "$agents" = 1 ] && [ "$kind" != shell ] && [ "$state" = live ]; then
+        cmd="$LAUNCH --kind $kind"
+    fi
+
+    if ! have_session "$s"; then
+        say "  session $s  (window $w: ${n:-unnamed})"
+        run tmux new-session -d -s "$s" -n "${n:-shell}" -c "$cwd" "$cmd"
+        seen="$seen $s"
+        made=$((made+1))
+        continue
+    fi
+
+    # The session exists. Only add a window that is not already there, so a
+    # rerun - or a run after someone rebuilt half of it by hand - is harmless.
+    if [ "$dry" = 0 ] && tmux list-windows -t "=$s" -F '#{window_index}' 2>/dev/null | grep -qx "$w"; then
+        skipped=$((skipped+1))
+        continue
+    fi
+    say "  window $s:$w  (${n:-unnamed})"
+    run tmux new-window -d -t "=$s:$w" -n "${n:-shell}" -c "$cwd" "$cmd"
+    made=$((made+1))
+done <<< "$entries"
+
+say "hat-restore: $made created, $skipped already present"
+exit 0
+HATRESTORE
+chmod +x "$HOME/.local/bin/hat-restore"
+
+# The hook catches a session started by hand - `claude` typed at a prompt -
+# which is most of them. It goes in as its OWN entry appended to the arrays, so
+# an existing hook pipeline on this box is never touched, and running it twice
+# is a no-op.
+if [ -f "$HOME/.claude/settings.json" ] && command -v jq >/dev/null 2>&1; then
+    cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.hatter.bak"
+    if jq --arg c "$HOME/.local/bin/hat-record" '
+            def add(ev):
+              .hooks[ev] = ((.hooks[ev] // [])
+                + (if [(.hooks[ev] // [])[]?.hooks[]?.command] | any(. == $c)
+                   then [] else [{hooks:[{type:"command",command:$c}]}] end));
+            add("SessionStart") | add("SessionEnd")
+       ' "$HOME/.claude/settings.json" > "$HOME/.claude/settings.json.hatter.new"; then
+        mv "$HOME/.claude/settings.json.hatter.new" "$HOME/.claude/settings.json"
+        echo "hat-record wired into SessionStart/SessionEnd (backup: settings.json.hatter.bak)"
+    else
+        rm -f "$HOME/.claude/settings.json.hatter.new"
+        echo "WARNING: could not update ~/.claude/settings.json - left unchanged" >&2
+    fi
+else
+    echo "no ~/.claude/settings.json (or no jq) - skipping the session hook"
+fi
+
+# A systemd user unit only fires at boot with lingering on, which is also what
+# keeps the tmux server alive across logout. Say so rather than installing a
+# unit that will never run.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1; then
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/hatter-restore.service" <<'HATUNIT'
+[Unit]
+Description=hatter: rebuild tmux sessions and resume agents after a reboot
+After=default.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/.local/bin/hat-restore --boot
+# The agents need the user's own PATH and login environment, not systemd's.
+Environment=SHELL=/bin/bash
+
+[Install]
+WantedBy=default.target
+HATUNIT
+    systemctl --user daemon-reload
+    if systemctl --user enable hatter-restore.service >/dev/null 2>&1; then
+        echo "hatter-restore.service enabled (runs at boot)"
+    else
+        echo "WARNING: could not enable hatter-restore.service" >&2
+    fi
+    if command -v loginctl >/dev/null 2>&1; then
+        case "$(loginctl show-user "$(id -un)" --property=Linger 2>/dev/null)" in
+            Linger=yes) : ;;
+            *) echo "NOTE: lingering is off - the boot unit will not run until:"
+               echo "        sudo loginctl enable-linger $(id -un)" ;;
+        esac
+    fi
+else
+    echo "no systemd --user here - hook up hat-restore at boot by hand"
+fi
+
+# tmux-continuum saves from a status-line interpolation, and a control-mode
+# client - which is what cmux attaches with - never draws one, so its autosave
+# never fires. Measured stale by weeks on every hat. A timer calls the same save
+# script directly, independent of whether anything is drawing.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1 \
+   && [ -x "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" ]; then
+    cat > "$HOME/.config/systemd/user/hatter-resurrect-save.service" <<'SAVESVC'
+[Unit]
+Description=hatter: tmux-resurrect snapshot (continuum cannot save under a control-mode client)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.tmux/plugins/tmux-resurrect/scripts/save.sh quiet
+SAVESVC
+    cat > "$HOME/.config/systemd/user/hatter-resurrect-save.timer" <<'SAVETIMER'
+[Unit]
+Description=hatter: snapshot tmux every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SAVETIMER
+    systemctl --user daemon-reload
+    if systemctl --user enable --now hatter-resurrect-save.timer >/dev/null 2>&1; then
+        echo "resurrect save timer enabled (every 15 min)"
+    else
+        echo "WARNING: could not enable the resurrect save timer" >&2
+    fi
+fi
+
 # ~/.local/bin is only on PATH for a login shell if the shell's profile adds it.
 # Ubuntu's ~/.profile does, but only when the directory already existed at login,
 # and zsh never reads ~/.profile at all. Make it deterministic.
@@ -998,6 +1562,29 @@ else
     echo "SELFTEST FAILED: 'bye' is not on PATH for a login shell" >&2
 fi
 
+# The boot-recovery pieces: each must run, and hat-restore must be able to read
+# its own registry. A dry run touches nothing.
+if "$HOME/.local/bin/hat-restore" --dry-run >/dev/null 2>&1; then
+    echo "selftest ok: 'hat-restore' runs"
+else
+    echo "SELFTEST FAILED: 'hat-restore' did not run" >&2
+fi
+if printf '{}' | "$HOME/.local/bin/hat-record" >/dev/null 2>&1; then
+    echo "selftest ok: 'hat-record' is a silent no-op outside tmux"
+else
+    echo "SELFTEST FAILED: 'hat-record' must never exit non-zero" >&2
+fi
+if systemctl --user is-enabled hatter-restore.service >/dev/null 2>&1; then
+    echo "selftest ok: boot restore is enabled"
+else
+    echo "NOTE: boot restore is not enabled on this host"
+fi
+
+# A box that was already running agents when hatter arrived would otherwise sit
+# with an empty registry until every one of them happened to restart, and the
+# first reboot would restore nothing. Record them now.
+if "$HOME/.local/bin/hat-restore" --backfill 2>&1 | tail -1; then :; fi
+
 # hat-creds only has to run; it is driven over ssh with an explicit path.
 if python3 "$HOME/.local/bin/hat-creds" status >/dev/null 2>&1; then
     echo "selftest ok: 'hat-creds' runs (credential push is available)"
@@ -1045,6 +1632,13 @@ cmd_new() {
     if [[ -z "$hat" ]]; then
         hat="${session%%-*}"
         if [[ "$hat" == "$session" ]]; then
+            # No prefix to read. If this hatter was started inside a cmux
+            # window, that window names the hat - which is the whole point of
+            # typing a bare name while wearing one.
+            hat=$(current_hat || true)
+            [[ -n "$hat" ]] && info "no hat given - taking '$hat' from this window"
+        fi
+        if [[ -z "$hat" || "$hat" == "$session" ]]; then
             die "cannot tell which hat '$session' belongs to.
   Either name it <hat>-<subproject>, or pass --hat <hat>.
   Known hats: $(hat_names | tr '\n' ' ')"
@@ -1177,6 +1771,20 @@ $listing
     fi
 
     if [[ -z "$hat" ]]; then
+        # A bare workspace name typed inside a cmux window: try this hat's
+        # prefix before giving up. Only an existing workspace counts - `tab`
+        # adds to one, so a guess that names nothing is no better than failing.
+        local cur=""
+        cur=$(current_hat || true)
+        if [[ -n "$cur" && -n "$(session_group "$cur-$session")" ]]; then
+            session="$cur-$session"
+            group=$(session_group "$session")
+            hat="$cur"
+            info "taking '$session' from this window"
+        fi
+    fi
+
+    if [[ -z "$hat" ]]; then
         die "no workspace named '$session', and its name has no hat prefix.
   See what exists with:  hatter list
   Known hats: $(hat_names | tr '\n' ' ')"
@@ -1259,7 +1867,13 @@ cmd_backup() {
     git remote add origin <user@host>:git/dotfiles.git"
     fi
 
-    cmd_sync
+    # A backup is still worth taking while cmux is down - the config on disk is
+    # the thing being preserved - but say plainly that it was not re-synced.
+    if cmux_alive; then
+        cmd_sync
+    else
+        warn "cmux is not answering; committing the config as it stands, unsynced"
+    fi
 
     # The config alone is only half the state - it is useless without the tool
     # that reads it. Keeping a copy of the script in the same repo means one
@@ -1443,6 +2057,9 @@ cmd_group() {
 }
 
 cmd_sync() {
+    # A dead socket makes every hat look empty; refuse rather than report a
+    # no-op as success.
+    require_cmux sync
     backup_config
 
     # Iterate hats, not windows. A group belongs to exactly one hat and so lives
@@ -1521,8 +2138,55 @@ cmd_sync() {
     info "Config synced: $CONFIG"
 }
 
+# What is actually missing for a hat, one line per finding:
+#   "<session>\tno tmux session"   recorded, but not running on the server
+#   "<session>\tnot mirrored"      running, but no workspace in the hat's window
+#   "\tno window"                  the hat has no cmux window at all
+# Empty output means there is nothing to rebuild. Anything unreachable is
+# reported as unknown rather than guessed at, because "missing" would then mean
+# "recreate everything", which is the opposite of what the caller asked for.
+hat_missing() {
+    local hat="$1" host live win titles group session
+    host=$(hat_ssh "$hat")
+    [[ -n "$host" ]] || { printf '\tno ssh destination\n'; return 0; }
+
+    if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" true 2>/dev/null; then
+        printf '\tunreachable\n'
+        return 0
+    fi
+    live=$(remote_sessions "$host" 2>/dev/null || true)
+
+    win=$(find_hat_window "$hat")
+    titles=""
+    [[ -n "$win" ]] && titles=$(titles_in_window "$win")
+    [[ -z "$win" ]] && printf '\tno window\n'
+
+    while IFS= read -r group; do
+        [[ -z "$group" ]] && continue
+        while IFS= read -r session; do
+            [[ -z "$session" ]] && continue
+            if ! grep -qxF "$session" <<<"$live"; then
+                printf '%s\tno tmux session\n' "$session"
+            elif [[ -n "$win" ]] && ! grep -qxF "$session" <<<"$titles"; then
+                printf '%s\tnot mirrored\n' "$session"
+            fi
+        done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+    done < <(groups_of_hat "$hat")
+}
+
 cmd_restore() {
-    local hats
+    require_cmux restore
+    local hats only_missing=0
+
+    local args=() a
+    for a in "$@"; do
+        case "$a" in
+            --missing|--only-missing) only_missing=1 ;;
+            *) args+=("$a") ;;
+        esac
+    done
+    set -- ${args[@]+"${args[@]}"}
+
     if [[ $# -gt 0 ]]; then
         local tok resolved=() l
         for tok in "$@"; do
@@ -1553,6 +2217,25 @@ cmd_restore() {
         if [[ "${want:-0}" -eq 0 ]]; then
             echo "  $hat: nothing recorded, skipping"
             continue
+        fi
+
+        # --missing is the safe default from the rack: a hat that is already
+        # whole is left completely alone - no window opened, no re-mirror, no
+        # restyle. A hat with even one gap gets the full pass below, because
+        # bringing a recreated session back always needs the mirror anyway.
+        if [[ "$only_missing" == 1 ]]; then
+            local gaps
+            gaps=$(hat_missing "$hat")
+            if [[ -z "$gaps" ]]; then
+                echo "  $hat: nothing missing, leaving it alone"
+                continue
+            fi
+            local line what why
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                what="${line%%	*}"; why="${line#*	}"
+                echo "  $hat: ${what:-(hat)} - $why"
+            done <<<"$gaps"
         fi
 
         # Probe before opening a window, so an unreachable hat does not leave an
@@ -1786,7 +2469,9 @@ cmd_autosave() {
             # snapshot. Sync failures must not stop the snapshot.
             hatter_lock 0 || return 0          # a command is mid-write; try next minute
             trap hatter_unlock EXIT
-            cmd_sync >/dev/null 2>&1 || warn "autosave: sync failed, snapshotting anyway"
+            # A subshell: cmd_sync dies on a dead socket, and the snapshot has
+            # to happen anyway.
+            ( cmd_sync ) >/dev/null 2>&1 || warn "autosave: sync failed, snapshotting anyway"
             local f
             f=$(autosave_snapshot) || true
             [[ -n "$f" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave -> $(basename "$f")"
@@ -2332,6 +3017,7 @@ edit_nav() {
 
 edit_top() {
     local SEL=1 nc nh nt i idx hat host state scol sess cred credstate dot dirty=1
+    local preselect=1 ch=""
     local cols lastcols="" hdrtail
     local letter slot email label r5 r7 e5 e7 active holders
     while :; do
@@ -2398,6 +3084,21 @@ edit_top() {
                 nh=$((nh+1))
             done < <(hat_names)
             dirty=0
+
+            # The rack's question is "which hat am I wearing", so when it can
+            # be answered from the launch window, open on that row. Once only:
+            # after the first render the highlight belongs to the user.
+            if [[ "$preselect" == 1 ]]; then
+                preselect=0
+                ch=$(current_hat || true)
+                if [[ -n "$ch" ]]; then
+                    i=0
+                    while [[ $i -lt $nh ]]; do
+                        [[ "${HATS[$i]}" == "$ch" ]] && { SEL=$((i+1)); break; }
+                        i=$((i+1))
+                    done
+                fi
+            fi
         fi
 
         nt=$((nc+nh))
@@ -2444,6 +3145,7 @@ edit_top() {
             "$C_DIM" "$C_R"
         printf '  %sA add hat   R rename   D forget   P provision   ! refresh%s\n' \
             "$C_DIM" "$C_R"
+        printf '  %sS sync / restore%s\n' "$C_DIM" "$C_R"
 
         edit_readkey
 
@@ -2506,6 +3208,93 @@ edit_top() {
             P)
                 [[ -z "$hat" ]] && continue
                 cmd_provision "$hat" || true; edit_pause ;;
+            S)
+                # No hat row selected (the highlight is on a credential) means
+                # every hat, which is what bare `hatter sync`/`restore` do.
+                edit_sync_restore "$hat" || return 0 ;;
+        esac
+    done
+}
+
+# --- level 2 (from a hat, or from the top): sync and restore -----------------
+#
+# The two commands that move state between the config and the live layout, put
+# where that layout is already in front of you. The screen leads with what is
+# actually missing, because that is the question you open this with; the
+# commands underneath are then an obvious yes or no.
+#
+# Restore defaults to --missing. From a menu the safe reading of "restore" is
+# "fill the gaps", and re-applying everything to a hat that is already whole -
+# reopening its window, re-mirroring, restyling - is a deliberate extra key.
+#
+# Every command runs in a subshell: cmd_sync and cmd_restore both die on a dead
+# cmux socket, and a die inside the rack would drop the whole UI mid-screen.
+edit_sync_restore() {
+    local hat="${1:-}" gaps="" probed=0 h line what why n
+    while :; do
+        edit_header "${hat:-all hats}" "SYNC / RESTORE" \
+            "sync records the live layout into the config;" \
+            "restore rebuilds the live layout from the config."
+
+        if [[ "$probed" == 0 ]]; then
+            printf '   %sprobing...%s' "$C_DIM" "$C_R"
+            gaps=""
+            for h in ${hat:-$(hat_names)}; do
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && continue
+                    gaps+="$h	$line"$'\n'
+                done < <(hat_missing "$h")
+            done
+            probed=1
+            printf '\r\033[K'
+        fi
+
+        n=0
+        if [[ -n "$gaps" ]]; then
+            printf '  %sMISSING%s\n' "$C_YL" "$C_R"
+            while IFS=$'\t' read -r h what why; do
+                [[ -z "$h" ]] && continue
+                n=$((n+1))
+                printf '     %s%-11s%s %-22s %s%s%s\n' \
+                    "$C_DIM" "$h" "$C_R" "${what:-(the hat itself)}" "$C_YL" "$why" "$C_R"
+            done <<<"$gaps"
+        else
+            printf '  %s● nothing missing - every recorded session is running and mirrored%s\n' \
+                "$C_GR" "$C_R"
+        fi
+
+        printf '\n  %ss%s  sync      write the live layout into the config\n' "$C_B" "$C_R"
+        if [[ $n -gt 0 ]]; then
+            printf '  %sr%s  restore   rebuild just the %s%s missing%s\n' \
+                "$C_B" "$C_R" "$C_YL" "$n" "$C_R"
+        else
+            printf '  %s%sr%s  restore   nothing missing to rebuild%s\n' \
+                "$C_DIM" "$C_B" "$C_R" "$C_DIM$C_R"
+        fi
+        printf '  %sf%s  force     re-apply everything: sessions, mirror, groups, styling\n' \
+            "$C_B" "$C_R"
+
+        edit_keys "s sync   r restore   f force   ! re-probe   q back"
+        edit_readkey
+        case "$KEY" in
+            q|Q|quit|left|esc|back|h) return 0 ;;
+            !) probed=0 ;;
+            s|S)
+                ( cmd_sync ) || warn "sync did not finish"
+                probed=0; edit_pause ;;
+            r|R)
+                if [[ $n -eq 0 ]]; then
+                    printf '  %snothing missing - use f to re-apply anyway%s\n' "$C_DIM" "$C_R"
+                    edit_pause
+                else
+                    ( cmd_restore --missing ${hat:+"$hat"} ) || warn "restore did not finish"
+                    probed=0; edit_pause
+                fi ;;
+            f|F)
+                if edit_confirm "force restore ${hat:-every hat}? reopens the window, re-mirrors and restyles even where nothing is missing"; then
+                    ( cmd_restore ${hat:+"$hat"} ) || warn "restore did not finish"
+                    probed=0; edit_pause
+                fi ;;
         esac
     done
 }
@@ -2807,7 +3596,7 @@ Commands:
   list                   Show the whole hat / group / workspace tree
   sync                   Record the live layout into the config
   restore [hat|group]    Rebuild the layout from the config
-  provision <hat>        Set up tmux persistence on a shell server
+  provision <hat>        Set up tmux persistence and boot recovery on a server
   backup [message]       sync, then commit and push the config to git
 
 Run `hatter` with no arguments to open the rack.
@@ -2900,6 +3689,12 @@ A bare name is auto-prefixed once the hat is known:
   hatter dev-atlas --group "Atlas"
   hatter atlas --group "Atlas"                # -> dev-atlas, hat from group
   hatter atlas --group "New Project" --hat dev
+
+Run from a terminal inside a cmux window, a bare name with nothing else to go
+on takes that window's hat, so `hatter atlas` while wearing dev means
+dev-atlas. An explicit --hat, a known prefix, or the group's hat all still win.
+Off the Mac - in a mirrored pane on a shell server - there is no window to read
+and the name must say which hat it belongs to.
 USAGE
     ;;
     tab) cat <<'USAGE'
@@ -2911,6 +3706,10 @@ does the same thing.
 
   hatter tab dev-atlas
   hatter tab dev-atlas notes
+
+Inside a cmux window, a bare name is resolved against that window's hat, so
+`hatter tab atlas` means dev-atlas while wearing dev - but only when that
+workspace already exists.
 USAGE
     ;;
     rename) cat <<'USAGE'
@@ -3010,8 +3809,15 @@ workspaces back in their groups, and re-apply styling. Idempotent.
 With no arguments, every hat. Hats with nothing recorded, or whose server is
 unreachable, are skipped rather than failing the run.
 
+Options:
+  --missing      Only touch hats that are actually incomplete: a recorded
+                 session not running on the server, one running but not
+                 mirrored, or a hat with no window. A hat that is already whole
+                 is left alone entirely - no window, no re-mirror, no restyle.
+
   hatter restore
   hatter restore dev
+  hatter restore --missing
 USAGE
     ;;
     backup) cat <<'USAGE'
@@ -3049,6 +3855,33 @@ Set up a shell server so its state survives both a reboot and a stray logout:
       bye session    close the session, and the cmux workspace with it
     `exit 99` does the same thing without the script. 99 rather than 1 because
     bare `exit` returns the last command's status, so 1 would fire by accident.
+
+It also installs boot recovery, which rebuilds the server's own tmux without
+the Mac being involved at all:
+
+  - hat-launch   what a pane runs. It mints the agent's session id BEFORE
+                 starting it, so which conversation a tab held is something the
+                 tab wrote down rather than something anyone has to infer.
+  - hat-record   a SessionStart/SessionEnd hook, appended as its own entry so
+                 existing hooks are untouched. This is what catches a session
+                 started by hand, which is most of them.
+  - hat-restore  replays the registry at boot: sessions, windows, names, working
+                 directories, and `claude --resume <id>` in each pane.
+                 --dry-run prints the plan; --no-agents rebuilds plain shells;
+                 --backfill records the agents running right now, which
+                 provision does for you so an already-busy box is covered
+                 before its first reboot rather than after it; --prune forgets
+                 entries whose tmux window is gone (closed tabs, and tabs
+                 dragged to another workspace, which changes the key an entry
+                 is filed under). --backfill prunes afterwards unless given
+                 --no-prune. Pruning refuses to run when tmux has no windows,
+                 since at boot the registry is the only truth there is.
+  - a systemd user unit for the above, and a timer that snapshots tmux-resurrect
+    every 15 minutes - continuum's own autosave never fires, because it hangs
+    off a status line that a control-mode client like cmux never draws.
+
+Boot recovery needs lingering (`sudo loginctl enable-linger <user>`); provision
+says so if it is off.
 
 Rewrites its managed block in ~/.tmux.conf on every run, then self-tests that a
 shell which exits comes back usable. Takes no options.
