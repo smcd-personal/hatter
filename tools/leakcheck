@@ -19,6 +19,12 @@
 #              one case-insensitive extended regex per line, # for comments
 #            plus the ssh destinations and hat names in hatter's own config.
 #
+# Details the maintainer has chosen to keep public - a copyright line, say - go
+# in a private accept-list: $HATTER_LEAK_ACCEPT (default
+# ~/.config/hatter/leak-accept), one "file<TAB>regex" per line. A hit is ignored
+# only when its file and its text both match, so the same detail anywhere else
+# is still caught. Only the maintainer adds to it.
+#
 # Exit 0 when clean, 1 when something matched, 2 on a usage error.
 # --locations-only prints where a match is but not what it is, for logs that
 # other people can read.
@@ -27,6 +33,7 @@ set -euo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hatter"
 PRIVATE="${HATTER_LEAK_PATTERNS:-$CONFIG_DIR/leak-patterns}"
+ACCEPT="${HATTER_LEAK_ACCEPT:-$CONFIG_DIR/leak-accept}"
 CONFIG="$CONFIG_DIR/config.json"
 
 # Generic matches that are fine to publish. A repo can add its own known-fake
@@ -83,6 +90,18 @@ build_patterns() {
 
 # --------------------------------------------------------------- scanning
 
+# True when the maintainer has accepted this text in this file.
+accepted() {
+    local file="$1" text="$2" afile are
+    [[ -f "$ACCEPT" ]] || return 1
+    while IFS=$'\t' read -r afile are; do
+        [[ -n "$afile" && "$afile" != \#* && -n "$are" ]] || continue
+        [[ "$file" == "$afile" ]] || continue
+        printf '%s\n' "$text" | grep -qiE -- "$are" && return 0
+    done < "$ACCEPT"
+    return 1
+}
+
 # Input: "location<TAB>text" lines. Prints each match, sets FOUND.
 # Patterns are matched against the text only, never the location.
 scan() {
@@ -101,6 +120,7 @@ scan() {
                     grep -viqEf "$TMP/allow" || continue
             fi
             loc=$(sed -n "${n}p" "$input" | cut -f1)
+            accepted "${loc%%:*}" "$text" && continue
             FOUND=1
             if [[ $LOCATIONS_ONLY -eq 1 ]]; then
                 printf '%s: %s\n' "$loc" "$class"
