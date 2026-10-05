@@ -10,9 +10,8 @@ hatter is currently ~1000 lines of bash that drive [cmux](https://cmux.com) from
 single JSON config, so that a set of remote tmux servers can be projected into a
 desktop workspace and rebuilt from scratch after any failure.
 
-It works, in daily use, across five hosts. This epic is about deciding whether it
-becomes a real, open, cross-platform project — and if so, doing it in the order
-that keeps the idea honest.
+This epic is about deciding whether it becomes a real, open, cross-platform
+project — and if so, doing it in the order that keeps the idea honest.
 
 ## The idea worth keeping: hats
 
@@ -76,9 +75,9 @@ The order matters. Do **not** start with the rewrite.
 4. **#1 Port to Go** — only once the interface has survived two implementations.
 5. Everything else.
 
-**Gate:** run the current bash version daily across all five hats for at least
-two weeks before committing to the rewrite. Five hats in real use will teach us
-more about what the abstraction needs than designing it now will.
+**Gate:** run the current bash version daily across several hats for at least
+two weeks before committing to the rewrite. Real use will teach us more about
+what the abstraction needs than designing it now will.
 
 ## Sub-issues
 
