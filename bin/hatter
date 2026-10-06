@@ -2127,6 +2127,85 @@ $(printf '%s\n' "$list" | sed 's/^/    /')"
     exit 1
 }
 
+# A new machine's ssh key cannot log in to a server that only takes keys, so
+# it cannot authorise itself. This machine already gets in, so it carries the
+# key there. The key travels on stdin rather than in the command line, which
+# keeps it out of quoting and out of the remote process list.
+#
+# Keys are compared on type and blob only, so the same key with a different
+# comment is not added twice.
+key_valid() {
+    # One line, and ssh-keygen agrees it is a public key.
+    [[ "$1" != *$'\n'* ]] || return 1
+    printf '%s\n' "$1" | ssh-keygen -l -f /dev/stdin >/dev/null 2>&1
+}
+
+key_add_to() {
+    # key_add_to <hat> <key> -> prints added | present; non-zero if unreachable
+    local dest script
+    dest=$(hat_ssh "$1")
+    [[ -n "$dest" ]] || return 1
+    # Run under sh whatever the login shell is: `set -- $k` needs word splitting.
+    script='IFS= read -r k || exit 3
+umask 077
+mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys || exit 4
+set -- $k
+if awk -v t="$1" -v b="$2" '\''$1 == t && $2 == b { f = 1 } END { exit !f }'\'' ~/.ssh/authorized_keys; then
+    echo present
+else
+    printf "%s\n" "$k" >> ~/.ssh/authorized_keys && echo added
+fi'
+    printf '%s\n' "$2" | remote_sh_stdin "$dest" "sh -c $(sq "$script")"
+}
+
+cmd_key() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        add) ;;
+        *) usage_cmd key; exit 1 ;;
+    esac
+
+    local src="${1:-}" key all=0 hat
+    shift || true
+    [[ -n "$src" ]] || { usage_cmd key; exit 1; }
+    if [[ -f "$src" ]]; then
+        key=$(cat "$src")
+    else
+        key="$src"
+    fi
+    # Trailing newline or CR from a file or a Windows clipboard.
+    key="${key%$'\n'}"; key="${key%$'\r'}"
+    key_valid "$key" || die "that is not one ssh public key (expected e.g. 'ssh-ed25519 AAAA... name')"
+
+    local -a hats=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) all=1 ;;
+            -*) die "unknown flag: $1" ;;
+            *) hat_exists "$1" || die "unknown hat: $1"; hats+=("$1") ;;
+        esac
+        shift
+    done
+    if [[ $all -eq 1 ]]; then
+        hats=()
+        while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
+    fi
+    [[ ${#hats[@]} -gt 0 ]] || die "name the hats to add the key to, or pass --all"
+
+    local fp result failed=0
+    fp=$(printf '%s\n' "$key" | ssh-keygen -l -f /dev/stdin 2>/dev/null | awk '{print $2}')
+    info "Adding $fp"
+    for hat in "${hats[@]}"; do
+        if result=$(key_add_to "$hat" "$key" 2>/dev/null) && [[ -n "$result" ]]; then
+            printf '  %-12s %s\n' "$hat" "$result"
+        else
+            printf '  %-12s unreachable - not added\n' "$hat"
+            failed=1
+        fi
+    done
+    return $failed
+}
+
 cmd_rename() {
     # Rename a session everywhere at once: on the server, in cmux, in the config.
     local old="${1:-}" new="${2:-}"
@@ -3973,6 +4052,7 @@ Commands:
   new <session>          Create or reattach a workspace  ("new" is optional)
   tab <session> [name]   Add a tab to a workspace
   attach <hat|session>   Open a workspace in this terminal, over plain ssh
+  key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
   repair <session>       Bring back a workspace cmux shows blank, in its place
   hat <subcommand>       Manage hats (shell servers)
@@ -4123,6 +4203,21 @@ place. The tmux session, and everything running in it, is never touched.
 Finally it syncs the config and refreshes the server's pane registry.
 
 In the rack, press f on a workspace.
+USAGE
+    ;;
+    key) cat <<'USAGE'
+hatter key add <public-key | file> <hat>... | --all
+
+Authorise another machine's ssh key on your hats, using the access this machine
+already has. A brand-new key cannot do this for itself on a server that only
+accepts keys, so this is how a new laptop - or a Windows box set up with
+tools/install-windows.ps1 - gets in.
+
+  hatter key add ~/new-laptop.pub --all
+  hatter key add 'ssh-ed25519 AAAAC3Nz... me@windows' dev ops
+
+The key is checked with ssh-keygen first, and each hat reports "added",
+"present" (already there, whatever its comment) or "unreachable".
 USAGE
     ;;
     attach) cat <<'USAGE'
@@ -4353,7 +4448,7 @@ shift || true
 # and jq, which run anywhere, WSL included. So cmux is required by the commands
 # that actually drive it rather than by the script itself.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|help|-h|--help) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|help|-h|--help) ;;
     *) need cmux ;;
 esac
 
@@ -4383,6 +4478,7 @@ case "$cmd" in
     new)       [[ $# -gt 0 ]] || { usage_cmd new; exit 1; };       cmd_new "$@" ;;
     tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
     attach)    [[ $# -eq 1 ]] || { usage_cmd attach; exit 1; };    cmd_attach "$1" ;;
+    key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;

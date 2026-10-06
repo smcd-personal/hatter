@@ -36,3 +36,72 @@ jobs:
 
       - name: Python tools compile
         run: python3 -m py_compile tools/*.py
+
+  # The Windows client: run the real installer on a real Windows machine, then
+  # prove the WezTerm config it wrote loads and the plugin works there.
+  windows-installer:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: A throwaway config repo, and a hand-written WezTerm config
+        shell: pwsh
+        run: |
+          $cfg = Join-Path $env:RUNNER_TEMP 'cfg'
+          New-Item -ItemType Directory $cfg | Out-Null
+          @'
+          {"version":3,
+           "hats":{"ci":{"ssh":"ci@127.0.0.1","remote_dir":"$HOME"}},
+           "groups":{"CI Group":{"hat":"ci","sessions":{"ci-one":{},"ci two":{}}}}}
+          '@ | Set-Content (Join-Path $cfg 'config.json')
+          git -C $cfg init -q -b main
+          git -C $cfg -c user.email=ci@example.com -c user.name=ci add .
+          git -C $cfg -c user.email=ci@example.com -c user.name=ci commit -qm config
+          'return {}' | Set-Content "$env:USERPROFILE\.wezterm.lua"
+
+      - name: Install, under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          & .\tools\install-windows.ps1 -NonInteractive -NoLaunch `
+              -ConfigRemote "$env:RUNNER_TEMP\cfg" `
+              -RepoUrl "$env:GITHUB_WORKSPACE" -Ref HEAD
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Run again, under PowerShell 7 - nothing to change
+        shell: pwsh
+        run: |
+          $out = & .\tools\install-windows.ps1 -NonInteractive -NoLaunch `
+              -RepoUrl "$env:GITHUB_WORKSPACE" -Ref HEAD *>&1 | Out-String
+          $out
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if ($out -notmatch 'wezterm\.lua is current') { throw 'second run rewrote .wezterm.lua' }
+
+      - name: Results
+        shell: pwsh
+        run: |
+          $w = Get-Content "$env:USERPROFILE\.wezterm.lua" -Raw
+          if (-not $w.StartsWith("-- Written by hatter's install-windows.ps1.")) { throw 'not written by the installer' }
+          if (-not (Get-ChildItem "$env:USERPROFILE\.wezterm.lua.bak-*")) { throw 'the old config was not backed up' }
+          if (-not (Test-Path "$env:USERPROFILE\.ssh\id_ed25519.pub")) { throw 'no key' }
+          if ((Get-Service ssh-agent).Status -ne 'Running') { throw 'ssh-agent not running' }
+          if ((git -C "$env:USERPROFILE\.config\hatter" config core.sshCommand) -notmatch 'OpenSSH/ssh.exe') { throw 'config repo not using system ssh' }
+
+      - name: The plugin, inside WezTerm on Windows
+        shell: pwsh
+        run: |
+          $plugin = ("$env:LOCALAPPDATA\hatter\src\plugin\init.lua" -replace '\\','/')
+          @"
+          local wezterm = require 'wezterm'
+          local hatter = dofile '$plugin'
+          local cfg = assert(hatter.read({}))
+          for _, e in ipairs(hatter.entries(cfg)) do
+            local a = hatter.ssh_args({}, cfg.hats[e.hat], e.session)
+            wezterm.log_error('ENTRY ' .. e.group .. ' | ' .. a[1] .. ' ' .. a[3] .. ' ' .. a[4])
+          end
+          return {}
+          "@ | Set-Content "$env:RUNNER_TEMP\t.lua"
+          $out = & "$env:ProgramFiles\WezTerm\wezterm.exe" --config-file "$env:RUNNER_TEMP\t.lua" ls-fonts 2>&1 | Out-String
+          $entries = @($out -split "`n" | Where-Object { $_ -match 'ENTRY' })
+          $entries
+          if ($entries.Count -ne 2) { $out; throw "expected 2 entries, got $($entries.Count)" }
+          if ($out -notmatch [regex]::Escape("ssh ci@127.0.0.1 tmux new-session -A -s 'ci two' -c `"`$HOME`"")) { throw 'wrong ssh command' }
