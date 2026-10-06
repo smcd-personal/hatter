@@ -229,28 +229,64 @@ function Install-Hatter {
 
     Step 'ssh key'
 
-    # What a file is, from its first line: a private key Windows OpenSSH can
-    # use, one it cannot (with the reason), or not a key at all ($null).
+    # What a file is, from its content - never its name, because a private key
+    # saved as "something.pub" is not unusual. Returns a private key Windows
+    # OpenSSH can use, one it cannot (with the reason), or $null for anything
+    # that is not a private key at all (public keys, known_hosts, config).
     function Get-KeyKind($path) {
-        $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
-        if (-not $item -or $item.PSIsContainer -or $item.Length -gt 65536) { return $null }
-        $first = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
-        if (-not $first) { return $null }
-        switch -Regex ($first) {
-            '^-----BEGIN (OPENSSH) PRIVATE KEY-----'    { return @{ Ok = $true;  Kind = 'OpenSSH' } }
-            '^-----BEGIN (RSA|EC) PRIVATE KEY-----'     { return @{ Ok = $true;  Kind = 'PEM' } }
-            '^-----BEGIN (ENCRYPTED )?PRIVATE KEY-----' { return @{ Ok = $true;  Kind = 'PKCS#8' } }
-            '^-----BEGIN (DSA) PRIVATE KEY-----'        { return @{ Ok = $false; Kind = 'DSA, which current OpenSSH has disabled' } }
-            '^PuTTY-User-Key-File-'                     { return @{ Ok = $false; Kind = 'a PuTTY key - in PuTTYgen, Conversions > Export OpenSSH key' } }
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if (-not $item -or $item.PSIsContainer -or $item.Length -lt 20 -or $item.Length -gt 65536) { return $null }
+        try {
+            $bytes = [IO.File]::ReadAllBytes($item.FullName)
+        } catch {
+            return @{ Ok = $false; Kind = 'you cannot read it, so it may or may not be a key' }
         }
-        return $null
+        $n = [Math]::Min($bytes.Length, 400)
+        $utf16 = ($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF)
+        $bom = ($bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+        if ($utf16 -and $bytes[0] -eq 0xFF) {
+            $text = [Text.Encoding]::Unicode.GetString($bytes, 2, $n - 2)
+        } elseif ($utf16) {
+            $text = [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $n - 2)
+        } else {
+            $text = [Text.Encoding]::UTF8.GetString($bytes, 0, $n)
+        }
+        $trimmed = $text.TrimStart([char]0xFEFF).TrimStart()
+        $lead = ($trimmed.Length -ne $text.TrimStart([char]0xFEFF).Length)
+        $first = ($trimmed -split "`r?`n")[0]
+
+        $k = $null
+        switch -Regex ($first) {
+            '^-----BEGIN (OPENSSH) PRIVATE KEY-----'    { $k = @{ Ok = $true;  Kind = 'OpenSSH' }; break }
+            '^-----BEGIN (RSA|EC) PRIVATE KEY-----'     { $k = @{ Ok = $true;  Kind = 'PEM' }; break }
+            '^-----BEGIN (ENCRYPTED )?PRIVATE KEY-----' { $k = @{ Ok = $true;  Kind = 'PKCS#8' }; break }
+            '^-----BEGIN (DSA) PRIVATE KEY-----'        { $k = @{ Ok = $false; Kind = 'DSA, which current OpenSSH has disabled' }; break }
+            '^PuTTY-User-Key-File-'                     { $k = @{ Ok = $false; Kind = 'a PuTTY key - in PuTTYgen, Conversions > Export OpenSSH key' }; break }
+            '^---- BEGIN SSH2 (ENCRYPTED )?PRIVATE KEY' { $k = @{ Ok = $false; Kind = 'an ssh.com (SSH2) key - in PuTTYgen, Conversions > Import key, then Export OpenSSH key' }; break }
+        }
+        if (-not $k -or -not $k.Ok) { return $k }
+
+        # ssh reads these bytes as they are, so it rejects what this read past.
+        if ($utf16) { return @{ Ok = $false; Kind = 'saved as UTF-16, which ssh cannot read - save it again as UTF-8 or ASCII' } }
+        if ($bom)   { return @{ Ok = $false; Kind = 'starts with a byte-order mark, which ssh rejects - save it again without one' } }
+        if ($lead)  { return @{ Ok = $false; Kind = 'has blank space before its BEGIN line, which ssh rejects - delete it' } }
+        if ($item.Name -like '*.pub') { $k.Misnamed = $true }
+        return $k
     }
 
-    # "256 SHA256:abc... comment (ED25519)", read from the .pub when there is
-    # one, so an encrypted key is described without asking for its passphrase.
+    # A real public key, one line: "ssh-ed25519 AAAA... comment".
+    function Test-PublicKeyFile($path) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+        $line = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
+        return ($line -match '^(ssh-|ecdsa-|sk-)\S+ [A-Za-z0-9+/=]+')
+    }
+
+    # "256 SHA256:abc... comment (ED25519)". OpenSSH-format keys carry their
+    # public half in the clear, and a .pub covers the rest, so this needs no
+    # passphrase.
     function Get-KeyLabel($path) {
         $src = $path
-        if (Test-Path -LiteralPath "$path.pub") { $src = "$path.pub" }
+        if (Test-PublicKeyFile "$path.pub") { $src = "$path.pub" }
         $r = Invoke-Native $SshKeygen @('-l', '-f', $src)
         if ($r.Code -eq 0) { return $r.Out.Trim() }
         return '(encrypted - shown once unlocked)'
@@ -266,7 +302,6 @@ function Install-Hatter {
             }
             $usable = @(); $unusable = @()
             foreach ($f in Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue) {
-                if ($f.Name -like '*.pub') { continue }
                 $k = Get-KeyKind $f.FullName
                 if (-not $k) { continue }
                 if ($k.Ok) { $usable += $f.FullName } else { $unusable += "$($f.Name) ($($k.Kind))" }
@@ -279,7 +314,9 @@ function Install-Hatter {
             }
             Write-Host ''
             for ($i = 0; $i -lt $usable.Count; $i++) {
-                Write-Host ("    {0}) {1}" -f ($i + 1), (Split-Path $usable[$i] -Leaf))
+                $leaf = Split-Path $usable[$i] -Leaf
+                if ($leaf -like '*.pub') { $leaf += '   <- a private key, despite the .pub name' }
+                Write-Host ("    {0}) {1}" -f ($i + 1), $leaf)
                 Write-Host ("       {0}" -f (Get-KeyLabel $usable[$i])) -ForegroundColor DarkGray
             }
             Write-Host '    n) none of these - make a new key'
@@ -352,6 +389,30 @@ function Install-Hatter {
     if (-not $kind.Ok) { Fail "$Key cannot be used ($($kind.Kind))." }
     if ($remembered) { Ok "$Key (chosen before; -KeyPath changes it)" } else { Ok "using $Key" }
 
+    # A private key called *.pub is one copy or upload away from being shared
+    # as if it were public, and ssh will not find it by name. Offer a proper
+    # name: id_<type> when free, since ssh tries those by itself.
+    if ($kind.ContainsKey('Misnamed')) {
+        Note ("{0} is a private key with a public key's name." -f (Split-Path $Key -Leaf))
+        $type = ''
+        $lr = Invoke-Native $SshKeygen @('-l', '-f', $Key)
+        if ($lr.Out -match '\((RSA|ED25519|ECDSA)\)\s*$') { $type = $Matches[1].ToLower() }
+        $dir = Split-Path $Key
+        $target = $null
+        if ($type -and -not (Test-Path -LiteralPath (Join-Path $dir "id_$type"))) {
+            $target = Join-Path $dir "id_$type"
+        } elseif (-not (Test-Path -LiteralPath ($Key -replace '\.pub$', ''))) {
+            $target = $Key -replace '\.pub$', ''
+        }
+        if ($target -and (Confirm-Step ("Rename it to {0}?" -f (Split-Path $target -Leaf)))) {
+            Move-Item -LiteralPath $Key -Destination $target
+            $Key = $target
+            Ok "renamed to $Key"
+        } else {
+            Warn "$Key is a private key named like a public one - never share it"
+        }
+    }
+
     # Windows OpenSSH refuses a private key that anyone but its owner, SYSTEM
     # or Administrators can read - which a key copied in from elsewhere usually
     # can, because it inherits its folder's permissions.
@@ -374,12 +435,17 @@ function Install-Hatter {
     }
 
     # The public half: the .pub beside it, or derived from the key itself.
-    if (Test-Path -LiteralPath "$Key.pub") {
-        $PubKey = (Get-Content -LiteralPath "$Key.pub" -Raw).Trim()
+    if (Test-PublicKeyFile "$Key.pub") {
+        $PubKey = (Get-Content -LiteralPath "$Key.pub" -TotalCount 1).Trim()
     } else {
-        Note 'no .pub beside the key - reading it from the key (asks for the passphrase if it has one)'
+        Note 'no public key beside it - reading it from the key (asks for the passphrase if it has one)'
         $PubKey = ((& $SshKeygen -y -f $Key) -join '').Trim()
         if (-not $PubKey) { Fail "could not read the public key from $Key" }
+        if (-not (Test-Path -LiteralPath "$Key.pub")) {
+            # ASCII and LF, as ssh writes it - not 5.1's UTF-16 default.
+            [IO.File]::WriteAllText("$Key.pub", $PubKey + "`n", (New-Object Text.ASCIIEncoding))
+            Ok "wrote $Key.pub"
+        }
     }
     $pubTmp = [IO.Path]::GetTempFileName()
     [IO.File]::WriteAllText($pubTmp, $PubKey + "`n")
