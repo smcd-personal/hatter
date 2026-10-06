@@ -455,6 +455,9 @@ return config
 
 try {
     Install-Hatter
+    # Otherwise the caller sees whatever the last native command left in
+    # $LASTEXITCODE - a refused ssh probe, say - and calls a finished run failed.
+    if ($NonInteractive) { exit 0 }
 } catch {
     $m = "$($_.Exception.Message)"
     if (-not $m.StartsWith($FailTag)) { throw }
