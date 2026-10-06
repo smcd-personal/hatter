@@ -58,12 +58,20 @@ jobs:
           git -C $cfg -c user.email=ci@example.com -c user.name=ci add .
           git -C $cfg -c user.email=ci@example.com -c user.name=ci commit -qm config
           'return {}' | Set-Content "$env:USERPROFILE\.wezterm.lua"
+          # An existing key outside ~/.ssh, with no .pub and the loose
+          # permissions it inherits from its folder - as a copied-in key has.
+          $keys = Join-Path $env:RUNNER_TEMP 'keys'
+          New-Item -ItemType Directory $keys | Out-Null
+          Start-Process -Wait -NoNewWindow ssh-keygen -ArgumentList "-q -t ed25519 -N `"`" -C ci-existing -f `"$keys\work_key`""
+          Remove-Item "$keys\work_key.pub"
+          icacls "$keys\work_key" /grant '*S-1-5-32-545:(R)' | Out-Null   # BUILTIN\Users
 
       - name: Install, under Windows PowerShell 5.1
         shell: powershell
         run: |
           & .\tools\install-windows.ps1 -NonInteractive -NoLaunch `
               -ConfigRemote "$env:RUNNER_TEMP\cfg" `
+              -KeyPath "$env:RUNNER_TEMP\keys\work_key" `
               -RepoUrl "$env:GITHUB_WORKSPACE" -Ref HEAD
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
@@ -75,6 +83,7 @@ jobs:
           $out
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           if ($out -notmatch 'wezterm\.lua is current') { throw 'second run rewrote .wezterm.lua' }
+          if ($out -notmatch 'work_key \(chosen before') { throw 'second run did not reuse the chosen key' }
 
       - name: Results
         shell: pwsh
@@ -82,7 +91,14 @@ jobs:
           $w = Get-Content "$env:USERPROFILE\.wezterm.lua" -Raw
           if (-not $w.StartsWith("-- Written by hatter's install-windows.ps1.")) { throw 'not written by the installer' }
           if (-not (Get-ChildItem "$env:USERPROFILE\.wezterm.lua.bak-*")) { throw 'the old config was not backed up' }
-          if (-not (Test-Path "$env:USERPROFILE\.ssh\id_ed25519.pub")) { throw 'no key' }
+          $key = "$env:RUNNER_TEMP\keys\work_key"
+          if (Test-Path "$env:USERPROFILE\.ssh\id_ed25519") { throw 'generated a key despite -KeyPath' }
+          $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+          $who = @((Get-Acl $key).Access | ForEach-Object { "$($_.IdentityReference)" } | Sort-Object -Unique)
+          "key ACL: $($who -join ', ')"
+          foreach ($w in $who) { if ($w -ne $me -and $w -notmatch '\\SYSTEM$') { throw "key still readable by $w" } }
+          $fp = ((ssh-keygen -l -f $key) -split ' ')[1]
+          if ((ssh-add -l) -notmatch [regex]::Escape($fp)) { throw 'key not in the agent' }
           if ((Get-Service ssh-agent).Status -ne 'Running') { throw 'ssh-agent not running' }
           if ((git -C "$env:USERPROFILE\.config\hatter" config core.sshCommand) -notmatch 'OpenSSH/ssh.exe') { throw 'config repo not using system ssh' }
 

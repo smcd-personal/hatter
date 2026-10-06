@@ -8,7 +8,7 @@
 
       1. winget, WezTerm and Git          installed if missing
       2. OpenSSH client and ssh-agent     one elevation prompt, only if needed
-      3. an ssh key, loaded in the agent  generated if missing
+      3. an ssh key, loaded in the agent  one you have, or a new one
       4. your hatter config               cloned, or pulled if already there
       5. the hatter WezTerm plugin        fetched at -Ref
       6. ~\.wezterm.lua                   written, then loaded to prove it works
@@ -22,6 +22,10 @@
 .PARAMETER ConfigRemote
     Where `hatter backup` pushes your config. Needed the first time only.
 
+.PARAMETER KeyPath
+    The private key to use. Without it the installer asks - listing the keys
+    it finds in a folder you choose - and remembers the answer for next time.
+
 .PARAMETER Ref
     The hatter branch, tag or commit to install the plugin from. Default main.
 
@@ -30,13 +34,15 @@
     ~\.wezterm.lua (which is always backed up first).
 
 .PARAMETER NonInteractive
-    For CI: never prompt. Implies -Yes, and a missing key is generated with
-    no passphrase. Not for a machine a person uses.
+    For CI: never prompt. Implies -Yes. With no -KeyPath and no key chosen
+    before, it uses ~/.ssh/id_ed25519, generating it with no passphrase if
+    missing. Not for a machine a person uses.
 #>
 [CmdletBinding()]
 param(
     [string]$ConfigRemote,
     [string]$Ref = 'main',
+    [string]$KeyPath,
     [string]$RepoUrl = 'https://github.com/smcd-personal/hatter',
     [switch]$NoMaximize,
     [switch]$Yes,
@@ -115,7 +121,8 @@ function Install-Hatter {
     $Ssh        = Join-Path $SshDir 'ssh.exe'
     $SshKeygen  = Join-Path $SshDir 'ssh-keygen.exe'
     $SshAdd     = Join-Path $SshDir 'ssh-add.exe'
-    $KeyPath    = Join-Path $Home_ '.ssh\id_ed25519'
+    $SshHome    = Join-Path $Home_ '.ssh'
+    $StateFile  = Join-Path $env:LOCALAPPDATA 'hatter\install.json'
     $ConfigBase = $env:XDG_CONFIG_HOME
     if (-not $ConfigBase) { $ConfigBase = Join-Path $Home_ '.config' }
     $ConfigDir  = Join-Path $ConfigBase 'hatter'
@@ -222,37 +229,187 @@ function Install-Hatter {
 
     Step 'ssh key'
 
-    if (-not (Test-Path $KeyPath)) {
-        New-Item -ItemType Directory -Force (Split-Path $KeyPath) | Out-Null
+    # What a file is, from its first line: a private key Windows OpenSSH can
+    # use, one it cannot (with the reason), or not a key at all ($null).
+    function Get-KeyKind($path) {
+        $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+        if (-not $item -or $item.PSIsContainer -or $item.Length -gt 65536) { return $null }
+        $first = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
+        if (-not $first) { return $null }
+        switch -Regex ($first) {
+            '^-----BEGIN (OPENSSH) PRIVATE KEY-----'    { return @{ Ok = $true;  Kind = 'OpenSSH' } }
+            '^-----BEGIN (RSA|EC) PRIVATE KEY-----'     { return @{ Ok = $true;  Kind = 'PEM' } }
+            '^-----BEGIN (ENCRYPTED )?PRIVATE KEY-----' { return @{ Ok = $true;  Kind = 'PKCS#8' } }
+            '^-----BEGIN (DSA) PRIVATE KEY-----'        { return @{ Ok = $false; Kind = 'DSA, which current OpenSSH has disabled' } }
+            '^PuTTY-User-Key-File-'                     { return @{ Ok = $false; Kind = 'a PuTTY key - in PuTTYgen, Conversions > Export OpenSSH key' } }
+        }
+        return $null
+    }
+
+    # "256 SHA256:abc... comment (ED25519)", read from the .pub when there is
+    # one, so an encrypted key is described without asking for its passphrase.
+    function Get-KeyLabel($path) {
+        $src = $path
+        if (Test-Path -LiteralPath "$path.pub") { $src = "$path.pub" }
+        $r = Invoke-Native $SshKeygen @('-l', '-f', $src)
+        if ($r.Code -eq 0) { return $r.Out.Trim() }
+        return '(encrypted - shown once unlocked)'
+    }
+
+    function Select-Key {
+        $dir = $SshHome
+        while ($true) {
+            $answer = Read-Host "  Folder to look in [$dir]"
+            if ($answer) { $dir = $answer.Trim().Trim('"') }
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
+                Note "no such folder: $dir"; $dir = $SshHome; continue
+            }
+            $usable = @(); $unusable = @()
+            foreach ($f in Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue) {
+                if ($f.Name -like '*.pub') { continue }
+                $k = Get-KeyKind $f.FullName
+                if (-not $k) { continue }
+                if ($k.Ok) { $usable += $f.FullName } else { $unusable += "$($f.Name) ($($k.Kind))" }
+            }
+            foreach ($u in $unusable) { Note "cannot use $u" }
+            if ($usable.Count -eq 0) {
+                Note "no OpenSSH private keys in $dir"
+                if (Confirm-Step 'Look in another folder?') { continue }
+                return $null
+            }
+            Write-Host ''
+            for ($i = 0; $i -lt $usable.Count; $i++) {
+                Write-Host ("    {0}) {1}" -f ($i + 1), (Split-Path $usable[$i] -Leaf))
+                Write-Host ("       {0}" -f (Get-KeyLabel $usable[$i])) -ForegroundColor DarkGray
+            }
+            Write-Host '    n) none of these - make a new key'
+            Write-Host ''
+            $default = ''
+            if ($usable.Count -eq 1) { $default = '1' }
+            while ($true) {
+                $pick = Read-Host "  Which key? [$default]"
+                if (-not $pick) { $pick = $default }
+                if ($pick -match '^[nN]') { return $null }
+                $n = 0
+                if ([int]::TryParse($pick, [ref]$n) -and $n -ge 1 -and $n -le $usable.Count) {
+                    return $usable[$n - 1]
+                }
+                Note "pick 1 to $($usable.Count), or n"
+            }
+        }
+    }
+
+    function Initialize-Key {
+        # Never over an existing key: id_ed25519 if free, else a name of its own.
+        $path = Join-Path $SshHome 'id_ed25519'
+        if (Test-Path -LiteralPath $path) { $path = Join-Path $SshHome 'id_ed25519_hatter' }
+        if (Test-Path -LiteralPath $path) { return $path }
+        New-Item -ItemType Directory -Force $SshHome | Out-Null
         $comment = "$env:USERNAME@$env:COMPUTERNAME"
         if ($NonInteractive) {
             # Start-Process passes this line as is, so -N "" reaches ssh-keygen
             # as an empty passphrase on both 5.1 and 7.
             Start-Process -Wait -NoNewWindow $SshKeygen `
-                -ArgumentList "-q -t ed25519 -N `"`" -C `"$comment`" -f `"$KeyPath`""
+                -ArgumentList "-q -t ed25519 -N `"`" -C `"$comment`" -f `"$path`""
         } else {
-            Note 'no key yet - making one. Choose a passphrase; the agent remembers it.'
-            & $SshKeygen -t ed25519 -C $comment -f $KeyPath
+            Note 'making a new key. Choose a passphrase; the agent will remember it.'
+            & $SshKeygen -t ed25519 -C $comment -f $path
         }
-        if (-not (Test-Path $KeyPath)) { Fail 'ssh-keygen did not create a key.' }
-        Ok "created $KeyPath"
-    } else {
-        Ok "found $KeyPath"
+        if (-not (Test-Path -LiteralPath $path)) { Fail 'ssh-keygen did not create a key.' }
+        Ok "created $path"
+        return $path
     }
-    $PubKey = (Get-Content "$KeyPath.pub" -Raw).Trim()
+
+    # Which key: -KeyPath, else the one chosen last time, else ask.
+    $state = @{}
+    if (Test-Path -LiteralPath $StateFile) {
+        try {
+            $j = Get-Content -LiteralPath $StateFile -Raw | ConvertFrom-Json
+            foreach ($p in $j.PSObject.Properties) { $state[$p.Name] = [string]$p.Value }
+        } catch { $state = @{} }
+    }
+
+    $Key = $null
+    $remembered = $false
+    if ($KeyPath) {
+        $Key = (Resolve-Path -LiteralPath $KeyPath -ErrorAction SilentlyContinue).Path
+        if (-not $Key) { Fail "no such key: $KeyPath" }
+    } elseif ($state['key'] -and (Test-Path -LiteralPath $state['key'])) {
+        $Key = $state['key']
+        $remembered = $true
+    } elseif ($NonInteractive) {
+        $Key = Join-Path $SshHome 'id_ed25519'
+        if (-not (Test-Path -LiteralPath $Key)) { $Key = Initialize-Key }
+    } else {
+        if (Confirm-Step 'Use an ssh key you already have? (n makes a new one)') {
+            $Key = Select-Key
+        }
+        if (-not $Key) { $Key = Initialize-Key }
+    }
+
+    $kind = Get-KeyKind $Key
+    if (-not $kind) { Fail "$Key is not a private key." }
+    if (-not $kind.Ok) { Fail "$Key cannot be used ($($kind.Kind))." }
+    if ($remembered) { Ok "$Key (chosen before; -KeyPath changes it)" } else { Ok "using $Key" }
+
+    # Windows OpenSSH refuses a private key that anyone but its owner, SYSTEM
+    # or Administrators can read - which a key copied in from elsewhere usually
+    # can, because it inherits its folder's permissions.
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $loose = @((Get-Acl -LiteralPath $Key).Access | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and
+        "$($_.IdentityReference)" -ne $me -and
+        "$($_.IdentityReference)" -notmatch '\\(SYSTEM|Administrators)$'
+    } | ForEach-Object { "$($_.IdentityReference)" } | Sort-Object -Unique)
+    if ($loose.Count -gt 0) {
+        Note ("others can read this key: {0}" -f ($loose -join ', '))
+        if (Confirm-Step 'ssh refuses a key like that. Restrict it to you?') {
+            # Drop inherited entries, keep you and SYSTEM, then remove the rest.
+            [void](Invoke-Native icacls @($Key, '/inheritance:r', '/grant:r', "${me}:(F)", '/grant:r', '*S-1-5-18:(F)'))
+            foreach ($who in $loose) { [void](Invoke-Native icacls @($Key, '/remove:g', $who)) }
+            Ok 'permissions restricted to you'
+        } else {
+            Warn "$Key is readable by others, so ssh will refuse to use it"
+        }
+    }
+
+    # The public half: the .pub beside it, or derived from the key itself.
+    if (Test-Path -LiteralPath "$Key.pub") {
+        $PubKey = (Get-Content -LiteralPath "$Key.pub" -Raw).Trim()
+    } else {
+        Note 'no .pub beside the key - reading it from the key (asks for the passphrase if it has one)'
+        $PubKey = ((& $SshKeygen -y -f $Key) -join '').Trim()
+        if (-not $PubKey) { Fail "could not read the public key from $Key" }
+    }
+    $pubTmp = [IO.Path]::GetTempFileName()
+    [IO.File]::WriteAllText($pubTmp, $PubKey + "`n")
+    $fp = ((Invoke-Native $SshKeygen @('-l', '-f', $pubTmp)).Out -split ' ')[1]
+    Remove-Item -LiteralPath $pubTmp -ErrorAction SilentlyContinue
+    Note $fp
+
+    $state['key'] = $Key
+    New-Item -ItemType Directory -Force (Split-Path $StateFile) | Out-Null
+    ([pscustomobject]$state | ConvertTo-Json) | Set-Content -LiteralPath $StateFile
+
+    # ssh tries only a few default names by itself. Any other key has to be in
+    # the agent, which is where this one goes.
+    $defaultNames = 'id_rsa', 'id_ecdsa', 'id_ecdsa_sk', 'id_ed25519', 'id_ed25519_sk'
+    $isDefault = ((Split-Path $Key) -eq $SshHome) -and ($defaultNames -contains (Split-Path $Key -Leaf))
 
     $agent = Get-Service ssh-agent -ErrorAction SilentlyContinue
     if ($agent -and $agent.Status -eq 'Running') {
-        $fp = ((Invoke-Native $SshKeygen @('-l', '-f', "$KeyPath.pub")).Out -split ' ')[1]
         $loaded = (Invoke-Native $SshAdd @('-l')).Out
-        if ($loaded -like "*$fp*") {
+        if ($fp -and $loaded -like "*$fp*") {
             Ok 'key loaded in the agent'
         } elseif ($NonInteractive) {
-            [void](Invoke-Native $SshAdd @($KeyPath))
+            $r = Invoke-Native $SshAdd @($Key)
+            if ($r.Code -eq 0) { Ok 'key loaded in the agent' } else { Warn "the key could not be added to the agent: $($r.Out)" }
         } else {
-            & $SshAdd $KeyPath
+            & $SshAdd $Key
             if ($LASTEXITCODE -eq 0) { Ok 'key loaded in the agent' } else { Warn 'the key could not be added to the agent' }
         }
+    } elseif (-not $isDefault) {
+        Warn "$Key is not one of ssh's default names, and with no agent running ssh will not find it"
     }
 
     function Show-KeyFix($hats) {
