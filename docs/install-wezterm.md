@@ -56,7 +56,11 @@ and then checks every hat:
 1. installs WezTerm and Git with winget, if they are missing
 2. adds the OpenSSH client and starts the ssh agent, asking for administrator
    rights once and only if something needs them
-3. makes an ssh key if you have none, and loads it into the agent
+3. asks whether to use an ssh key you already have. If so, it lists the
+   usable private keys in a folder you pick (default `~\.ssh`), with their
+   fingerprints; if not, it makes one. The key goes into the agent, its
+   permissions are tightened if Windows' ssh would refuse it, and the choice
+   is remembered for the next run
 4. clones your config to `~\.config\hatter`, or pulls it if it is there,
    using Windows' ssh for that repository only
 5. fetches the plugin to `%LOCALAPPDATA%\hatter\src`
@@ -67,6 +71,10 @@ and then checks every hat:
 Each step checks before it acts, so **run it again whenever you like**: to
 update the plugin and the config, or as a health check when something is off.
 A plain `-ConfigRemote` is only needed the first time.
+
+**Keys from PuTTY** (`.ppk`) are listed but cannot be used as they are: open
+the key in PuTTYgen, choose *Conversions > Export OpenSSH key*, save it in
+`~\.ssh`, and run the installer again.
 
 **A hat that says "key not authorised".** A new key cannot log in to a server
 that only accepts keys, so it cannot add itself. The installer puts your public
@@ -94,6 +102,7 @@ Options, for when the defaults do not fit:
 
 | Option | Does |
 |---|---|
+| `-KeyPath <file>` | Use this private key, without asking; also changes a remembered one |
 | `-Ref <branch\|tag>` | Install the plugin from another ref (default `main`) |
 | `-NoMaximize` | Do not open WezTerm maximized |
 | `-Yes` | Answer yes to every question |

@@ -96,7 +96,8 @@ jobs:
           $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
           $who = @((Get-Acl $key).Access | ForEach-Object { "$($_.IdentityReference)" } | Sort-Object -Unique)
           "key ACL: $($who -join ', ')"
-          foreach ($w in $who) { if ($w -ne $me -and $w -notmatch '\\SYSTEM$') { throw "key still readable by $w" } }
+          # What Windows OpenSSH accepts: the owner, SYSTEM and Administrators.
+          foreach ($w in $who) { if ($w -ne $me -and $w -notmatch '\\(SYSTEM|Administrators)$') { throw "key still readable by $w" } }
           $fp = ((ssh-keygen -l -f $key) -split ' ')[1]
           if ((ssh-add -l) -notmatch [regex]::Escape($fp)) { throw 'key not in the agent' }
           if ((Get-Service ssh-agent).Status -ne 'Running') { throw 'ssh-agent not running' }
