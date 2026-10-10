@@ -412,10 +412,16 @@ have_cmux() { command -v cmux >/dev/null 2>&1; }
 # from an honest "this window holds nothing", so without this probe a whole run
 # reports "no window open" for every hat, leaves the config untouched, and
 # still exits 0. Probe once; the commands that drive cmux fail loudly instead.
+#
+# A running cmux can also refuse the socket. Its default access mode,
+# cmuxOnly, only answers processes started inside cmux, so a launchd job such
+# as the autosave timer is turned away with "Access denied". That needs a
+# different fix from a dead app, so the probe keeps what cmux said.
 CMUX_ALIVE=""
+CMUX_PROBE_ERR=""
 cmux_alive() {
     if [[ -z "$CMUX_ALIVE" ]]; then
-        if have_cmux && cmux list-windows --json >/dev/null 2>&1; then
+        if have_cmux && CMUX_PROBE_ERR=$(cmux list-windows --json 2>&1 >/dev/null); then
             CMUX_ALIVE=yes
         else
             CMUX_ALIVE=no
@@ -428,6 +434,14 @@ cmux_alive() {
 require_cmux() {
     cmux_alive && return 0
     have_cmux || die "the cmux CLI is not on PATH, and '$1' needs it"
+    if [[ "$CMUX_PROBE_ERR" == *"Access denied"* ]]; then
+        die "cmux refused its control socket: only processes started inside cmux
+  may use it, and this one was not (a launchd job, or another terminal).
+  Nothing was changed. Give the socket a password - the cmux CLI reads the
+  saved one by itself - in Settings > Automation, or in ~/.config/cmux/cmux.json:
+    \"automation\": { \"socketControlMode\": \"password\", \"socketPassword\": \"<secret>\" }
+  then run 'cmux reload-config' and 'hatter $1' again."
+    fi
     die "cmux is not answering on its control socket, so the live layout cannot be
   read. Nothing was changed. Start or restart the cmux app, confirm with
     cmux list-windows --json
@@ -2470,8 +2484,24 @@ cmd_autosave() {
             hatter_lock 0 || return 0          # a command is mid-write; try next minute
             trap hatter_unlock EXIT
             # A subshell: cmd_sync dies on a dead socket, and the snapshot has
-            # to happen anyway.
-            ( cmd_sync ) >/dev/null 2>&1 || warn "autosave: sync failed, snapshotting anyway"
+            # to happen anyway. Its error goes to the log once, when it first
+            # appears or changes, rather than once a minute.
+            local err state
+            state="$AUTOSAVE_DIR/sync-state"
+            mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+            if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
+                if [[ "$(sed -n 1p "$state" 2>/dev/null)" != ok ]]; then
+                    [[ -s "$state" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: sync ok again"
+                fi
+                printf 'ok\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$state" 2>/dev/null || true
+            else
+                err=$(printf '%s\n' "$err" | sed -n 's/^error: //p; s/^  !! //p' | head -n 1)
+                [[ -n "$err" ]] || err="sync exited non-zero with no message"
+                if [[ "$(sed -n 3p "$state" 2>/dev/null)" != "$err" ]]; then
+                    warn "autosave: sync failed, snapshotting anyway: $err"
+                fi
+                printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
+            fi
             local f
             f=$(autosave_snapshot) || true
             [[ -n "$f" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave -> $(basename "$f")"
@@ -2528,6 +2558,13 @@ cmd_autosave() {
                 info "Timer: loaded, every 60s"
             else
                 info "Timer: not installed  (install with: hatter autosave install)"
+            fi
+            local st="$AUTOSAVE_DIR/sync-state"
+            if [[ -s "$st" ]]; then
+                printf '  last sync: %s at %s\n' "$(sed -n 1p "$st")" "$(sed -n 2p "$st")"
+                [[ -n "$(sed -n 3p "$st")" ]] && printf '      error: %s\n' "$(sed -n 3p "$st")"
+            else
+                printf '  last sync: none recorded yet\n'
             fi
             printf '  snapshots: %s of %s\n' "$(autosave_files | wc -l | tr -d ' ')" "$AUTOSAVE_KEEP"
             printf '  directory: %s\n' "$AUTOSAVE_DIR" ;;
