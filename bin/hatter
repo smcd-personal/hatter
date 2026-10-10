@@ -2046,6 +2046,87 @@ cmd_repair() {
     info "Repaired '$session'"
 }
 
+# The attach half of a client: put this terminal inside one workspace. No cmux,
+# no window bookkeeping and no config writes, so it runs from any bash that has
+# ssh - a Linux box, WSL, a phone's ssh app via a jump host. `-A` attaches when
+# the session exists and creates it when it does not, so the one command is
+# always right, and tmux keeps the state either way.
+#
+# Plain ssh, not SSH_OPTS: an interactive login that happens to become the
+# ControlMaster holds the socket for every short-lived hatter call after it,
+# and those would then die with the terminal.
+attach_session() {
+    local hat="$1" session="$2" dest dir
+    [[ -t 0 && -t 1 ]] || die "attach needs a terminal - '$session' is on hat '$hat'"
+    dest=$(hat_ssh "$hat")
+    [[ -n "$dest" ]] || die "hat '$hat' has no ssh destination"
+    dir=$(hat_dir "$hat")
+    exec ssh -t "$dest" \
+        "tmux new-session -A -s $(sq "$session") -c $(sq_dir "$dir")"
+}
+
+# The workspaces a hat has: those the config records, plus any running on its
+# server that were never recorded. One per line, sorted, unique.
+hat_workspaces() {
+    local hat="$1" dest
+    # Each stage can end non-zero without meaning anything (the last session
+    # listed belongs to another hat; the server is unreachable), and pipefail
+    # would turn that into a silent exit, so the group ends in an explicit 0.
+    {
+        cfg --arg l "$hat" '
+            .groups[] | select(.hat == $l) | .sessions | keys[]?'
+        dest=$(hat_ssh "$hat")
+        if [[ -n "$dest" ]]; then
+            { remote_sessions "$dest" 2>/dev/null || true; } \
+                | while IFS= read -r s; do
+                      if [[ "$(session_hat "$s")" == "$hat" ]]; then
+                          printf '%s\n' "$s"
+                      fi
+                  done
+        fi
+        return 0
+    } | sort -u | sed '/^$/d'
+    return 0
+}
+
+cmd_attach() {
+    local target="$1" hat session
+    target=$(tmux_session_name "$target")
+
+    # A recorded session, or one whose prefix names a hat.
+    if ! hat_exists "$target"; then
+        hat=$(session_hat "$target")
+        [[ -n "$hat" ]] || die "'$target' is neither a hat nor a workspace of one.
+  Known hats: $(hat_names | tr '\n' ' ')"
+        attach_session "$hat" "$target"
+    fi
+
+    # A hat: pick one of its workspaces.
+    hat="$target"
+    local list n
+    list=$(hat_workspaces "$hat")
+    n=$(printf '%s' "$list" | grep -c '' || true)
+
+    if [[ "$n" -eq 0 ]]; then
+        die "hat '$hat' has no workspaces yet. Name one to create it:
+    hatter attach $hat-<name>"
+    fi
+    if [[ "$n" -eq 1 ]]; then
+        attach_session "$hat" "$list"
+    fi
+    [[ -t 0 ]] || die "hat '$hat' has $n workspaces - name one:
+$(printf '%s\n' "$list" | sed 's/^/    /')"
+
+    local -a choices=()
+    while IFS= read -r session; do choices+=("$session"); done <<<"$list"
+    PS3="workspace on '$hat': "
+    select session in "${choices[@]}"; do
+        [[ -n "$session" ]] && attach_session "$hat" "$session"
+        echo "pick a number from 1 to $n"
+    done
+    exit 1
+}
+
 cmd_rename() {
     # Rename a session everywhere at once: on the server, in cmux, in the config.
     local old="${1:-}" new="${2:-}"
@@ -3891,6 +3972,7 @@ hatter - cmux windows, groups and workspaces backed by remote tmux
 Commands:
   new <session>          Create or reattach a workspace  ("new" is optional)
   tab <session> [name]   Add a tab to a workspace
+  attach <hat|session>   Open a workspace in this terminal, over plain ssh
   rename <old> <new>     Rename a session on its server, in cmux and in config
   repair <session>       Bring back a workspace cmux shows blank, in its place
   hat <subcommand>       Manage hats (shell servers)
@@ -4041,6 +4123,24 @@ place. The tmux session, and everything running in it, is never touched.
 Finally it syncs the config and refreshes the server's pane registry.
 
 In the rack, press f on a workspace.
+USAGE
+    ;;
+    attach) cat <<'USAGE'
+hatter attach <hat | session>
+
+Open a workspace in this terminal: ssh to its hat and attach to the tmux
+session, creating it if it is not running. Nothing else is touched - no cmux,
+no config writes - so this works from any terminal with bash and ssh.
+
+  hatter attach dev-atlas     that workspace
+  hatter attach dev           pick one of dev's workspaces
+
+Given a hat, the choice is every workspace the config records for it plus any
+running on its server. Detach with the tmux prefix then d; the session keeps
+running.
+
+On Windows without bash, the WezTerm plugin (plugin/init.lua) does the same
+- see docs/install-wezterm.md.
 USAGE
     ;;
     rename) cat <<'USAGE'
@@ -4253,12 +4353,13 @@ shift || true
 # and jq, which run anywhere, WSL included. So cmux is required by the commands
 # that actually drive it rather than by the script itself.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|help|-h|--help) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|help|-h|--help) ;;
     *) need cmux ;;
 esac
 
 case "$cmd" in
-    rack|edit|list|ls|help|""|-h|--help|autosave) ;;
+    # attach ends in exec, which skips the EXIT trap that would unlock.
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
@@ -4281,6 +4382,7 @@ case "$cmd" in
     # These need arguments, so bare invocation shows the command's options.
     new)       [[ $# -gt 0 ]] || { usage_cmd new; exit 1; };       cmd_new "$@" ;;
     tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
+    attach)    [[ $# -eq 1 ]] || { usage_cmd attach; exit 1; };    cmd_attach "$1" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;

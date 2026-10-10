@@ -71,9 +71,12 @@ tool. The plan for what comes next — a typed port, a client-adapter interface 
 it is not tied to one terminal, Windows and Linux clients — is in
 [EPIC.md](EPIC.md) and [issues/](issues/).
 
-Client support today is [cmux](https://cmux.com); the
-adapter interface (issue 2) is the keystone that opens it to WezTerm, wmux and a
-headless mode.
+Client support today is [cmux](https://cmux.com) for the full layout, and
+[WezTerm](https://wezterm.org) on Windows, macOS and Linux for reaching any hat
+through a picker - a plugin in [plugin/](plugin/init.lua) that needs no bash, so
+Windows works without WSL. `hatter attach` does the same from any terminal. The
+adapter interface (issue 2) is what will let `restore` and `sync` drive WezTerm,
+wmux and a headless mode too.
 
 ## Requirements
 
@@ -88,8 +91,10 @@ Two guides, depending on which terminal you have:
 
 - **[macOS with cmux](docs/install-cmux-macos.md)** — the full-feature path.
   cmux is the only client hatter drives end-to-end today, and it is macOS-only.
-- **[macOS or Windows with WezTerm](docs/install-wezterm.md)** — the server half
-  works today; the client backend is [#4](https://github.com/smcd-personal/hatter/issues/4).
+- **[Windows, macOS or Linux with WezTerm](docs/install-wezterm.md)** —
+  installing WezTerm, ssh and your config, then a picker that opens any
+  workspace on any hat. On Windows it needs no WSL. `restore` and `sync` for
+  WezTerm are [#4](https://github.com/smcd-personal/hatter/issues/4).
 
 The short version, once your terminal is sorted:
 
