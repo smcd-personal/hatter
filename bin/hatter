@@ -2149,13 +2149,18 @@ key_add_to() {
     script='IFS= read -r k || exit 3
 umask 077
 mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys || exit 4
+set -f
 set -- $k
-if awk -v t="$1" -v b="$2" '\''$1 == t && $2 == b { f = 1 } END { exit !f }'\'' ~/.ssh/authorized_keys; then
+if awk -v t="$1" -v b="$2" '\''{ sub(/\r$/, "") } $1 == t && $2 == b { f = 1 } END { exit !f }'\'' ~/.ssh/authorized_keys; then
     echo present
 else
+    # A file saved without a final newline would swallow the new key into its last line.
+    if [ -s ~/.ssh/authorized_keys ] && [ -n "$(tail -c 1 ~/.ssh/authorized_keys)" ]; then echo >> ~/.ssh/authorized_keys; fi
     printf "%s\n" "$k" >> ~/.ssh/authorized_keys && echo added
 fi'
-    printf '%s\n' "$2" | remote_sh_stdin "$dest" "sh -c $(sq "$script")"
+    # BatchMode: a hat that refuses this machine's key is "unreachable", not a
+    # password prompt fighting the key for stdin.
+    printf '%s\n' "$2" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=10 "$dest" "sh -c $(sq "$script")"
 }
 
 cmd_key() {

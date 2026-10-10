@@ -557,7 +557,8 @@ function Install-Hatter {
 
     $maximize = 'true'
     if ($NoMaximize) { $maximize = 'false' }
-    $luaPlugin = ConvertTo-Slash $PluginDir
+    # Inside a Lua single-quoted string: a name like O'Brien must not end it.
+    $luaPlugin = (ConvertTo-Slash $PluginDir) -replace "'", "\'"
 
     $lua = @"
 $Marker
