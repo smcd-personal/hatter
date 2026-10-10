@@ -358,20 +358,72 @@ remote_sessions() {
     remote_sh "$1" "tmux list-sessions -F '#S' 2>/dev/null || true"
 }
 
+# A session's tabs in tmux index order, as {id, name, cwd[, pinned]}. The
+# window id is only for lining the tabs up with cmux, and never stored.
 remote_windows_json() {
     local host="$1" session="$2"
-    local fmt=$'#{window_name}\t#{pane_current_path}'
+    local fmt=$'#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@hatter-pinned}'
     remote_sh "$host" \
         "tmux list-windows -t $(sq "=$session") -F $(sq "$fmt") 2>/dev/null || true" \
-    | jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {name: .[0], cwd: (.[1] // null)})'
+    | jq -R -s 'split("\n") | map(select(length>0) | split("\t")
+        | {id: .[0], name: (.[1] // ""), cwd: (.[2] // null)}
+          + (if .[3] == "1" then {pinned: true} else {} end))'
+}
+
+# A pinned tab is one hatter keeps: restore creates it first, and brings it
+# back if it was closed. cmux cannot pin a mirrored tmux pane, so the pin is
+# hatter's own. It is held twice: as the tmux window option @hatter-pinned,
+# which follows the window through a rename or a move, and as "pinned": true
+# in the config, which survives tmux-resurrect - that brings windows back after
+# a reboot but not their user options. Either one counts.
+PIN_OPT='@hatter-pinned'
+
+# A remote command that creates a window and, when <pinned> is true, pins it.
+# <create> must be a tmux new-session/new-window call that takes -P -F.
+pinned_create() {
+    local create="$1" pinned="$2"
+    if [[ "$pinned" == "true" ]]; then
+        printf 'w=$(%s -P -F %s) && tmux set-option -w -t "$w" %s 1' \
+            "$create" "'#{window_id}'" "$PIN_OPT"
+    else
+        printf '%s' "$create"
+    fi
+}
+
+# Bring back any pinned tab missing from a running session, and re-pin a live
+# tab of the same name that lost its option. Tabs are matched by name, which
+# is why only a named tab can be pinned.
+ensure_pinned_tabs() {
+    local host="$1" session="$2" dir="$3" windows="$4" live name cwd
+    [[ "$(jq '[.[] | select(.pinned)] | length' <<<"$windows")" -gt 0 ]] || return 0
+    live=$(remote_sh "$host" \
+        "tmux list-windows -t $(sq "=$session") -F '#{window_id}	#{window_name}' 2>/dev/null || true")
+    while IFS=$'\x1f' read -r name cwd; do
+        [[ -z "$name" ]] && continue
+        local wid
+        wid=$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' <<<"$live")
+        if [[ -n "$wid" ]]; then
+            remote_sh "$host" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1" >/dev/null 2>&1 || true
+            continue
+        fi
+        [[ -z "$cwd" || "$cwd" == "null" ]] && cwd="$dir"
+        info "Reopening pinned tab '$name' in '$session' on $host"
+        remote_sh "$host" "$(pinned_create \
+            "tmux new-window -d -t $(sq "=$session") -n $(sq "$name") -c $(sq_dir "$cwd")" true)" >/dev/null
+    done < <(jq -r '.[] | select(.pinned) | [.name, (.cwd // "")] | join("\u001f")' <<<"$windows")
 }
 
 ensure_remote_session() {
     # ensure_remote_session <host> <session> <default-dir> [windows-json]
     local host="$1" session="$2" dir="$3" windows="${4:-[]}"
 
-    remote_session_exists "$host" "$session" && return 0
+    if remote_session_exists "$host" "$session"; then
+        ensure_pinned_tabs "$host" "$session" "$dir" "$windows"
+        return 0
+    fi
 
+    # Pinned tabs first, each group keeping its recorded order.
+    windows=$(jq '[.[] | select(.pinned)] + [.[] | select(.pinned | not)]' <<<"$windows")
     local n
     n=$(jq 'length' <<<"$windows")
 
@@ -382,8 +434,10 @@ ensure_remote_session() {
     fi
 
     info "Recreating tmux session '$session' on $host ($n windows)"
-    local first=1 name cwd cmd nameopt
-    while IFS=$'\t' read -r name cwd; do
+    # Fields are split on \x1f, not a tab: tab is IFS whitespace, so read
+    # would fold an empty tab name into the next field.
+    local first=1 name cwd pinned cmd nameopt
+    while IFS=$'\x1f' read -r name cwd pinned; do
         [[ -z "${cwd:-}" || "$cwd" == "null" ]] && cwd="$dir"
         nameopt=""
         [[ -n "${name:-}" ]] && nameopt="-n $(sq "$name")"
@@ -393,8 +447,8 @@ ensure_remote_session() {
         else
             cmd="tmux new-window -d -t $(sq "=$session") $nameopt -c $(sq_dir "$cwd")"
         fi
-        remote_sh "$host" "$cmd"
-    done < <(jq -r '.[] | [.name, .cwd] | @tsv' <<<"$windows")
+        remote_sh "$host" "$(pinned_create "$cmd" "$pinned")" >/dev/null
+    done < <(jq -r '.[] | [(.name // ""), (.cwd // ""), (.pinned // false | tostring)] | join("\u001f")' <<<"$windows")
 }
 
 # ----------------------------------------------------------- cmux primitives
@@ -451,6 +505,22 @@ require_cmux() {
 # Refs like workspace:3 are window-scoped and collide across windows, so every
 # id this script stores or passes around is a UUID.
 cmux_json() { have_cmux || return 1; cmux --id-format both "$@" --json; }
+
+# The tmux window ids of a mirrored workspace, one per line, in the order cmux
+# shows its tabs. cmux keeps the order it first mirrored them in and does not
+# follow a later tmux reorder, so this - not the window index - is the order
+# the user sees. Prints nothing when cmux cannot say; callers keep tmux order.
+cmux_tab_order() {
+    local win="$1" wref="$2" host="$3" session="$4" map panes
+    map=$(cmux rpc remote.tmux.pane_surfaces \
+        "$(jq -nc --arg h "$host" --arg s "$session" '{host: $h, session: $s}')" 2>/dev/null) || return 0
+    panes=$(cmux_json list-panes --workspace "$wref" --window "$win" 2>/dev/null) || return 0
+    jq -rn --argjson m "$map" --argjson p "$panes" '
+        ([$m.panes[]? | {key: .surface_id, value: .window_id}] | from_entries) as $w
+        | [$p.panes[]?.surface_ids[]? | $w[.] // empty]
+        | reduce .[] as $x ([]; if index([$x]) then . else . + [$x] end)
+        | .[]' 2>/dev/null || true
+}
 
 window_ids() { have_cmux || return 0; cmux list-windows --json | jq -r '.[].id'; }
 
@@ -1756,10 +1826,58 @@ hat_status_row() {
 }
 
 cmd_tab() {
+    case "${1:-}" in
+        pin|unpin) [[ $# -eq 3 ]] && { cmd_tab_pin "$@"; return; } ;;
+    esac
     # Add a tab back to a workspace: in the mirror a tab IS a tmux window, so
     # creating one on the server makes it appear - no re-mirror needed.
-    local session="${1:-}" name="${2:-}" dir=""
+    local session="${1:-}" name="${2:-}"
     [[ -n "$session" ]] || die "usage: hatter tab <session> [tab-name]"
+    tab_target "$session"
+    local nameopt=""
+    [[ -n "$name" ]] && nameopt="-n $(sq "$name")"
+    remote_sh "$TAB_HOST" "tmux new-window -t $(sq "=$TAB_SESSION") $nameopt -c $(sq_dir "$(hat_dir "$TAB_HAT")")"
+    info "Added a tab to '$TAB_SESSION' on $TAB_HOST${name:+ (named '$name')}"
+}
+
+# hatter tab pin|unpin <session> <tab>   - <tab> is a window index or name
+cmd_tab_pin() {
+    local action="$1" tab="$3" line wid idx name
+    tab_target "$2"
+    line=$(remote_sh "$TAB_HOST" \
+        "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}	#{window_index}	#{window_name}' 2>/dev/null" \
+        | awk -F'\t' -v t="$tab" '$2==t {print; exit} $3==t && !n {n=$0} END {if (n) print n}' | head -n 1)
+    [[ -n "$line" ]] || die "no tab '$tab' in '$TAB_SESSION' - give its index or its name"
+    IFS=$'\t' read -r wid idx name <<<"$line"
+    if [[ "$action" == pin ]]; then
+        [[ -n "$name" ]] || die "tab $idx has no name, and a pinned tab is matched by name when it is
+  brought back. Name it first:  tmux rename-window -t '=$TAB_SESSION:$idx' <name>"
+        remote_sh "$TAB_HOST" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1"
+    else
+        remote_sh "$TAB_HOST" "tmux set-option -wu -t $(sq "$wid") $PIN_OPT"
+    fi
+
+    if [[ -z "$TAB_GROUP" ]]; then
+        warn "'$TAB_SESSION' is not in any group, so restore does not know it; the pin is on tmux only"
+    else
+        # The config is the half of the pin that survives a reboot, so it is
+        # written now rather than at the next sync.
+        backup_config
+        jq_write --arg g "$TAB_GROUP" --arg s "$TAB_SESSION" --arg n "$name" \
+                 --argjson p "$([[ "$action" == pin ]] && echo true || echo false)" '
+            .groups[$g].sessions[$s].windows |= ((. // [])
+                | if any(.[]; .name == $n) then . else . + [{name: $n, cwd: null}] end
+                | map(if .name == $n then (if $p then .pinned = true else del(.pinned) end) else . end))'
+    fi
+    if [[ "$action" == pin ]]; then info "Pinned tab '$name' in '$TAB_SESSION'"
+    else info "Unpinned tab '${name:-$idx}' in '$TAB_SESSION'"; fi
+}
+
+# Resolve a workspace name the way `hatter tab` takes it. Sets TAB_SESSION,
+# TAB_GROUP (empty when no group records it), TAB_HAT and TAB_HOST, and dies
+# unless the session is running.
+tab_target() {
+    local session="$1"
 
     # A hat is not a workspace. Catch the confusion explicitly rather than
     # failing later with advice that cannot help.
@@ -1805,7 +1923,6 @@ $listing
     fi
 
     host=$(hat_ssh "$hat")
-    dir=$(hat_dir "$hat")
 
     if ! remote_session_exists "$host" "$session"; then
         if [[ -n "$group" ]]; then
@@ -1818,10 +1935,7 @@ $listing
   Or list what exists:  hatter list"
     fi
 
-    local nameopt=""
-    [[ -n "$name" ]] && nameopt="-n $(sq "$name")"
-    remote_sh "$host" "tmux new-window -t $(sq "=$session") $nameopt -c $(sq_dir "$dir")"
-    info "Added a tab to '$session' on $host${name:+ (named '$name')}"
+    TAB_SESSION="$session" TAB_GROUP="$group" TAB_HAT="$hat" TAB_HOST="$host"
 }
 
 cmd_rename() {
@@ -2098,7 +2212,7 @@ cmd_sync() {
             continue
         fi
 
-        local groups_json ws_json gname
+        local groups_json ws_json gname order recorded
         groups_json=$(cmux_json workspace-group list --window "$w" 2>/dev/null || echo '{"groups":[]}')
         ws_json=$(cmux_json workspace list --window "$w" 2>/dev/null || echo '{"workspaces":[]}')
 
@@ -2141,6 +2255,22 @@ cmd_sync() {
                 grep -qxF "$title" <<<"$live" || continue
 
                 windows=$(remote_windows_json "$host" "$title")
+                order=$(cmux_tab_order "$w" "$wref" "$host" "$title" | jq -R . | jq -sc .)
+                recorded=$(cfg --arg g "$gname" --arg s "$title" '.groups[$g].sessions[$s].windows // []')
+                # Order as cmux shows it, ties and strays in tmux order. A tab
+                # the config has pinned stays pinned; a pinned tab that has
+                # been closed stays recorded, at the front, so restore can
+                # bring it back.
+                windows=$(jq -c --argjson o "${order:-[]}" --argjson rec "$recorded" '
+                    ([$rec[] | select(.pinned) | .name]) as $pins
+                    | to_entries
+                    | sort_by((.value.id as $i | $o | index($i)) // 1e9, .key)
+                    | map(.value | del(.id)
+                          | if (.name != "" and (.name as $n | $pins | index($n)))
+                            then .pinned = true else . end)
+                    | . as $live
+                    | [$rec[] | select(.pinned and (.name as $n | [$live[].name] | index($n) | not))]
+                      + $live' <<<"$windows")
                 fresh=$(jq --arg s "$title" --argjson wj "$windows" '.[$s] = {windows: $wj}' <<<"$fresh")
                 echo "  $hat / $gname / $title  ($(jq 'length' <<<"$windows") tabs)"
             done < <(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .member_workspace_ids[]?' <<<"$groups_json")
@@ -2169,6 +2299,8 @@ hat_missing() {
         return 0
     fi
     live=$(remote_sessions "$host" 2>/dev/null || true)
+    local tabs
+    tabs=$(remote_sh "$host" "tmux list-windows -a -F '#{session_name}	#{window_name}' 2>/dev/null || true" 2>/dev/null || true)
 
     win=$(find_hat_window "$hat")
     titles=""
@@ -2181,7 +2313,16 @@ hat_missing() {
             [[ -z "$session" ]] && continue
             if ! grep -qxF "$session" <<<"$live"; then
                 printf '%s\tno tmux session\n' "$session"
-            elif [[ -n "$win" ]] && ! grep -qxF "$session" <<<"$titles"; then
+                continue
+            fi
+            local pin
+            while IFS= read -r pin; do
+                [[ -z "$pin" ]] && continue
+                grep -qxF "$session"$'\t'"$pin" <<<"$tabs" \
+                    || printf '%s\tpinned tab %s closed\n' "$session" "$pin"
+            done < <(cfg --arg g "$group" --arg s "$session" \
+                        '.groups[$g].sessions[$s].windows[]? | select(.pinned) | .name')
+            if [[ -n "$win" ]] && ! grep -qxF "$session" <<<"$titles"; then
                 printf '%s\tnot mirrored\n' "$session"
             fi
         done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
@@ -2330,7 +2471,8 @@ cmd_list() {
             [[ -z "$group" ]] && continue
             printf '  group %s\n' "$group"
             cfg --arg g "$group" '.groups[$g].sessions | to_entries[]
-                | "    \(.key)  (\(.value.windows | length) tabs)"'
+                | ([.value.windows[]? | select(.pinned) | .name] | join(", ")) as $p
+                | "    \(.key)  (\(.value.windows | length) tabs\(if $p == "" then "" else "; pinned: \($p)" end))"'
         done < <(groups_of_hat "$hat")
         echo
     done < <(hat_names)
@@ -2970,7 +3112,7 @@ edit_windows() {
     local hat="$1" session="$2" host
     host=$(hat_ssh "$hat")
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-        "tmux list-windows -t $(sq "=$session") -F '#{window_index}	#{window_name}	#{window_active}	#{window_panes}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}' 2>/dev/null" \
+        "tmux list-windows -t $(sq "=$session") -F '#{window_index}	#{window_name}	#{window_active}	#{window_panes}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}	#{@hatter-pinned}' 2>/dev/null" \
         2>/dev/null
 }
 
@@ -3004,6 +3146,7 @@ edit_header() {
     printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
     printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$2" "$C_R" "$C_DIM" "$3" "$C_R"
     [[ -n "${4:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$4" "$C_R"
+    [[ -n "${5:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$5" "$C_R"
     printf '\n'
 }
 
@@ -3540,10 +3683,10 @@ edit_workspaces() {
 
 edit_tabs() {
     local hat="$1" group="$2" ws="$3" SEL=1 n i
-    local idx nm active panes cmd cwd dead mark short plural
+    local idx nm active panes cmd cwd dead pin mark short plural
     while :; do
-        IDXS=(); NAMES=(); METAS=(); n=0
-        while IFS=$'\t' read -r idx nm active panes cmd cwd dead; do
+        IDXS=(); NAMES=(); METAS=(); PINS=(); n=0
+        while IFS=$'\t' read -r idx nm active panes cmd cwd dead pin; do
             [[ -z "$idx" ]] && continue
             if [[ "$dead" == "1" ]]; then mark="${C_RD}✗ dead${C_R}   "
             elif [[ "$active" == "1" ]]; then mark="${C_GR}● active${C_R} "
@@ -3552,7 +3695,9 @@ edit_tabs() {
             short=$(edit_trunc_left "$(edit_short_path "$cwd")" 30)
             plural=" "; [[ "$panes" != "1" ]] && plural="s"
             IDXS[$n]="$idx"
+            PINS[$n]="${pin:-}"
             NAMES[$n]="${nm:-(unnamed)}"
+            [[ "$pin" == "1" ]] && NAMES[$n]="📌 ${NAMES[$n]}"
             METAS[$n]=$(printf '%s %s%-10s%s %s%s pane%s  %s%s' \
                 "$mark" "$C_CY" "$(edit_trunc "$cmd" 10)" "$C_R" \
                 "$C_DIM" "$panes" "$plural" "$short" "$C_R")
@@ -3562,7 +3707,8 @@ edit_tabs() {
 
         edit_header "$hat › $group › $ws" "TABS" \
             "a tab is a tmux window inside the workspace. It survives losing the" \
-            "client, and closing it here closes it everywhere."
+            "client, and closing it here closes it everywhere." \
+            "A pinned tab 📌 comes back first on restore, even if it was closed."
 
         i=0
         while [[ $i -lt $n ]]; do
@@ -3573,7 +3719,7 @@ edit_tabs() {
         [[ $n -eq 0 ]] && \
             printf '   %s(workspace is not running - go back and use restore)%s\n' "$C_YL" "$C_R"
 
-        edit_keys "a add   r rename   d close   ! refresh   q quit"
+        edit_keys "a add   r rename   p pin/unpin   d close   ! refresh   q quit"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
         idx="${IDXS[$((SEL-1))]:-}"
@@ -3590,6 +3736,14 @@ edit_tabs() {
                 edit_ask "new name for tab '${NAMES[$((SEL-1))]}'"
                 [[ -n "$EDIT_REPLY" ]] && remote_sh "$(hat_ssh "$hat")" \
                     "tmux rename-window -t $(sq "=$ws:$idx") $(sq "$EDIT_REPLY")" >/dev/null 2>&1 || true ;;
+            p|P)
+                [[ $n -eq 0 ]] && continue
+                # A subshell: cmd_tab_pin dies on a tab it cannot pin.
+                if [[ "${PINS[$((SEL-1))]}" == "1" ]]; then
+                    ( cmd_tab_pin unpin "$ws" "$idx" ) || edit_pause
+                else
+                    ( cmd_tab_pin pin "$ws" "$idx" ) || edit_pause
+                fi ;;
             d|D)
                 [[ $n -eq 0 ]] && continue
                 if edit_confirm "close tab '${NAMES[$((SEL-1))]}'? whatever is running in it is killed"; then
@@ -3736,6 +3890,7 @@ USAGE
     ;;
     tab) cat <<'USAGE'
 hatter tab <session> [tab-name]
+hatter tab pin|unpin <session> <tab>
 
 Add a tab to a workspace. A tab is a tmux window, so this creates one on the
 server and the mirror picks it up. Inside the session, tmux's own `prefix + c`
@@ -3743,6 +3898,13 @@ does the same thing.
 
   hatter tab dev-atlas
   hatter tab dev-atlas notes
+
+Pin a tab, by index or name, and hatter keeps it: `restore` creates pinned
+tabs first and brings one back if it was closed. Only a named tab can be
+pinned. cmux cannot pin a mirrored tab itself, so this is hatter's pin.
+
+  hatter tab pin dev-atlas notes
+  hatter tab unpin dev-atlas 0
 
 Inside a cmux window, a bare name is resolved against that window's hat, so
 `hatter tab atlas` means dev-atlas while wearing dev - but only when that
