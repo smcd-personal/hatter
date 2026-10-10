@@ -1938,6 +1938,114 @@ $listing
     TAB_SESSION="$session" TAB_GROUP="$group" TAB_HAT="$hat" TAB_HOST="$host"
 }
 
+# A tab dragged from one cmux workspace to another can come up blank. The tmux
+# window is fine - alive, and capture-pane shows every line - but cmux has
+# stopped painting it, and nothing on the tmux side helps: cmux reasserts its
+# own idea of the window over resize-window, select-window and refresh-client.
+# Mirroring the host again rebuilds cmux's view, but the workspace comes back
+# new: outside its group, at the end of the sidebar. So repair records where it
+# was, detaches it, re-mirrors, and puts it back.
+cmd_repair() {
+    local session="$1" hat host lines win="" ws="" w
+    require_cmux repair
+    session=$(tmux_session_name "$session")
+    hat=$(session_hat "$session")
+    [[ -n "$hat" ]] || die "cannot tell which hat '$session' belongs to.
+  Known hats: $(hat_names | tr '\n' ' ')"
+    host=$(hat_ssh "$hat")
+
+    # Only a fault in cmux's view is ours to fix. A session that is gone, or
+    # empty on the server too, would come back exactly as it is.
+    remote_session_exists "$host" "$session" \
+        || die "'$session' is not running on $host, so there is nothing to repair.
+  'hatter restore' re-creates it."
+    lines=$(remote_sh "$host" "tmux list-windows -t $(sq "=$session") -F '#{window_index}' |
+        while read -r w; do tmux capture-pane -p -t $(sq "=$session"):\"\$w\"; done |
+        grep -cv '^[[:space:]]*\$'" 2>/dev/null || true)
+    [[ "${lines:-0}" -gt 0 ]] || die "'$session' is blank on $host as well, so this is not cmux.
+  Look at it with: ssh -t $host tmux attach -t $(sq "=$session")"
+    info "'$session' has content on $host - the fault is in cmux's view of it"
+
+    # Where it is now: its window, its group, and its neighbour in that group.
+    for w in $(window_ids); do
+        ws=$(workspace_ref_by_title "$session" "$w")
+        if [[ -n "$ws" ]]; then win="$w"; break; fi
+    done
+    [[ -n "$ws" ]] || die "'$session' is not open in cmux. 'hatter restore $hat' opens it."
+
+    local groups gid="" gname="" after="" before=""
+    groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null || echo '{"groups":[]}')
+    # Outside any group the place is the sidebar itself: remember its predecessor.
+    local prev
+    prev=$(cmux_json workspace list --window "$win" 2>/dev/null | jq -r --arg ws "$ws" '
+        [.workspaces[]?.id] as $m | ($m | index($ws)) as $i
+        | if $i != null and $i > 0 then $m[$i - 1] else empty end' 2>/dev/null || true)
+    gid=$(jq -r --arg ws "$ws" '.groups[]? | select((.member_workspace_ids // []) | index($ws)) | .id' <<<"$groups" | head -1)
+    if [[ -n "$gid" ]]; then
+        gname=$(jq -r --arg g "$gid" '.groups[] | select(.id == $g) | .name // empty' <<<"$groups")
+        after=$(jq -r --arg g "$gid" --arg ws "$ws" '
+            .groups[] | select(.id == $g) | .member_workspace_ids as $m
+            | ($m | index($ws)) as $i | if $i > 0 then $m[$i - 1] else empty end' <<<"$groups")
+        before=$(jq -r --arg g "$gid" --arg ws "$ws" '
+            .groups[] | select(.id == $g) | .member_workspace_ids as $m
+            | ($m | index($ws)) as $i | $m[$i + 1] // empty' <<<"$groups")
+    fi
+
+    info "Detaching '$session' from cmux (its tmux session keeps running)"
+    cmux close-workspace --workspace "$ws" >/dev/null 2>&1 \
+        || die "cmux would not close the workspace - nothing was changed"
+    # Wait until it is really gone, or the wait below could take the old one
+    # for the re-mirrored one.
+    local i
+    for ((i = 0; i < 20; i++)); do
+        [[ -z "$(workspace_ref_by_title "$session" "$win")" ]] && break
+        sleep 0.25
+    done
+    [[ -z "$(workspace_ref_by_title "$session" "$win")" ]] \
+        || die "cmux still shows '$session' after closing it - nothing was re-mirrored"
+
+    # From here the workspace is closed, so every way out says how to get it back.
+    local back="The session is safe on $host. Bring it back with:
+    cmux ssh-tmux $host"
+    mirror_hat "$hat" "$win" || die "re-mirroring failed. $back"
+    local new
+    new=$(wait_for_workspace "$session" "$win")
+    [[ -n "$new" ]] || die "'$session' did not come back into cmux. $back"
+
+    if [[ -n "$gname" ]]; then
+        local gref
+        gref=$(group_ref_in_window "$win" "$gname")
+        if [[ -z "$gref" ]]; then
+            # It was the group's only member, and closing it took the group too.
+            gref=$(ensure_cmux_group "$gname" "$win")
+        fi
+        if ! cmux workspace-group add --group "$gref" --workspace "$new" >/dev/null 2>&1; then
+            warn "could not put '$session' back in group '$gname'"
+            gname=""
+        fi
+        if group_exists "$gname"; then apply_group_style "$gname" "$gref"; fi
+        if [[ -z "$gname" ]]; then :
+        elif [[ -n "$after" ]]; then
+            cmux reorder-workspace --workspace "$new" --after "$after" --window "$win" >/dev/null 2>&1 \
+                || warn "could not move '$session' back to its old place"
+        elif [[ -n "$before" ]]; then
+            cmux reorder-workspace --workspace "$new" --before "$before" --window "$win" >/dev/null 2>&1 \
+                || warn "could not move '$session' back to its old place"
+        fi
+        [[ -z "$gname" ]] || info "Back in '$gname', where it was"
+    elif [[ -n "$prev" ]]; then
+        cmux reorder-workspace --workspace "$new" --after "$prev" --window "$win" >/dev/null 2>&1 \
+            || warn "could not move '$session' back to its old place"
+    fi
+
+    # Record the result: the config, and the server's pane registry, whose
+    # entries are keyed on windows a drag has just moved.
+    ( cmd_sync ) >/dev/null 2>&1 || warn "sync did not finish - run 'hatter sync'"
+    remote_sh "$host" 'h="$HOME/.local/bin/hat-restore"; [ -x "$h" ] && "$h" --backfill' \
+        >/dev/null 2>&1 || true
+    info "Repaired '$session'"
+}
+
 cmd_rename() {
     # Rename a session everywhere at once: on the server, in cmux, in the config.
     local old="${1:-}" new="${2:-}"
@@ -3642,7 +3750,7 @@ edit_workspaces() {
         done
         [[ $n -eq 0 ]] && printf '   %s(no workspaces in this group yet - press a)%s\n' "$C_DIM" "$C_R"
 
-        edit_keys "a add   r rename   d delete   ! refresh   q quit"
+        edit_keys "a add   r rename   f fix blank   d delete   ! refresh   q quit"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
         ws="${WSS[$((SEL-1))]:-}"
@@ -3667,6 +3775,11 @@ edit_workspaces() {
                     cmd_rename "$ws" "$EDIT_REPLY" || true; edit_fetch_hat "$hat"
                 fi
                 edit_pause ;;
+            f|F)
+                [[ $n -eq 0 ]] && continue
+                # A subshell: repair dies on anything it cannot fix.
+                ( cmd_repair "$ws" ) || warn "repair did not finish"
+                edit_fetch_hat "$hat"; edit_pause ;;
             d|D)
                 [[ $n -eq 0 ]] && continue
                 if edit_confirm "kill tmux session '$ws' and forget it? this ends everything running in it"; then
@@ -3779,6 +3892,7 @@ Commands:
   new <session>          Create or reattach a workspace  ("new" is optional)
   tab <session> [name]   Add a tab to a workspace
   rename <old> <new>     Rename a session on its server, in cmux and in config
+  repair <session>       Bring back a workspace cmux shows blank, in its place
   hat <subcommand>       Manage hats (shell servers)
   group <subcommand>     Manage groups (projects)
   rack                   The hat rack: browse and edit every level
@@ -3909,6 +4023,24 @@ pinned. cmux cannot pin a mirrored tab itself, so this is hatter's pin.
 Inside a cmux window, a bare name is resolved against that window's hat, so
 `hatter tab atlas` means dev-atlas while wearing dev - but only when that
 workspace already exists.
+USAGE
+    ;;
+    repair) cat <<'USAGE'
+hatter repair <session>
+
+Bring back a workspace that cmux shows blank. Dragging a tab between cmux
+workspaces can leave it like that: the tmux window is alive with all its
+content, but cmux has stopped painting it, and nothing on the tmux side helps.
+
+  hatter repair dev-atlas
+
+repair checks the session has content on its server - if it does not, this is
+not the fault and nothing is touched - then detaches the workspace from cmux,
+mirrors the hat again, and puts the workspace back in its group, in its old
+place. The tmux session, and everything running in it, is never touched.
+Finally it syncs the config and refreshes the server's pane registry.
+
+In the rack, press f on a workspace.
 USAGE
     ;;
     rename) cat <<'USAGE'
@@ -4150,6 +4282,7 @@ case "$cmd" in
     new)       [[ $# -gt 0 ]] || { usage_cmd new; exit 1; };       cmd_new "$@" ;;
     tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
+    repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;
     backup)    cmd_backup "$@" ;;
     hat|login) [[ $# -gt 0 ]] || { usage_cmd hat; exit 1; };       cmd_hat "$@" ;;
