@@ -1975,6 +1975,11 @@ cmd_repair() {
 
     local groups gid="" gname="" after="" before=""
     groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null || echo '{"groups":[]}')
+    # Outside any group the place is the sidebar itself: remember its predecessor.
+    local prev
+    prev=$(cmux_json workspace list --window "$win" 2>/dev/null | jq -r --arg ws "$ws" '
+        [.workspaces[]?.id] as $m | ($m | index($ws)) as $i
+        | if $i != null and $i > 0 then $m[$i - 1] else empty end' 2>/dev/null || true)
     gid=$(jq -r --arg ws "$ws" '.groups[]? | select((.member_workspace_ids // []) | index($ws)) | .id' <<<"$groups" | head -1)
     if [[ -n "$gid" ]]; then
         gname=$(jq -r --arg g "$gid" '.groups[] | select(.id == $g) | .name // empty' <<<"$groups")
@@ -1989,7 +1994,13 @@ cmd_repair() {
     info "Detaching '$session' from cmux (its tmux session keeps running)"
     cmux close-workspace --workspace "$ws" >/dev/null 2>&1 \
         || die "cmux would not close the workspace - nothing was changed"
-    sleep 1
+    # Wait until it is really gone, or the wait below could take the old one
+    # for the re-mirrored one.
+    local i
+    for ((i = 0; i < 20; i++)); do
+        [[ -z "$(workspace_ref_by_title "$session" "$win")" ]] && break
+        sleep 0.25
+    done
 
     # From here the workspace is closed, so every way out says how to get it back.
     local back="The session is safe on $host. Bring it back with:
@@ -2005,18 +2016,24 @@ cmd_repair() {
         if [[ -z "$gref" ]]; then
             # It was the group's only member, and closing it took the group too.
             gref=$(ensure_cmux_group "$gname" "$win")
-            if group_exists "$gname"; then apply_group_style "$gname" "$gref"; fi
         fi
-        cmux workspace-group add --group "$gref" --workspace "$new" >/dev/null 2>&1 \
-            || warn "could not put '$session' back in group '$gname'"
-        if [[ -n "$after" ]]; then
+        if ! cmux workspace-group add --group "$gref" --workspace "$new" >/dev/null 2>&1; then
+            warn "could not put '$session' back in group '$gname'"
+            gname=""
+        fi
+        if group_exists "$gname"; then apply_group_style "$gname" "$gref"; fi
+        if [[ -z "$gname" ]]; then :
+        elif [[ -n "$after" ]]; then
             cmux reorder-workspace --workspace "$new" --after "$after" --window "$win" >/dev/null 2>&1 \
                 || warn "could not move '$session' back to its old place"
         elif [[ -n "$before" ]]; then
             cmux reorder-workspace --workspace "$new" --before "$before" --window "$win" >/dev/null 2>&1 \
                 || warn "could not move '$session' back to its old place"
         fi
-        info "Back in '$gname', where it was"
+        [[ -z "$gname" ]] || info "Back in '$gname', where it was"
+    elif [[ -n "$prev" ]]; then
+        cmux reorder-workspace --workspace "$new" --after "$prev" --window "$win" >/dev/null 2>&1 \
+            || warn "could not move '$session' back to its old place"
     fi
 
     # Record the result: the config, and the server's pane registry, whose
