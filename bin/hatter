@@ -2001,6 +2001,8 @@ cmd_repair() {
         [[ -z "$(workspace_ref_by_title "$session" "$win")" ]] && break
         sleep 0.25
     done
+    [[ -z "$(workspace_ref_by_title "$session" "$win")" ]] \
+        || die "cmux still shows '$session' after closing it - nothing was re-mirrored"
 
     # From here the workspace is closed, so every way out says how to get it back.
     local back="The session is safe on $host. Bring it back with:
