@@ -2069,15 +2069,24 @@ attach_session() {
 # server that were never recorded. One per line, sorted, unique.
 hat_workspaces() {
     local hat="$1" dest
+    # Each stage can end non-zero without meaning anything (the last session
+    # listed belongs to another hat; the server is unreachable), and pipefail
+    # would turn that into a silent exit, so the group ends in an explicit 0.
     {
         cfg --arg l "$hat" '
             .groups[] | select(.hat == $l) | .sessions | keys[]?'
         dest=$(hat_ssh "$hat")
-        [[ -n "$dest" ]] && remote_sessions "$dest" 2>/dev/null \
-            | while IFS= read -r s; do
-                  [[ "$(session_hat "$s")" == "$hat" ]] && printf '%s\n' "$s"
-              done
+        if [[ -n "$dest" ]]; then
+            { remote_sessions "$dest" 2>/dev/null || true; } \
+                | while IFS= read -r s; do
+                      if [[ "$(session_hat "$s")" == "$hat" ]]; then
+                          printf '%s\n' "$s"
+                      fi
+                  done
+        fi
+        return 0
     } | sort -u | sed '/^$/d'
+    return 0
 }
 
 cmd_attach() {
@@ -4130,7 +4139,7 @@ Given a hat, the choice is every workspace the config records for it plus any
 running on its server. Detach with the tmux prefix then d; the session keeps
 running.
 
-On Windows without bash, clients/wezterm/hatter.lua does the same from WezTerm
+On Windows without bash, the WezTerm plugin (plugin/init.lua) does the same
 - see docs/install-wezterm.md.
 USAGE
     ;;

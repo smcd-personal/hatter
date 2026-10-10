@@ -166,9 +166,15 @@ end
 function M.pull(window, opts)
   local path = opts.config_path or default_config_path()
   local dir = path:gsub('[/\\][^/\\]*$', '')
-  local ok, out, errout = wezterm.run_child_process {
+  -- run_child_process raises, rather than returning false, when git cannot
+  -- be started at all (not on PATH).
+  local called, ok, out, errout = pcall(wezterm.run_child_process, {
     'git', '-C', dir, 'pull', '--ff-only',
-  }
+  })
+  if not called then
+    notify(window, 'git pull failed: ' .. tostring(ok))
+    return
+  end
   -- git reports some of a successful pull on stderr, so show whichever has it.
   local msg = ((out ~= '' and out) or errout or ''):gsub('%s+$', '')
   notify(window, (ok and 'config updated: ' or 'git pull failed: ') .. msg)
