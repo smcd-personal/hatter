@@ -358,6 +358,33 @@ remote_sessions() {
     remote_sh "$1" "tmux list-sessions -F '#S' 2>/dev/null || true"
 }
 
+# Every session the config records on a server, across all the hats that share
+# its ssh destination: the server keeps one list per account, not per hat.
+host_recorded_sessions() {
+    cfg --arg h "$1" '
+        [.hats | to_entries[] | select(.value.ssh == $h) | .key] as $hats
+        | .groups[] | select(.hat as $x | $hats | index($x))
+        | .sessions | keys[]?'
+}
+
+# Tell a server what the config records, and drop its registry entries for tabs
+# that have closed. hat-restore rebuilds tmux at boot from that registry and
+# never sees this config, so without this a sync changes nothing about what a
+# reboot brings back. Only call it while the server's tmux is up: the prune
+# measures the registry against the windows that exist right now.
+tell_server_sessions() {
+    # Read the list first: a failed read piped straight through would hand the
+    # server an empty list, and an empty list means "bring nothing back".
+    local host="$1" list
+    list=$(host_recorded_sessions "$host") || return 1
+    printf '%s\n' "$list" | remote_sh_stdin "$host" '
+        d="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+        mkdir -p "$d" && cat > "$d/sessions.tmp" && mv "$d/sessions.tmp" "$d/sessions" || exit 1
+        h="$HOME/.local/bin/hat-restore"
+        if [ -x "$h" ]; then "$h" --prune >/dev/null 2>&1; fi
+        exit 0'
+}
+
 # A session's tabs in tmux index order, as {id, name, cwd[, pinned]}. The
 # window id is only for lining the tabs up with cmux, and never stored.
 remote_windows_json() {
@@ -1353,10 +1380,17 @@ cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 # changes the very key an entry is filed under - accumulate as orphans that a
 # reboot would faithfully resurrect. --prune drops them, and --backfill runs it
 # afterwards by default.
+#
+# The registry knows every tab this box has run, not which ones the client still
+# wants. `hatter sync` writes that down in $STATE/sessions, and a rebuild skips
+# any session not on it, so a workspace closed on the client stays closed even
+# if its tmux session outlived it. No list - a client that has never synced -
+# rebuilds everything, as before.
 set -uo pipefail
 
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
 PANES="$STATE/panes"
+KEEP="$STATE/sessions"
 LAUNCH="$HOME/.local/bin/hat-launch"
 
 dry=0 quiet=0 agents=1 backfill=0 prune=0 no_prune=0
@@ -1505,9 +1539,14 @@ have_session() {
     tmux has-session -t "=$1" 2>/dev/null
 }
 
-made=0 skipped=0
+made=0 skipped=0 unwanted=0
 while IFS=$'\t' read -r s w n cwd kind sid state; do
     [ -n "$s" ] || continue
+    if [ -f "$KEEP" ] && ! grep -qxF -- "$s" "$KEEP"; then
+        [ "$dry" = 1 ] && printf '  would leave closed: %s:%s  (not in the client config)\n' "$s" "$w"
+        unwanted=$((unwanted+1))
+        continue
+    fi
     [ -d "$cwd" ] || cwd="$HOME"
 
     # A pane whose agent had already exited comes back as the shell it was.
@@ -1537,7 +1576,7 @@ while IFS=$'\t' read -r s w n cwd kind sid state; do
     made=$((made+1))
 done <<< "$entries"
 
-say "hat-restore: $made created, $skipped already present"
+say "hat-restore: $made created, $skipped already present, $unwanted left closed"
 exit 0
 HATRESTORE
 chmod +x "$HOME/.local/bin/hat-restore"
@@ -2554,7 +2593,7 @@ cmd_sync() {
     # Iterate hats, not windows. A group belongs to exactly one hat and so lives
     # in exactly one window; scanning every window would let a same-named group
     # in some other window overwrite the real one.
-    local hat
+    local hat reached=""
     while IFS= read -r hat; do
         [[ -z "$hat" ]] && continue
 
@@ -2572,6 +2611,7 @@ cmd_sync() {
             echo "  $hat: $host unreachable or idle, leaving its config untouched"
             continue
         fi
+        reached+="$host"$'\n'
 
         local groups_json ws_json gname order recorded
         groups_json=$(window_groups_json "$w" 2>/dev/null || echo '{"groups":[]}')
@@ -2643,6 +2683,14 @@ cmd_sync() {
         done < <(jq -r '.groups[]?.name' <<<"$groups_json")
     done < <(hat_names)
     cmux_snapshot_drop
+
+    # Once per server, after every hat on it is recorded.
+    local h
+    while IFS= read -r h; do
+        [[ -z "$h" ]] && continue
+        tell_server_sessions "$h" \
+            || warn "$h: could not tell the server what to bring back after a reboot"
+    done < <(printf '%s' "$reached" | sort -u)
 
     info "Config synced: $CONFIG"
 }
@@ -4420,6 +4468,10 @@ renaming or rearranging anything in the cmux sidebar. Takes no options.
 
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.
+
+Each server reached is also told which sessions the config records for it, and
+forgets the tabs that have closed. Its boot-time rebuild (hat-restore) then
+brings back only those, so a workspace closed before a reboot stays closed.
 USAGE
     ;;
     restore) cat <<'USAGE'
