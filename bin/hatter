@@ -514,7 +514,7 @@ cmux_tab_order() {
     local win="$1" wref="$2" host="$3" session="$4" map panes
     map=$(cmux rpc remote.tmux.pane_surfaces \
         "$(jq -nc --arg h "$host" --arg s "$session" '{host: $h, session: $s}')" 2>/dev/null) || return 0
-    panes=$(cmux_json list-panes --workspace "$wref" --window "$win" 2>/dev/null) || return 0
+    panes=$(workspace_panes_json "$wref" "$win" 2>/dev/null) || return 0
     jq -rn --argjson m "$map" --argjson p "$panes" '
         ([$m.panes[]? | {key: .surface_id, value: .window_id}] | from_entries) as $w
         | [$p.panes[]?.surface_ids[]? | $w[.] // empty]
@@ -522,10 +522,89 @@ cmux_tab_order() {
         | .[]' 2>/dev/null || true
 }
 
-window_ids() { have_cmux || return 0; cmux list-windows --json | jq -r '.[].id'; }
+# A snapshot of cmux's windows, for a command that only reads them. Each cmux
+# call costs a noticeable fraction of a second, and find_hat_window asks every
+# window for its lists once per hat, so sync takes one snapshot - the whole tree
+# in one call, plus each window's groups - and answers from it. Anything that
+# changes cmux must not run while one is held.
+CMUX_SNAP=0
+CMUX_SNAP_TREE=""
+CMUX_SNAP_IDS=()
+CMUX_SNAP_WS=()
+CMUX_SNAP_TITLES=()
+CMUX_SNAP_GROUPS=()
+CMUX_SNAP_GNAMES=()
+
+cmux_snapshot_drop() {
+    CMUX_SNAP=0; CMUX_SNAP_TREE=""
+    CMUX_SNAP_IDS=(); CMUX_SNAP_WS=(); CMUX_SNAP_TITLES=(); CMUX_SNAP_GROUPS=(); CMUX_SNAP_GNAMES=()
+}
+
+cmux_snapshot() {
+    local w ws groups
+    cmux_snapshot_drop
+    CMUX_SNAP_TREE=$(cmux_json tree --all 2>/dev/null) || { CMUX_SNAP_TREE=""; return 0; }
+    for w in $(jq -r '.windows[]?.id' <<<"$CMUX_SNAP_TREE"); do
+        ws=$(jq -c --arg w "$w" \
+            '{workspaces: [.windows[] | select(.id == $w) | .workspaces[]? | {id, title}]}' <<<"$CMUX_SNAP_TREE")
+        groups=$(cmux_json workspace-group list --window "$w" 2>/dev/null || echo '{"groups":[]}')
+        CMUX_SNAP_IDS+=("$w")
+        CMUX_SNAP_WS+=("$ws")
+        CMUX_SNAP_TITLES+=("$(jq -r '.workspaces[].title // empty' <<<"$ws")")
+        CMUX_SNAP_GROUPS+=("$groups")
+        CMUX_SNAP_GNAMES+=("$(jq -r '.groups[]?.name' <<<"$groups")")
+    done
+    CMUX_SNAP=1
+}
+
+# snap_index <window> -> its index in the snapshot; non-zero when there is none
+snap_index() {
+    local i
+    [[ "$CMUX_SNAP" == 1 ]] || return 1
+    for ((i = 0; i < ${#CMUX_SNAP_IDS[@]}; i++)); do
+        [[ "${CMUX_SNAP_IDS[$i]}" == "$1" ]] && { printf '%s' "$i"; return 0; }
+    done
+    return 1
+}
+
+window_ws_json() {
+    local i
+    if i=$(snap_index "$1"); then printf '%s\n' "${CMUX_SNAP_WS[$i]}"; return 0; fi
+    cmux_json workspace list --window "$1"
+}
+
+window_groups_json() {
+    local i
+    if i=$(snap_index "$1"); then printf '%s\n' "${CMUX_SNAP_GROUPS[$i]}"; return 0; fi
+    cmux_json workspace-group list --window "$1"
+}
+
+# workspace_panes_json <workspace> <window> -> cmux list-panes JSON
+workspace_panes_json() {
+    if [[ "$CMUX_SNAP" == 1 ]]; then
+        jq -c --arg ws "$1" '{panes: [.windows[].workspaces[]? | select(.id == $ws) | .panes[]?]}' \
+            <<<"$CMUX_SNAP_TREE"
+        return 0
+    fi
+    cmux_json list-panes --workspace "$1" --window "$2"
+}
+
+window_ids() {
+    if [[ "$CMUX_SNAP" == 1 ]]; then
+        [[ ${#CMUX_SNAP_IDS[@]} -eq 0 ]] || printf '%s\n' "${CMUX_SNAP_IDS[@]}"
+        return 0
+    fi
+    have_cmux || return 0
+    cmux list-windows --json | jq -r '.[].id'
+}
 
 groups_in_window() {
-    cmux_json workspace-group list --window "$1" 2>/dev/null | jq -r '.groups[]?.name'
+    local i
+    if i=$(snap_index "$1"); then
+        [[ -z "${CMUX_SNAP_GNAMES[$i]}" ]] || printf '%s\n' "${CMUX_SNAP_GNAMES[$i]}"
+        return 0
+    fi
+    window_groups_json "$1" 2>/dev/null | jq -r '.groups[]?.name'
 }
 
 group_ref_in_window() {
@@ -534,7 +613,12 @@ group_ref_in_window() {
 }
 
 titles_in_window() {
-    cmux_json workspace list --window "$1" 2>/dev/null | jq -r '.workspaces[]?.title // empty'
+    local i
+    if i=$(snap_index "$1"); then
+        [[ -z "${CMUX_SNAP_TITLES[$i]}" ]] || printf '%s\n' "${CMUX_SNAP_TITLES[$i]}"
+        return 0
+    fi
+    window_ws_json "$1" 2>/dev/null | jq -r '.workspaces[]?.title // empty'
 }
 
 workspace_ref_by_title() {
@@ -564,6 +648,8 @@ find_hat_window() {
 
     wanted=$(cfg --arg l "$hat" '
         .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?')
+    local mine
+    mine=$(groups_of_hat "$hat")
 
     for w in $(window_ids); do
         score=0
@@ -580,7 +666,7 @@ find_hat_window() {
 
         while IFS= read -r g; do
             [[ -z "$g" ]] && continue
-            [[ "$(group_hat "$g")" == "$hat" ]] && score=$((score + 1))
+            if [[ -n "$mine" ]] && grep -qxF "$g" <<<"$mine"; then score=$((score + 1)); fi
         done <<<"$names"
 
         if [[ $score -gt $best_score ]]; then
@@ -2462,6 +2548,8 @@ cmd_sync() {
     # no-op as success.
     require_cmux sync
     backup_config
+    # sync only reads cmux, so one look at every window serves the whole run.
+    cmux_snapshot
 
     # Iterate hats, not windows. A group belongs to exactly one hat and so lives
     # in exactly one window; scanning every window would let a same-named group
@@ -2486,8 +2574,8 @@ cmd_sync() {
         fi
 
         local groups_json ws_json gname order recorded
-        groups_json=$(cmux_json workspace-group list --window "$w" 2>/dev/null || echo '{"groups":[]}')
-        ws_json=$(cmux_json workspace list --window "$w" 2>/dev/null || echo '{"workspaces":[]}')
+        groups_json=$(window_groups_json "$w" 2>/dev/null || echo '{"groups":[]}')
+        ws_json=$(window_ws_json "$w" 2>/dev/null || echo '{"workspaces":[]}')
 
         while IFS= read -r gname; do
             [[ -z "$gname" ]] && continue
@@ -2507,10 +2595,13 @@ cmd_sync() {
             fi
 
             local color icon pinned collapsed
-            color=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .custom_color // ""' <<<"$groups_json")
-            icon=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .icon_symbol // ""' <<<"$groups_json")
-            pinned=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .is_pinned // false' <<<"$groups_json")
-            collapsed=$(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .is_collapsed // false' <<<"$groups_json")
+            # One jq for all four. The separator is not whitespace, so read keeps
+            # an empty colour or icon as an empty field.
+            IFS=$'\x1f' read -r color icon pinned collapsed < <(jq -r --arg n "$gname" '
+                first(.groups[] | select(.name==$n))
+                | [.custom_color // "", .icon_symbol // "",
+                   (.is_pinned // false | tostring), (.is_collapsed // false | tostring)]
+                | join("\u001f")' <<<"$groups_json") || true
 
             jq_write --arg g "$gname" --arg c "$color" --arg i "$icon" \
                      --argjson p "${pinned:-false}" --argjson co "${collapsed:-false}" '
@@ -2551,6 +2642,7 @@ cmd_sync() {
             jq_write --arg g "$gname" --argjson s "$fresh" '.groups[$g].sessions = $s'
         done < <(jq -r '.groups[]?.name' <<<"$groups_json")
     done < <(hat_names)
+    cmux_snapshot_drop
 
     info "Config synced: $CONFIG"
 }
