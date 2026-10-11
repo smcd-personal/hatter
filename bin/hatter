@@ -387,6 +387,16 @@ tell_server_sessions() {
 
 # A session's tabs in tmux index order, as {id, name, cwd[, pinned]}. The
 # window id is only for lining the tabs up with cmux, and never stored.
+# Every session on a server and every window in them, in one round trip:
+#   S<tab>session
+#   W<tab>session<tab>window id<tab>name<tab>cwd<tab>pinned
+remote_tmux_state() {
+    local sfmt=$'S\t#S'
+    local wfmt=$'W\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@hatter-pinned}'
+    remote_sh "$1" "tmux list-sessions -F $(sq "$sfmt") 2>/dev/null || true
+        tmux list-windows -a -F $(sq "$wfmt") 2>/dev/null || true"
+}
+
 remote_windows_json() {
     local host="$1" session="$2"
     local fmt=$'#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@hatter-pinned}'
@@ -533,14 +543,27 @@ require_cmux() {
 # id this script stores or passes around is a UUID.
 cmux_json() { have_cmux || return 1; cmux --id-format both "$@" --json; }
 
+cmux_pane_map() {
+    cmux rpc remote.tmux.pane_surfaces \
+        "$(jq -nc --arg h "$1" --arg s "$2" '{host: $h, session: $s}')" 2>/dev/null
+}
+
 # The tmux window ids of a mirrored workspace, one per line, in the order cmux
 # shows its tabs. cmux keeps the order it first mirrored them in and does not
 # follow a later tmux reorder, so this - not the window index - is the order
 # the user sees. Prints nothing when cmux cannot say; callers keep tmux order.
+#
+# A fifth argument names a file already holding the remote.tmux.pane_surfaces
+# answer, so sync can fetch those for every session at once; empty means cmux
+# could not say.
 cmux_tab_order() {
-    local win="$1" wref="$2" host="$3" session="$4" map panes
-    map=$(cmux rpc remote.tmux.pane_surfaces \
-        "$(jq -nc --arg h "$host" --arg s "$session" '{host: $h, session: $s}')" 2>/dev/null) || return 0
+    local win="$1" wref="$2" host="$3" session="$4" mapfile="${5:-}" map panes
+    if [[ -n "$mapfile" ]]; then
+        map=$(cat "$mapfile" 2>/dev/null || true)
+        [[ -n "$map" ]] || return 0
+    else
+        map=$(cmux_pane_map "$host" "$session") || return 0
+    fi
     panes=$(workspace_panes_json "$wref" "$win" 2>/dev/null) || return 0
     jq -rn --argjson m "$map" --argjson p "$panes" '
         ([$m.panes[]? | {key: .surface_id, value: .window_id}] | from_entries) as $w
@@ -571,16 +594,29 @@ cmux_snapshot() {
     local w ws groups
     cmux_snapshot_drop
     CMUX_SNAP_TREE=$(cmux_json tree --all 2>/dev/null) || { CMUX_SNAP_TREE=""; return 0; }
-    for w in $(jq -r '.windows[]?.id' <<<"$CMUX_SNAP_TREE"); do
+    # The tree has no groups, so ask each window for those - all at once.
+    local tmp i=0 ids
+    ids=$(jq -r '.windows[]?.id' <<<"$CMUX_SNAP_TREE")
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-snap.XXXXXX")
+    for w in $ids; do
+        cmux_json workspace-group list --window "$w" > "$tmp/$i" 2>/dev/null &
+        i=$((i + 1))
+    done
+    wait
+    i=0
+    for w in $ids; do
         ws=$(jq -c --arg w "$w" \
             '{workspaces: [.windows[] | select(.id == $w) | .workspaces[]? | {id, title}]}' <<<"$CMUX_SNAP_TREE")
-        groups=$(cmux_json workspace-group list --window "$w" 2>/dev/null || echo '{"groups":[]}')
+        groups=$(cat "$tmp/$i")
+        [[ -n "$groups" ]] || groups='{"groups":[]}'
+        i=$((i + 1))
         CMUX_SNAP_IDS+=("$w")
         CMUX_SNAP_WS+=("$ws")
         CMUX_SNAP_TITLES+=("$(jq -r '.workspaces[].title // empty' <<<"$ws")")
         CMUX_SNAP_GROUPS+=("$groups")
         CMUX_SNAP_GNAMES+=("$(jq -r '.groups[]?.name' <<<"$groups")")
     done
+    rm -rf "$tmp"
     CMUX_SNAP=1
 }
 
@@ -670,39 +706,35 @@ workspace_ref_by_title() {
 # a workspace whose title is one of this hat's sessions, or which carries the
 # hat prefix, is much stronger evidence than a matching group name.
 find_hat_window() {
-    local hat="$1" w best="" best_score=0 score
-    local wanted titles names t g
+    local hat="$1" w t
 
-    wanted=$(cfg --arg l "$hat" '
-        .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?')
-    local mine
-    mine=$(groups_of_hat "$hat")
-
-    for w in $(window_ids); do
-        score=0
-        titles=$(titles_in_window "$w")
-        names=$(groups_in_window "$w")
-
-        while IFS= read -r t; do
-            [[ -z "$t" ]] && continue
-            [[ "$t" == "$hat"-* ]] && score=$((score + 5))
-            if [[ -n "$wanted" ]] && grep -qxF "$t" <<<"$wanted"; then
-                score=$((score + 10))
-            fi
-        done <<<"$titles"
-
-        while IFS= read -r g; do
-            [[ -z "$g" ]] && continue
-            if [[ -n "$mine" ]] && grep -qxF "$g" <<<"$mine"; then score=$((score + 1)); fi
-        done <<<"$names"
-
-        if [[ $score -gt $best_score ]]; then
-            best_score=$score
-            best="$w"
-        fi
-    done
-
-    printf '%s' "$best"
+    # One awk scores every window: hundreds of greps, one per title per window,
+    # were most of the time a sync spent finding its windows. Ties go to the
+    # first window, as cmux lists them.
+    {
+        cfg --arg l "$hat" '
+            .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?' \
+            | sed 's/^/want	/'
+        groups_of_hat "$hat" | sed 's/^/mine	/'
+        for w in $(window_ids); do
+            printf 'win\t%s\n' "$w"
+            while IFS= read -r t; do
+                [[ -n "$t" ]] && printf 'title\t%s\t%s\n' "$w" "$t"
+            done <<<"$(titles_in_window "$w")"
+            while IFS= read -r t; do
+                [[ -n "$t" ]] && printf 'group\t%s\t%s\n' "$w" "$t"
+            done <<<"$(groups_in_window "$w")"
+        done
+    } | awk -F '\t' -v hat="$hat" '
+        $1 == "want"  { want[$2] = 1; next }
+        $1 == "mine"  { mine[$2] = 1; next }
+        $1 == "win"   { order[++n] = $2; score[$2] = 0; next }
+        $1 == "title" { if (index($3, hat "-") == 1) score[$2] += 5
+                        if ($3 in want) score[$2] += 10; next }
+        $1 == "group" { if ($3 in mine) score[$2] += 1; next }
+        END { best = ""; bs = 0
+              for (i = 1; i <= n; i++) if (score[order[i]] > bs) { bs = score[order[i]]; best = order[i] }
+              printf "%s", best }'
 }
 
 # "Which hat am I wearing right now", answered from the launch context: find the
@@ -2586,52 +2618,109 @@ cmd_sync() {
     # A dead socket makes every hat look empty; refuse rather than report a
     # no-op as success.
     require_cmux sync
-    backup_config
+    local try
+    for try in 1 2 3; do
+        sync_once && return 0
+        [[ "$try" == 3 ]] || info "Another hatter changed the config while syncing - reading it again"
+    done
+    die "the config kept changing while syncing - run 'hatter sync' again"
+}
+
+# One pass of sync. Reading cmux and the servers is the slow part, so it runs
+# without the config lock, with the servers and cmux asked all at once; the lock
+# is taken once, at the end, for a single write. Returns 1, having written
+# nothing, if another command wrote the config in the meantime - its change is
+# newer than what this pass read.
+sync_once() {
+    local stamp tmp
+    stamp=$(cksum < "$CONFIG")
     # sync only reads cmux, so one look at every window serves the whole run.
     cmux_snapshot
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-sync.XXXXXX")
 
     # Iterate hats, not windows. A group belongs to exactly one hat and so lives
     # in exactly one window; scanning every window would let a same-named group
     # in some other window overwrite the real one.
-    local hat reached=""
+    local hats=() wins=() hosts=() hat i n reached=""
     while IFS= read -r hat; do
         [[ -z "$hat" ]] && continue
+        hats+=("$hat")
+        wins+=("$(find_hat_window "$hat")")
+        hosts+=("$(hat_ssh "$hat")")
+    done < <(hat_names)
+    n=${#hats[@]}
 
-        local w
-        w=$(find_hat_window "$hat")
+    # Every server at once: its sessions, and every session's windows.
+    for ((i = 0; i < n; i++)); do
+        [[ -n "${wins[$i]}" && -n "${hosts[$i]}" ]] || continue
+        remote_tmux_state "${hosts[$i]}" > "$tmp/ssh.$i" 2>/dev/null &
+    done
+    wait
+
+    # Then every mirrored session's pane map at once, eight at a time.
+    local groups_json ws_json wref title live jobs=0
+    for ((i = 0; i < n; i++)); do
+        [[ -s "$tmp/ssh.$i" ]] || continue
+        live=$(awk -F '\t' '$1 == "S" { print $2 }' "$tmp/ssh.$i")
+        groups_json=$(window_groups_json "${wins[$i]}" 2>/dev/null || echo '{"groups":[]}')
+        ws_json=$(window_ws_json "${wins[$i]}" 2>/dev/null || echo '{"workspaces":[]}')
+        while IFS=$'\t' read -r wref title; do
+            [[ -z "$wref" || -z "$title" ]] && continue
+            grep -qxF "$title" <<<"$live" || continue
+            ( cmux_pane_map "${hosts[$i]}" "$title" > "$tmp/map.${wref//[^A-Za-z0-9_-]/_}" || true ) &
+            jobs=$((jobs + 1))
+            [[ $((jobs % 8)) -ne 0 ]] || wait
+        done < <(jq -r --argjson ws "$ws_json" '
+            ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
+            | .groups[]?.member_workspace_ids[]? | [., ($t[.] // "")] | @tsv' <<<"$groups_json")
+    done
+    wait
+
+    # Work out the new config, all in memory, saying what was found.
+    local patch='{}' adopt="" w host gname order recorded owner wjson
+    for ((i = 0; i < n; i++)); do
+        hat="${hats[$i]}" w="${wins[$i]}" host="${hosts[$i]}"
         if [[ -z "$w" ]]; then
             echo "  $hat: no window open, leaving its config untouched"
             continue
         fi
-
-        local host live=""
-        host=$(hat_ssh "$hat")
-        [[ -n "$host" ]] && live=$(remote_sessions "$host" 2>/dev/null || true)
+        live=""
+        [[ -s "$tmp/ssh.$i" ]] && live=$(awk -F '\t' '$1 == "S" { print $2 }' "$tmp/ssh.$i")
         if [[ -z "$live" ]]; then
             echo "  $hat: $host unreachable or idle, leaving its config untouched"
             continue
         fi
         reached+="$host"$'\n'
+        # Session -> its windows, in tmux order.
+        wjson=$(jq -R -s '
+            split("\n") | map(select(startswith("W\t")) | split("\t")
+                | {s: .[1], w: ({id: .[2], name: (.[3] // ""), cwd: (.[4] // null)}
+                                + (if .[5] == "1" then {pinned: true} else {} end))})
+            | reduce .[] as $x ({}; .[$x.s] += [$x.w])' < "$tmp/ssh.$i")
 
-        local groups_json ws_json gname order recorded
         groups_json=$(window_groups_json "$w" 2>/dev/null || echo '{"groups":[]}')
         ws_json=$(window_ws_json "$w" 2>/dev/null || echo '{"workspaces":[]}')
 
         while IFS= read -r gname; do
             [[ -z "$gname" ]] && continue
 
+            # A group of the same name owned by a different hat is a name
+            # clash, not this hat's group - leave it alone. A group adopted
+            # earlier in this pass counts as owned, though not yet written.
+            owner=""
             if group_exists "$gname"; then
-                # a group of the same name owned by a different hat is a name
-                # clash, not this hat's group - leave it alone
-                local owner
                 owner=$(group_hat "$gname")
-                [[ -n "$owner" && "$owner" != "$hat" ]] && {
-                    warn "group '$gname' is in $hat's window but config says hat '$owner'; skipping"
-                    continue
-                }
             else
-                info "Adopting group '$gname' under hat '$hat'"
-                register_group "$gname" "$hat"
+                owner=$(awk -F '\t' -v g="$gname" '$1 == g { print $2; exit }' <<<"$adopt")
+                if [[ -z "$owner" ]]; then
+                    info "Adopting group '$gname' under hat '$hat'"
+                    adopt+="$gname"$'\t'"$hat"$'\n'
+                    owner="$hat"
+                fi
+            fi
+            if [[ -n "$owner" && "$owner" != "$hat" ]]; then
+                warn "group '$gname' is in $hat's window but config says hat '$owner'; skipping"
+                continue
             fi
 
             local color icon pinned collapsed
@@ -2643,23 +2732,16 @@ cmd_sync() {
                    (.is_pinned // false | tostring), (.is_collapsed // false | tostring)]
                 | join("\u001f")' <<<"$groups_json") || true
 
-            jq_write --arg g "$gname" --arg c "$color" --arg i "$icon" \
-                     --argjson p "${pinned:-false}" --argjson co "${collapsed:-false}" '
-                .groups[$g].color     = (if $c == "" then null else $c end)
-                | .groups[$g].icon    = (if $i == "" then null else $i end)
-                | .groups[$g].pinned  = $p
-                | .groups[$g].collapsed = $co
-            '
-
-            local fresh='{}' wref title windows
+            local fresh='{}' windows
             while IFS= read -r wref; do
                 [[ -z "$wref" ]] && continue
                 title=$(jq -r --arg r "$wref" '.workspaces[] | select(.id==$r) | .title' <<<"$ws_json")
                 [[ -z "$title" || "$title" == "null" ]] && continue
                 grep -qxF "$title" <<<"$live" || continue
 
-                windows=$(remote_windows_json "$host" "$title")
-                order=$(cmux_tab_order "$w" "$wref" "$host" "$title" | jq -R . | jq -sc .)
+                windows=$(jq -c --arg s "$title" '.[$s] // []' <<<"$wjson")
+                order=$(cmux_tab_order "$w" "$wref" "$host" "$title" \
+                            "$tmp/map.${wref//[^A-Za-z0-9_-]/_}" | jq -R . | jq -sc .)
                 recorded=$(cfg --arg g "$gname" --arg s "$title" '.groups[$g].sessions[$s].windows // []')
                 # Order as cmux shows it, ties and strays in tmux order. A tab
                 # the config has pinned stays pinned; a pinned tab that has
@@ -2679,18 +2761,51 @@ cmd_sync() {
                 echo "  $hat / $gname / $title  ($(jq 'length' <<<"$windows") tabs)"
             done < <(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .member_workspace_ids[]?' <<<"$groups_json")
 
-            jq_write --arg g "$gname" --argjson s "$fresh" '.groups[$g].sessions = $s'
+            patch=$(jq -c --arg g "$gname" --arg c "$color" --arg i "$icon" \
+                          --argjson p "${pinned:-false}" --argjson co "${collapsed:-false}" \
+                          --argjson s "$fresh" '
+                .[$g] = {color: (if $c == "" then null else $c end),
+                         icon: (if $i == "" then null else $i end),
+                         pinned: $p, collapsed: $co, sessions: $s}' <<<"$patch")
         done < <(jq -r '.groups[]?.name' <<<"$groups_json")
-    done < <(hat_names)
+    done
+    rm -rf "$tmp"
     cmux_snapshot_drop
 
-    # Once per server, after every hat on it is recorded.
+    # Write it, once. A command that already holds the lock (backup, repair)
+    # is the only writer, so there is nothing to wait for or compare.
+    local held=0
+    if [[ "$HATTER_LOCK_HELD" != 1 ]]; then
+        hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
+        held=1
+        trap hatter_unlock EXIT
+    fi
+    if [[ "$(cksum < "$CONFIG")" != "$stamp" ]]; then
+        if [[ "$held" == 1 ]]; then hatter_unlock; trap - EXIT; fi
+        return 1
+    fi
+    backup_config
+    while IFS=$'\t' read -r gname hat; do
+        [[ -n "$gname" ]] && register_group "$gname" "$hat"
+    done <<<"$adopt"
+    jq_write --argjson p "$patch" '
+        reduce ($p | to_entries[]) as $e (.;
+            .groups[$e.key].color       = $e.value.color
+            | .groups[$e.key].icon      = $e.value.icon
+            | .groups[$e.key].pinned    = $e.value.pinned
+            | .groups[$e.key].collapsed = $e.value.collapsed
+            | .groups[$e.key].sessions  = $e.value.sessions)'
+    if [[ "$held" == 1 ]]; then hatter_unlock; trap - EXIT; fi
+
+    # Once per server, after every hat on it is recorded and the config holds
+    # it - and all at once.
     local h
     while IFS= read -r h; do
         [[ -z "$h" ]] && continue
-        tell_server_sessions "$h" \
-            || warn "$h: could not tell the server what to bring back after a reboot"
+        ( tell_server_sessions "$h" \
+            || warn "$h: could not tell the server what to bring back after a reboot" ) &
     done < <(printf '%s' "$reached" | sort -u)
+    wait
 
     info "Config synced: $CONFIG"
 }
@@ -3036,8 +3151,8 @@ cmd_autosave() {
         run|"")
             # What the timer runs: pick up anything renamed inside cmux, then
             # snapshot. Sync failures must not stop the snapshot.
-            hatter_lock 0 || return 0          # a command is mid-write; try next minute
-            trap hatter_unlock EXIT
+            # sync takes the config lock itself, only for its final write; the
+            # lock is held below just for the snapshot.
             # A subshell: cmd_sync dies on a dead socket, and the snapshot has
             # to happen anyway. Its error goes to the log once, when it first
             # appears or changes, rather than once a minute.
@@ -3057,6 +3172,8 @@ cmd_autosave() {
                 fi
                 printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
             fi
+            hatter_lock 0 || return 0          # a command is mid-write; try next minute
+            trap hatter_unlock EXIT
             local f
             f=$(autosave_snapshot) || true
             [[ -n "$f" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave -> $(basename "$f")"
@@ -4603,7 +4720,8 @@ esac
 
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach) ;;
+    # sync takes the lock itself, only for its final write.
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|sync) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
