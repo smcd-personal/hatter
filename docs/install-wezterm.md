@@ -41,6 +41,85 @@ You need:
 
 Everything below runs in PowerShell. Windows 10 1809 or later, 64-bit.
 
+### The quick way: one command
+
+Paste this into PowerShell, with your own config remote (wherever
+`hatter backup` pushes):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/smcd-personal/hatter/main/tools/install-windows.ps1))) -ConfigRemote you@shell.example.com:git/dotfiles.git
+```
+
+[`tools/install-windows.ps1`](../tools/install-windows.ps1) does A1 to A6 below
+and then checks every hat:
+
+1. installs WezTerm and Git with winget, if they are missing
+2. adds the OpenSSH client and starts the ssh agent, asking for administrator
+   rights once and only if something needs them
+3. asks whether to use an ssh key you already have. If so, it lists the
+   usable private keys in a folder you pick (default `~\.ssh`), with their
+   fingerprints; if not, it makes one. The key goes into the agent, its
+   permissions are tightened if Windows' ssh would refuse it, and the choice
+   is remembered for the next run
+4. clones your config to `~\.config\hatter`, or pulls it if it is there,
+   using Windows' ssh for that repository only
+5. fetches the plugin to `%LOCALAPPDATA%\hatter\src`
+6. writes `~\.wezterm.lua`, backing up any you already have after asking, and
+   loads it in WezTerm to prove it works before going on
+7. connects to each hat and prints a table
+
+Each step checks before it acts, so **run it again whenever you like**: to
+update the plugin and the config, or as a health check when something is off.
+A plain `-ConfigRemote` is only needed the first time.
+
+**Keys from PuTTY** (`.ppk`) are listed but cannot be used as they are: open
+the key in PuTTYgen, choose *Conversions > Export OpenSSH key*, save it in
+`~\.ssh`, and run the installer again.
+
+**A hat that says "key not authorised".** A new key cannot log in to a server
+that only accepts keys, so it cannot add itself. The installer puts your public
+key on the clipboard and prints a command for a machine that already gets in,
+usually your Mac:
+
+```sh
+hatter key add 'ssh-ed25519 AAAA... you@windows' dev ops
+```
+
+Run that, then run the installer again. If even the config server refuses the
+key, the clone fails the same way and prints the same fix.
+
+**Your own WezTerm settings** go in `~\.wezterm-local.lua`, which survives
+re-runs. It returns a function:
+
+```lua
+return function(config, wezterm)
+  config.font_size = 12
+  config.color_scheme = 'Builtin Solarized Dark'
+end
+```
+
+Options, for when the defaults do not fit:
+
+| Option | Does |
+|---|---|
+| `-KeyPath <file>` | Use this private key, without asking; also changes a remembered one |
+| `-Ref <branch\|tag>` | Install the plugin from another ref (default `main`) |
+| `-NoMaximize` | Do not open WezTerm maximized |
+| `-Yes` | Answer yes to every question |
+| `-SkipInstall` | Never install software; fail if WezTerm or Git is missing |
+| `-SkipHatCheck` | Do not connect to the hats |
+| `-NoLaunch` | Do not open WezTerm at the end |
+
+If you would rather read a script before running it, download it first:
+
+```powershell
+irm https://raw.githubusercontent.com/smcd-personal/hatter/main/tools/install-windows.ps1 -OutFile install-windows.ps1
+notepad install-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1 -ConfigRemote you@shell.example.com:git/dotfiles.git
+```
+
+The rest of this section is what the script does, by hand.
+
 ### A1. Install WezTerm and Git
 
 ```powershell
@@ -205,10 +284,14 @@ table.insert(config.keys, {
   `git pull` (from the picker or by hand) shows up straight away. Workspaces
   created on this machine reach the config the next time `hatter sync` or
   autosave runs on a machine with `hatter`, followed by `hatter backup`.
-- **The plugin.** Open the debug overlay (`Ctrl+Shift+L`) and run
-  `wezterm.plugin.update_all()`, then reload the config (`Ctrl+Shift+R`).
+- **The plugin.** If you used the installer, run it again. If you set up by
+  hand with `wezterm.plugin.require`, open the debug overlay (`Ctrl+Shift+L`),
+  run `wezterm.plugin.update_all()`, then reload the config (`Ctrl+Shift+R`).
 
 ### Troubleshooting
+
+Running the installer again checks everything below and says which part is
+wrong. By hand:
 
 - **The picker shows a toast "cannot read …config.json".** The clone is not in
   `$env:USERPROFILE\.config\hatter`, or `XDG_CONFIG_HOME` points elsewhere.
