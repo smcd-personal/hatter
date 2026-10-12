@@ -26,7 +26,7 @@ jobs:
       - name: shellcheck
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          shellcheck --severity=error bin/hatter file-issues.sh
+          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh
 
       - name: Help runs with no config and no cmux
         run: |
@@ -36,6 +36,81 @@ jobs:
 
       - name: Python tools compile
         run: python3 -m py_compile tools/*.py
+
+  # The Android client: the real installer inside a real Termux userland,
+  # which has no /tmp and a long TMPDIR. The hat it reaches is Termux's own
+  # sshd in the same container, and a tmux session stands in for the phone's
+  # terminal.
+  termux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install, attach and pick, inside Termux
+        run: |
+          mkdir -p "$RUNNER_TEMP/ci"
+          cat > "$RUNNER_TEMP/ci/test.sh" <<'EOF'
+          set -euo pipefail
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+          [ ! -d /tmp ] || fail "this image has a /tmp, so the fallback is not tested"
+          echo "TMPDIR=$TMPDIR"
+
+          # The server half: Termux's sshd on 8022, with tmux.
+          pkg install -y openssh tmux >/dev/null
+          sshd
+          mkdir -p ~/.ssh
+          printf 'Host termux-ci\n  HostName 127.0.0.1\n  Port 8022\n' > ~/.ssh/config
+          mkdir -p ~/.config/hatter
+          echo '{"version":3,"hats":{"ci":{"ssh":"termux-ci","remote_dir":"$HOME"}},
+                 "groups":{"CI":{"hat":"ci","sessions":{"ci-two":{}}}}}' > ~/.config/hatter/config.json
+
+          # First run: a new key the hat does not accept yet.
+          set +e
+          out=$(bash /src/tools/install-termux.sh --non-interactive 2>&1); rc=$?
+          set -e
+          echo "$out"
+          [ "$rc" -ne 0 ] || fail "first run passed with an unauthorised key"
+          echo "$out" | grep -q "refuses this key" || fail "refused key not reported"
+          echo "$out" | grep -q "hatter key add 'ssh-ed25519 " || fail "no key-add line"
+
+          # What `hatter key add` does from another machine.
+          cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
+
+          bash /src/tools/install-termux.sh --non-interactive
+          out=$(bash /src/tools/install-termux.sh --non-interactive)
+          echo "$out" | grep -q 'hatter is current' || fail "a re-run reinstalled hatter"
+
+          command -v hatter
+          hatter key add "$(cat ~/.ssh/id_ed25519.pub)" ci | grep -q present || fail "key add"
+          ls -la "$TMPDIR"
+          sock=$(find "$TMPDIR" -maxdepth 2 -type s | head -1)
+          [ -n "$sock" ] || fail "no ssh control socket under TMPDIR"
+          echo "control socket: $sock (${#sock} chars)"
+
+          grep -q "extra-keys" ~/.termux/termux.properties || fail "no extra-keys row"
+          [ -f ~/.shortcuts/hatter/ci ] && [ -f ~/.shortcuts/hatter/"ci two" ] \
+            || fail "shortcuts missing: $(ls ~/.shortcuts/hatter)"
+          head -1 ~/.shortcuts/hatter/ci | grep -q "^#!$PREFIX/bin/bash" || fail "shortcut shebang"
+
+          # attach, by name, from a terminal.
+          tmux new-session -d -s phone1 -x 80 -y 24 "hatter attach ci-one; sleep 30"
+          for i in $(seq 20); do tmux has-session -t =ci-one 2>/dev/null && break; sleep 1; done
+          tmux has-session -t =ci-one || fail "hatter attach ci-one did not start it"
+
+          # Bare hatter, with no cmux: the picker. ci-one is running and
+          # ci-two is recorded, so ci has two workspaces and asks.
+          tmux new-session -d -s phone2 -x 80 -y 24 "hatter; sleep 30"
+          for i in $(seq 20); do
+            tmux capture-pane -p -t phone2 | grep -q "workspace on 'ci'" && break; sleep 1
+          done
+          tmux capture-pane -p -t phone2
+          tmux send-keys -t phone2 2 Enter
+          for i in $(seq 20); do tmux has-session -t =ci-two 2>/dev/null && break; sleep 1; done
+          tmux has-session -t =ci-two || fail "picking 2 did not attach ci-two"
+          echo PASS
+          EOF
+          docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/ci:/ci:ro" \
+              termux/termux-docker:x86_64 bash /ci/test.sh
 
   # The Windows client: run the real installer on a real Windows machine, then
   # prove the WezTerm config it wrote loads and the plugin works there.

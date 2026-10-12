@@ -74,7 +74,8 @@ it is not tied to one terminal, Windows and Linux clients — is in
 Client support today is [cmux](https://cmux.com) for the full layout, and
 [WezTerm](https://wezterm.org) on Windows, macOS and Linux for reaching any hat
 through a picker - a plugin in [plugin/](plugin/init.lua) that needs no bash, so
-Windows works without WSL. `hatter attach` does the same from any terminal. The
+Windows works without WSL. `hatter attach` does the same from any terminal,
+Termux on Android included. The
 adapter interface (issue 2) is what will let `restore` and `sync` drive WezTerm,
 wmux and a headless mode too.
 
@@ -87,7 +88,7 @@ wmux and a headless mode too.
 
 ## Install
 
-Two guides, depending on which terminal you have:
+Three guides, depending on which terminal you have:
 
 - **[macOS with cmux](docs/install-cmux-macos.md)** — the full-feature path.
   cmux is the only client hatter drives end-to-end today, and it is macOS-only.
@@ -95,6 +96,9 @@ Two guides, depending on which terminal you have:
   installing WezTerm, ssh and your config, then a picker that opens any
   workspace on any hat. On Windows it needs no WSL. `restore` and `sync` for
   WezTerm are [#4](https://github.com/smcd-personal/hatter/issues/4).
+- **[Android, in Termux](docs/install-android.md)** — one installer, then
+  `hatter` opens a picker of your hats and their workspaces. Home-screen
+  shortcuts, a tmux-friendly key row, and mosh if you want it.
 
 The short version, once your terminal is sorted:
 

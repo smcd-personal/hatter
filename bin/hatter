@@ -45,20 +45,38 @@ warn() { echo "  !! $*" >&2; }
 # the autosave timer repeats that on a schedule. Multiplexing them over one
 # persistent connection per host turns a ~2s handshake into a few milliseconds.
 # Kept inside hatter rather than in ~/.ssh/config so nothing outside it changes.
-# Deliberately /tmp and not TMPDIR: a control socket path has a hard 104-byte
-# limit, and macOS hands every process a ~50-character TMPDIR, which blows it.
-# The directory is per-uid and 0700; if it exists but belongs to someone else,
-# multiplexing is dropped rather than trusted.
-HATTER_SSH_CTL="/tmp/.hatter-ssh-$(id -u)"
-SSH_OPTS=()
-# -O follows a symlink, so a link planted by someone else pointing at a
-# directory we do own would pass it. Test the link itself, before and after.
-if [[ ! -L "$HATTER_SSH_CTL" ]] \
-   && mkdir -p "$HATTER_SSH_CTL" 2>/dev/null \
-   && [[ -d "$HATTER_SSH_CTL" && -O "$HATTER_SSH_CTL" && ! -L "$HATTER_SSH_CTL" ]] \
-   && chmod 700 "$HATTER_SSH_CTL" 2>/dev/null; then
-    SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$HATTER_SSH_CTL/%C" -o ControlPersist=600)
-fi
+# /tmp first, and TMPDIR only as a fallback: a control socket path has a hard
+# 104-byte limit, and macOS hands every process a ~50-character TMPDIR, which
+# blows it. Android has no /tmp at all, and Termux's TMPDIR is long enough that
+# only a short name fits under it. The limit leaves room for the directory, a
+# slash, %C's 40 characters, and the ~17-character suffix ssh adds to the
+# socket's name while it creates it; so at most 45 for the directory. With no
+# directory that short and safe, multiplexing is skipped - hatter just runs
+# slower.
+#
+# Each directory is per-uid and 0700; if it exists but belongs to someone
+# else, it is passed over rather than trusted.
+HATTER_SSH_CTL_MAX=45
+HATTER_SSH_CTL=""
+# Never empty: bash 3.2 calls "${SSH_OPTS[@]}" of an empty array unbound, and
+# set -u turns that into an exit.
+SSH_OPTS=(-o ControlMaster=no)
+for _ctl in "/tmp/.hatter-ssh-$(id -u)" \
+            ${TMPDIR:+"${TMPDIR%/}/.hatter-ssh-$(id -u)"} \
+            ${TMPDIR:+"${TMPDIR%/}/hs$(id -u)"}; do
+    [[ ${#_ctl} -le $HATTER_SSH_CTL_MAX ]] || continue
+    # -O follows a symlink, so a link planted by someone else pointing at a
+    # directory we do own would pass it. Test the link itself, before and after.
+    if [[ ! -L "$_ctl" ]] \
+       && mkdir -p "$_ctl" 2>/dev/null \
+       && [[ -d "$_ctl" && -O "$_ctl" && ! -L "$_ctl" ]] \
+       && chmod 700 "$_ctl" 2>/dev/null; then
+        HATTER_SSH_CTL="$_ctl"
+        SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$HATTER_SSH_CTL/%C" -o ControlPersist=600)
+        break
+    fi
+done
+unset _ctl
 
 # Single-quote a value for safe interpolation into a remote sh command.
 sq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -231,6 +249,7 @@ hat_ssh() {
     printf '%s' "$d"
 }
 hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
+hat_mosh()   { cfg --arg l "$1" '.hats[$l].mosh // false'; }
 hat_names()  { cfg '.hats | keys[]?'; }
 
 # Each hat gets a colour, so the same hat looks the same everywhere it appears
@@ -950,6 +969,14 @@ set -g @continuum-save-interval '15'
 set -g default-command 'while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
 set -g remain-on-exit off
 set-hook -gu pane-died
+
+# One session, several screens - a desktop and a phone, say. A window takes the
+# size of whichever client used it last, rather than shrinking to the smallest
+# one attached, and each window is sized by the clients looking at it rather
+# than by every client on the session. `mouse` is left alone: it changes how
+# text selection works on the desktop.
+set -g window-size latest
+setw -g aggressive-resize on
 
 # Keep `run tpm` last.
 run '~/.tmux/plugins/tpm/tpm'
@@ -1760,6 +1787,8 @@ if tmux has-session 2>/dev/null; then
     tmux set -g default-command 'while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
     tmux set -g remain-on-exit off
     tmux set-hook -gu pane-died 2>/dev/null || true
+    tmux set -g window-size latest 2>/dev/null || true
+    tmux setw -g aggressive-resize on 2>/dev/null || true
     echo "applied to the running tmux server"
 fi
 
@@ -2213,13 +2242,22 @@ cmd_repair() {
 # ControlMaster holds the socket for every short-lived hatter call after it,
 # and those would then die with the terminal.
 attach_session() {
-    local hat="$1" session="$2" dest dir
+    local hat="$1" session="$2" dest dir cmd
     [[ -t 0 && -t 1 ]] || die "attach needs a terminal - '$session' is on hat '$hat'"
     dest=$(hat_ssh "$hat")
     [[ -n "$dest" ]] || die "hat '$hat' has no ssh destination"
     dir=$(hat_dir "$hat")
-    exec ssh -t "$dest" \
-        "tmux new-session -A -s $(sq "$session") -c $(sq_dir "$dir")"
+    cmd="tmux new-session -A -s $(sq "$session") -c $(sq_dir "$dir")"
+    # mosh survives a phone sleeping, roaming and changing networks, where ssh
+    # drops. It runs the command itself rather than through a shell, so the
+    # shell that expands "$HOME" is asked for by name.
+    if [[ "$(hat_mosh "$hat")" == true ]]; then
+        if command -v mosh >/dev/null 2>&1; then
+            exec mosh "$dest" -- sh -c "$cmd"
+        fi
+        warn "hat '$hat' asks for mosh, which is not installed here - using ssh"
+    fi
+    exec ssh -t "$dest" "$cmd"
 }
 
 # The workspaces a hat has: those the config records, plus any running on its
@@ -2246,6 +2284,42 @@ hat_workspaces() {
     return 0
 }
 
+# A numbered menu on stderr. Prints the choice; an empty answer or end of
+# input picks nothing and returns non-zero.
+pick_one() {
+    local prompt="$1" a i=1
+    shift
+    local -a opts=("$@")
+    for a in "${opts[@]}"; do printf '  %2d) %s\n' "$i" "$a" >&2; i=$((i+1)); done
+    while true; do
+        printf '%s' "$prompt" >&2
+        IFS= read -r a || { echo >&2; return 1; }
+        [[ -n "$a" ]] || return 1
+        if [[ "$a" =~ ^[0-9]+$ ]] && [[ "$a" -ge 1 && "$a" -le ${#opts[@]} ]]; then
+            printf '%s' "${opts[$((a-1))]}"
+            return 0
+        fi
+        echo "  pick a number from 1 to ${#opts[@]}" >&2
+    done
+}
+
+# With no argument: the hat first, then the workspace. On a phone, a number
+# beats typing a session name on a soft keyboard.
+cmd_attach_pick() {
+    [[ -t 0 && -t 1 ]] || { usage_cmd attach; exit 1; }
+    local -a hats=()
+    local hat
+    while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
+    [[ ${#hats[@]} -gt 0 ]] || die "no hats yet. Add one:
+    hatter hat add <name> --ssh you@shell.example.com"
+    if [[ ${#hats[@]} -eq 1 ]]; then
+        hat="${hats[0]}"
+    else
+        hat=$(pick_one "hat: " "${hats[@]}") || exit 0
+    fi
+    cmd_attach "$hat"
+}
+
 cmd_attach() {
     local target="$1" hat session
     target=$(tmux_session_name "$target")
@@ -2264,24 +2338,84 @@ cmd_attach() {
     list=$(hat_workspaces "$hat")
     n=$(printf '%s' "$list" | grep -c '' || true)
 
-    if [[ "$n" -eq 0 ]]; then
-        die "hat '$hat' has no workspaces yet. Name one to create it:
-    hatter attach $hat-<name>"
-    fi
     if [[ "$n" -eq 1 ]]; then
         attach_session "$hat" "$list"
     fi
-    [[ -t 0 ]] || die "hat '$hat' has $n workspaces - name one:
+    if [[ ! -t 0 ]]; then
+        [[ "$n" -eq 0 ]] && die "hat '$hat' has no workspaces yet. Name one to create it:
+    hatter attach $hat-<name>"
+        die "hat '$hat' has $n workspaces - name one:
 $(printf '%s\n' "$list" | sed 's/^/    /')"
+    fi
 
+    # At a terminal, a new workspace is one more choice, so a hat with none
+    # is a starting point rather than a dead end.
     local -a choices=()
-    while IFS= read -r session; do choices+=("$session"); done <<<"$list"
-    PS3="workspace on '$hat': "
-    select session in "${choices[@]}"; do
-        [[ -n "$session" ]] && attach_session "$hat" "$session"
-        echo "pick a number from 1 to $n"
+    if [[ "$n" -gt 0 ]]; then
+        while IFS= read -r session; do choices+=("$session"); done <<<"$list"
+    fi
+    choices+=("+ new workspace")
+    session=$(pick_one "workspace on '$hat': " "${choices[@]}") || exit 0
+    if [[ "$session" == "+ new workspace" ]]; then
+        local name
+        printf '  name (becomes %s-<name>): ' "$hat" >&2
+        IFS= read -r name || exit 0
+        [[ -n "$name" ]] || exit 0
+        [[ "$name" == "$hat"-* ]] || name="$hat-$name"
+        session=$(tmux_session_name "$name")
+    fi
+    attach_session "$hat" "$session"
+}
+
+# Termux:Widget lists the scripts under ~/.shortcuts as home-screen buttons.
+# One per hat, which opens the workspace picker, and one per recorded
+# workspace. A workspace is named "<hat> <rest of its name>": a space sorts
+# before anything else, so each hat's workspaces come straight after it.
+#
+# The directory is hatter's own, but only files carrying the marker are
+# removed, so a script of your own put there survives a rewrite.
+SHORTCUT_MARK='# hatter shortcut - rewritten by `hatter shortcuts`; edits are lost.'
+
+shortcut_write() {
+    # shortcut_write <dir> <file name> <attach target> <hatter> <bash>
+    local f="$1/${2//\//_}"
+    printf '#!%s\n%s\nexec %s attach %s\n' "$5" "$SHORTCUT_MARK" "$(sq "$4")" "$(sq "$3")" > "$f"
+    chmod 700 "$f"
+}
+
+cmd_shortcuts() {
+    local dir="$HOME/.shortcuts/hatter"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir) [[ -n "${2:-}" ]] || die "--dir needs a path"; dir="$2"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
     done
-    exit 1
+
+    local self bash_bin
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    bash_bin=$(command -v bash) || die "bash is not on PATH"
+
+    mkdir -p "$dir"
+    local f
+    for f in "$dir"/*; do
+        [[ -f "$f" ]] || continue
+        [[ "$(sed -n 2p "$f" 2>/dev/null)" == "$SHORTCUT_MARK" ]] && rm -f "$f"
+    done
+
+    local hat session n=0
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        shortcut_write "$dir" "$hat" "$hat" "$self" "$bash_bin"
+        n=$((n+1))
+        while IFS= read -r session; do
+            [[ -n "$session" ]] || continue
+            shortcut_write "$dir" "$hat ${session#"$hat"-}" "$session" "$self" "$bash_bin"
+            n=$((n+1))
+        done < <(cfg --arg l "$hat" '[.groups[] | select(.hat == $l) | .sessions | keys[]?] | unique[]')
+    done < <(hat_names)
+    info "Wrote $n shortcuts to $dir"
+    return 0
 }
 
 # A new machine's ssh key cannot log in to a server that only takes keys, so
@@ -2472,21 +2606,33 @@ cmd_hat() {
         list|"")
             cfg '.hats | to_entries[]
                  | "\(.key)\t-> \(.value.ssh)  [\(.value.remote_dir)]"
-                   + (if .value.default_group then "  default group: \(.value.default_group)" else "" end)'
+                   + (if .value.default_group then "  default group: \(.value.default_group)" else "" end)
+                   + (if .value.mosh then "  mosh" else "" end)'
             ;;
         add|set)
-            local name="${1:-}" ssh_dest="" dir="" defgroup=""
+            local name="${1:-}" ssh_dest="" dir="" defgroup="" mosh=""
             shift || true
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --ssh|--host) ssh_dest="$2"; shift 2 ;;
                     --dir) dir="$2"; shift 2 ;;
                     --group) defgroup="$2"; shift 2 ;;
+                    --mosh) mosh=true; shift ;;
+                    --no-mosh) mosh=false; shift ;;
                     *) die "unknown flag: $1" ;;
                 esac
             done
-            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>]"
+            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh]"
+            # Only the transport changing: no need to ask for the rest again.
+            if [[ -n "$mosh" && -z "$ssh_dest$dir$defgroup" ]] && hat_exists "$name"; then
+                jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
+                info "Hat '$name' attaches with $([[ "$mosh" == true ]] && echo mosh || echo ssh)"
+                return 0
+            fi
             register_hat "$name" "$ssh_dest" "$dir" "$defgroup"
+            if [[ -n "$mosh" ]]; then
+                jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
+            fi
             if [[ -n "$defgroup" ]]; then
                 group_exists "$defgroup" || register_group "$defgroup" "$name"
             fi
@@ -4313,7 +4459,7 @@ hatter - cmux windows, groups and workspaces backed by remote tmux
 Commands:
   new <session>          Create or reattach a workspace  ("new" is optional)
   tab <session> [name]   Add a tab to a workspace
-  attach <hat|session>   Open a workspace in this terminal, over plain ssh
+  attach [hat|session]   Open a workspace in this terminal, over plain ssh
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
   repair <session>       Bring back a workspace cmux shows blank, in its place
@@ -4327,8 +4473,9 @@ Commands:
   restore [hat|group]    Rebuild the layout from the config
   provision <hat>        Set up tmux persistence and boot recovery on a server
   backup [message]       sync, then commit and push the config to git
+  shortcuts              Write Termux:Widget home-screen shortcuts (Android)
 
-Run `hatter` with no arguments to open the rack.
+Run `hatter` with no arguments to open the rack, or without cmux, to attach.
 Run `hatter <command>` or `hatter help <command>` for a command's options.
 
 Config: ~/.config/hatter/config.json
@@ -4483,21 +4630,41 @@ The key is checked with ssh-keygen first, and each hat reports "added",
 USAGE
     ;;
     attach) cat <<'USAGE'
-hatter attach <hat | session>
+hatter attach [hat | session]
 
 Open a workspace in this terminal: ssh to its hat and attach to the tmux
 session, creating it if it is not running. Nothing else is touched - no cmux,
-no config writes - so this works from any terminal with bash and ssh.
+no config writes - so this works from any terminal with bash and ssh,
+Termux on Android included.
 
   hatter attach dev-atlas     that workspace
-  hatter attach dev           pick one of dev's workspaces
+  hatter attach dev           pick one of dev's workspaces, or a new one
+  hatter attach               pick the hat, then the workspace
 
 Given a hat, the choice is every workspace the config records for it plus any
 running on its server. Detach with the tmux prefix then d; the session keeps
-running.
+running. On a machine without cmux, bare `hatter` does the same as
+`hatter attach`.
+
+A hat added with `hatter hat add <hat> --mosh` attaches over mosh when mosh
+is installed here, and over ssh otherwise. mosh rides out a phone sleeping
+or changing networks; the server needs mosh-server too.
 
 On Windows without bash, the WezTerm plugin (plugin/init.lua) does the same
 - see docs/install-wezterm.md.
+USAGE
+    ;;
+    shortcuts) cat <<'USAGE'
+hatter shortcuts [--dir <path>]
+
+Write home-screen shortcuts for the Termux:Widget app on Android: one per hat,
+which opens that hat's workspace picker, and one per workspace the config
+records, which attaches straight to it. A workspace's shortcut is named
+"<hat> <rest of its name>", so each hat's workspaces sort right after it.
+
+The shortcuts go in ~/.shortcuts/hatter (or --dir). Run this again after
+pulling a newer config; it replaces the shortcuts it wrote before and leaves
+any other file there alone.
 USAGE
     ;;
     rename) cat <<'USAGE'
@@ -4519,10 +4686,12 @@ cmux window. The hat name is the prefix on every session that belongs to it.
 Subcommands:
   list                                    Hats and their destinations
   status                                  Live probe: reachable, tmux, sessions
-  add <hat> --ssh user@host [--dir path] [--group <name>]
+  add <hat> --ssh user@host [--dir path] [--group <name>] [--mosh]
                                           Register or update a hat. --group sets
                                           the default group new workspaces land
-                                          in when you omit --group.
+                                          in when you omit --group. --mosh makes
+                                          `hatter attach` use mosh where it is
+                                          installed (--no-mosh turns it off).
   rename <old> <new>                      Rename a hat and re-prefix its sessions
   rm <hat>                                Forget a hat (server untouched)
 
@@ -4713,15 +4882,22 @@ shift || true
 # a shell server, pushing a login to it, adding a tab, backups - is bash, ssh
 # and jq, which run anywhere, WSL included. So cmux is required by the commands
 # that actually drive it rather than by the script itself.
+#
+# Without cmux, bare `hatter` has no rack to open, but attaching still works:
+# so on a phone, or any machine that only reaches its hats, it opens the
+# attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|help|-h|--help) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|shortcuts|help|-h|--help) ;;
+    "") if ! command -v cmux >/dev/null 2>&1; then
+            if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
+        fi ;;
     *) need cmux ;;
 esac
 
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|sync) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|shortcuts|sync) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
@@ -4744,7 +4920,8 @@ case "$cmd" in
     # These need arguments, so bare invocation shows the command's options.
     new)       [[ $# -gt 0 ]] || { usage_cmd new; exit 1; };       cmd_new "$@" ;;
     tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
-    attach)    [[ $# -eq 1 ]] || { usage_cmd attach; exit 1; };    cmd_attach "$1" ;;
+    attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
+               if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
@@ -4759,6 +4936,7 @@ case "$cmd" in
     autosave)  cmd_autosave "$@" ;;
     list|ls)   cmd_list "$@" ;;
     sync)      cmd_sync "$@" ;;
+    shortcuts) cmd_shortcuts "$@" ;;
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
