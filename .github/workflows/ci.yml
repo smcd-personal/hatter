@@ -77,8 +77,8 @@ jobs:
           cat ~/.ssh/id_ed25519.pub >> ~/.ssh/authorized_keys
 
           bash /src/tools/install-termux.sh --non-interactive
-          bash /src/tools/install-termux.sh --non-interactive | grep -q 'hatter is current' \
-            || fail "second run reinstalled hatter"
+          out=$(bash /src/tools/install-termux.sh --non-interactive)
+          echo "$out" | grep -q 'hatter is current' || fail "a re-run reinstalled hatter"
 
           command -v hatter
           hatter key add "$(cat ~/.ssh/id_ed25519.pub)" ci | grep -q present || fail "key add"
