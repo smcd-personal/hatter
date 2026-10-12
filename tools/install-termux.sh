@@ -151,6 +151,15 @@ else
     src="$tmp"
     note "from $REPO_RAW/$REF"
 fi
+# Android has no /usr/bin/env. Termux's termux-exec rewrites such shebangs on
+# the fly, but only where it is loaded, so the copy installed here names
+# Termux's own bash instead.
+if [[ "$TERMUX" == 1 ]]; then
+    fixed=$(mktemp "${TMPDIR:-/tmp}/hatter.XXXXXX")
+    { printf '#!%s/bin/bash\n' "$PREFIX"; tail -n +2 "$src"; } > "$fixed"
+    [[ -n "$tmp" ]] && rm -f "$tmp"
+    src="$fixed"; tmp="$fixed"
+fi
 if cmp -s "$src" "$HATTER"; then
     ok "$HATTER is current"
 else
