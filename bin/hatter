@@ -2566,14 +2566,32 @@ cmd_backup() {
     else
         warn "cmux is not answering; committing the config as it stands, unsynced"
     fi
+    backup_commit_push "$msg"
+}
+
+backup_self() { printf '%s/%s' "$(cd "$(dirname "$0")" && pwd)" "$(basename "$0")"; }
+backup_script_stale() {
+    local self
+    self=$(backup_self)
+    ! cmp -s "$self" "$CONFIG_DIR/bin/$(basename "$self")"
+}
+
+# The half of a backup after the sync: commit and push. Holds the config lock
+# while it commits, so the autosave timer cannot write halfway through.
+backup_commit_push() {
+    local msg="${1:-}" held=0
+    if [[ "$HATTER_LOCK_HELD" != 1 ]]; then
+        hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
+        held=1
+    fi
 
     # The config alone is only half the state - it is useless without the tool
     # that reads it. Keeping a copy of the script in the same repo means one
     # clone restores both after a Mac rebuild.
     mkdir -p "$CONFIG_DIR/bin"
     local self
-    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-    if ! cmp -s "$self" "$CONFIG_DIR/bin/$(basename "$self")"; then
+    self=$(backup_self)
+    if backup_script_stale; then
         cp "$self" "$CONFIG_DIR/bin/$(basename "$self")"
         chmod +x "$CONFIG_DIR/bin/$(basename "$self")"
     fi
@@ -2598,6 +2616,48 @@ cmd_backup() {
     else
         warn "no 'origin' remote set; committed locally only"
     fi
+    [[ "$held" == 1 ]] && hatter_unlock
+    return 0
+}
+
+# After a sync, the next thing worth doing is usually getting it off this
+# machine. So an interactive sync asks, defaulting to yes, unless the config
+# says never. The answer lives in the config rather than beside it, so "never"
+# holds on every machine it is cloned to.
+backup_ask_wanted() {
+    [[ -t 0 && -t 1 ]] || return 1
+    [[ -d "$CONFIG_DIR/.git" ]] && command -v git >/dev/null 2>&1 || return 1
+    [[ "$(cfg '.prefs.backup_after_sync // "ask"')" != never ]] || return 1
+    backup_pending
+}
+
+# Anything a backup would change: uncommitted edits, a newer copy of this
+# script, or commits the remote does not have yet.
+backup_pending() {
+    [[ -n "$(git -C "$CONFIG_DIR" status --porcelain 2>/dev/null)" ]] && return 0
+    backup_script_stale && return 0
+    local ahead
+    ahead=$(git -C "$CONFIG_DIR" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+    [[ "$ahead" -gt 0 ]]
+}
+
+backup_never_ask() {
+    jq_write '.prefs.backup_after_sync = "never"'
+    info "Will not ask again. Turn it back on with: hatter sync --ask-backup"
+}
+
+# The plain-terminal version. The rack asks with a single key instead.
+backup_offer() {
+    backup_ask_wanted || return 0
+    local a
+    printf 'Back up the config to git now? [Y]es / [n]o / ne[v]er ask: '
+    IFS= read -r a || { echo; return 0; }
+    case "$a" in
+        ""|y|Y|yes|YES|Yes) backup_commit_push ;;
+        v|V|never|NEVER|Never) backup_never_ask ;;
+        *) info "Not backed up" ;;
+    esac
+    return 0
 }
 
 cmd_hat() {
@@ -4136,7 +4196,18 @@ edit_sync_restore() {
             q|Q|quit|left|esc|back|h) return 0 ;;
             !) probed=0 ;;
             s|S)
-                ( cmd_sync ) || warn "sync did not finish"
+                if ! ( cmd_sync ); then
+                    warn "sync did not finish"
+                elif backup_ask_wanted; then
+                    printf '  %sback up the config to git now?%s [Y]es / [n]o / ne[v]er ask ' \
+                        "$C_YL" "$C_R" >&2
+                    edit_readkey
+                    case "$KEY" in
+                        enter|y|Y) printf 'yes\n' >&2; ( backup_commit_push ) || warn "backup did not finish" ;;
+                        v|V)       printf 'never\n' >&2; ( backup_never_ask ) || true ;;
+                        *)         printf 'no\n' >&2 ;;
+                    esac
+                fi
                 probed=0; edit_pause ;;
             r|R)
                 if [[ $n -eq 0 ]]; then
@@ -4750,7 +4821,7 @@ hatter sync
 
 Record the live layout into the config: group membership, titles, colors,
 pin/collapse, and every session's tabs and working directories. Run it after
-renaming or rearranging anything in the cmux sidebar. Takes no options.
+renaming or rearranging anything in the cmux sidebar.
 
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.
@@ -4758,6 +4829,14 @@ left as they are rather than being emptied.
 Each server reached is also told which sessions the config records for it, and
 forgets the tabs that have closed. Its boot-time rebuild (hat-restore) then
 brings back only those, so a workspace closed before a reboot stays closed.
+
+Then, at a terminal, it offers to back up: commit and push the config as
+`hatter backup` does, without syncing twice. Enter means yes; n skips it this
+time; v (never) stops the question, on every machine the config is cloned to.
+It is not asked when there is nothing to back up, when the config is not a git
+repo, or when sync is not run at a terminal.
+
+  --ask-backup    ask again after saying never
 USAGE
     ;;
     restore) cat <<'USAGE'
@@ -4935,7 +5014,15 @@ case "$cmd" in
     creds|cred|credential|credentials) cmd_creds "$@" ;;
     autosave)  cmd_autosave "$@" ;;
     list|ls)   cmd_list "$@" ;;
-    sync)      cmd_sync "$@" ;;
+    sync)      case "${1:-}" in
+                   "") ;;
+                   --ask-backup)
+                       jq_write 'del(.prefs.backup_after_sync) | if .prefs == {} then del(.prefs) else . end'
+                       info "Will ask to back up after each sync" ;;
+                   *) die "unknown argument: $1  (try: hatter help sync)" ;;
+               esac
+               cmd_sync
+               backup_offer ;;
     shortcuts) cmd_shortcuts "$@" ;;
     restore)   cmd_restore "$@" ;;
 
