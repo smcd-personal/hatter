@@ -1262,6 +1262,9 @@ cat > "$HOME/.local/bin/hat-launch" <<'HATLAUNCH'
 #   hat-launch --kind claude|codex|shell
 #   hat-launch --resume claude <session-id>
 #
+# tmux options it reads: @hat_default_kind (the kind above) and
+# @hat_<kind>_args (extra arguments for every launch of that kind).
+#
 # Two contracts inherited from the default-command this replaces, both
 # load-bearing:
 #   - the login shell runs in a loop, so `exit` and stray ctrl-D hand back a
@@ -1290,7 +1293,47 @@ if [ -z "$kind" ] && [ -n "${TMUX:-}" ]; then
 fi
 [ -n "$kind" ] || kind=shell
 
+# At boot tmux is started by systemd, so a pane inherits none of the login
+# profile - and with it not CLAUDE_CONFIG_DIR, which moves where Claude Code
+# keeps its transcripts. Without it `claude --resume` looks in ~/.claude and
+# reports "No conversation found" for every session there is. The variables
+# that decide where an agent lives are taken from a login shell instead.
+#
+# The shell asked is the account's own, from passwd: the boot unit pins
+# SHELL=/bin/bash, and a zsh user's profile is not one bash reads. A profile
+# that blocks gets 10 seconds, and anything it prints is skipped by reading
+# only what follows the marker.
+login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+[ -x "${login_shell:-}" ] || login_shell="${SHELL:-/bin/bash}"
+# Read via a file, not a pipe: a profile that leaves a background child
+# holding the pipe open would keep the read loop waiting past the timeout.
+to=""; command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
+envf=$(mktemp 2>/dev/null) || envf=""
+if [ -n "$envf" ]; then
+    $to "$login_shell" -lc 'printf "HATENV\0"; env -0' </dev/null >"$envf" 2>/dev/null
+    seen=0
+    while IFS= read -r -d '' kv; do
+        case "$kv" in *HATENV) seen=1; continue ;; esac
+        [ "$seen" = 1 ] || continue
+        case "$kv" in
+            PATH=*|CLAUDE_CONFIG_DIR=*|CODEX_HOME=*) export "$kv" ;;
+        esac
+    done < "$envf"
+    rm -f "$envf"
+fi
+
+# Extra arguments for every launch of this kind, new or resumed, from a tmux
+# option such as `set -g @hat_claude_args '--permission-mode auto'`. A restored
+# agent then starts the way a hand-started one would. The value is split on
+# whitespace with no quote handling, so each argument must be a single word.
+extra=()
+if [ -n "${TMUX:-}" ]; then
+    read -r -a extra <<< "$(tmux show-options -gv "@hat_${kind}_args" 2>/dev/null)" || extra=()
+fi
+
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+# How Claude Code names a project dir after a path: /a/.b -> -a--b
+mangle() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '-'; }
 
 # Never write stdout from here: nothing downstream expects it, and the hook
 # sibling of this script shares the rule for a harder reason.
@@ -1322,27 +1365,59 @@ run_agent() {
     case "$kind" in
         claude)
             if [ -n "$sid" ]; then
+                # A resume that cannot work must not cost the id: the shell
+                # this pane falls back to would otherwise overwrite the entry,
+                # and the next restore would have nothing left to resume.
+                local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}" t dir proj start rc
+                for t in "$cfg"/projects/*/"$sid".jsonl; do break; done
+                if [ ! -e "$t" ]; then
+                    printf 'hat-launch: no transcript for %s under %s/projects - not resuming; its registry entry is kept\n' "$sid" "$cfg" >&2
+                    keep=1
+                    return 1
+                fi
+                # `--resume` only searches the project dir named after the
+                # current directory. If the transcript sits under another one,
+                # move to the directory that name stands for. It is not
+                # necessarily where the session started (a session can be moved
+                # into a worktree), so pick it from every cwd the transcript
+                # recorded.
+                proj=${t%/*}; proj=${proj##*/}
+                if [ "$(mangle "$PWD")" != "$proj" ]; then
+                    while IFS= read -r dir; do
+                        if [ "$(mangle "$dir")" = "$proj" ] && [ -d "$dir" ]; then
+                            cd "$dir" 2>/dev/null && break
+                        fi
+                    done < <(grep -ao '"cwd":"[^"]*"' "$t" 2>/dev/null | cut -d'"' -f4 | sort -u)
+                fi
                 record claude "$sid" "$$"
-                "$bin" --resume "$sid"
+                start=$(date +%s)
+                "$bin" ${extra[@]+"${extra[@]}"} --resume "$sid"; rc=$?
+                # A resume that dies at once ("No conversation found") never
+                # ran: keep the id rather than record the shell over it.
+                if [ "$rc" != 0 ] && [ $(( $(date +%s) - start )) -lt 15 ]; then
+                    printf 'hat-launch: resuming %s failed at once (exit %s) - its registry entry is kept\n' "$sid" "$rc" >&2
+                    keep=1
+                fi
             else
                 # Minting the id here is the whole point: it is known before the
                 # agent starts, so a reboot never has to work out which session
                 # this pane held.
                 sid=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
                 record claude "$sid" "$$"
-                "$bin" --session-id "$sid"
+                "$bin" ${extra[@]+"${extra[@]}"} --session-id "$sid"
             fi ;;
         *)
             record "$kind" "${sid:-}" "$$"
-            "$bin" ;;
+            "$bin" ${extra[@]+"${extra[@]}"} ;;
     esac
 }
 
+keep=0
 [ "$kind" != shell ] && { run_agent || true; }
 
 # Whatever happened above, the pane ends up here: a login shell in the loop the
 # tab's survival depends on.
-record shell "" "$$"
+[ "$keep" = 1 ] || record shell "" "$$"
 while :; do
     "${SHELL:-/bin/bash}" -l
     [ $? -eq 99 ] && break
@@ -1644,23 +1719,42 @@ chmod +x "$HOME/.local/bin/hat-restore"
 # which is most of them. It goes in as its OWN entry appended to the arrays, so
 # an existing hook pipeline on this box is never touched, and running it twice
 # is a no-op.
-if [ -f "$HOME/.claude/settings.json" ] && command -v jq >/dev/null 2>&1; then
-    cp "$HOME/.claude/settings.json" "$HOME/.claude/settings.json.hatter.bak"
+#
+# It goes in the settings file Claude Code actually reads. A login profile that
+# exports CLAUDE_CONFIG_DIR moves that file out of ~/.claude, and a hook wired
+# into the old one never fires: the registry is then fed by --backfill alone
+# and drifts out of step with the tabs.
+claude_cfg=$("${SHELL:-/bin/bash}" -lc 'printf "HATCFG<%s>" "${CLAUDE_CONFIG_DIR:-}"' </dev/null 2>/dev/null) || claude_cfg=""
+case "$claude_cfg" in
+    *"HATCFG<"*) claude_cfg=${claude_cfg##*HATCFG<}; claude_cfg=${claude_cfg%%>*} ;;
+    *) claude_cfg="" ;;
+esac
+[ -n "$claude_cfg" ] || claude_cfg="$HOME/.claude"
+claude_settings="$claude_cfg/settings.json"
+if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
+    [ -e "$claude_settings.hatter.bak" ] || cp "$claude_settings" "$claude_settings.hatter.bak"
     if jq --arg c "$HOME/.local/bin/hat-record" '
             def add(ev):
               .hooks[ev] = ((.hooks[ev] // [])
                 + (if [(.hooks[ev] // [])[]?.hooks[]?.command] | any(. == $c)
                    then [] else [{hooks:[{type:"command",command:$c}]}] end));
             add("SessionStart") | add("SessionEnd")
-       ' "$HOME/.claude/settings.json" > "$HOME/.claude/settings.json.hatter.new"; then
-        mv "$HOME/.claude/settings.json.hatter.new" "$HOME/.claude/settings.json"
-        echo "hat-record wired into SessionStart/SessionEnd (backup: settings.json.hatter.bak)"
+       ' "$claude_settings" > "$claude_settings.hatter.new"; then
+        # Written through, not moved over: a symlinked settings.json stays one.
+        if ! cat "$claude_settings.hatter.new" > "$claude_settings"; then
+            cp "$claude_settings.hatter.bak" "$claude_settings" 2>/dev/null || true
+            rm -f "$claude_settings.hatter.new"
+            echo "WARNING: could not write $claude_settings - restored from settings.json.hatter.bak" >&2
+        else
+            rm -f "$claude_settings.hatter.new"
+            echo "hat-record wired into SessionStart/SessionEnd in $claude_settings (backup: settings.json.hatter.bak)"
+        fi
     else
-        rm -f "$HOME/.claude/settings.json.hatter.new"
-        echo "WARNING: could not update ~/.claude/settings.json - left unchanged" >&2
+        rm -f "$claude_settings.hatter.new"
+        echo "WARNING: could not update $claude_settings - left unchanged" >&2
     fi
 else
-    echo "no ~/.claude/settings.json (or no jq) - skipping the session hook"
+    echo "no $claude_settings (or no jq) - skipping the session hook"
 fi
 
 # A systemd user unit only fires at boot with lingering on, which is also what
