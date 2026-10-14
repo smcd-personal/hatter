@@ -59,7 +59,7 @@ restore.
   the `->` column says which hats hold what right now.
 - **Autosave and backup.** Rolling snapshots of the config plus one frozen
   checkpoint per 8 hours; `hatter backup` is a real git commit to a remote you
-  control.
+  control, and `hatter sync` offers to take one when it is done.
 - **The hat rack.** `hatter` on its own opens an interactive walk down
   hat › group › workspace › tab, naming each level as you go, so the
   vocabulary is learned by looking around.
