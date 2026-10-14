@@ -218,6 +218,37 @@ show_key_fix() {
     printf '  then run this installer again.\n'
 }
 
+# The owner/repo a GitHub ssh remote names, in either spelling: scp-like
+# user@host:owner/repo, or ssh://user@host[:port]/owner/repo.
+github_repo_of() {
+    local r="$1" host path
+    case "$r" in
+        ssh://*) r="${r#ssh://}"; host="${r%%/*}"; path="${r#*/}" ;;
+        *://*)   return 1 ;;
+        *:*)     host="${r%%:*}"; path="${r#*:}" ;;
+        *)       return 1 ;;
+    esac
+    host="${host#*@}"; host="${host%%:*}"
+    [[ "$host" == github.com ]] || return 1
+    path="${path%/}"; path="${path%.git}"
+    [[ "$path" == ?*/?* ]] || return 1
+    printf '%s' "$path"
+}
+
+# GitHub is not a hat, so `hatter key add` cannot help there. A deploy key
+# lets this phone read the one repo and nothing else on the account, which an
+# account key would not. The hats are named in the same breath: the installer
+# stops here, and would otherwise only find out about them on the next run.
+show_github_key_fix() {
+    printf '\n  GitHub does not accept this phone'"'"'s key for %s yet, and your hats\n' "$1"
+    printf '  most likely will not either. On a machine signed in to gh that already\n'
+    printf '  reaches your hats, run:\n\n'
+    printf "    echo '%s' | gh repo deploy-key add - -R %s --title termux\n" "$PUBKEY" "$1"
+    printf '    hatter key add %s --all\n\n' "'$PUBKEY'"
+    printf '  The deploy key can read that repo only (add --allow-write for the phone\n'
+    printf '  to run hatter backup too). Then run this installer again.\n'
+}
+
 # ------------------------------------------------------------------ 4. config
 
 step "hatter config"
@@ -239,10 +270,25 @@ else
         mkdir -p "$(dirname "$CONFIG_DIR")"
         if ! out=$(git clone -q "$CONFIG_REMOTE" "$CONFIG_DIR" 2>&1); then
             printf '%s\n' "$out" >&2
+            # GitHub says "Repository not found", not "Permission denied", to
+            # a key it knows that cannot see the repo - a deploy key for
+            # another repo, say. To the phone, both mean the same thing.
+            if gh_repo=$(github_repo_of "$CONFIG_REMOTE") \
+                    && [[ "$out" == *"Permission denied"* || "$out" == *"Repository not found"* ]]; then
+                show_github_key_fix "$gh_repo"
+                die "GitHub does not let this key read $gh_repo yet"
+            fi
             if [[ "$out" == *"Permission denied"* ]]; then
                 show_key_fix "<the hat on ${CONFIG_REMOTE%%:*}>"
                 die "the config server does not accept this key yet"
             fi
+            # Over https a private repo wants a GitHub login, which the phone
+            # does not have; its key is what it does have.
+            case "$CONFIG_REMOTE" in
+                https://github.com/*)
+                    note "Over https, GitHub asks for a login this phone does not have."
+                    note "Use the repo's ssh address instead (Code > SSH on GitHub)." ;;
+            esac
             die "could not clone $CONFIG_REMOTE"
         fi
         ok "cloned into $CONFIG_DIR"
