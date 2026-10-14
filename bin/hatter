@@ -1246,15 +1246,22 @@ fi
 # only what follows the marker.
 login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
 [ -x "${login_shell:-}" ] || login_shell="${SHELL:-/bin/bash}"
-to=""; command -v timeout >/dev/null 2>&1 && to="timeout 10"
-seen=0
-while IFS= read -r -d '' kv; do
-    case "$kv" in *HATENV) seen=1; continue ;; esac
-    [ "$seen" = 1 ] || continue
-    case "$kv" in
-        PATH=*|CLAUDE_CONFIG_DIR=*|CODEX_HOME=*) export "$kv" ;;
-    esac
-done < <($to "$login_shell" -lc 'printf "HATENV\0"; env -0' </dev/null 2>/dev/null)
+# Read via a file, not a pipe: a profile that leaves a background child
+# holding the pipe open would keep the read loop waiting past the timeout.
+to=""; command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
+envf=$(mktemp 2>/dev/null) || envf=""
+if [ -n "$envf" ]; then
+    $to "$login_shell" -lc 'printf "HATENV\0"; env -0' </dev/null >"$envf" 2>/dev/null
+    seen=0
+    while IFS= read -r -d '' kv; do
+        case "$kv" in *HATENV) seen=1; continue ;; esac
+        [ "$seen" = 1 ] || continue
+        case "$kv" in
+            PATH=*|CLAUDE_CONFIG_DIR=*|CODEX_HOME=*) export "$kv" ;;
+        esac
+    done < "$envf"
+    rm -f "$envf"
+fi
 
 # Extra arguments for every launch of this kind, new or resumed, from a tmux
 # option such as `set -g @hat_claude_args '--permission-mode auto'`. A restored
@@ -1659,7 +1666,10 @@ chmod +x "$HOME/.local/bin/hat-restore"
 # into the old one never fires: the registry is then fed by --backfill alone
 # and drifts out of step with the tabs.
 claude_cfg=$("${SHELL:-/bin/bash}" -lc 'printf "HATCFG<%s>" "${CLAUDE_CONFIG_DIR:-}"' </dev/null 2>/dev/null) || claude_cfg=""
-claude_cfg=${claude_cfg##*HATCFG<}; claude_cfg=${claude_cfg%%>*}
+case "$claude_cfg" in
+    *"HATCFG<"*) claude_cfg=${claude_cfg##*HATCFG<}; claude_cfg=${claude_cfg%%>*} ;;
+    *) claude_cfg="" ;;
+esac
 [ -n "$claude_cfg" ] || claude_cfg="$HOME/.claude"
 claude_settings="$claude_cfg/settings.json"
 if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
@@ -1672,9 +1682,14 @@ if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
             add("SessionStart") | add("SessionEnd")
        ' "$claude_settings" > "$claude_settings.hatter.new"; then
         # Written through, not moved over: a symlinked settings.json stays one.
-        cat "$claude_settings.hatter.new" > "$claude_settings"
-        rm -f "$claude_settings.hatter.new"
-        echo "hat-record wired into SessionStart/SessionEnd in $claude_settings (backup: settings.json.hatter.bak)"
+        if ! cat "$claude_settings.hatter.new" > "$claude_settings"; then
+            cp "$claude_settings.hatter.bak" "$claude_settings" 2>/dev/null || true
+            rm -f "$claude_settings.hatter.new"
+            echo "WARNING: could not write $claude_settings - restored from settings.json.hatter.bak" >&2
+        else
+            rm -f "$claude_settings.hatter.new"
+            echo "hat-record wired into SessionStart/SessionEnd in $claude_settings (backup: settings.json.hatter.bak)"
+        fi
     else
         rm -f "$claude_settings.hatter.new"
         echo "WARNING: could not update $claude_settings - left unchanged" >&2
