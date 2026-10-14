@@ -1766,6 +1766,22 @@ case "$(basename "${SHELL:-/bin/sh}")" in
     *)    ensure_path_in "$HOME/.profile" ;;
 esac
 
+# zsh has a builtin `bye`, a synonym for `exit`, and builtins win over PATH.
+# Left alone, `bye` is a plain `exit 0`: the pane loop hands back a fresh
+# prompt and ~/.local/bin/bye never runs. Disable the builtin in every
+# interactive zsh, which is where `bye` gets typed.
+if [ "$(basename "${SHELL:-/bin/sh}")" = zsh ]; then
+    [ -e "$HOME/.zshrc" ] || touch "$HOME/.zshrc"
+    if ! grep -qF 'hatter: zsh builtin bye off' "$HOME/.zshrc"; then
+        cat >> "$HOME/.zshrc" <<'ZSHBYE'
+
+# hatter: zsh builtin bye off (it is `exit`; use ~/.local/bin/bye)
+disable bye 2>/dev/null
+ZSHBYE
+        echo "disabled zsh's builtin bye in ~/.zshrc"
+    fi
+fi
+
 # tpm reads the @plugin options off the running tmux server, so the config has
 # to be sourced before install_plugins can see what to fetch.
 tmux source-file "$CONF" >/dev/null 2>&1 || true
@@ -1825,11 +1841,14 @@ else
     echo "selftest ok: 'exit 99' closes the tab"
 fi
 
-# `bye` has to be reachable from a *login* shell, which is what panes run.
-if "${SHELL:-/bin/sh}" -lc 'command -v bye' >/dev/null 2>&1; then
-    echo "selftest ok: 'bye' is on PATH for a login shell"
+# `bye` has to resolve to the script in an interactive login shell, which is
+# what panes run. Being on PATH is not enough: a builtin, alias or function of
+# the same name wins, and `command -v` reports those too.
+bye_resolves=$("${SHELL:-/bin/sh}" -lic 'command -v bye' 2>/dev/null </dev/null | tail -n 1)
+if [ "$bye_resolves" = "$HOME/.local/bin/bye" ]; then
+    echo "selftest ok: 'bye' resolves to ~/.local/bin/bye in a login shell"
 else
-    echo "SELFTEST FAILED: 'bye' is not on PATH for a login shell" >&2
+    echo "SELFTEST FAILED: 'bye' resolves to '${bye_resolves:-nothing}', not ~/.local/bin/bye" >&2
 fi
 
 # The boot-recovery pieces: each must run, and hat-restore must be able to read
