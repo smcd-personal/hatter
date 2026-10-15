@@ -2304,6 +2304,218 @@ $listing
     TAB_SESSION="$session" TAB_GROUP="$group" TAB_HAT="$hat" TAB_HOST="$host"
 }
 
+# --------------------------------------------------------------- dragged tabs
+#
+# Dragging a tab from one mirrored workspace to another moves only cmux's tab:
+# cmux never tells tmux, so the window stays in its old session. The dragged
+# tab has nothing behind it and stays blank, and the old workspace no longer
+# shows the window at all, though it keeps running. cmux gives the dragged tab
+# a new surface id, while the old session's pane map still names the old id,
+# which is now in no workspace.
+#
+# So a dragged tab is a terminal surface its own session does not map (an
+# orphan), and the window it came from is one none of whose mapped surfaces are
+# left in cmux (hidden). They pair by the tab's title, which is the window's
+# name, or "tmux window" for a window with none - and only when the title picks
+# out one orphan and one hidden window. Anything less certain is left alone:
+# not every unmapped tab is dragged, since a mirrored workspace can also hold a
+# local shell, titled "Terminal" or by whatever runs in it.
+#
+# The plan reads one JSON object on stdin:
+#   workspaces  [{id, title, surfaces: [{id, title, type}]}]  the hat's window
+#   surfaces    [id]                  every surface cmux has, in any window
+#   maps        {session: [{surface_id, window_id}]}   mirrored sessions only
+#   windows     [{session, id, name}]                  tmux on the hat's server
+# and prints a line per finding, tab separated:
+#   move    surface workspace to-session from-session window-id name
+#   orphan  surface workspace session title       (nothing to pair it with)
+DRAG_PLAN_JQ='
+  .surfaces as $all
+  | (.windows | map({key: .id, value: .}) | from_entries) as $win
+  | .maps as $maps
+  | [.workspaces[] | select($maps[.title] != null)
+      | .id as $ws | .title as $s | [$maps[$s][].surface_id] as $m
+      | .surfaces[]? | select(.type == "terminal")
+      | select(.id as $x | $m | index([$x]) | not)
+      | {surface: .id, ws: $ws, session: $s, title: (.title // "")}] as $orphans
+  | [$maps | to_entries[] | .key as $s
+      | (.value | group_by(.window_id))[]
+      | select(all(.[]; .surface_id as $x | $all | index([$x]) | not))
+      | .[0].window_id as $w
+      | select($win[$w].session == $s)
+      | {session: $s, window: $w, name: ($win[$w].name // "")}] as $hidden
+  | $orphans[] as $o
+  | [$hidden[] | select(.session != $o.session
+                        and (if .name == "" then "tmux window" else .name end) == $o.title)] as $named
+  | ([$orphans[] | select(.title == $o.title)] | length) as $twins
+  | (if ($named | length) == 1 and $twins == 1 then $named[0] else null end) as $h
+  | if $h == null then ["orphan", $o.surface, $o.ws, $o.session, $o.title]
+    else ["move", $o.surface, $o.ws, $o.session, $h.session, $h.window, $h.name] end
+  | @tsv'
+
+drag_plan() { jq -r "$DRAG_PLAN_JQ"; }
+
+# The plan's input for one hat's window, from a cmux tree and the server's
+# remote_tmux_state. Only sessions cmux says it mirrors get a map: an empty map
+# would make every tab in the workspace look dragged.
+drag_facts() {
+    local win="$1" host="$2" tree="$3" state="$4" tmp k=0 title maps
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-drag.XXXXXX")
+    while IFS= read -r title; do
+        [[ -n "$title" ]] || continue
+        awk -F '\t' -v s="$title" '$1 == "S" && $2 == s { f = 1 } END { exit !f }' <<<"$state" || continue
+        printf '%s' "$title" > "$tmp/t.$k"
+        ( cmux_pane_map "$host" "$title" > "$tmp/m.$k" || true ) &
+        k=$((k + 1))
+        [[ $((k % 8)) -ne 0 ]] || wait
+    done < <(jq -r --arg w "$win" '.windows[]? | select(.id == $w) | .workspaces[]?.title // empty' <<<"$tree")
+    wait
+    maps=$(for ((k = k - 1; k >= 0; k--)); do
+        jq -c --arg s "$(cat "$tmp/t.$k")" '
+            select(.mirrored == true and ((.panes // []) | length) > 0)
+            | {($s): [.panes[] | {surface_id, window_id}]}' "$tmp/m.$k" 2>/dev/null || true
+    done | jq -s 'add // {}')
+    rm -rf "$tmp"
+    jq -n --arg w "$win" --argjson t "$tree" --argjson m "$maps" --arg st "$state" '{
+        workspaces: [$t.windows[]? | select(.id == $w) | .workspaces[]?
+            | {id, title, surfaces: [.panes[]?.surfaces[]? | {id, title, type}]}],
+        surfaces: [$t.windows[]?.workspaces[]?.panes[]?.surfaces[]?.id],
+        maps: $m,
+        windows: [$st | split("\n")[] | select(startswith("W\t")) | split("\t")
+            | {session: .[1], id: .[2], name: (.[3] // "")}]}'
+}
+
+# Cheap first look, so the timer only asks for pane maps when something is off:
+# does any mirrored workspace show fewer terminal tabs than its session has
+# windows? A drag always leaves its source workspace one short. A local shell
+# in a workspace, or a window split into panes, only ever adds tabs.
+drag_suspect() {
+    local win="$1" tree="$2" state="$3"
+    jq -e -n --arg w "$win" --argjson t "$tree" --arg st "$state" '
+        ([$st | split("\n")[] | select(startswith("W\t")) | split("\t")[1]]
+            | group_by(.) | map({key: .[0], value: length}) | from_entries) as $n
+        | any($t.windows[]? | select(.id == $w) | .workspaces[]?;
+              $n[.title] != null
+              and $n[.title] > ([.panes[]?.surfaces[]? | select(.type == "terminal")] | length))' \
+        >/dev/null 2>&1
+}
+
+# Sessions heal_dragged_tabs moved a tab into, one per line.
+HEAL_MOVED=""
+
+# heal_dragged_tabs [hat] [report]
+# Put every dragged tab's tmux window where the tab was dropped, then close the
+# blank tab: cmux draws the moved window as a new tab of its own. Every hat when
+# none is named. With "report", says which blank tabs it could not pair.
+heal_dragged_tabs() {
+    local only="${1:-}" report="${2:-}" hat w tree seen="" i tmp
+    local hats=() wins=() hosts=()
+    HEAL_MOVED=""
+    cmux_alive || return 0
+    cmux_snapshot
+    tree="$CMUX_SNAP_TREE"
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        [[ -z "$only" || "$hat" == "$only" ]] || continue
+        w=$(find_hat_window "$hat")
+        [[ -n "$w" ]] || continue
+        # Hats sharing a server share its window; one look is enough.
+        grep -qxF "$w" <<<"$seen" && continue
+        seen+="$w"$'\n'
+        hats+=("$hat"); wins+=("$w"); hosts+=("$(hat_ssh "$hat")")
+    done < <(hat_names)
+    cmux_snapshot_drop
+    [[ -n "$tree" && ${#hats[@]} -gt 0 ]] || return 0
+    # Every server at once, as sync does.
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-heal.XXXXXX")
+    for ((i = 0; i < ${#hats[@]}; i++)); do
+        remote_tmux_state "${hosts[$i]}" > "$tmp/$i" 2>/dev/null &
+    done
+    wait
+    for ((i = 0; i < ${#hats[@]}; i++)); do
+        heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" || true
+    done
+    rm -rf "$tmp"
+    return 0
+}
+
+heal_hat_drags() {
+    local host="$1" win="$2" tree="$3" state="$4" report="$5" first second
+    [[ -n "$state" ]] || return 0
+    drag_suspect "$win" "$tree" "$state" || return 0
+
+    first=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
+    grep -q '^move' <<<"$first" || { drag_report "$report" "$first"; return 0; }
+
+    # A tab mid-drag, or a mirror mid-reconnect, can look like this for a
+    # moment. Act only on what is still true a little later.
+    sleep 2
+    tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    state=$(remote_tmux_state "$host" 2>/dev/null || true)
+    [[ -n "$state" ]] || return 0
+    second=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
+    drag_report "$report" "$second"
+
+    local moved=0 kind orphan ws to from wid name
+    while IFS=$'\t' read -r kind orphan ws to from wid name; do
+        [[ "$kind" == move ]] || continue
+        grep -qxF "$(printf 'move\t%s\t%s\t%s\t%s\t%s\t%s' "$orphan" "$ws" "$to" "$from" "$wid" "$name")" \
+            <<<"$first" || continue
+        # A dragged tab has nothing behind it, so it shows nothing. One that
+        # shows anything is something else, whatever its title says.
+        if cmux read-screen --surface "$orphan" --workspace "$ws" --window "$win" 2>/dev/null \
+                | grep -q '[^[:space:]]'; then
+            [[ -z "$report" ]] || warn "the tab '${name:-tmux window}' in '$to' is not blank, so it was left alone"
+            continue
+        fi
+        heal_move "$host" "$win" "$orphan" "$ws" "$to" "$from" "$wid" "$name" && moved=1
+    done <<<"$second"
+
+    # The server's pane registry is keyed on windows that have just changed
+    # session.
+    [[ "$moved" == 0 ]] || remote_sh "$host" \
+        'h="$HOME/.local/bin/hat-restore"; [ -x "$h" ] && "$h" --backfill' >/dev/null 2>&1 || true
+    return 0
+}
+
+drag_report() {
+    local report="$1" plan="$2" kind orphan ws session title
+    [[ -n "$report" ]] || return 0
+    while IFS=$'\t' read -r kind orphan ws session title; do
+        [[ "$kind" == orphan ]] || continue
+        warn "the blank tab '$title' in '$session' has no tmux window that is clearly its own"
+    done <<<"$plan"
+    return 0
+}
+
+heal_move() {
+    local host="$1" win="$2" orphan="$3" ws="$4" to="$5" from="$6" wid="$7" name="$8" i map
+    local label="${name:-$wid}"
+    remote_sh "$host" "tmux move-window -d -s $(sq "=$from:$wid") -t $(sq "=$to:")" >/dev/null 2>&1 || {
+        warn "could not move tab '$label' from '$from' to '$to' on $host"
+        return 1
+    }
+    # Close the blank tab only once cmux shows the window in its new place, and
+    # only while no session maps it: a mapped tab's close kills its window.
+    for ((i = 0; i < 20; i++)); do
+        map=$(cmux_pane_map "$host" "$to" || true)
+        [[ -n "$map" ]] || map='{}'
+        if jq -e --arg w "$wid" --arg o "$orphan" '
+                any(.panes[]?; .window_id == $w) and all(.panes[]?; .surface_id != $o)' \
+                <<<"$map" >/dev/null 2>&1; then
+            cmux close-surface --surface "$orphan" --workspace "$ws" --window "$win" >/dev/null 2>&1 \
+                || warn "moved tab '$label' into '$to', but could not close its blank copy"
+            info "Moved tab '$label' into '$to': it was dragged there in cmux, but tmux had kept it in '$from'"
+            HEAL_MOVED+="$to"$'\n'
+            return 0
+        fi
+        sleep 0.25
+    done
+    warn "moved tab '$label' into '$to', but cmux has not shown it there yet"
+    HEAL_MOVED+="$to"$'\n'
+    return 0
+}
+
 # A tab dragged from one cmux workspace to another can come up blank. The tmux
 # window is fine - alive, and capture-pane shows every line - but cmux has
 # stopped painting it, and nothing on the tmux side helps: cmux reasserts its
@@ -2319,6 +2531,15 @@ cmd_repair() {
     [[ -n "$hat" ]] || die "cannot tell which hat '$session' belongs to.
   Known hats: $(hat_names | tr '\n' ' ')"
     host=$(hat_ssh "$hat")
+
+    # A tab dragged here is blank because tmux never moved its window. Moving
+    # the window fixes that, and nothing needs re-mirroring.
+    heal_dragged_tabs "$hat" report
+    if grep -qxF "$session" <<<"$HEAL_MOVED"; then
+        ( cmd_sync ) >/dev/null 2>&1 || warn "sync did not finish - run 'hatter sync'"
+        info "Repaired '$session'"
+        return 0
+    fi
 
     # Only a fault in cmux's view is ours to fix. A session that is gone, or
     # empty on the server too, would come back exactly as it is.
@@ -3549,6 +3770,11 @@ cmd_autosave() {
             local err state
             state="$AUTOSAVE_DIR/sync-state"
             mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+            # Tabs dragged between workspaces first, so the sync records where
+            # they were dropped. A subshell, for the same reason as the sync.
+            ( heal_dragged_tabs ) 2>&1 | while IFS= read -r line; do
+                echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: $line"
+            done || true
             if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
                 if [[ "$(sed -n 1p "$state" 2>/dev/null)" != ok ]]; then
                     [[ -s "$state" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: sync ok again"
@@ -4779,7 +5005,8 @@ hatter autosave [subcommand]
 
 Snapshots of config.json, kept separately from git.
 
-  run                Sync from the live client, then snapshot (what the timer runs)
+  run                Move dragged tabs (see: hatter help repair), sync from the
+                     live client, then snapshot (what the timer runs)
   now                Snapshot only, no sync
   list               Show the checkpoints and the rolling save
   restore <n|latest> Roll the config back to one of them
@@ -4859,16 +5086,29 @@ USAGE
 hatter repair <session>
 
 Bring back a workspace that cmux shows blank. Dragging a tab between cmux
-workspaces can leave it like that: the tmux window is alive with all its
-content, but cmux has stopped painting it, and nothing on the tmux side helps.
+workspaces can leave it like that, in one of two ways.
 
   hatter repair dev-atlas
 
-repair checks the session has content on its server - if it does not, this is
-not the fault and nothing is touched - then detaches the workspace from cmux,
-mirrors the hat again, and puts the workspace back in its group, in its old
-place. The tmux session, and everything running in it, is never touched.
-Finally it syncs the config and refreshes the server's pane registry.
+The usual way: cmux moves the tab but never tells tmux, so the window stays
+in its old session. The dropped tab has nothing behind it, and the old
+workspace no longer shows the window. repair moves the tmux window into the
+session the tab was dropped on and closes the blank tab, and cmux shows the
+window there as a new tab, at the end. Nothing is re-mirrored. The autosave
+timer does the same once a minute, so a dragged tab is usually fixed before
+you ask. A tab is only moved when its window is certain: the blank tab's
+title names exactly one window that cmux no longer shows anywhere, and the
+tab really is blank. A local shell sitting in a mirrored workspace is never
+taken for one.
+
+The other way: the window did move, but cmux has stopped painting it, and
+nothing on the tmux side helps. For that, repair checks the session has
+content on its server - if it does not, this is not the fault and nothing is
+touched - then detaches the workspace from cmux, mirrors the hat again, and
+puts the workspace back in its group, in its old place.
+
+Either way the tmux session, and everything running in it, keeps running.
+Finally repair syncs the config and refreshes the server's pane registry.
 
 In the rack, press f on a workspace.
 USAGE
@@ -5154,7 +5394,7 @@ shift || true
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|shortcuts|help|-h|--help) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|shortcuts|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -5164,7 +5404,7 @@ esac
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|shortcuts|sync) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|shortcuts|sync|_drag-plan) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
@@ -5212,6 +5452,8 @@ case "$cmd" in
                cmd_sync
                backup_offer ;;
     shortcuts) cmd_shortcuts "$@" ;;
+    # Not for people: the dragged-tab planner on its own, for the tests.
+    _drag-plan) drag_plan ;;
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
