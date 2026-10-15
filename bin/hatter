@@ -786,10 +786,12 @@ find_hat_window() {
         for w in $(window_ids); do
             printf 'win\t%s\n' "$w"
             while IFS= read -r t; do
-                [[ -n "$t" ]] && printf 'title\t%s\t%s\n' "$w" "$t"
+                [[ -z "$t" ]] || printf 'title\t%s\t%s\n' "$w" "$t"
             done <<<"$(titles_in_window "$w")"
             while IFS= read -r t; do
-                [[ -n "$t" ]] && printf 'group\t%s\t%s\n' "$w" "$t"
+                # Not "-n && printf": a window with no groups would end the
+                # loop, and the function, on a failed test.
+                [[ -z "$t" ]] || printf 'group\t%s\t%s\n' "$w" "$t"
             done <<<"$(groups_in_window "$w")"
         done
     } | awk -F '\t' -v hat="$hat" '
@@ -2333,13 +2335,13 @@ DRAG_PLAN_JQ='
   .surfaces as $all
   | (.windows | map({key: .id, value: .}) | from_entries) as $win
   | .maps as $maps
-  | [.workspaces[] | select($maps[.title] != null)
+  | [.workspaces[] | select(.title != null and $maps[.title] != null)
       | .id as $ws | .title as $s | [$maps[$s][].surface_id] as $m
       | .surfaces[]? | select(.type == "terminal")
       | select(.id as $x | $m | index([$x]) | not)
       | {surface: .id, ws: $ws, session: $s, title: (.title // "")}] as $orphans
   | [$maps | to_entries[] | .key as $s
-      | (.value | group_by(.window_id))[]
+      | (.value | map(select(.window_id != null)) | group_by(.window_id))[]
       | select(all(.[]; .surface_id as $x | $all | index([$x]) | not))
       | .[0].window_id as $w
       | select($win[$w].session == $s)
@@ -2376,7 +2378,7 @@ drag_facts() {
             | {($s): [.panes[] | {surface_id, window_id}]}' "$tmp/m.$k" 2>/dev/null || true
     done | jq -s 'add // {}')
     rm -rf "$tmp"
-    jq -n --arg w "$win" --argjson t "$tree" --argjson m "$maps" --arg st "$state" '{
+    printf '%s' "$tree" | jq --arg w "$win" --argjson m "$maps" --arg st "$state" '. as $t | {
         workspaces: [$t.windows[]? | select(.id == $w) | .workspaces[]?
             | {id, title, surfaces: [.panes[]?.surfaces[]? | {id, title, type}]}],
         surfaces: [$t.windows[]?.workspaces[]?.panes[]?.surfaces[]?.id],
@@ -2391,8 +2393,9 @@ drag_facts() {
 # in a workspace, or a window split into panes, only ever adds tabs.
 drag_suspect() {
     local win="$1" tree="$2" state="$3"
-    jq -e -n --arg w "$win" --argjson t "$tree" --arg st "$state" '
-        ([$st | split("\n")[] | select(startswith("W\t")) | split("\t")[1]]
+    printf '%s' "$tree" | jq -e --arg w "$win" --arg st "$state" '
+        . as $t
+        | ([$st | split("\n")[] | select(startswith("W\t")) | split("\t")[1]]
             | group_by(.) | map({key: .[0], value: length}) | from_entries) as $n
         | any($t.windows[]? | select(.id == $w) | .workspaces[]?;
               $n[.title] != null
@@ -2444,7 +2447,10 @@ heal_hat_drags() {
     [[ -n "$state" ]] || return 0
     drag_suspect "$win" "$tree" "$state" || return 0
 
-    first=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
+    first=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || {
+        [[ -z "$report" ]] || warn "could not work out which tabs were dragged on $host"
+        return 0
+    }
     grep -q '^move' <<<"$first" || { drag_report "$report" "$first"; return 0; }
 
     # A tab mid-drag, or a mirror mid-reconnect, can look like this for a
@@ -2462,10 +2468,18 @@ heal_hat_drags() {
         grep -qxF "$(printf 'move\t%s\t%s\t%s\t%s\t%s\t%s' "$orphan" "$ws" "$to" "$from" "$wid" "$name")" \
             <<<"$first" || continue
         # A dragged tab has nothing behind it, so it shows nothing. One that
-        # shows anything is something else, whatever its title says.
-        if cmux read-screen --surface "$orphan" --workspace "$ws" --window "$win" 2>/dev/null \
-                | grep -q '[^[:space:]]'; then
-            [[ -z "$report" ]] || warn "the tab '${name:-tmux window}' in '$to' is not blank, so it was left alone"
+        # shows anything is something else, whatever its title says - and one
+        # cmux cannot read is not known to be blank.
+        local screen
+        if ! screen=$(cmux read-screen --surface "$orphan" --workspace "$ws" --window "$win" \
+                </dev/null 2>/dev/null) || [[ "$screen" =~ [^[:space:]] ]]; then
+            [[ -z "$report" ]] || warn "the tab '${name:-tmux window}' in '$to' is not plainly blank, so it was left alone"
+            continue
+        fi
+        # Moving a session's last window ends the session. The drag asked for
+        # that, but it is too much to do unasked.
+        if [[ "$(awk -F '\t' -v s="$from" '$1 == "W" && $2 == s' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
+            [[ -z "$report" ]] || warn "'${name:-tmux window}' is the last tab of '$from'; move it with: tmux move-window -s '=$from:$wid' -t '=$to:'"
             continue
         fi
         heal_move "$host" "$win" "$orphan" "$ws" "$to" "$from" "$wid" "$name" && moved=1
@@ -2483,7 +2497,7 @@ drag_report() {
     [[ -n "$report" ]] || return 0
     while IFS=$'\t' read -r kind orphan ws session title; do
         [[ "$kind" == orphan ]] || continue
-        warn "the blank tab '$title' in '$session' has no tmux window that is clearly its own"
+        warn "the tab '$title' in '$session' has no tmux window of its own, and none was clearly its window"
     done <<<"$plan"
     return 0
 }
@@ -2498,12 +2512,12 @@ heal_move() {
     # Close the blank tab only once cmux shows the window in its new place, and
     # only while no session maps it: a mapped tab's close kills its window.
     for ((i = 0; i < 20; i++)); do
-        map=$(cmux_pane_map "$host" "$to" || true)
+        map=$(cmux_pane_map "$host" "$to" </dev/null || true)
         [[ -n "$map" ]] || map='{}'
         if jq -e --arg w "$wid" --arg o "$orphan" '
                 any(.panes[]?; .window_id == $w) and all(.panes[]?; .surface_id != $o)' \
                 <<<"$map" >/dev/null 2>&1; then
-            cmux close-surface --surface "$orphan" --workspace "$ws" --window "$win" >/dev/null 2>&1 \
+            cmux close-surface --surface "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
                 || warn "moved tab '$label' into '$to', but could not close its blank copy"
             info "Moved tab '$label' into '$to': it was dragged there in cmux, but tmux had kept it in '$from'"
             HEAL_MOVED+="$to"$'\n'
@@ -5099,7 +5113,8 @@ timer does the same once a minute, so a dragged tab is usually fixed before
 you ask. A tab is only moved when its window is certain: the blank tab's
 title names exactly one window that cmux no longer shows anywhere, and the
 tab really is blank. A local shell sitting in a mirrored workspace is never
-taken for one.
+taken for one. A session's last tab is left where it is, since moving it
+would end that session: repair says how to move it.
 
 The other way: the window did move, but cmux has stopped painting it, and
 nothing on the tmux side helps. For that, repair checks the session has
@@ -5404,7 +5419,7 @@ esac
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|shortcuts|sync|_drag-plan) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|shortcuts|sync|_drag-plan|_drag-heal) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
@@ -5452,8 +5467,9 @@ case "$cmd" in
                cmd_sync
                backup_offer ;;
     shortcuts) cmd_shortcuts "$@" ;;
-    # Not for people: the dragged-tab planner on its own, for the tests.
+    # Not for people: the dragged-tab planner, and the healer, for the tests.
     _drag-plan) drag_plan ;;
+    _drag-heal) heal_dragged_tabs "${1:-}" report ;;
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;

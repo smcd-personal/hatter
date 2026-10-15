@@ -7,6 +7,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"
 HOME=$(mktemp -d); export HOME
+trap 'rm -rf "$HOME"' EXIT
 unset XDG_CONFIG_HOME
 fails=0
 
@@ -122,6 +123,58 @@ check "a local shell is never taken for a dragged tab" \
            "dev-b": [{"surface_id": "s-9", "window_id": "@9"}]},
   "windows": [{"session": "dev-a", "id": "@1", "name": "one"}, {"session": "dev-a", "id": "@2", "name": ""},
               {"session": "dev-b", "id": "@9", "name": "base"}]}'
+
+# Two blank tabs with the same title and one hidden window of that name: the
+# window could be either one's, so neither moves.
+check "two tabs with one title move nothing" \
+"orphan${T}s-new1${T}ws-b${T}dev-b${T}two
+orphan${T}s-new2${T}ws-c${T}dev-c${T}two" '{
+  "workspaces": [
+    {"id": "ws-b", "title": "dev-b", "surfaces": [{"id": "s-3", "title": "three", "type": "terminal"},
+                                                  {"id": "s-new1", "title": "two", "type": "terminal"}]},
+    {"id": "ws-c", "title": "dev-c", "surfaces": [{"id": "s-4", "title": "four", "type": "terminal"},
+                                                  {"id": "s-new2", "title": "two", "type": "terminal"}]}],
+  "surfaces": ["s-3", "s-new1", "s-4", "s-new2"],
+  "maps": {"dev-a": [{"surface_id": "s-old", "window_id": "@2"}],
+           "dev-b": [{"surface_id": "s-3", "window_id": "@3"}],
+           "dev-c": [{"surface_id": "s-4", "window_id": "@4"}]},
+  "windows": [{"session": "dev-a", "id": "@2", "name": "two"}, {"session": "dev-b", "id": "@3", "name": "three"},
+              {"session": "dev-c", "id": "@4", "name": "four"}]}'
+
+# A tab dragged back into its own session: its window is hidden there, but
+# moving it would go nowhere.
+check "a window is never moved into its own session" \
+"orphan${T}s-new${T}ws-a${T}dev-a${T}two" '{
+  "workspaces": [
+    {"id": "ws-a", "title": "dev-a", "surfaces": [{"id": "s-1", "title": "one", "type": "terminal"},
+                                                  {"id": "s-new", "title": "two", "type": "terminal"}]}],
+  "surfaces": ["s-1", "s-new"],
+  "maps": {"dev-a": [{"surface_id": "s-1", "window_id": "@1"}, {"surface_id": "s-old", "window_id": "@2"}]},
+  "windows": [{"session": "dev-a", "id": "@1", "name": "one"}, {"session": "dev-a", "id": "@2", "name": "two"}]}'
+
+# A window split into two panes, one of them still shown: the window is on
+# show, not lost, so it is not taken.
+check "a split window with a pane still shown is not taken" \
+"orphan${T}s-new${T}ws-b${T}dev-b${T}two" '{
+  "workspaces": [
+    {"id": "ws-a", "title": "dev-a", "surfaces": [{"id": "s-2a", "title": "two", "type": "terminal"}]},
+    {"id": "ws-b", "title": "dev-b", "surfaces": [{"id": "s-3", "title": "three", "type": "terminal"},
+                                                  {"id": "s-new", "title": "two", "type": "terminal"}]}],
+  "surfaces": ["s-2a", "s-3", "s-new"],
+  "maps": {"dev-a": [{"surface_id": "s-2a", "window_id": "@2"}, {"surface_id": "s-2b", "window_id": "@2"}],
+           "dev-b": [{"surface_id": "s-3", "window_id": "@3"}]},
+  "windows": [{"session": "dev-a", "id": "@2", "name": "two"}, {"session": "dev-b", "id": "@3", "name": "three"}]}'
+
+# A map entry with no window id does not stop the rest of the plan.
+check "a map entry with no window id is skipped" \
+"move${T}s-new${T}ws-b${T}dev-b${T}dev-a${T}@2${T}two" '{
+  "workspaces": [
+    {"id": "ws-b", "title": "dev-b", "surfaces": [{"id": "s-3", "title": "three", "type": "terminal"},
+                                                  {"id": "s-new", "title": "two", "type": "terminal"}]}],
+  "surfaces": ["s-3", "s-new"],
+  "maps": {"dev-a": [{"surface_id": "s-old", "window_id": "@2"}, {"surface_id": "s-x"}],
+           "dev-b": [{"surface_id": "s-3", "window_id": "@3"}]},
+  "windows": [{"session": "dev-a", "id": "@2", "name": "two"}, {"session": "dev-b", "id": "@3", "name": "three"}]}'
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"
