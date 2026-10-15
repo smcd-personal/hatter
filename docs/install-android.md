@@ -94,6 +94,24 @@ hatter key add 'ssh-ed25519 AAAAC3Nz... hatter@termux' --all
 Run that there, then run the installer again on the phone. Every hat should
 say `ok`.
 
+### A config kept on GitHub
+
+If `hatter backup` pushes to a private GitHub repo, give `--config-remote`
+its ssh address (the one under **Code > SSH** on GitHub), not the https one:
+the phone has a key, not a GitHub login. GitHub is not a hat, so when it
+refuses the key the installer prints two lines instead, to run on a machine
+that is signed in to `gh` and already reaches your hats:
+
+```sh
+echo 'ssh-ed25519 AAAAC3Nz... hatter@termux' | gh repo deploy-key add - -R you/hatter-config --title termux
+hatter key add 'ssh-ed25519 AAAAC3Nz... hatter@termux' --all
+```
+
+The first adds the key to that one repo as a read-only deploy key. That is
+narrower than adding it to your GitHub account, which would let the phone
+reach every repo you have. The phone only reads the config; add
+`--allow-write` if you want to run `hatter backup` from it.
+
 ## 4. Use it
 
 ```sh
