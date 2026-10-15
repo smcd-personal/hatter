@@ -550,12 +550,15 @@ cmux_refusal() {
     local err
     err=$(printf '%s' "$CMUX_PROBE_ERR" | tr '[:upper:]' '[:lower:]')
     case "$err" in
-        *"access denied"*) echo denied ;;
         *authenticat*|*password*) echo auth ;;
+        *"access denied"*) echo denied ;;
         ""|*"socket not found"*|*"connection refused"*|*"no such file"*) echo gone ;;
         *) echo other ;;
     esac
 }
+
+# What cmux said, indented to sit inside a die message
+cmux_probe_err_quoted() { printf '%s\n' "${CMUX_PROBE_ERR:-(no reply)}" | sed 's/^/    /'; }
 
 # One line for a warning, e.g. "cmux is not answering"
 cmux_refusal_summary() {
@@ -581,7 +584,7 @@ require_cmux() {
   then run 'cmux reload-config' and 'hatter $1' again." ;;
         auth)
             die "cmux is running but refused the control socket password:
-    $CMUX_PROBE_ERR
+$(cmux_probe_err_quoted)
   Nothing was changed. Restarting cmux will not fix this. The CLI sends the
   password saved in ~/.config/cmux/cmux.json; check that
     \"automation\": { \"socketPassword\": \"<secret>\" }
@@ -589,13 +592,15 @@ require_cmux() {
   confirm with 'cmux list-windows --json', and run 'hatter $1' again." ;;
         gone)
             die "cmux is not answering on its control socket, so the live layout cannot be
-  read. Nothing was changed. Start or restart the cmux app, confirm with
+  read:
+$(cmux_probe_err_quoted)
+  Nothing was changed. Start or restart the cmux app, confirm with
     cmux list-windows --json
   and run 'hatter $1' again." ;;
     esac
     die "cmux answered its control socket with an error, so the live layout
   cannot be read:
-    $CMUX_PROBE_ERR
+$(cmux_probe_err_quoted)
   Nothing was changed. Fix what cmux reports, confirm with
     cmux list-windows --json
   and run 'hatter $1' again."

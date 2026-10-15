@@ -14,6 +14,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/config"
 cat > "$tmp/bin/cmux" <<'STUB'
 #!/usr/bin/env bash
+echo "$*" >> "${FAKE_CMUX_LOG:-/dev/null}"
 if [[ -n "${FAKE_CMUX_OK:-}" ]]; then echo '[]'; exit 0; fi
 printf '%s\n' "${FAKE_CMUX_ERR:-}" >&2
 exit 1
@@ -58,11 +59,23 @@ expect "backup auth" "Error: ERROR: Authentication required" \
 expect "backup gone" "" \
     backup "cmux is not answering; committing"
 
-# a live cmux passes the probe and no refusal is reported
+# auth wins over denied when a reply mentions both, whatever the case
+expect "auth+denied" "ACCESS DENIED: wrong password" \
+    restore "refused the control socket password" "only processes started inside cmux"
+
+# a multi-line error stays inside the message, indented
+expect "multi-line" "$(printf 'Error: first line\nsecond line')" \
+    restore "    second line"
+
+# a live cmux passes the probe: the probe ran, and no refusal is reported
+: > "$tmp/cmux.log"
 out=$(env -u CMUX_WORKSPACE_ID -u CMUX_SURFACE_ID -u CMUX_TAB_ID \
         PATH="$tmp/bin:$PATH" XDG_CONFIG_HOME="$tmp/config" FAKE_CMUX_OK=1 \
-        "$hatter" restore 2>&1 </dev/null) || true
-if [[ "$out" == *"control socket"* ]]; then
+        FAKE_CMUX_LOG="$tmp/cmux.log" "$hatter" restore 2>&1 </dev/null) || true
+if ! grep -q '^list-windows --json' "$tmp/cmux.log"; then
+    echo "FAIL alive: the probe never ran:"; printf '%s\n' "$out" | sed 's/^/    /'
+    fails=$((fails + 1))
+elif [[ "$out" == *"control socket"* || "$out" == *"cmux answered"* ]]; then
     echo "FAIL alive: probe reported a refusal:"; printf '%s\n' "$out" | sed 's/^/    /'
     fails=$((fails + 1))
 else
