@@ -540,20 +540,63 @@ cmux_alive() {
     [[ "$CMUX_ALIVE" == yes ]]
 }
 
+# Sorts a failed probe by what cmux said, because each answer needs a
+# different fix and only one of them is "start the app":
+#   gone    nothing answered: no reply, a missing socket, a refused connection
+#   denied  cmuxOnly mode turned away a process started outside cmux
+#   auth    password mode, and the CLI sent no password or the wrong one
+#   other   cmux answered with something not listed here
+cmux_refusal() {
+    local err
+    err=$(printf '%s' "$CMUX_PROBE_ERR" | tr '[:upper:]' '[:lower:]')
+    case "$err" in
+        *"access denied"*) echo denied ;;
+        *authenticat*|*password*) echo auth ;;
+        ""|*"socket not found"*|*"connection refused"*|*"no such file"*) echo gone ;;
+        *) echo other ;;
+    esac
+}
+
+# One line for a warning, e.g. "cmux is not answering"
+cmux_refusal_summary() {
+    case "$(cmux_refusal)" in
+        gone)   echo "cmux is not answering" ;;
+        denied) echo "cmux refused its control socket to a process started outside cmux" ;;
+        auth)   echo "cmux refused the control socket password" ;;
+        *)      echo "cmux returned an error: $(printf '%s' "$CMUX_PROBE_ERR" | head -n 1)" ;;
+    esac
+}
+
 # <what> names the command for the error message, e.g. require_cmux sync
 require_cmux() {
     cmux_alive && return 0
     have_cmux || die "the cmux CLI is not on PATH, and '$1' needs it"
-    if [[ "$CMUX_PROBE_ERR" == *"Access denied"* ]]; then
-        die "cmux refused its control socket: only processes started inside cmux
+    case "$(cmux_refusal)" in
+        denied)
+            die "cmux refused its control socket: only processes started inside cmux
   may use it, and this one was not (a launchd job, or another terminal).
   Nothing was changed. Give the socket a password - the cmux CLI reads the
   saved one by itself - in Settings > Automation, or in ~/.config/cmux/cmux.json:
     \"automation\": { \"socketControlMode\": \"password\", \"socketPassword\": \"<secret>\" }
-  then run 'cmux reload-config' and 'hatter $1' again."
-    fi
-    die "cmux is not answering on its control socket, so the live layout cannot be
+  then run 'cmux reload-config' and 'hatter $1' again." ;;
+        auth)
+            die "cmux is running but refused the control socket password:
+    $CMUX_PROBE_ERR
+  Nothing was changed. Restarting cmux will not fix this. The CLI sends the
+  password saved in ~/.config/cmux/cmux.json; check that
+    \"automation\": { \"socketPassword\": \"<secret>\" }
+  is there and matches Settings > Automation, then run 'cmux reload-config',
+  confirm with 'cmux list-windows --json', and run 'hatter $1' again." ;;
+        gone)
+            die "cmux is not answering on its control socket, so the live layout cannot be
   read. Nothing was changed. Start or restart the cmux app, confirm with
+    cmux list-windows --json
+  and run 'hatter $1' again." ;;
+    esac
+    die "cmux answered its control socket with an error, so the live layout
+  cannot be read:
+    $CMUX_PROBE_ERR
+  Nothing was changed. Fix what cmux reports, confirm with
     cmux list-windows --json
   and run 'hatter $1' again."
 }
@@ -2696,7 +2739,7 @@ cmd_backup() {
     if cmux_alive; then
         cmd_sync
     else
-        warn "cmux is not answering; committing the config as it stands, unsynced"
+        warn "$(cmux_refusal_summary); committing the config as it stands, unsynced"
     fi
     backup_commit_push "$msg"
 }
