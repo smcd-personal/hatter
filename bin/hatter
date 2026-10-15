@@ -762,6 +762,12 @@ find_hat_window() {
 # it is running on a shell server, or when cmux is not answering - callers treat
 # that as "no default given" and carry on, never as an error. Probed once; the
 # answer cannot change while a run is in flight.
+#
+# Every hat's find_hat_window reads every window, so read live this was
+# hats x windows cmux calls - most of the rack's startup. It works from a cmux
+# snapshot instead: the caller's if one is held (sync), otherwise one of its
+# own, dropped again before returning so that a caller which goes on to change
+# cmux never reads a stale layout.
 CURRENT_HAT_CACHE=""
 current_hat() {
     if [[ -n "$CURRENT_HAT_CACHE" ]]; then
@@ -774,9 +780,23 @@ current_hat() {
     [[ -n "$HATTER_LAUNCH_WORKSPACE" ]] || return 1
     cmux_alive || return 1
 
+    local took=0 hat
+    if [[ "$CMUX_SNAP" != 1 ]]; then
+        cmux_snapshot
+        took=1
+    fi
+    hat=$(current_hat_find) || hat=""
+    [[ "$took" == 1 ]] && cmux_snapshot_drop
+    [[ -n "$hat" ]] || return 1
+    CURRENT_HAT_CACHE="$hat"
+    printf '%s' "$hat"
+}
+
+# The search itself, for current_hat: no caching, no snapshot handling.
+current_hat_find() {
     local w mine="" hat
     for w in $(window_ids); do
-        if cmux_json workspace list --window "$w" 2>/dev/null \
+        if window_ws_json "$w" 2>/dev/null \
              | jq -e --arg id "$HATTER_LAUNCH_WORKSPACE" \
                    '.workspaces[]? | select(.id == $id)' >/dev/null 2>&1; then
             mine="$w"
@@ -788,7 +808,6 @@ current_hat() {
     while IFS= read -r hat; do
         [[ -z "$hat" ]] && continue
         if [[ "$(find_hat_window "$hat")" == "$mine" ]]; then
-            CURRENT_HAT_CACHE="$hat"
             printf '%s' "$hat"
             return 0
         fi
@@ -2813,11 +2832,15 @@ cmd_hat() {
         status)
             printf '%-10s  %-24s  %-8s  %-5s  %-8s  %-4s  %s\n' \
                 HAT DESTINATION STATUS TMUX RESURRECT SESS WINDOW
+            # Each row finds its hat's window, which reads every window: one
+            # snapshot for the table rather than one pass of cmux per hat.
             local hat
+            cmux_snapshot
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
                 hat_status_row "$hat"
             done < <(hat_names)
+            cmux_snapshot_drop
             ;;
         rename|mv)
             local old="${1:-}" new="${2:-}"
@@ -4268,12 +4291,16 @@ edit_sync_restore() {
         if [[ "$probed" == 0 ]]; then
             printf '   %sprobing...%s' "$C_DIM" "$C_R"
             gaps=""
+            # hat_missing finds each hat's window, which reads every window:
+            # one snapshot for the whole probe, gone before anything restores.
+            cmux_snapshot
             for h in ${hat:-$(hat_names)}; do
                 while IFS= read -r line; do
                     [[ -z "$line" ]] && continue
                     gaps+="$h	$line"$'\n'
                 done < <(hat_missing "$h")
             done
+            cmux_snapshot_drop
             probed=1
             printf '\r\033[K'
         fi

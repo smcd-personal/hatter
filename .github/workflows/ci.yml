@@ -34,6 +34,9 @@ jobs:
           /bin/bash bin/hatter --help >/dev/null
           /bin/bash bin/hatter help provision >/dev/null
 
+      - name: Tests
+        run: for t in tests/*.sh; do /bin/bash "$t"; done
+
       - name: Python tools compile
         run: python3 -m py_compile tools/*.py
 
