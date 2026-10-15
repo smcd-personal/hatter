@@ -83,3 +83,4 @@ git -C ~/dev/hatter config core.hooksPath .githooks
   `set -e` hazards, bash special variables, explicit client targets.
 - `bash -n bin/hatter` and `shellcheck --severity=error bin/hatter` pass.
 - `tools/leakcheck --all` is clean.
+- Every script in `tests/` passes. They need no cmux, ssh or real config.
