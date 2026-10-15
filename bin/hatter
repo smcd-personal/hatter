@@ -2832,11 +2832,15 @@ cmd_hat() {
         status)
             printf '%-10s  %-24s  %-8s  %-5s  %-8s  %-4s  %s\n' \
                 HAT DESTINATION STATUS TMUX RESURRECT SESS WINDOW
+            # Each row finds its hat's window, which reads every window: one
+            # snapshot for the table rather than one pass of cmux per hat.
             local hat
+            cmux_snapshot
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
                 hat_status_row "$hat"
             done < <(hat_names)
+            cmux_snapshot_drop
             ;;
         rename|mv)
             local old="${1:-}" new="${2:-}"
@@ -4287,12 +4291,16 @@ edit_sync_restore() {
         if [[ "$probed" == 0 ]]; then
             printf '   %sprobing...%s' "$C_DIM" "$C_R"
             gaps=""
+            # hat_missing finds each hat's window, which reads every window:
+            # one snapshot for the whole probe, gone before anything restores.
+            cmux_snapshot
             for h in ${hat:-$(hat_names)}; do
                 while IFS= read -r line; do
                     [[ -z "$line" ]] && continue
                     gaps+="$h	$line"$'\n'
                 done < <(hat_missing "$h")
             done
+            cmux_snapshot_drop
             probed=1
             printf '\r\033[K'
         fi

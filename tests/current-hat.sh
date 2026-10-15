@@ -32,6 +32,7 @@ win=""
 for ((i = 1; i <= \$#; i++)); do
     [[ "\${!i}" == --window ]] && { j=\$((i + 1)); win="\${!j}"; }
 done
+[[ "\$1" == tree && -n "\${STUB_TREE_FAIL:-}" ]] && exit 1
 case "\$1 \${2:-}" in
     "list-windows "*)      jq -c '[.windows[] | {id}]' "\$tree" ;;
     "tree "*)              cat "\$tree" ;;
@@ -41,6 +42,9 @@ case "\$1 \${2:-}" in
 esac
 EOF
 chmod +x "$work/bin/cmux"
+# Every hat is unreachable, at once: only the cmux side of a status row matters.
+printf '#!/bin/sh\necho "ssh: connect to host x: Connection refused" >&2\nexit 255\n' > "$work/bin/ssh"
+chmod +x "$work/bin/ssh"
 
 cat > "$work/cfg/hatter/config.json" <<'EOF'
 {"version":3,
@@ -83,5 +87,17 @@ n=$(calls)
 # --- a launch workspace no hat owns: no answer, snapshot still dropped -------
 out=$(run 'HATTER_LAUNCH_WORKSPACE=NOWHERE; current_hat || echo "none $CMUX_SNAP"')
 [[ "$out" == "none 0" ]] || fail "unknown launch workspace: got '$out', want 'none 0'"
+
+# --- the snapshot cannot be taken: live reads still find the hat -------------
+out=$(STUB_TREE_FAIL=1 run 'current_hat > "$TMPDIR_T/h"; echo "$(cat "$TMPDIR_T/h") $CMUX_SNAP"')
+[[ "$out" == "gamma 0" ]] || fail "snapshot failed: got '$out', want 'gamma 0' (live fallback)"
+
+# --- hat status: one snapshot for the table, not a cmux pass per hat ---------
+out=$(run 'cmd_hat status; echo "snap=$CMUX_SNAP"')
+grep -q '^gamma .* W3' <<<"$out" || fail "hat status: gamma's window not found: $out"
+[[ "$(tail -1 <<<"$out")" == snap=0 ]] || fail "hat status: snapshot left held"
+# 1 tree + 3 group lists, against 21 when each row read cmux itself.
+n=$(calls)
+[[ "$n" -le 4 ]] || { cat "$work/calls" >&2; fail "hat status: $n cmux calls, want at most 4"; }
 
 echo "PASS current-hat"
