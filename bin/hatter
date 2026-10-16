@@ -2420,7 +2420,7 @@ heal_dragged_tabs() {
     while IFS= read -r hat; do
         [[ -n "$hat" ]] || continue
         [[ -z "$only" || "$hat" == "$only" ]] || continue
-        w=$(find_hat_window "$hat")
+        w=$(find_hat_window "$hat") || continue
         [[ -n "$w" ]] || continue
         # Hats sharing a server share its window; one look is enough.
         grep -qxF "$w" <<<"$seen" && continue
@@ -2430,7 +2430,7 @@ heal_dragged_tabs() {
     cmux_snapshot_drop
     [[ -n "$tree" && ${#hats[@]} -gt 0 ]] || return 0
     # Every server at once, as sync does.
-    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-heal.XXXXXX")
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-heal.XXXXXX") || return 0
     for ((i = 0; i < ${#hats[@]}; i++)); do
         remote_tmux_state "${hosts[$i]}" > "$tmp/$i" 2>/dev/null &
     done
