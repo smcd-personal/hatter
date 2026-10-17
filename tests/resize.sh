@@ -5,9 +5,12 @@ set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")
-sock="hatter-test-$$"
+# One throwaway tmux server per case, each on its own socket: reusing one name
+# right after kill-server races the old server's exit.
+socks=""
 cleanup() {
-    if command -v tmux >/dev/null 2>&1; then tmux -L "$sock" kill-server 2>/dev/null || true; fi
+    local k
+    for k in $socks; do tmux -L "$k" kill-server 2>/dev/null || true; done
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -25,20 +28,22 @@ grep -q '^# hat-resize' "$work/hd/.local/bin/hat-resize" || fail "could not extr
 line=$(extract BLOCK | grep "^run-shell .*window-size")
 [ -n "$line" ] || fail "no window-size line in the managed block"
 printf '%s\n' "$line" > "$work/tmux.conf"
-first_size() {
-    tmux -L "$sock" kill-server 2>/dev/null || true
-    XDG_STATE_HOME="$work/state" tmux -L "$sock" -f "$work/tmux.conf" new-session -d -s t1
-    XDG_STATE_HOME="$work/state" tmux -L "$sock" new-window -d -t '=t1'
-    tmux -L "$sock" list-windows -t '=t1' -F '#{window_width}x#{window_height}' | sort -u | tr '\n' ' '
+n=0
+first_size() {  # sets $got: the distinct window sizes on a fresh server
+    n=$((n + 1)); local k="hatter-test-$$-$n"
+    socks="$socks $k"
+    XDG_STATE_HOME="$work/state" tmux -L "$k" -f "$work/tmux.conf" new-session -d -s t1
+    XDG_STATE_HOME="$work/state" tmux -L "$k" new-window -d -t '=t1'
+    got=$(tmux -L "$k" list-windows -t '=t1' -F '#{window_width}x#{window_height}' | sort -u | tr '\n' ' ')
+    tmux -L "$k" kill-server 2>/dev/null || true
 }
 if command -v tmux >/dev/null 2>&1; then
     echo 180x57 > "$work/state/hatter/window-size"
-    [ "$(first_size)" = "180x57 " ] || fail "conf: recorded 180x57, windows came up $(first_size)"
+    first_size; [ "$got" = "180x57 " ] || fail "conf: recorded 180x57, windows came up $got"
     rm "$work/state/hatter/window-size"
-    [ "$(first_size)" = "80x24 " ] || fail "conf: nothing recorded, windows came up $(first_size)"
+    first_size; [ "$got" = "80x24 " ] || fail "conf: nothing recorded, windows came up $got"
     echo garbage > "$work/state/hatter/window-size"
-    [ "$(first_size)" = "80x24 " ] || fail "conf: a bad record changed the size"
-    tmux -L "$sock" kill-server 2>/dev/null || true
+    first_size; [ "$got" = "80x24 " ] || fail "conf: a bad record changed the size: $got"
 else
     echo "skip: no tmux here for the .tmux.conf check"
 fi
