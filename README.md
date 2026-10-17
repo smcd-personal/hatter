@@ -45,7 +45,8 @@ restore.
 
 - **Persistence on both ends.** tmux-resurrect and tmux-continuum are set up per
   hat, so a server reboot comes back to the same sessions. The config covers the
-  client side.
+  client side. Restored tabs start at the size cmux last used rather than tmux's
+  80x24; `hatter resize` fixes tabs that are already stuck there.
 - **Logging out cannot destroy a tab.** Every pane runs its login shell in a
   loop, so a stray ctrl-D hands back a fresh prompt. Two deliberate ways out:
   `bye`, or `exit 99`.
