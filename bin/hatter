@@ -1867,13 +1867,61 @@ fi
 # script directly, independent of whether anything is drawing.
 if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1 \
    && [ -x "$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh" ]; then
+    cat > "$HOME/.local/bin/hat-save" <<'HATSAVE'
+#!/usr/bin/env bash
+# hat-save - one tmux-resurrect snapshot, for the systemd timer.
+#
+# save.sh writes a snapshot and points `last` at it even when there is nothing
+# to save: with no tmux server it writes an empty file, and restoring from that
+# brings back no sessions at all - just when a restore is needed. So this only
+# saves while there are sessions, and if the snapshot still comes out empty
+# (the server died mid-save) it points `last` back at the one before.
+set -u
+
+save="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
+[ -x "$save" ] || { echo "hat-save: no tmux-resurrect"; exit 0; }
+command -v tmux >/dev/null 2>&1 || { echo "hat-save: no tmux"; exit 0; }
+
+sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || sessions=""
+if [ -z "$sessions" ]; then
+    echo "hat-save: no tmux sessions - keeping the last snapshot"
+    exit 0
+fi
+
+# Where resurrect keeps its snapshots, resolved the way resurrect does.
+dir=$(tmux show-option -gqv @resurrect-dir 2>/dev/null) || dir=""
+if [ -z "$dir" ]; then
+    if [ -d "$HOME/.tmux/resurrect" ]; then
+        dir="$HOME/.tmux/resurrect"
+    else
+        dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+    fi
+fi
+dir="${dir//\$HOME/$HOME}"
+dir="${dir//\~/$HOME}"
+
+prev=$(readlink "$dir/last" 2>/dev/null) || prev=""
+"$save" quiet || exit $?
+now=$(readlink "$dir/last" 2>/dev/null) || now=""
+case "$now" in
+    "")  exit 0 ;;
+    /*)  snap="$now" ;;
+    *)   snap="$dir/$now" ;;
+esac
+if [ -n "$prev" ] && [ "$now" != "$prev" ] && [ ! -s "$snap" ]; then
+    ln -sfn "$prev" "$dir/last"
+    echo "hat-save: snapshot came out empty - last still points at $prev"
+fi
+exit 0
+HATSAVE
+    chmod +x "$HOME/.local/bin/hat-save"
     cat > "$HOME/.config/systemd/user/hatter-resurrect-save.service" <<'SAVESVC'
 [Unit]
 Description=hatter: tmux-resurrect snapshot (continuum cannot save under a control-mode client)
 
 [Service]
 Type=oneshot
-ExecStart=%h/.tmux/plugins/tmux-resurrect/scripts/save.sh quiet
+ExecStart=%h/.local/bin/hat-save
 SAVESVC
     cat > "$HOME/.config/systemd/user/hatter-resurrect-save.timer" <<'SAVETIMER'
 [Unit]
