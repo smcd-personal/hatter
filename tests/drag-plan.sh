@@ -23,7 +23,7 @@ check() {
     fi
 }
 
-T=$'\t'
+T=$'\x1f'
 
 # Two sessions. dev-a had windows @1 one and @2 two, and @2's tab was dragged
 # into dev-b: cmux holds it there under a new id (s-new), while dev-a's map
@@ -39,6 +39,20 @@ check "a dragged tab is moved to where it was dropped" \
            "dev-b": [{"surface_id": "s-3", "window_id": "@3"}]},
   "windows": [{"session": "dev-a", "id": "@1", "name": "one"}, {"session": "dev-a", "id": "@2", "name": "two"},
               {"session": "dev-b", "id": "@3", "name": "three"}]}'
+
+# The same drag, with a backslash in the session names: the plan names them
+# as they are, not escaped.
+check "names with a backslash come through as they are" \
+"move${T}s-new${T}ws-b${T}dev-b\\y${T}dev-a\\x${T}@2${T}two" '{
+  "workspaces": [
+    {"id": "ws-a", "title": "dev-a\\x", "surfaces": [{"id": "s-1", "title": "one", "type": "terminal"}]},
+    {"id": "ws-b", "title": "dev-b\\y", "surfaces": [{"id": "s-3", "title": "three", "type": "terminal"},
+                                                  {"id": "s-new", "title": "two", "type": "terminal"}]}],
+  "surfaces": ["s-1", "s-3", "s-new"],
+  "maps": {"dev-a\\x": [{"surface_id": "s-1", "window_id": "@1"}, {"surface_id": "s-old", "window_id": "@2"}],
+           "dev-b\\y": [{"surface_id": "s-3", "window_id": "@3"}]},
+  "windows": [{"session": "dev-a\\x", "id": "@1", "name": "one"}, {"session": "dev-a\\x", "id": "@2", "name": "two"},
+              {"session": "dev-b\\y", "id": "@3", "name": "three"}]}'
 
 # Nothing dragged: every tab mapped, every map entry shown.
 check "a healthy hat plans nothing" "" '{
