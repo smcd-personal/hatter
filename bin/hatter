@@ -84,7 +84,12 @@ HATTER_SSH_CTL_MAX=45
 HATTER_SSH_CTL=""
 # Never empty: bash 3.2 calls "${SSH_OPTS[@]}" of an empty array unbound, and
 # set -u turns that into an exit.
-SSH_OPTS=(-o ControlMaster=no)
+#
+# Keepalives on every connection: a server that stops answering mid-command (a
+# wedged box, a dropped route) would otherwise hold list or sync open until TCP
+# gives up, which takes hours. Three missed 10-second probes end it.
+SSH_KEEPALIVE=(-o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+SSH_OPTS=(-o ControlMaster=no "${SSH_KEEPALIVE[@]}")
 for _ctl in "/tmp/.hatter-ssh-$(id -u)" \
             ${TMPDIR:+"${TMPDIR%/}/.hatter-ssh-$(id -u)"} \
             ${TMPDIR:+"${TMPDIR%/}/hs$(id -u)"}; do
@@ -96,7 +101,8 @@ for _ctl in "/tmp/.hatter-ssh-$(id -u)" \
        && [[ -d "$_ctl" && -O "$_ctl" && ! -L "$_ctl" ]] \
        && chmod 700 "$_ctl" 2>/dev/null; then
         HATTER_SSH_CTL="$_ctl"
-        SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$HATTER_SSH_CTL/%C" -o ControlPersist=600)
+        SSH_OPTS=(-o ControlMaster=auto -o "ControlPath=$HATTER_SSH_CTL/%C" -o ControlPersist=600
+                  "${SSH_KEEPALIVE[@]}")
         break
     fi
 done
