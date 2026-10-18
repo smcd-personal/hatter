@@ -1047,6 +1047,12 @@ set-hook -gu pane-died
 set -g window-size latest
 setw -g aggressive-resize on
 
+# A window made with no client attached - every window a restore makes - takes
+# default-size, which is 80x24 unless set, and a control-mode client such as
+# cmux does not size every window it shows. hat-save records the size the
+# client really uses; start from it. Before tpm, so resurrect's restore gets it.
+run-shell 'f="${XDG_STATE_HOME:-$HOME/.local/state}/hatter/window-size"; s=$(cat "$f" 2>/dev/null); case "$s" in [1-9]*x[1-9]*) tmux set -g default-size "$s" ;; esac; true'
+
 # Keep `run tpm` last.
 run '~/.tmux/plugins/tpm/tpm'
 # <<< hatter managed <<<
@@ -1784,6 +1790,61 @@ exit 0
 HATRESTORE
 chmod +x "$HOME/.local/bin/hat-restore"
 
+cat > "$HOME/.local/bin/hat-resize" <<'HATRESIZE'
+#!/usr/bin/env bash
+# hat-resize - bring windows stuck at 80x24 up to the size the client uses.
+#
+#   hat-resize                     every session
+#   hat-resize <session>           one session
+#   hat-resize [<session>] --size 180x57   a size other than the recorded one
+#
+# A window no client has sized stays at tmux's 80x24, and a control-mode client
+# such as cmux does not size every window it shows. The size comes from the
+# record hat-save keeps. Each window is resized by its id: resize-window with no
+# target acts on the session's current window, which under a control-mode
+# client is not the window you are in.
+#
+# tmux then holds each window at that size (window-size manual), even when the
+# client resizes. To let one follow the client again:
+#   tmux set-window-option -u -t <window> window-size
+set -u
+
+session="" size=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --size) size="${2:-}"; shift 2 || { echo "hat-resize: --size needs WxH" >&2; exit 2; } ;;
+        -*)     echo "hat-resize: unknown option: $1" >&2; exit 2 ;;
+        *)      session="$1"; shift ;;
+    esac
+done
+
+if [ -z "$size" ]; then
+    size=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/hatter/window-size" 2>/dev/null) || size=""
+    [ -n "$size" ] || { echo "hat-resize: no window size recorded yet - pass --size WxH" >&2; exit 1; }
+fi
+case "$size" in
+    [1-9]*x[1-9]*) ;;
+    *) echo "hat-resize: not a size: '$size' (want WxH, e.g. 180x57)" >&2; exit 2 ;;
+esac
+w=${size%x*} h=${size#*x}
+case "$w$h" in *[!0-9]*) echo "hat-resize: not a size: '$size'" >&2; exit 2 ;; esac
+
+if [ -n "$session" ]; then
+    windows=$(tmux list-windows -t "=$session" -F '#{window_id} #{window_width}x#{window_height}' 2>/dev/null) \
+        || { echo "hat-resize: no session '$session'" >&2; exit 1; }
+else
+    windows=$(tmux list-windows -a -F '#{window_id} #{window_width}x#{window_height}' 2>/dev/null) \
+        || { echo "hat-resize: no tmux server" >&2; exit 1; }
+fi
+
+n=0
+for id in $(printf '%s\n' "$windows" | awk '$2 == "80x24" {print $1}'); do
+    tmux resize-window -t "$id" -x "$w" -y "$h" && n=$((n + 1))
+done
+echo "hat-resize: $n window(s) resized to $size"
+HATRESIZE
+chmod +x "$HOME/.local/bin/hat-resize"
+
 # The hook catches a session started by hand - `claude` typed at a prompt -
 # which is most of them. It goes in as its OWN entry appended to the arrays, so
 # an existing hook pipeline on this box is never touched, and running it twice
@@ -1878,6 +1939,10 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/
 # brings back no sessions at all - just when a restore is needed. So this only
 # saves while there are sessions, and if the snapshot still comes out empty
 # (the server died mid-save) it points `last` back at the one before.
+#
+# It also records the window size the client really uses, which .tmux.conf
+# reads at server start: a restore makes its windows with no client attached,
+# and without it they come back at tmux's 80x24.
 set -u
 
 save="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
@@ -1888,6 +1953,19 @@ sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || sessions=""
 if [ -z "$sessions" ]; then
     echo "hat-save: no tmux sessions - keeping the last snapshot"
     exit 0
+fi
+
+# The commonest window size that no default explains. A window no client has
+# sized sits at 80x24 or at the current default-size, so neither counts; when
+# nothing else is left, the record stands. It is applied here too, so windows
+# made on this server from now on start at it.
+state="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+def=$(tmux show-option -gv default-size 2>/dev/null) || def=""
+size=$(tmux list-windows -a -F '#{window_width}x#{window_height}' 2>/dev/null \
+    | grep -vxF -e 80x24 -e "${def:-80x24}" | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')
+if [ -n "$size" ] && mkdir -p "$state" \
+   && printf '%s\n' "$size" > "$state/window-size.tmp" && mv "$state/window-size.tmp" "$state/window-size"; then
+    tmux set-option -g default-size "$size" 2>/dev/null || true
 fi
 
 # Where resurrect keeps its snapshots, resolved the way resurrect does.
@@ -2585,6 +2663,28 @@ heal_move() {
 # Mirroring the host again rebuilds cmux's view, but the workspace comes back
 # new: outside its group, at the end of the sidebar. So repair records where it
 # was, detaches it, re-mirrors, and puts it back.
+# Bring tmux windows stuck at 80x24 up to the size the client uses, by running
+# hat-resize on the server. Takes a hat (every session on it) or a session.
+cmd_resize() {
+    local target="$1" hat session="" host
+    shift
+    if hat_exists "$target"; then
+        hat="$target"
+    else
+        session=$(tmux_session_name "$target")
+        hat=$(session_hat "$session")
+        [[ -n "$hat" ]] || die "'$target' is neither a hat nor a session hatter can place.
+  Known hats: $(hat_names | tr '\n' ' ')"
+    fi
+    host=$(hat_ssh "$hat")
+    [[ -n "$host" ]] || die "hat '$hat' has no ssh destination"
+    local cmd='h="$HOME/.local/bin/hat-resize"; [ -x "$h" ] || { echo "hat-resize is not installed - run: hatter provision '"$(sq "$hat")"'" >&2; exit 1; }; "$h"'
+    [[ -n "$session" ]] && cmd+=" $(sq "$session")"
+    local a
+    for a in "$@"; do cmd+=" $(sq "$a")"; done
+    remote_sh "$host" "$cmd"
+}
+
 cmd_repair() {
     local session="$1" hat host lines win="" ws="" w
     require_cmux repair
@@ -5010,6 +5110,7 @@ Commands:
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
   repair <session>       Bring back a workspace cmux shows blank, in its place
+  resize <hat|session>   Bring tabs stuck at 80x24 up to the window's size
   hat <subcommand>       Manage hats (shell servers)
   group <subcommand>     Manage groups (projects)
   rack                   The hat rack: browse and edit every level
@@ -5142,6 +5243,31 @@ pinned. cmux cannot pin a mirrored tab itself, so this is hatter's pin.
 Inside a cmux window, a bare name is resolved against that window's hat, so
 `hatter tab atlas` means dev-atlas while wearing dev - but only when that
 workspace already exists.
+USAGE
+    ;;
+    resize) cat <<'USAGE'
+hatter resize <hat|session> [--size WxH]
+
+Bring tmux windows stuck at 80x24 up to the size cmux uses, on every session
+of a hat or on one session.
+
+  hatter resize dev
+  hatter resize dev-atlas --size 200x60
+
+A window made with no client attached comes up at tmux's 80x24, and cmux does
+not size every window it shows, so after a restore an agent can sit at 80x24
+in a much larger cmux window. Provisioned servers avoid this: the save timer
+records the size cmux uses, and the tmux server starts from it. resize is for
+windows that are already wrong. The size is that record unless --size says
+otherwise.
+
+tmux then holds each resized window at that size, even when cmux resizes. To
+let one follow cmux again, in that tab:
+
+  tmux set-window-option -u -t "$TMUX_PANE" window-size
+
+An agent already running picks up the new size at once, but what it printed
+before stays wrapped at 80 columns until it restarts.
 USAGE
     ;;
     repair) cat <<'USAGE'
@@ -5457,7 +5583,7 @@ shift || true
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|shortcuts|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|resize|shortcuts|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -5467,7 +5593,7 @@ esac
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|shortcuts|sync|_drag-plan|_drag-heal) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|resize|shortcuts|sync|_drag-plan|_drag-heal) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
        trap hatter_unlock EXIT ;;
 esac
@@ -5495,6 +5621,7 @@ case "$cmd" in
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
+    resize)    [[ $# -gt 0 ]] || { usage_cmd resize; exit 1; };    cmd_resize "$@" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;
     backup)    cmd_backup "$@" ;;
     hat|login) [[ $# -gt 0 ]] || { usage_cmd hat; exit 1; };       cmd_hat "$@" ;;

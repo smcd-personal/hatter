@@ -15,7 +15,9 @@ grep -q '^# hat-save' "$work/hat-save" || fail "could not extract hat-save from 
 
 # --- stubs -------------------------------------------------------------------
 # tmux: STUB_SESSIONS unset means no server; set but empty means a server with
-# no sessions. STUB_RDIR is what @resurrect-dir reads as.
+# no sessions. STUB_RDIR is what @resurrect-dir reads as, STUB_DEF what
+# default-size reads as, STUB_WINDOWS the window sizes, one per line.
+# set-option calls go to STUB_LOG.
 mkdir -p "$work/bin"
 cat > "$work/bin/tmux" <<'EOF'
 #!/usr/bin/env bash
@@ -25,7 +27,15 @@ case "$1" in
         [ -z "$STUB_SESSIONS" ] || printf '%s\n' "$STUB_SESSIONS" ;;
     show-option)
         [ -n "${STUB_SESSIONS+x}" ] || exit 1
-        printf '%s\n' "${STUB_RDIR:-}" ;;
+        case "$*" in
+            *@resurrect-dir*) printf '%s\n' "${STUB_RDIR:-}" ;;
+            *default-size*)   printf '%s\n' "${STUB_DEF:-80x24}" ;;
+            *) echo "stub tmux: unexpected: $*" >&2; exit 1 ;;
+        esac ;;
+    list-windows)
+        [ -z "${STUB_WINDOWS:-}" ] || printf '%s\n' "$STUB_WINDOWS" ;;
+    set-option)
+        echo "$*" >> "$STUB_LOG" ;;
     *) echo "stub tmux: unexpected: $*" >&2; exit 1 ;;
 esac
 EOF
@@ -53,7 +63,7 @@ reset() {
     printf 'pane\tgood\n' > "$rdir/tmux_resurrect_good.txt"
     ln -s tmux_resurrect_good.txt "$rdir/last"
 }
-run() { HOME="$work/hd" PATH="$work/bin:$PATH" "$work/hat-save"; }
+run() { (unset XDG_STATE_HOME; HOME="$work/hd" PATH="$work/bin:$PATH" STUB_LOG="$work/set" "$work/hat-save"); }
 files() { ls "$rdir" | wc -l | tr -d ' '; }
 
 # --- no tmux server: nothing written, `last` unchanged ------------------------
@@ -101,5 +111,38 @@ case "$out" in *"came out empty"*) ;; *) fail "mid-save: said '$out'" ;; esac
 rm -rf "$rdir" "$work/save-calls"; mkdir -p "$rdir"
 STUB_SESSIONS="main" STUB_CONTENT=$'pane\tfirst\n' run >/dev/null
 [ -s "$rdir/$(readlink "$rdir/last")" ] || fail "first save: last is not the new snapshot"
+
+# --- the window size the client uses is recorded, and applied ----------------
+rec="$work/hd/.local/state/hatter/window-size"
+size_case() {  # size_case <default-size> <window sizes...>
+    reset; rm -f "$work/set"
+    local def="$1"; shift
+    STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_DEF="$def" \
+        STUB_WINDOWS="$(printf '%s\n' "$@")" run >/dev/null
+}
+
+rm -f "$rec"
+size_case 80x24 80x24 180x57 180x57 179x56 80x24
+[ "$(cat "$rec")" = 180x57 ] || fail "size: recorded '$(cat "$rec" 2>/dev/null)', want 180x57 (the commonest sized)"
+grep -qx "set-option -g default-size 180x57" "$work/set" || fail "size: default-size not applied: $(cat "$work/set" 2>/dev/null)"
+
+# Windows at the current default-size are ones no client sized, however many.
+size_case 180x57 180x57 180x57 180x57 200x60
+[ "$(cat "$rec")" = 200x60 ] || fail "size: default-size windows outvoted a real size: '$(cat "$rec")'"
+
+# Only defaults left: the record stands, and nothing is applied.
+size_case 200x60 80x24 200x60 80x24
+[ "$(cat "$rec")" = 200x60 ] || fail "size: record lost when every window was a default: '$(cat "$rec")'"
+[ ! -e "$work/set" ] || fail "size: default-size set with nothing new: $(cat "$work/set")"
+
+# A first run with nothing sized writes no record at all.
+rm -f "$rec"
+size_case 80x24 80x24 80x24
+[ ! -e "$rec" ] || fail "size: recorded '$(cat "$rec")' when no window was sized"
+
+# No server: no record.
+rm -f "$rec"; reset
+(unset STUB_SESSIONS; STUB_WINDOWS=180x57 run >/dev/null)
+[ ! -e "$rec" ] || fail "size: recorded with no server"
 
 echo "ok: hat-save"
