@@ -70,6 +70,8 @@ case "$1 ${2:-}" in
                            cat "$d/groups.$(arg --window "$@").json" ;;
     "workspace-group create")
         echo "$*" >> "$log"
+        # STUB_CREATE_FAIL: cmux refuses, and says why.
+        [[ -z "${STUB_CREATE_FAIL:-}" ]] || { echo "boom: no such window" >&2; exit 1; }
         name=$(arg --name "$@"); from=$(arg --from "$@"); w=$(win_of_ws "${from%%,*}")
         edit "$w" --arg n "$name" --arg f "$from" --arg id "g-new-$name-$w" '
             ($f | split(",")) as $ids
@@ -417,6 +419,93 @@ groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a
 printf 'dev-a\n' > "$d/server.dev"
 STUB_FLAG_FAIL=1 hatter_in sync || true
 expect "...while one with no members at all is" "$(yes_if grep -qx "workspace-group ungroup g-U" "$d/log")"
+
+
+# --- second-round review fixes ---------------------------------------------------
+
+# A group made by another hatter since the caller looked is used, not made twice.
+setup stale-snap "$(jq '.groups.G.sessions["dev-x"] = {"windows": []}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+in_lib "settle_ungrouped dev W1 \$'dev-a\ndev-x' '' '{\"groups\": []}' \"\$(jq -c '{workspaces: .windows[0].workspaces}' '$d/tree.json')\"" \
+    > "$d/out" 2>&1 || true
+expect "a group that exists by now is added to, not made again" \
+    "$(yes_if all_of unlogged "workspace-group create" -- logged "workspace-group add --group g-G --workspace ws-x")"
+
+# A create cmux refuses is reported as a failure, not as workspaces put back.
+setup create-fails "$(jq '.groups.H = {"hat": "dev", "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+STUB_CREATE_FAIL=1 hatter_in sync || true
+expect "a refused create says so and claims nothing put back" \
+    "$(yes_if all_of says "could not create group 'H'" -- bash -c '! grep -q "put back" "$1"' _ "$d/out")"
+# ensure_cmux_group shows what cmux said.
+err=$(in_lib "export STUB_CREATE_FAIL=1; ensure_cmux_group G W9" 2>&1 || true)
+expect "a failed group create shows cmux's own words" "$(yes_if grep -q "cmux said: boom" <<<"$err")"
+
+# An Unassigned cmux will not remove is tried once, not on every tick.
+setup stuck-rm "$ONE_HAT" '{"windows": [{"id": "W1", "workspaces": [
+  {"id": "ws-a", "title": "dev-a", "panes": []}, {"id": "ws-t", "title": "local shell", "panes": []}]}]}'
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]},
+                       {"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-t"]}]}'
+printf 'dev-a\n' > "$d/server.dev"
+STUB_FLAG_FAIL=1 hatter_in sync || true
+expect "a group cmux will not remove is warned about" "$(yes_if says "cmux would not remove the group 'Unassigned'")"
+: > "$d/log"
+STUB_FLAG_FAIL=1 hatter_in sync || true
+expect "...once: the next tick neither tries nor warns" \
+    "$(yes_if all_of unlogged "ungroup" -- bash -c '! grep -q "would not remove" "$1"' _ "$d/out")"
+
+# A default group called Unassigned is cleared, with or without a group so named;
+# and one cannot be given.
+setup default-only "$(jq '.hats.dev.default_group = "Unassigned"' <<<"$ONE_HAT")" "$ONE_TREE"
+hatter_in group list || true
+expect "a default group named Unassigned is cleared even with no such group" \
+    "$(yes_if is '.hats.dev | has("default_group")' false)"
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+rc=0; hatter_in hat add ops --ssh ops@ops.example.com --group Unassigned || rc=$?
+expect "hat add refuses Unassigned as a default group, writing nothing" \
+    "$(yes_if all_of [ "$rc" != 0 ] -- same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+
+# help changes nothing, migration included.
+setup help-only "$(jq '.groups.Unassigned = {"hat": "dev", "sessions": {"dev-m": {}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+hatter_in help group || true
+expect "help does not migrate" "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+
+# Recording into Unassigned checks, inside the write, that no group of the hat
+# has taken the session meanwhile: here, while its tabs were being read.
+setup race "$ONE_HAT" "$ONE_TREE"
+printf 'dev-a\ndev-y\n' > "$d/server.dev"
+in_lib "remote_windows_json() { jq_write '.groups.G.sessions[\"dev-y\"] = {\"windows\": []}'; echo '[]'; }
+        settle_ungrouped dev '' \$'dev-a\ndev-y'" >/dev/null 2>&1 || true
+expect "a session another group took meanwhile is not recorded in Unassigned" \
+    "$(yes_if all_of is '.groups | has("Unassigned@dev")' false -- is '.groups.G.sessions | has("dev-y")' true)"
+
+# Creating or attaching a session Unassigned holds, with no --group, places it.
+setup new-moves "$(UCFG '{"dev-x": {"windows": [{"name": "kept"}]}}')" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in new dev-x || true
+expect "hatter new moves a session out of Unassigned into the hat's real group" \
+    "$(yes_if all_of is '.groups.G.sessions["dev-x"].windows[0].name' kept -- is '.groups | has("Unassigned@dev")' false)"
+setup new-stays "$(UCFG '{"dev-x": {"windows": []}}' | jq 'del(.groups.G)')" "$ONE_TREE"
+printf 'dev-x\n' > "$d/server.dev"
+hatter_in new dev-x || true
+expect "...but stays when the hat has no other group" "$(yes_if is '.groups["Unassigned@dev"].sessions | has("dev-x")' true)"
+
+# Two hats recording the same name: its prefix says whose it is.
+setup same-name "$(jq '.hats.ops = {"ssh": "ops@ops.example.com"}
+                       | .groups = ({"O": {"hat": "ops", "sessions": {"dev-s": {}}}} + .groups)
+                       | .groups.G.sessions["dev-s"] = {}' <<<"$ONE_HAT")" "$ONE_TREE"
+expect "a session two hats record belongs to the hat its prefix names" \
+    "$(yes_if all_of [ "$(in_lib 'session_hat dev-s')" = dev ] -- [ "$(in_lib 'session_group dev-s dev')" = G ])"
+
+# Every change to cmux's groups goes through the helpers.
+expect "no group change bypasses the helpers" \
+    "$(yes_if bash -c 'sed "/^# --- group changes in cmux/,/^# cmux_group_to_top/d" "$1" \
+                       | grep -v "^ *#" | grep -q "cmux workspace-group \(add\|rename\|set-\|pin\|collapse\|create\|move\|ungroup\)" && exit 1
+                       grep -q "^# --- group changes in cmux" "$1"' _ "$hatter")"
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "PASS unassigned"

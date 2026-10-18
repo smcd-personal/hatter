@@ -212,32 +212,48 @@ seed_config() {
 JSON
     fi
     migrate_config
-    migrate_unassigned
 }
 
 # A group a user named Unassigned before hatter kept one of its own. Sync would
 # read cmux's Unassigned as hatter's and leave this one behind, so its sessions
-# move into its hat's Unassigned (an entry already there wins), and a hat that
-# took it as its default group loses that default: a workspace made on purpose
-# does not go to Unassigned. A group with no hat cannot be keyed to one, so it
-# is left as it is; `hatter list` shows it among the groups with no hat.
+# move into its hat's Unassigned (an entry already there wins). A default group
+# named Unassigned is cleared in any case: a workspace made on purpose does not
+# go to Unassigned. A group with no hat cannot be keyed to one, so it is left
+# as it is; `hatter list` shows it among the groups with no hat. Runs under the
+# config lock, and not for help.
 migrate_unassigned() {
+    local need held=0
+    # The cheap look first, without the lock: almost every run has nothing to do.
+    need=$(cfg '[(.groups.Unassigned // {} | select(.managed != true and (.hat // "") != "")),
+                 (.hats[]? | select(.default_group == "Unassigned"))] | length' 2>/dev/null) || return 0
+    [[ "${need:-0}" -gt 0 ]] || return 0
+    if [[ "$HATTER_LOCK_HELD" != 1 ]]; then
+        hatter_lock 20 || return 0
+        held=1
+    fi
+    # Read again under the lock: another hatter may have done it meanwhile.
     local hat
-    hat=$(cfg '.groups.Unassigned // {} | select(.managed != true) | .hat // empty' 2>/dev/null) || return 0
-    [[ -n "$hat" ]] || return 0
-    info "Moving the group 'Unassigned' into hatter's own Unassigned group for hat '$hat'"
-    backup_config
-    jq_write --arg l "$hat" --arg n "$UNASSIGNED" '
-        .groups.Unassigned as $old
-        | "\($n)@\($l)" as $k
-        | ([.groups | to_entries[] | select(.key != "Unassigned" and .key != $k and .value.hat == $l)
-            | .value.sessions // {} | keys[]]) as $elsewhere
-        | .groups[$k] = (($old | del(.sessions)) + (.groups[$k] // {}) + {hat: $l, name: $n, managed: true})
-        | .groups[$k].sessions = ((($old.sessions // {}) + (.groups[$k].sessions // {}))
-                                  | with_entries(select(.key as $x | $elsewhere | index($x) | not)))
-        | del(.groups.Unassigned)
-        | .hats |= map_values(if .default_group == "Unassigned" then del(.default_group) else . end)
-        | '"$PRUNE_UNASSIGNED"
+    hat=$(cfg '.groups.Unassigned // {} | select(.managed != true) | .hat // empty' 2>/dev/null) || hat=""
+    need=$(cfg '[.hats[]? | select(.default_group == "Unassigned")] | length' 2>/dev/null) || need=0
+    if [[ -n "$hat" || "${need:-0}" -gt 0 ]]; then
+        [[ -z "$hat" ]] || info "Moving the group 'Unassigned' into hatter's own Unassigned group for hat '$hat'"
+        backup_config
+        jq_write --arg l "$hat" --arg n "$UNASSIGNED" '
+            if $l == "" then . else
+              .groups.Unassigned as $old
+              | "\($n)@\($l)" as $k
+              | ([.groups | to_entries[] | select(.key != "Unassigned" and .key != $k and .value.hat == $l)
+                  | .value.sessions // {} | keys[]]) as $elsewhere
+              | .groups[$k] = (($old | del(.sessions)) + (.groups[$k] // {}) + {hat: $l, name: $n, managed: true})
+              | .groups[$k].sessions = ((($old.sessions // {}) + (.groups[$k].sessions // {}))
+                                        | with_entries(select(.key as $x | $elsewhere | index($x) | not)))
+              | del(.groups.Unassigned)
+            end
+            | .hats |= map_values(if .default_group == "Unassigned" then del(.default_group) else . end)
+            | '"$PRUNE_UNASSIGNED"
+    fi
+    [[ "$held" == 1 ]] && hatter_unlock
+    return 0
 }
 
 # v1 stored host/remote_dir per group. v2 hoisted those into named entries.
@@ -396,19 +412,23 @@ PRUNE_UNASSIGNED='.groups |= with_entries(select((.value.managed == true
                     and ((.value.sessions // {}) | length) == 0) | not))'
 
 # Which hat owns a session: an explicit config entry wins, otherwise the
-# session-name prefix decides.
+# session-name prefix decides. Two hats can each record a session of the same
+# name; then the one its prefix names wins.
 session_hat() {
-    local session="$1" found
-    found=$(cfg --arg s "$session" '
-        .groups | to_entries[] | select(.value.sessions[$s]) | .value.hat' | head -1)
+    local session="$1" found prefix="${1%%-*}"
+    found=$(cfg --arg s "$session" --arg p "$prefix" '
+        [.groups | to_entries[] | select(.value.sessions[$s]) | .value.hat]
+        | if index($p) then $p else .[0] // empty end')
     [[ -n "$found" ]] && { printf '%s' "$found"; return 0; }
-    local prefix="${session%%-*}"
     hat_exists "$prefix" && printf '%s' "$prefix"
     return 0
 }
 
+# session_group <session> [hat]: the group that records it, among that hat's
+# groups when the hat is known.
 session_group() {
-    cfg --arg s "$1" '.groups | to_entries[] | select(.value.sessions[$s]) | .key' | head -1
+    cfg --arg s "$1" --arg l "${2:-}" '.groups | to_entries[]
+        | select(.value.sessions[$s] and ($l == "" or .value.hat == $l)) | .key' | head -1
 }
 
 # The session a name means on a hat: the name as given if it already carries
@@ -2648,9 +2668,20 @@ cmd_new() {
     # names a session the hat already has, which is then reattached.
     session=$(hat_session_name "$hat" "$session")
 
-    # Work out the group.
+    # Work out the group. A session Unassigned holds is one nobody placed;
+    # creating or attaching it on purpose places it, so with no --group it
+    # moves to the hat's default or first real group, when the hat has one.
     if [[ -z "$group" ]]; then
-        group=$(session_group "$session") || true
+        group=$(session_group "$session" "$hat") || true
+        if [[ -n "$group" ]] && group_managed "$group"; then
+            local placed_in
+            placed_in=$(hat_default_group "$hat")
+            [[ -n "$placed_in" ]] || placed_in=$(hat_pick_group "$hat")
+            if [[ -n "$placed_in" && "$placed_in" != "$group" ]] && ! group_name_reserved "$placed_in"; then
+                info "Moving '$session' out of $UNASSIGNED into group '$placed_in'"
+                group="$placed_in"
+            fi
+        fi
     fi
     if [[ -z "$group" ]]; then
         group=$(hat_default_group "$hat")
@@ -3955,6 +3986,9 @@ cmd_hat() {
                 esac
             done
             [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh]"
+            # Before anything is written: a default group may not be hatter's own.
+            [[ -n "$defgroup" ]] && group_name_reserved "$defgroup" && \
+                die "'$UNASSIGNED' is hatter's own group, kept for workspaces in no group - pick another default group"
             # Only the transport changing: no need to ask for the rest again.
             if [[ -n "$mosh" && -z "$ssh_dest$dir$defgroup" ]] && hat_exists "$name"; then
                 jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
@@ -4154,7 +4188,13 @@ settle_ungrouped() {
     done <<<"$un"
     if [[ "$entries" != '{}' ]]; then
         group_exists "$key" || register_group "$key" "$hat"
-        jq_write --arg g "$key" --argjson e "$entries" '.groups[$g].sessions += $e'
+        # Checked again inside the write: a session some group of the hat has
+        # recorded since (another hatter, say) stays where it was put.
+        jq_write --arg g "$key" --arg l "$hat" --argjson e "$entries" '
+            ([.groups | to_entries[] | select(.key != $g and .value.hat == $l)
+              | .value.sessions // {} | keys[]]) as $taken
+            | .groups[$g].sessions += ($e | with_entries(select(.key as $s | $taken | index($s) | not)))
+            | '"$PRUNE_UNASSIGNED"
     fi
     if group_exists "$key" && [[ "$(cfg --arg g "$key" '.groups[$g].sessions | length')" == 0 ]]; then
         jq_write "$PRUNE_UNASSIGNED"
@@ -5729,6 +5769,9 @@ edit_top() {
                 edit_ask "ssh destination (user@host)"; local nhost="$EDIT_REPLY"
                 edit_ask "remote dir [\$HOME]"; local dir="${EDIT_REPLY:-\$HOME}"
                 edit_ask "default group for new workspaces"; local g="$EDIT_REPLY"
+                if [[ -n "$g" ]] && group_name_reserved "$g"; then
+                    warn "'$UNASSIGNED' is hatter's own group - pick another default group"; edit_pause; continue
+                fi
                 register_hat "$nh_name" "$nhost" "$dir" "$g"
                 [[ -n "$g" ]] && { group_exists "$g" || register_group "$g" "$nh_name"; }
                 edit_fetch_hat "$nh_name"; edit_pause ;;
@@ -6343,7 +6386,10 @@ they do not exist yet.
 
 Options:
   --group <name>     Project/area to put it in. Created if new. Defaults to the
-                     hat's default_group from the config.
+                     group already recording the session, then the hat's
+                     default_group, then its first group. A session in the
+                     hat's Unassigned group moves to the default or first
+                     real group (see: hatter help group).
   --hat <hat>        Which shell server. Needed only when the session name has
                      no <hat>- prefix and the group is also new.
   --ssh user@host    Register an unknown hat's destination without prompting.
@@ -6583,8 +6629,11 @@ there). It holds sessions created on the server directly, mirrored in loose,
 or forgotten while still running. It is removed, from cmux and the config,
 once it is empty, and an entry in it is dropped like any other once its
 session stops. Move a workspace out of it as out of any group: drag it in
-cmux and sync, or `hatter new <session> --group <name>`. A new workspace goes
-to Unassigned only when its hat has no other group.
+cmux and sync, or `hatter new <session> --group <name>`; with no --group,
+`hatter new` takes it to the hat's default or first real group, since making
+or attaching a workspace on purpose places it. A new workspace goes to
+Unassigned only when its hat has no other group, and a cmux Unassigned that
+cmux will not remove is left until what is in it changes.
 
 Group names are config keys, unique across hats, while every hat's window has
 its own Unassigned; so its key is Unassigned@<hat>, the hat's Unassigned, and
@@ -6834,6 +6883,10 @@ for a in "$@"; do
         -h|--help) usage_cmd "$cmd"; exit 0 ;;
     esac
 done
+
+# Not for help, which changes nothing; for everything else, before it reads
+# the config.
+case "$cmd" in help|-h|--help) ;; *) migrate_unassigned ;; esac
 
 case "$cmd" in
     -h|--help)     usage_main; exit 0 ;;
