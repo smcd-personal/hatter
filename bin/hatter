@@ -705,7 +705,6 @@ focus_restore() {
 hatter_on_exit() {
     local rc="${1:-0}"
     set +e
-    [[ -z "${EDIT_CACHE:-}" ]] || edit_cleanup
     focus_restore
     hatter_unlock
     exit "$rc"
@@ -4428,6 +4427,14 @@ edit_cleanup() {
     printf '\033[?25h'                       # cursor back on
 }
 
+# The rack's EXIT trap. Not folded into hatter_on_exit: the rack's subshells
+# (a sync) set that one as their own trap, and must not clear the rack's cache.
+edit_on_exit() {
+    local rc="$1"
+    edit_cleanup || true
+    hatter_on_exit "$rc"
+}
+
 # Read one keypress. Arrow keys arrive as ESC [ A..D, so a bare ESC has to be
 # told apart from the start of a sequence by a short timeout. bash 3.2's read
 # only takes whole-second timeouts, hence -t 1.
@@ -5202,8 +5209,8 @@ cmd_rack() {
     [[ -t 0 && -t 1 ]] || die "the rack needs an interactive terminal"
     colour_setup
     EDIT_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/hatter-edit.XXXXXX")
-    # On EXIT, hatter_on_exit runs edit_cleanup too.
     trap edit_cleanup INT TERM
+    trap 'edit_on_exit $?' EXIT
     edit_refresh_all
     edit_top
     printf '\033[H\033[2J\033[?25h'

@@ -211,6 +211,17 @@ PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="$wor
 [[ "$(where)" == "W1 U1 P1" ]] || { fail "nested: the outer hatter did not restore: '$(where)'"; show; }
 [[ "$(ncalls 'focus-window --window W1')" -eq 1 ]] || { fail "nested: restored more than once"; show; }
 
+# The rack runs sync in a subshell, and sync sets the one EXIT trap there. That
+# trap unlocks the config, and must leave the rack's own cache alone.
+reset
+mkdir -p "$work/cache"
+PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="$work/st" \
+    CACHE="$work/cache" LIB="$work/hatter-lib.sh" \
+    bash -c 'source "$LIB"; EDIT_CACHE="$CACHE"; ( cmd_sync ) </dev/null >/dev/null 2>&1' \
+    || fail "sync in a subshell: failed"
+[[ -d "$work/cache" ]] || fail "sync in a subshell: its EXIT trap removed the rack's cache"
+[[ ! -e "$work/cfg/hatter/.lock" ]] || fail "sync in a subshell: left the config locked"
+
 # A record whose owner has exited belongs to no one: the run restores itself.
 reset
 true & dead=$!; wait "$dead"
