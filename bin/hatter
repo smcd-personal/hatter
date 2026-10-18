@@ -4223,22 +4223,65 @@ cmd_provision() {
 cmd_list() {
     echo "config: $CONFIG"
     echo
-    local hat group
+    # Live state, so that neither a recorded session cmux has stopped showing
+    # nor a running one no group records can hide: every server at once, and
+    # one look at cmux, which list only reads.
+    local hats=() hat group i n tmp
     while IFS= read -r hat; do
-        [[ -z "$hat" ]] && continue
-        local dg
+        [[ -n "$hat" ]] && hats+=("$hat")
+    done < <(hat_names)
+    n=${#hats[@]}
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-list.XXXXXX")
+    for ((i = 0; i < n; i++)); do
+        ( hat_live_sessions "$(hat_ssh "${hats[$i]}")" > "$tmp/$i" 2>/dev/null \
+            || rm -f "$tmp/$i" ) &
+    done
+    wait
+    local cmux_up=0
+    if cmux_alive; then cmux_up=1; cmux_snapshot; fi
+
+    local reached live win titles dg sess desc mark un
+    for ((i = 0; i < n; i++)); do
+        hat="${hats[$i]}"
+        reached=0 live="" titles="" win=""
+        if [[ -f "$tmp/$i" ]]; then reached=1; live=$(cat "$tmp/$i"); fi
+        if [[ "$cmux_up" == 1 ]]; then
+            win=$(find_hat_window "$hat")
+            [[ -n "$win" ]] && titles=$(titles_in_window "$win")
+        fi
         dg=$(hat_default_group "$hat")
-        printf 'window "%s"  ->  %s  [%s]%s\n' "$hat" "$(hat_ssh "$hat")" "$(hat_dir "$hat")" \
-            "${dg:+  (default group: $dg)}"
+        printf 'window "%s"  ->  %s  [%s]%s%s\n' "$hat" "$(hat_ssh "$hat")" "$(hat_dir "$hat")" \
+            "${dg:+  (default group: $dg)}" \
+            "$([[ "$reached" == 1 ]] || echo "  (server not reached: live state unknown)")"
         while IFS= read -r group; do
             [[ -z "$group" ]] && continue
             printf '  group %s\n' "$group"
-            cfg --arg g "$group" '.groups[$g].sessions | to_entries[]
+            while IFS=$'\t' read -r sess desc; do
+                [[ -z "$sess" ]] && continue
+                mark=""
+                if [[ "$reached" == 1 ]]; then
+                    if ! grep -qxF "$sess" <<<"$live"; then
+                        mark="  - not running"
+                    elif [[ -n "$win" ]] && ! grep -qxF "$sess" <<<"$titles"; then
+                        mark="  - running, not in cmux"
+                    fi
+                fi
+                printf '    %s  (%s)%s\n' "$sess" "$desc" "$mark"
+            done < <(cfg --arg g "$group" '.groups[$g].sessions | to_entries[]
                 | ([.value.windows[]? | select(.pinned) | .name] | join(", ")) as $p
-                | "    \(.key)  (\(.value.windows | length) tabs\(if $p == "" then "" else "; pinned: \($p)" end))"'
+                | [.key, "\(.value.windows | length) tabs\(if $p == "" then "" else "; pinned: \($p)" end)"]
+                | @tsv')
         done < <(groups_of_hat "$hat")
+        if [[ "$reached" == 1 ]]; then
+            un=$(hat_unrecorded "$hat" "$live")
+            if [[ -n "$un" ]]; then
+                echo "  running, in no group (not recorded)"
+                sed 's/^/    /' <<<"$un"
+            fi
+        fi
         echo
-    done < <(hat_names)
+    done
+    rm -rf "$tmp"
 
     local orphans
     orphans=$(cfg '.groups | to_entries[] | select((.value.hat // "") == "") | .key')
@@ -4250,6 +4293,7 @@ cmd_list() {
         printf '  %s\n' "$w"
         groups_in_window "$w" | sed 's/^/    /'
     done
+    cmux_snapshot_drop
 }
 
 # ---------------------------------------------------------------- autosave
@@ -5388,6 +5432,15 @@ edit_groups() {
         done
         [[ $n -eq 0 ]] && printf '   %s(no groups in this hat yet - press a)%s\n' "$C_DIM" "$C_R"
 
+        # Running sessions no group records would otherwise show nowhere.
+        local un
+        un=$(hat_unrecorded "$hat" "$(cut -f1 "$(edit_sessions_file "$hat")" 2>/dev/null || true)")
+        if [[ -n "$un" ]]; then
+            printf '\n  %srunning, in no group:%s %s\n' "$C_YL" "$C_R" "$(paste -sd ' ' - <<<"$un")"
+            printf '     %sto keep one, hatter new <session> --group <name>; to end it, hatter rm%s\n' \
+                "$C_DIM" "$C_R"
+        fi
+
         edit_keys "a add   r rename   d forget   q quit"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
@@ -5421,8 +5474,21 @@ edit_groups() {
 
 # --- level 3: workspaces ----------------------------------------------------
 
+# The titles cmux shows in a hat's window, for marking a running session that
+# no workspace shows. Empty when cmux cannot say, and then nothing is marked.
+edit_cmux_titles() {
+    local win
+    cmux_alive || return 0
+    cmux_snapshot
+    win=$(find_hat_window "$1")
+    [[ -n "$win" ]] && titles_in_window "$win"
+    cmux_snapshot_drop
+    return 0
+}
+
 edit_workspaces() {
-    local hat="$1" group="$2" SEL=1 n ws i tabs att state
+    local hat="$1" group="$2" SEL=1 n ws i tabs att state titles
+    titles=$(edit_cmux_titles "$hat")
     while :; do
         WSS=(); n=0
         while IFS= read -r ws; do
@@ -5443,6 +5509,8 @@ edit_workspaces() {
             if [[ -n "$tabs" ]]; then
                 state=$(printf '%s● running%s  %s tab(s)' "$C_GR" "$C_R" "$tabs")
                 [[ "$att" == "1" ]] && state="$state  ${C_DIM}attached${C_R}"
+                [[ -n "$titles" ]] && ! grep -qxF "$ws" <<<"$titles" \
+                    && state="$state  ${C_YL}not in cmux${C_R} ${C_DIM}restore --missing mirrors it${C_R}"
             else
                 state=$(printf '%s✗ not running%s  %sre-create with restore%s' \
                         "$C_RD" "$C_R" "$C_DIM" "$C_R")
@@ -5463,7 +5531,7 @@ edit_workspaces() {
             enter|right|l)
                 [[ $n -gt 0 ]] && { edit_tabs "$hat" "$group" "$ws" || return 1; }
                 : ;;
-            !) edit_fetch_hat "$hat" ;;
+            !) edit_fetch_hat "$hat"; titles=$(edit_cmux_titles "$hat") ;;
             a|A)
                 edit_ask "new workspace name (a bare name gets the '$hat-' prefix)"
                 if [[ -n "$EDIT_REPLY" ]]; then
@@ -5950,7 +6018,9 @@ vocabulary is learned by looking around. Add, rename and remove are available at
 each one, and live status is shown where it exists:
 
   hats        up / no tmux server, and how many workspaces
-  workspaces  running / not running, tab count, whether a client is attached
+  groups      running sessions that no group records
+  workspaces  running / not running, tab count, whether a client is attached,
+              and running but not in cmux
   tabs        active, dead, running command, pane count, working directory
 
 Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
@@ -5965,7 +6035,16 @@ hatter list
 
 Show the whole tree from the config - every hat, its groups, and each group's
 workspaces with tab counts - followed by the cmux windows that are actually
-open. Takes no options. For live server state instead, use `hatter hat status`.
+open. Takes no options.
+
+Each server is asked which sessions are running, so nothing can hide:
+
+  not running              recorded, but its tmux session is gone
+  running, not in cmux     recorded and running, but no workspace shows it
+  running, in no group     running on the server, but no group records it
+
+A hat whose server cannot be reached says so, and its sessions go unmarked.
+For a per-hat summary, use `hatter hat status`.
 USAGE
     ;;
     sync) cat <<'USAGE'

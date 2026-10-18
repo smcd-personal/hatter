@@ -129,6 +129,37 @@ hatter_in sync || true
 expect "sync: an unreachable server leaves the config untouched" \
     "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
 
+# --- list: both kinds are marked ---------------------------------------------
+setup list
+printf 'dev-a\ndev-b\ndev-x\n' > "$d/server"
+hatter_in list || true
+expect "list: a running session missing from cmux is marked" \
+    "$(yes_if grep -q "dev-b .*- running, not in cmux" "$d/out")"
+expect "list: a session cmux shows is not marked" \
+    "$(yes_if grep -qx "    dev-a  (1 tabs)" "$d/out")"
+expect "list: a recorded session not running is marked" \
+    "$(yes_if grep -q "dev-c .*- not running" "$d/out")"
+expect "list: a running session no group records is listed" \
+    "$(yes_if bash -c 'sed -n "/running, in no group/{n;p;}" "$1" | grep -x "    dev-x" >/dev/null' _ "$d/out")"
+touch "$d/down"
+hatter_in list || true
+expect "list: an unreachable server says so and marks nothing" \
+    "$(yes_if grep -q "server not reached" "$d/out")"
+expect "list: an unreachable server marks nothing" \
+    "$(yes_if bash -c '! grep -q "not running\|not in cmux" "$1"' _ "$d/out")"
+
+# Two hats on one server: a running session no group records is listed once,
+# under the hat its prefix names.
+setup shared
+jq '.hats.ops = {"ssh": "dev@example.com", "remote_dir": "$HOME"}' \
+    "$d/home/.config/hatter/config.json" > "$d/c" && mv "$d/c" "$d/home/.config/hatter/config.json"
+printf 'dev-a\nops-y\n' > "$d/server"
+hatter_in list || true
+expect "list: a shared server's unrecorded session is listed once" \
+    "$(yes_if [ "$(grep -cx "    ops-y" "$d/out")" = 1 ])"
+expect "list: ...under the hat its prefix names" \
+    "$(yes_if bash -c 'sed -n "/^window \"ops\"/,/^$/p" "$1" | grep -qx "    ops-y"' _ "$d/out")"
+
 # --- rm: the deliberate way to forget ----------------------------------------
 setup rm
 printf 'dev-a\ndev-b\ndev-x\n' > "$d/server"
