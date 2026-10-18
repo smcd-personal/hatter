@@ -386,6 +386,33 @@ host_recorded_sessions() {
         | .sessions | keys[]?'
 }
 
+# hat_live_sessions <host>: the tmux sessions running there, one per line.
+# Non-zero when the server cannot be reached, which is not the same as a
+# server with no sessions: callers must not treat the first as the second.
+hat_live_sessions() {
+    local out
+    out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" \
+            "tmux list-sessions -F '#S' 2>/dev/null; echo @@hatter-ok" 2>/dev/null) || true
+    grep -qx '@@hatter-ok' <<<"$out" || return 1
+    grep -vx '@@hatter-ok' <<<"$out" || true
+    return 0
+}
+
+# hat_unrecorded <hat> <live sessions>: the running sessions that no hat on
+# this hat's server records, and that belong to this hat. Several hats can share
+# one server; a session goes to the hat its name is prefixed with, and one with
+# no such prefix goes to the first of them by name, so each is shown once.
+hat_unrecorded() {
+    cfg --arg l "$1" --arg live "$2" '
+        .hats[$l].ssh as $h
+        | ([.hats | to_entries[] | select(.value.ssh == $h) | .key] | sort) as $hats
+        | ([.groups[] | select(.hat as $x | $hats | index($x)) | .sessions | keys[]?]) as $rec
+        | $live | split("\n")[]
+        | select(. != "" and (. as $s | $rec | index($s) | not))
+        | select((split("-")[0]) as $p
+                 | if ($hats | index($p)) then $p == $l else $hats[0] == $l end)'
+}
+
 # Tell a server what the config records, and drop its registry entries for tabs
 # that have closed. hat-restore rebuilds tmux at boot from that registry and
 # never sees this config, so without this a sync changes nothing about what a
@@ -3450,9 +3477,10 @@ sync_once() {
     wait
 
     # Work out the new config, all in memory, saying what was found.
-    local patch='{}' adopt="" w host gname order recorded owner wjson
+    local patch='{}' adopt="" w host gname order recorded owner wjson seen lives=()
     for ((i = 0; i < n; i++)); do
         hat="${hats[$i]}" w="${wins[$i]}" host="${hosts[$i]}"
+        lives[$i]=""
         if [[ -z "$w" ]]; then
             echo "  $hat: no window open, leaving its config untouched"
             continue
@@ -3464,6 +3492,8 @@ sync_once() {
             continue
         fi
         reached+="$host"$'\n'
+        lives[$i]="$live"
+        seen=""
         # Session -> its windows, in tmux order.
         wjson=$(jq -R -s '
             split("\n") | map(select(startswith("W\t")) | split("\t")
@@ -3531,6 +3561,7 @@ sync_once() {
                     | [$rec[] | select(.pinned and (.name as $n | [$live[].name] | index($n) | not))]
                       + $live' <<<"$windows")
                 fresh=$(jq --arg s "$title" --argjson wj "$windows" '.[$s] = {windows: $wj}' <<<"$fresh")
+                seen+="$title"$'\n'
                 echo "  $hat / $gname / $title  ($(jq 'length' <<<"$windows") tabs)"
             done < <(jq -r --arg n "$gname" '.groups[] | select(.name==$n) | .member_workspace_ids[]?' <<<"$groups_json")
 
@@ -3541,6 +3572,29 @@ sync_once() {
                          icon: (if $i == "" then null else $i end),
                          pinned: $p, collapsed: $co, sessions: $s}' <<<"$patch")
         done < <(jq -r '.groups[]?.name' <<<"$groups_json")
+
+        # The recorded sessions cmux did not show in any of this hat's groups.
+        # Not being in cmux is not being gone: closing a mirrored workspace only
+        # detaches it, and its session runs on. One still running keeps its
+        # entry; only one gone from the server as well is dropped. A group cmux
+        # does not show at all is not rewritten, so its entries stay as they were.
+        local rg rs
+        while IFS=$'\t' read -r rg rs; do
+            [[ -z "$rs" ]] && continue
+            grep -qxF "$rs" <<<"$seen" && continue
+            if grep -qxF "$rs" <<<"$live"; then
+                echo "  $hat / $rg / $rs  kept (running, not in cmux)"
+                if jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null; then
+                    patch=$(jq -c --arg g "$rg" --arg s "$rs" \
+                                  --argjson e "$(cfg -c --arg g "$rg" --arg s "$rs" '.groups[$g].sessions[$s]')" \
+                                  '.[$g].sessions[$s] = $e' <<<"$patch")
+                fi
+            elif jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null; then
+                echo "  $hat / $rg / $rs  dropped (not running, not in cmux)"
+            fi
+        done < <(cfg --arg l "$hat" '
+            .groups | to_entries[] | select(.value.hat == $l)
+            | .key as $g | .value.sessions | keys[]? | [$g, .] | @tsv')
     done
     rm -rf "$tmp"
     cmux_snapshot_drop
@@ -3569,6 +3623,16 @@ sync_once() {
             | .groups[$e.key].collapsed = $e.value.collapsed
             | .groups[$e.key].sessions  = $e.value.sessions)'
     if [[ "$held" == 1 ]]; then hatter_unlock; trap - EXIT; fi
+
+    # Sessions running that no group records, now that the config holds what
+    # this pass found: say so, rather than leave them where nothing shows them.
+    local un
+    for ((i = 0; i < n; i++)); do
+        [[ -n "${lives[$i]}" ]] || continue
+        while IFS= read -r un; do
+            [[ -z "$un" ]] || echo "  ${hats[$i]}: '$un' is running but in no group, so not recorded"
+        done < <(hat_unrecorded "${hats[$i]}" "${lives[$i]}")
+    done
 
     # Once per server, after every hat on it is recorded and the config holds
     # it - and all at once.
@@ -5442,6 +5506,16 @@ renaming or rearranging anything in the cmux sidebar.
 
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.
+
+Not being in cmux is not the same as being gone. Closing a mirrored workspace
+only detaches it, and its tmux session runs on. So a recorded session that cmux
+no longer shows in a group, but that is still running on its server, keeps its
+entry, and sync reports it as "kept (running, not in cmux)"; `hatter restore
+--missing` mirrors it again. An entry is dropped only when its session is gone
+from the server too. To close a workspace for good, use `hatter rm`.
+
+Sessions running on a server that no group records are reported as well, and
+`hatter list` marks both kinds.
 
 Each server reached is also told which sessions the config records for it, and
 forgets the tabs that have closed. Its boot-time rebuild (hat-restore) then
