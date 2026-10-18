@@ -2548,9 +2548,16 @@ heal_hat_drags() {
 # drag_not_blank <read-screen status> <read-screen output>
 # Empty when the tab is plainly blank; otherwise why it is not, short enough
 # for one log line.
+#
+# A dragged tab is the tmux window's own container surface, which cmux stopped
+# routing to a terminal when it mirrored the window's panes into it. Carried to
+# another workspace it has no terminal at all, so cmux refuses to read it with
+# surface_unavailable. A local shell always has a terminal behind it, so that
+# refusal is as blank as a tab gets; any other failure is not known to be.
 drag_not_blank() {
     local rc="$1" screen="$2" line
     if [[ "$rc" != 0 ]]; then
+        grep -q 'surface_unavailable' <<<"$screen" && return 0
         line=$(printf '%s\n' "$screen" | grep -m 1 '[^[:space:]]' || true)
         printf 'cmux could not read it (exit %s%s)' "$rc" "${line:+: ${line:0:80}}"
         return 0
@@ -5215,9 +5222,12 @@ window there as a new tab, at the end. Nothing is re-mirrored. The autosave
 timer does the same once a minute, so a dragged tab is usually fixed before
 you ask. A tab is only moved when its window is certain: the blank tab's
 title names exactly one window that cmux no longer shows anywhere, and the
-tab really is blank. A local shell sitting in a mirrored workspace is never
-taken for one. A session's last tab is left where it is, since moving it
-would end that session: repair says how to move it.
+tab really is blank, or has no terminal behind it at all. A local shell
+sitting in a mirrored workspace is never taken for one. A session's last tab
+is left where it is, since moving it would end that session. Whenever a
+dragged tab is left alone, repair says why and gives the tmux command that
+moves it, and does not go on to re-mirror: that would lose the blank tab, and
+the window would show nowhere. The timer logs it once.
 
 The other way: the window did move, but cmux has stopped painting it, and
 nothing on the tmux side helps. For that, repair checks the session has

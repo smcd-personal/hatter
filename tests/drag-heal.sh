@@ -64,7 +64,9 @@ case "$*" in
     esac ;;
   read-screen*)
     case "$STUB_SCREEN" in
-      fail)  exit 1 ;;
+      fail)  echo 'Error: internal_error: Failed to read terminal text' >&2; exit 1 ;;
+      # What cmux says for a dragged tab: no terminal behind it at all.
+      unavailable) echo 'Error: surface_unavailable: The terminal surface is no longer available; reopen it or create a new terminal session.' >&2; exit 1 ;;
       text)  printf 'user@mac ~ %% \n' ;;
       blank) printf '   \n\n' ;;
     esac ;;
@@ -119,6 +121,12 @@ expect "a blank dragged tab: its window is moved" \
 expect "a blank dragged tab: the blank copy is closed" \
     "$(grep -q '^close .*--surface s-new ' <<<"$log" && echo y)"
 
+log=$(run unavailable unavailable)
+expect "a dragged tab cmux has no terminal for (surface_unavailable): its window is moved" \
+    "$(grep -q "^move .*move-window .*'=dev-a:@2' .*'=dev-b:'" <<<"$log" && echo y)"
+expect "a dragged tab cmux has no terminal for: the blank copy is closed" \
+    "$(grep -q '^close .*--surface s-new ' <<<"$log" && echo y)"
+
 log=$(run text text)
 expect "a tab showing text is neither moved nor closed" "$([[ -z "$log" ]] && echo y)"
 
@@ -129,7 +137,7 @@ expect "a tab showing text: the warning says what it shows, and how to move it b
 log=$(run fail fail)
 expect "a tab cmux cannot read is neither moved nor closed" "$([[ -z "$log" ]] && echo y)"
 expect "a tab cmux cannot read: the warning gives read-screen's exit status" \
-    "$(grep -q 'could not read it (exit 1)' "$work/run-fail/out" && echo y)"
+    "$(grep -q 'could not read it (exit 1: Error: internal_error' "$work/run-fail/out" && echo y)"
 
 # The autosave timer: a left-alone tab is logged on the first pass only.
 HATTER_CMD="_drag-heal dev once" run once text >/dev/null
