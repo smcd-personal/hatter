@@ -212,6 +212,32 @@ seed_config() {
 JSON
     fi
     migrate_config
+    migrate_unassigned
+}
+
+# A group a user named Unassigned before hatter kept one of its own. Sync would
+# read cmux's Unassigned as hatter's and leave this one behind, so its sessions
+# move into its hat's Unassigned (an entry already there wins), and a hat that
+# took it as its default group loses that default: a workspace made on purpose
+# does not go to Unassigned. A group with no hat cannot be keyed to one, so it
+# is left as it is; `hatter list` shows it among the groups with no hat.
+migrate_unassigned() {
+    local hat
+    hat=$(cfg '.groups.Unassigned // {} | select(.managed != true) | .hat // empty' 2>/dev/null) || return 0
+    [[ -n "$hat" ]] || return 0
+    info "Moving the group 'Unassigned' into hatter's own Unassigned group for hat '$hat'"
+    backup_config
+    jq_write --arg l "$hat" --arg n "$UNASSIGNED" '
+        .groups.Unassigned as $old
+        | "\($n)@\($l)" as $k
+        | ([.groups | to_entries[] | select(.key != "Unassigned" and .key != $k and .value.hat == $l)
+            | .value.sessions // {} | keys[]]) as $elsewhere
+        | .groups[$k] = (($old | del(.sessions)) + (.groups[$k] // {}) + {hat: $l, name: $n, managed: true})
+        | .groups[$k].sessions = ((($old.sessions // {}) + (.groups[$k].sessions // {}))
+                                  | with_entries(select(.key as $x | $elsewhere | index($x) | not)))
+        | del(.groups.Unassigned)
+        | .hats |= map_values(if .default_group == "Unassigned" then del(.default_group) else . end)
+        | '"$PRUNE_UNASSIGNED"
 }
 
 # v1 stored host/remote_dir per group. v2 hoisted those into named entries.
@@ -337,6 +363,15 @@ groups_of_hat() {
                       | sort_by(if .value.managed then 0 else 1 end) | .[].key'
 }
 
+# The group to put a new workspace in when nothing names one: the hat's first
+# real group. Unassigned holds sessions nobody placed, so a workspace made on
+# purpose goes there only when the hat has no other group at all.
+hat_pick_group() {
+    cfg --arg l "$1" 'first((.groups | to_entries[] | select(.value.hat == $l)
+                             | select(.value.managed | not) | .key),
+                            (.groups | to_entries[] | select(.value.hat == $l) | .key)) // empty'
+}
+
 # Unassigned is the group hatter keeps for itself, one per hat, for every
 # running session that would otherwise be in no group. Group names are config
 # keys and so unique across hats, while each hat's window shows its own
@@ -442,9 +477,12 @@ register_group() {
 # empty by the move goes with it.
 remember_session() {
     local group="$1" session="$2"
+    # Only the groups of the same hat: a group of another hat that happens to
+    # record the same name is a different session, on a different server.
     jq_write --arg g "$group" --arg s "$session" '
-        (first(.groups[] | .sessions[$s]? // empty) // {windows: []}) as $e
-        | .groups |= map_values(if .sessions then del(.sessions[$s]) else . end)
+        (.groups[$g].hat // null) as $h
+        | (first(.groups[] | select((.hat // null) == $h) | .sessions[$s]? // empty) // {windows: []}) as $e
+        | .groups |= map_values(if (.hat // null) == $h and .sessions then del(.sessions[$s]) else . end)
         | .groups[$g].sessions[$s] = $e
         | '"$PRUNE_UNASSIGNED"
 }
@@ -2561,7 +2599,7 @@ cmd_new() {
         group=$(hat_default_group "$hat")
     fi
     if [[ -z "$group" ]]; then
-        group=$(groups_of_hat "$hat" | head -1)
+        group=$(hat_pick_group "$hat")
     fi
     if [[ -z "$group" ]]; then
         [[ -t 0 ]] || die "no group for '$session' and no --group given"
@@ -3942,7 +3980,9 @@ cmd_group() {
     case "$sub" in
         list|"")
             cfg '.groups | to_entries[]
-                 | "\(.key)\t[hat: \(.value.hat)\(if .value.managed then ", managed by hatter" else "" end)]  \(.value.sessions | keys | join(", "))"'
+                 | if .value.managed
+                   then "\(.value.name // .key)\t[hat: \(.value.hat), hatter'"'"'s own; key \(.key)]  \(.value.sessions | keys | join(", "))"
+                   else "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys | join(", "))" end'
             ;;
         add|set)
             local name="${1:-}" hat=""
@@ -4548,7 +4588,7 @@ cmd_restore() {
                     continue
                 fi
                 cmux_change workspace-group add --group "$gref" --workspace "$wref" >/dev/null 2>&1 || true
-                echo "  ok  $hat / $group / $session -> $wref"
+                echo "  ok  $hat / $(group_display "$group") / $session -> $wref"
             done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
             apply_group_style "$group" "$gref"
         done < <(groups_of_hat "$hat")
