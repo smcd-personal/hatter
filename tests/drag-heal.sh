@@ -22,11 +22,14 @@ case "$*" in
     if [[ -f "$STUB_DIR/looked" ]]; then touch "$STUB_DIR/pass2"; fi
     touch "$STUB_DIR/looked"
     if [[ "${STUB_LAST:-}" ]]; then a_panes='[]'
+    elif [[ "${STUB_NODRAG:-}" ]]; then
+      a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]},{"surfaces":[{"id":"s-old","title":"two","type":"terminal"}]}]'
     else a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]}]'; fi
+    b_drop=',{"surfaces":[{"id":"s-new","title":"two","type":"terminal"}]}'
+    [[ "${STUB_NODRAG:-}" ]] && b_drop=""
     echo '{"windows":[{"id":"W1","workspaces":[
       {"id":"ws-a","title":"dev-a","panes":'"$a_panes"'},
-      {"id":"ws-b","title":"dev-b","panes":[{"surfaces":[{"id":"s-3","title":"three","type":"terminal"}]},
-                                            {"surfaces":[{"id":"s-new","title":"two","type":"terminal"}]}]}]}]}' ;;
+      {"id":"ws-b","title":"dev-b","panes":[{"surfaces":[{"id":"s-3","title":"three","type":"terminal"}]}'"$b_drop"']}]}]}' ;;
   *"workspace-group list"*) echo '{"groups":[]}' ;;
   *"remote.tmux.pane_surfaces"*)
     # The window id of "two": @5 once STUB_SECOND=newid has swapped it.
@@ -66,6 +69,7 @@ case "$*" in
       blank) printf '   \n\n' ;;
     esac ;;
   close-surface*) echo "close $*" >> "$log" ;;
+  close-workspace*) echo "close-workspace $*" >> "$log" ;;
 esac
 exit 0
 STUB
@@ -88,17 +92,20 @@ exit 0
 STUB
 chmod +x "$work/bin/cmux" "$work/bin/ssh"
 
-# run <name> <screen> [VAR=value ...] -> the stub log, after one heal
+# run <name> <screen> [VAR=value ...] -> the stub log, after one heal.
+# HATTER_CMD replaces the heal with another command; KEEP=1 reuses the run's
+# directory, as a second autosave pass would. Output is in $work/run-<name>/out.
 run() {
     local d="$work/run-$1" screen="$2"
     shift 2
-    rm -rf "$d"; mkdir -p "$d/home/.config/hatter"
+    [[ "${KEEP:-}" ]] || rm -rf "$d"
+    mkdir -p "$d/home/.config/hatter"
     echo '{"version":3,"hats":{"dev":{"ssh":"dev@example.com","remote_dir":"$HOME"}},
            "groups":{"G":{"hat":"dev","sessions":{"dev-a":{},"dev-b":{}}}}}' \
         > "$d/home/.config/hatter/config.json"
-    touch "$d/log"
+    rm -f "$d/log" "$d/looked" "$d/pass2"; touch "$d/log"
     env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
-        STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" _drag-heal >"$d/out" 2>&1 || true
+        STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" ${HATTER_CMD:-_drag-heal} >"$d/out" 2>&1 || true
     cat "$d/log"
 }
 
@@ -115,8 +122,32 @@ expect "a blank dragged tab: the blank copy is closed" \
 log=$(run text text)
 expect "a tab showing text is neither moved nor closed" "$([[ -z "$log" ]] && echo y)"
 
+expect "a tab showing text: the warning says what it shows, and how to move it by hand" \
+    "$(grep -q 'it shows "user@mac' "$work/run-text/out" \
+        && grep -qF "tmux move-window -s '=dev-a:@2' -t '=dev-b:'" "$work/run-text/out" && echo y)"
+
 log=$(run fail fail)
 expect "a tab cmux cannot read is neither moved nor closed" "$([[ -z "$log" ]] && echo y)"
+expect "a tab cmux cannot read: the warning gives read-screen's exit status" \
+    "$(grep -q 'could not read it (exit 1)' "$work/run-fail/out" && echo y)"
+
+# The autosave timer: a left-alone tab is logged on the first pass only.
+HATTER_CMD="_drag-heal dev once" run once text >/dev/null
+first=$(grep -c 'was left alone' "$work/run-once/out" || true)
+KEEP=1 HATTER_CMD="_drag-heal dev once" run once text >/dev/null
+second=$(grep -c 'was left alone' "$work/run-once/out" || true)
+expect "the timer logs a left-alone tab once, not every pass" \
+    "$([[ "$first" == 1 && "$second" == 0 ]] && echo y)"
+
+# repair over a left-alone drag stops; it must not re-mirror (close-workspace).
+log=$(HATTER_CMD="repair dev-b" run repair-refused text)
+expect "repair stops at a left-alone drag instead of re-mirroring" \
+    "$(grep -q 'was not re-mirrored' "$work/run-repair-refused/out" \
+        && ! grep -q '^close-workspace' <<<"$log" && echo y)"
+log=$(HATTER_CMD="repair dev-b" run repair-nodrag blank STUB_NODRAG=1)
+expect "repair with no drag goes on to its re-mirror checks" \
+    "$(! grep -q 'was not re-mirrored' "$work/run-repair-nodrag/out" \
+        && grep -qE 'has content|not running|blank on' "$work/run-repair-nodrag/out" && echo y)"
 
 log=$(run last blank STUB_LAST=1)
 expect "a session's last window is neither moved nor closed" \

@@ -2578,6 +2578,7 @@ drag_refuse() {
         once)
             seen="$AUTOSAVE_DIR/drag-refused"
             grep -qxF "$orphan" "$seen" 2>/dev/null && return 0
+            mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
             # Surface ids are never reused; the last few are all worth keeping.
             { tail -n 99 "$seen" 2>/dev/null; echo "$orphan"; } > "$seen.tmp" 2>/dev/null \
                 && mv "$seen.tmp" "$seen" 2>/dev/null || true ;;
@@ -5571,7 +5572,7 @@ case "$cmd" in
     shortcuts) cmd_shortcuts "$@" ;;
     # Not for people: the dragged-tab planner, and the healer, for the tests.
     _drag-plan) drag_plan ;;
-    _drag-heal) heal_dragged_tabs "${1:-}" report ;;
+    _drag-heal) heal_dragged_tabs "${1:-}" "${2:-report}" ;;
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
