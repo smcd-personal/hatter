@@ -38,6 +38,9 @@ unset CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID
 # ---------------------------------------------------------------- utilities
 
 die()  { echo "error: $*" >&2; exit 1; }
+# The unit separator, between fields that may be empty or hold any name: tab
+# is whitespace to read, which merges empty fields and trims names.
+US=$'\x1f'
 info() { echo "==> $*"; }
 warn() { echo "  !! $*" >&2; }
 
@@ -364,15 +367,23 @@ remember_session() {
 
 # --------------------------------------------------------------- remote tmux
 
+# Every command hatter sends a server reaches the account's login shell, which
+# need not be sh: fish, say, reads `$(...)`, `if ... fi` and `2>&1` its own
+# way. So each goes as `sh -c '<script>'`, one word the login shell only has
+# to pass on, and sh runs the script. (csh and tcsh cannot hold a newline in a
+# quoted word, so a multi-line script still needs a login shell other than
+# those.)
+posix_sh() { printf 'sh -c %s' "$(sq "$*")"; }
+
 remote_sh() {
     # -n so ssh cannot swallow the stdin of a calling loop.
     local host="$1"; shift
-    ssh -n "${SSH_OPTS[@]}" -o ConnectTimeout=10 "$host" "$@"
+    ssh -n "${SSH_OPTS[@]}" -o ConnectTimeout=10 "$host" "$(posix_sh "$*")"
 }
 
 remote_sh_stdin() {
     local host="$1"; shift
-    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 "$host" "$@"
+    ssh "${SSH_OPTS[@]}" -o ConnectTimeout=10 "$host" "$(posix_sh "$*")"
 }
 
 remote_session_exists() {
@@ -413,9 +424,9 @@ fi'
 # server with no sessions, and callers must not treat them as one.
 hat_live_sessions() {
     local out
-    out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" "$REMOTE_LIST_SH"'
+    out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" "$(posix_sh "$REMOTE_LIST_SH"'
         if [ -n "$lerr" ]; then printf "@@hatter-err %s\n" "$lerr"
-        else [ -z "$list" ] || printf "%s\n" "$list"; echo @@hatter-ok; fi' 2>/dev/null) || true
+        else [ -z "$list" ] || printf "%s\n" "$list"; echo @@hatter-ok; fi')" 2>/dev/null) || true
     if grep -q '^@@hatter-err ' <<<"$out"; then
         sed -n 's/^@@hatter-err //p' <<<"$out" | head -n 1 >&2
         return 2
@@ -428,14 +439,15 @@ hat_live_sessions() {
 # Where a session stands, worded once for sync, list and the rack:
 #   session_place <session> <live> <shown> <grouped>
 # <live> is the server's running sessions, <shown> the titles cmux shows in the
-# hat's window and <grouped> those of them in a group; "?" for <shown> means
-# cmux could not be read. Prints one of:
+# hat's window and <grouped> those of them in a group. Either is "?" when cmux
+# could not be read, and then nothing is claimed about it. Prints one of:
 #   not running | running | running, in no cmux group | running, not in cmux
 session_place() {
     grep -qxF -- "$1" <<<"$2" || { echo "not running"; return 0; }
-    if [[ "$3" == "?" ]] || grep -qxF -- "$1" <<<"$4"; then echo running
-    elif grep -qxF -- "$1" <<<"$3"; then echo "running, in no cmux group"
-    else echo "running, not in cmux"; fi
+    if [[ "$3" == "?" ]]; then echo running
+    elif ! grep -qxF -- "$1" <<<"$3"; then echo "running, not in cmux"
+    elif [[ "$4" == "?" ]] || grep -qxF -- "$1" <<<"$4"; then echo running
+    else echo "running, in no cmux group"; fi
 }
 
 # hat_unrecorded <hat> <live sessions>: the running sessions that no hat on
@@ -524,7 +536,7 @@ ensure_pinned_tabs() {
     while IFS=$'\x1f' read -r name cwd; do
         [[ -z "$name" ]] && continue
         local wid
-        wid=$(AWK_N="$name" awk -F'\t' '$2==ENVIRON["AWK_N"] {print $1; exit}' <<<"$live")
+        wid=$(AWK_N="$name" awk -F'\t' '($2 "") == (ENVIRON["AWK_N"] "") {print $1; exit}' <<<"$live")
         if [[ -n "$wid" ]]; then
             remote_sh "$host" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1" >/dev/null 2>&1 || true
             continue
@@ -741,14 +753,17 @@ cmux_snapshot() {
     for w in $ids; do
         ws=$(jq -c --arg w "$w" \
             '{workspaces: [.windows[] | select(.id == $w) | .workspaces[]? | {id, title}]}' <<<"$CMUX_SNAP_TREE")
+        # A window whose groups could not be read is kept as "", not as a
+        # window with no groups: window_groups_json then fails, as a live read
+        # would, so no caller mistakes it for an empty window.
         groups=$(cat "$tmp/$i")
-        [[ -n "$groups" ]] || groups='{"groups":[]}'
+        jq -e '.groups | type == "array"' <<<"$groups" >/dev/null 2>&1 || groups=""
         i=$((i + 1))
         CMUX_SNAP_IDS+=("$w")
         CMUX_SNAP_WS+=("$ws")
         CMUX_SNAP_TITLES+=("$(jq -r '.workspaces[].title // empty' <<<"$ws")")
         CMUX_SNAP_GROUPS+=("$groups")
-        CMUX_SNAP_GNAMES+=("$(jq -r '.groups[]?.name' <<<"$groups")")
+        CMUX_SNAP_GNAMES+=("$( [[ -z "$groups" ]] || jq -r '.groups[]?.name' <<<"$groups")")
     done
     rm -rf "$tmp"
     CMUX_SNAP=1
@@ -772,7 +787,10 @@ window_ws_json() {
 
 window_groups_json() {
     local i
-    if i=$(snap_index "$1"); then printf '%s\n' "${CMUX_SNAP_GROUPS[$i]}"; return 0; fi
+    if i=$(snap_index "$1"); then
+        [[ -n "${CMUX_SNAP_GROUPS[$i]}" ]] || return 1
+        printf '%s\n' "${CMUX_SNAP_GROUPS[$i]}"; return 0
+    fi
     cmux_json workspace-group list --window "$1"
 }
 
@@ -819,15 +837,19 @@ titles_in_window() {
 }
 
 # window_titles <window> [grouped]: the workspace titles cmux shows in a
-# window, or only those in one of its groups.
+# window, or only those in one of its groups; "?" when cmux could not say,
+# which session_place reads as unknown rather than as "none".
 window_titles() {
-    if [[ "${2:-}" != grouped ]]; then titles_in_window "$1"; return 0; fi
     local ws gs
-    ws=$(window_ws_json "$1" 2>/dev/null) || return 0
-    gs=$(window_groups_json "$1" 2>/dev/null) || return 0
+    ws=$(window_ws_json "$1" 2>/dev/null) || { echo "?"; return 0; }
+    if [[ "${2:-}" != grouped ]]; then
+        jq -r '.workspaces[]?.title // empty' <<<"$ws" 2>/dev/null || echo "?"
+        return 0
+    fi
+    gs=$(window_groups_json "$1" 2>/dev/null) || { echo "?"; return 0; }
     jq -r --argjson ws "$ws" '
         ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
-        | .groups[]?.member_workspace_ids[]? | $t[.] // empty' <<<"$gs" 2>/dev/null || true
+        | .groups[]?.member_workspace_ids[]? | $t[.] // empty' <<<"$gs" 2>/dev/null || echo "?"
 }
 
 workspace_ref_by_title() {
@@ -874,7 +896,7 @@ find_hat_window() {
             done <<<"$(groups_in_window "$w")"
         done
     } | AWK_HAT="$hat" awk -F '\t' '
-        BEGIN { hat = ENVIRON["AWK_HAT"] }
+        BEGIN { hat = ENVIRON["AWK_HAT"] "" }
         $1 == "want"  { want[$2] = 1; next }
         $1 == "mine"  { mine[$2] = 1; next }
         $1 == "win"   { order[++n] = $2; score[$2] = 0; next }
@@ -1711,7 +1733,8 @@ do_backfill() {
 
     # pane_pid -> session/window/name/cwd
     local panes
-    panes=$(tmux list-panes -a -F '#{pane_pid}	#{session_name}	#{window_index}	#{window_name}	#{pane_current_path}' 2>/dev/null) || panes=""
+    local us=$'\x1f'
+    panes=$(tmux list-panes -a -F "#{pane_pid}$us#{session_name}$us#{window_index}$us#{window_name}$us#{pane_current_path}" 2>/dev/null) || panes=""
     [ -n "$panes" ] || { say "hat-restore: no tmux panes"; return 0; }
 
     local n=0 miss=0 pid cwd sid owner line ppid hops f
@@ -1722,7 +1745,7 @@ do_backfill() {
         # shell, and how many levels deep depends on how it was started.
         owner=""; ppid="$pid"; hops=0
         while [ -n "$ppid" ] && [ "$ppid" != 1 ] && [ "$hops" -lt 12 ]; do
-            line=$(printf '%s\n' "$panes" | awk -v p="$ppid" -F'\t' '$1==p {print; exit}')
+            line=$(printf '%s\n' "$panes" | awk -v p="$ppid" -F'\037' '$1==p {print; exit}')
             [ -n "$line" ] && { owner="$line"; break; }
             ppid=$(awk '{print $4}' "/proc/$ppid/stat" 2>/dev/null)
             hops=$((hops+1))
@@ -1730,7 +1753,7 @@ do_backfill() {
         [ -n "$owner" ] || { miss=$((miss+1)); continue; }
 
         local _pp s w nm pcwd
-        IFS=$'\t' read -r _pp s w nm pcwd <<EOT
+        IFS=$'\x1f' read -r _pp s w nm pcwd <<EOT
 $owner
 EOT
         [ -n "$cwd" ] || cwd="$pcwd"
@@ -2364,7 +2387,7 @@ hat_status_row() {
     dest=$(hat_ssh "$hat")
 
     err=$(mktemp)
-    if probe=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$dest" '
+    if probe=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$dest" "$(posix_sh '
         printf "%s|" "$(tmux -V 2>/dev/null | awk "{print \$2}")"
         if [ -d "$HOME/.tmux/plugins/tmux-resurrect" ] \
            && [ -d "$HOME/.tmux/plugins/tmux-continuum" ]; then
@@ -2373,7 +2396,7 @@ hat_status_row() {
             printf "no|"
         fi
         printf "%s" "$(tmux list-sessions 2>/dev/null | wc -l | tr -d " ")"
-    ' 2>"$err"); then
+    ')" 2>"$err"); then
         reach="up"
         IFS='|' read -r tmuxv resurrect sessions <<<"$probe"
         [[ -n "$tmuxv" ]] || { tmuxv="-"; resurrect="-"; }
@@ -2419,10 +2442,10 @@ cmd_tab_pin() {
     local action="$1" tab="$3" line wid idx name
     tab_target "$2"
     line=$(remote_sh "$TAB_HOST" \
-        "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}	#{window_index}	#{window_name}' 2>/dev/null" \
-        | AWK_T="$tab" awk -F'\t' 'BEGIN {t = ENVIRON["AWK_T"]} $2==t {print; exit} $3==t && !n {n=$0} END {if (n) print n}' | head -n 1)
+        "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}$US#{window_index}$US#{window_name}' 2>/dev/null" \
+        | AWK_T="$tab" awk -F'\037' 'BEGIN {t = ENVIRON["AWK_T"] ""} ($2 "")==t {print; exit} ($3 "")==t && !n {n=$0} END {if (n) print n}' | head -n 1)
     [[ -n "$line" ]] || die "no tab '$tab' in '$TAB_SESSION' - give its index or its name"
-    IFS=$'\t' read -r wid idx name <<<"$line"
+    IFS=$'\x1f' read -r wid idx name <<<"$line"
     if [[ "$action" == pin ]]; then
         [[ -n "$name" ]] || die "tab $idx has no name, and a pinned tab is matched by name when it is
   brought back. Name it first:  tmux rename-window -t '=$TAB_SESSION:$idx' <name>"
@@ -2571,7 +2594,7 @@ drag_facts() {
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-drag.XXXXXX")
     while IFS= read -r title; do
         [[ -n "$title" ]] || continue
-        AWK_S="$title" awk -F '\t' '$1 == "S" && $2 == ENVIRON["AWK_S"] { f = 1 } END { exit !f }' <<<"$state" || continue
+        AWK_S="$title" awk -F '\t' '$1 == "S" && ($2 "") == (ENVIRON["AWK_S"] "") { f = 1 } END { exit !f }' <<<"$state" || continue
         printf '%s' "$title" > "$tmp/t.$k"
         ( cmux_pane_map "$host" "$title" > "$tmp/m.$k" || true ) &
         k=$((k + 1))
@@ -2684,7 +2707,7 @@ heal_hat_drags() {
         fi
         # Moving a session's last window ends the session. The drag asked for
         # that, but it is too much to do unasked.
-        if [[ "$(AWK_S="$from" awk -F '\t' '$1 == "W" && $2 == ENVIRON["AWK_S"]' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
+        if [[ "$(AWK_S="$from" awk -F '\t' '$1 == "W" && ($2 "") == (ENVIRON["AWK_S"] "")' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
             [[ -z "$report" ]] || warn "'${name:-tmux window}' is the last tab of '$from'; move it with: tmux move-window -s '=$from:$wid' -t '=$to:'"
             continue
         fi
@@ -2900,7 +2923,7 @@ attach_session() {
         fi
         warn "hat '$hat' asks for mosh, which is not installed here - using ssh"
     fi
-    exec ssh -t "$dest" "$cmd"
+    exec ssh -t "$dest" "$(posix_sh "$cmd")"
 }
 
 # The workspaces a hat has: those the config records, plus any running on its
@@ -3094,7 +3117,7 @@ else
 fi'
     # BatchMode: a hat that refuses this machine's key is "unreachable", not a
     # password prompt fighting the key for stdin.
-    printf '%s\n' "$2" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=10 "$dest" "sh -c $(sq "$script")"
+    printf '%s\n' "$2" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=10 "$dest" "$(posix_sh "$script")"
 }
 
 cmd_key() {
@@ -3174,7 +3197,7 @@ else
 fi
 f=$(readlink "$dir/last" 2>/dev/null) || f=""
 case "$f" in "") exit 0 ;; /*) ;; *) f="$dir/$f" ;; esac
-strip() { S="$s" awk -F "\t" "!((\$1 == \"pane\" || \$1 == \"window\" || \$1 == \"grouped_session\") && \$2 == ENVIRON[\"S\"])" "$1"; }
+strip() { S="$s" awk -F "\t" "!((\$1 == \"pane\" || \$1 == \"window\" || \$1 == \"grouped_session\") && (\$2 \"\") == (ENVIRON[\"S\"] \"\"))" "$1"; }
 if [ -s "$f" ] && [ "$(strip "$f" | wc -l)" -ne "$(wc -l < "$f")" ]; then
     new="tmux_resurrect_$(date +%Y%m%dT%H%M%S)-hatter-rm.txt"
     strip "$f" > "$dir/$new.tmp" && mv "$dir/$new.tmp" "$dir/$new" && ln -sfn "$new" "$dir/last"
@@ -3234,7 +3257,8 @@ cmd_rm() {
         info "Forgot '$session' (group '$group'); the server was not touched"
         echo "  If it is running it goes on running, and tmux-resurrect may bring it back"
         echo "  after a reboot. hatter's own boot rebuild drops it once a sync has told the"
-        echo "  server what the config records."
+        echo "  server what the config records - but while cmux still shows it in a group,"
+        echo "  the next sync records it there again."
         return 0
     fi
 
@@ -3677,8 +3701,11 @@ sync_once() {
                                 + (if .[5] == "1" then {pinned: true} else {} end))})
             | reduce .[] as $x ({}; .[$x.s] += [$x.w])' < "$tmp/ssh.$i")
 
-        groups_json=$(window_groups_json "$w" 2>/dev/null || echo '{"groups":[]}')
-        ws_json=$(window_ws_json "$w" 2>/dev/null || echo '{"workspaces":[]}')
+        # A read that failed is unknown, not empty: no group is found there,
+        # which changes nothing, and nothing is said about where a session is.
+        local gread=1 wread=1
+        groups_json=$(window_groups_json "$w" 2>/dev/null) || { groups_json='{"groups":[]}'; gread=0; }
+        ws_json=$(window_ws_json "$w" 2>/dev/null) || { ws_json='{"workspaces":[]}'; wread=0; }
 
         while IFS= read -r gname; do
             [[ -z "$gname" ]] && continue
@@ -3690,10 +3717,10 @@ sync_once() {
             if group_exists "$gname"; then
                 owner=$(group_hat "$gname")
             else
-                owner=$(AWK_G="$gname" awk -F '\t' '$1 == ENVIRON["AWK_G"] { print $2; exit }' <<<"$adopt")
+                owner=$(AWK_G="$gname" awk -F '\037' '($1 "") == (ENVIRON["AWK_G"] "") { print $2; exit }' <<<"$adopt")
                 if [[ -z "$owner" ]]; then
                     info "Adopting group '$gname' under hat '$hat'"
-                    adopt+="$gname"$'\t'"$hat"$'\n'
+                    adopt+="$gname$US$hat"$'\n'
                     owner="$hat"
                 fi
             fi
@@ -3764,6 +3791,8 @@ sync_once() {
         grouped=$(jq -r --argjson ws "$ws_json" '
             ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
             | .groups[]?.member_workspace_ids[]? | $t[.] // empty' <<<"$groups_json")
+        [[ "$wread" == 1 ]] || shown="?"
+        [[ "$gread" == 1 ]] || grouped="?"
         while IFS=$'\x1f' read -r rg rs; do
             [[ -z "$rs" ]] && continue
             total=$((total + 1))
@@ -3815,7 +3844,7 @@ sync_once() {
         return 1
     fi
     backup_config
-    while IFS=$'\t' read -r gname hat; do
+    while IFS=$'\x1f' read -r gname hat; do
         [[ -n "$gname" ]] && register_group "$gname" "$hat"
     done <<<"$adopt"
     jq_write --argjson p "$patch" '
@@ -3851,19 +3880,19 @@ sync_once() {
 }
 
 # What is actually missing for a hat, one line per finding:
-#   "<session>\tno tmux session"   recorded, but not running on the server
-#   "<session>\tnot mirrored"      running, but no workspace in the hat's window
-#   "\tno window"                  the hat has no cmux window at all
+#   "<session>\x1fno tmux session"   recorded, but not running on the server
+#   "<session>\x1fnot mirrored"      running, but no workspace in the hat's window
+#   "\x1fno window"                  the hat has no cmux window at all
 # Empty output means there is nothing to rebuild. Anything unreachable is
 # reported as unknown rather than guessed at, because "missing" would then mean
 # "recreate everything", which is the opposite of what the caller asked for.
 hat_missing() {
     local hat="$1" host live win titles group session
     host=$(hat_ssh "$hat")
-    [[ -n "$host" ]] || { printf '\tno ssh destination\n'; return 0; }
+    [[ -n "$host" ]] || { printf '\037no ssh destination\n'; return 0; }
 
-    if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" true 2>/dev/null; then
-        printf '\tunreachable\n'
+    if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" "$(posix_sh true)" 2>/dev/null; then
+        printf '\037unreachable\n'
         return 0
     fi
     live=$(remote_sessions "$host" 2>/dev/null || true)
@@ -3873,25 +3902,25 @@ hat_missing() {
     win=$(find_hat_window "$hat")
     titles=""
     [[ -n "$win" ]] && titles=$(titles_in_window "$win")
-    [[ -z "$win" ]] && printf '\tno window\n'
+    [[ -z "$win" ]] && printf '\037no window\n'
 
     while IFS= read -r group; do
         [[ -z "$group" ]] && continue
         while IFS= read -r session; do
             [[ -z "$session" ]] && continue
             if ! grep -qxF "$session" <<<"$live"; then
-                printf '%s\tno tmux session\n' "$session"
+                printf '%s\037no tmux session\n' "$session"
                 continue
             fi
             local pin
             while IFS= read -r pin; do
                 [[ -z "$pin" ]] && continue
                 grep -qxF "$session"$'\t'"$pin" <<<"$tabs" \
-                    || printf '%s\tpinned tab %s closed\n' "$session" "$pin"
+                    || printf '%s\037pinned tab %s closed\n' "$session" "$pin"
             done < <(cfg --arg g "$group" --arg s "$session" \
                         '.groups[$g].sessions[$s].windows[]? | select(.pinned) | .name')
             if [[ -n "$win" ]] && ! grep -qxF "$session" <<<"$titles"; then
-                printf '%s\tnot mirrored\n' "$session"
+                printf '%s\037not mirrored\n' "$session"
             fi
         done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
     done < <(groups_of_hat "$hat")
@@ -3956,14 +3985,14 @@ cmd_restore() {
             local line what why
             while IFS= read -r line; do
                 [[ -z "$line" ]] && continue
-                what="${line%%	*}"; why="${line#*	}"
+                what="${line%%"$US"*}"; why="${line#*"$US"}"
                 echo "  $hat: ${what:-(hat)} - $why"
             done <<<"$gaps"
         fi
 
         # Probe before opening a window, so an unreachable hat does not leave an
         # empty one behind, and never let one bad hat abort the whole restore.
-        if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" true 2>/dev/null; then
+        if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" "$(posix_sh true)" 2>/dev/null; then
             warn "$hat: $host unreachable, skipping"
             continue
         fi
@@ -4496,7 +4525,7 @@ creds_push_to() {
     # pipe: it is never written to disk on either side.
     if out=$("$CSWAP_BIN" export - --account "$email" \
              | ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 "$host" \
-                   'python3 "$HOME/.local/bin/hat-creds" install' 2>&1); then
+                   "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" install')" 2>&1); then
         echo "    ${out##*$'\n'}"
         set_hat_credential "$hat" "$email"
         return 0
@@ -4511,7 +4540,7 @@ creds_push_to() {
 
 creds_probe_hat() {
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$(hat_ssh "$1")" \
-        'python3 "$HOME/.local/bin/hat-creds" status' 2>/dev/null || true
+        "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" status')" 2>/dev/null || true
 }
 
 cmd_creds() {
@@ -4692,7 +4721,7 @@ edit_fetch_hat() {
     host=$(hat_ssh "$hat"); f=$(edit_sessions_file "$hat")
     : > "$f"; : > "$f.cred"
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-        "tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' 2>/dev/null; printf '@@@\n'; python3 \"\$HOME/.local/bin/hat-creds\" status 2>/dev/null || true" \
+        "$(posix_sh "tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' 2>/dev/null; printf '@@@\n'; python3 \"\$HOME/.local/bin/hat-creds\" status 2>/dev/null || true")" \
         > "$f.raw" 2>/dev/null || : > "$f.raw"
     awk -v sf="$f" -v cf="$f.cred" \
         '/^@@@$/ { seen = 1; next } seen { print > cf; next } { print > sf }' \
@@ -4728,14 +4757,14 @@ edit_refresh_all() {
 }
 
 edit_session_field() {
-    AWK_S="$2" awk -F'\t' -v c="$3" '$1==ENVIRON["AWK_S"] {print $c; exit}' "$(edit_sessions_file "$1")" 2>/dev/null
+    AWK_S="$2" awk -F'\t' -v c="$3" '($1 "")==(ENVIRON["AWK_S"] "") {print $c; exit}' "$(edit_sessions_file "$1")" 2>/dev/null
 }
 
 edit_windows() {
     local hat="$1" session="$2" host
     host=$(hat_ssh "$hat")
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-        "tmux list-windows -t $(sq "=$session") -F '#{window_index}	#{window_name}	#{window_active}	#{window_panes}	#{pane_current_command}	#{pane_current_path}	#{pane_dead}	#{@hatter-pinned}' 2>/dev/null" \
+        "$(posix_sh "tmux list-windows -t $(sq "=$session") -F '#{window_index}$US#{window_name}$US#{window_active}$US#{window_panes}$US#{pane_current_command}$US#{pane_current_path}$US#{pane_dead}$US#{@hatter-pinned}' 2>/dev/null")" \
         2>/dev/null
 }
 
@@ -5048,7 +5077,7 @@ edit_sync_restore() {
             for h in ${hat:-$(hat_names)}; do
                 while IFS= read -r line; do
                     [[ -z "$line" ]] && continue
-                    gaps+="$h	$line"$'\n'
+                    gaps+="$h$US$line"$'\n'
                 done < <(hat_missing "$h")
             done
             cmux_snapshot_drop
@@ -5059,7 +5088,7 @@ edit_sync_restore() {
         n=0
         if [[ -n "$gaps" ]]; then
             printf '  %sMISSING%s\n' "$C_YL" "$C_R"
-            while IFS=$'\t' read -r h what why; do
+            while IFS=$'\x1f' read -r h what why; do
                 [[ -z "$h" ]] && continue
                 n=$((n+1))
                 printf '     %s%-11s%s %-22s %s%s%s\n' \
@@ -5376,7 +5405,7 @@ edit_tabs() {
     local idx nm active panes cmd cwd dead pin mark short plural
     while :; do
         IDXS=(); NAMES=(); METAS=(); PINS=(); n=0
-        while IFS=$'\t' read -r idx nm active panes cmd cwd dead pin; do
+        while IFS=$'\x1f' read -r idx nm active panes cmd cwd dead pin; do
             [[ -z "$idx" ]] && continue
             if [[ "$dead" == "1" ]]; then mark="${C_RD}✗ dead${C_R}   "
             elif [[ "$active" == "1" ]]; then mark="${C_GR}● active${C_R} "
@@ -5749,7 +5778,9 @@ cannot be read, nothing is changed.
                    as it is: the session runs on, and tmux-resurrect may bring
                    it back after a reboot. Use it for an entry whose server is
                    gone, or a session you want to keep but stop tracking.
-                   `hatter list` then shows it, if running, as in no group.
+                   While cmux still shows it in a group, the next sync
+                   records it there again; otherwise `hatter list` shows
+                   it, if running, as in no group.
 
 The rack's workspace screen does both with d: k ends and forgets, f forgets
 only.
