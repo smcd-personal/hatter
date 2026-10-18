@@ -31,6 +31,10 @@ Four nouns, and one of them is the idea:
 | **workspace** | a tmux session, named `<hat>-<subproject>` |
 | **tab** | a tmux window inside that session |
 
+No workspace runs outside a group: a running session that no group records
+goes into its hat's **Unassigned** group, which hatter manages itself and
+removes once it is empty (`hatter help group`).
+
 The hat prefix on a session name is what selects the window and the ssh
 connection, so a side project can live under your main hat as
 `dev-website-parser` and still land in the right place.
