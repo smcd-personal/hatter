@@ -27,6 +27,8 @@ cat > "$work/bin/ssh" <<'STUB'
 cmd="${*: -1}"
 dest=""
 for a in "$@"; do case "$a" in *@*.example.com) dest="$a" ;; esac; done
+# hatter sends every command as `sh -c '<script>'`; take the script out.
+[[ "$cmd" == "sh -c "* ]] && { eval "set -- $cmd"; cmd="$3"; }
 srv="$STUB_DIR/server.${dest%%@*}"
 touch "$srv"
 case "$cmd" in
