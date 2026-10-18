@@ -197,7 +197,7 @@ expect "sync: a session cmux shows is recorded from tmux" \
     "$(yes_if [ "$(cfg_of '.groups.G.sessions["dev-a"].windows[0].name')" = w-dev-a ])"
 expect "sync: a group cmux does not show is left alone" "$(yes_if has H dev-h)"
 expect "sync: a running session no group records is reported" \
-    "$(yes_if grep -q "'dev-x' is running but in no group" "$d/out")"
+    "$(yes_if grep -q "dev / Unassigned / dev-x  (running, was in no group)" "$d/out")"
 expect "sync: the server is told about the kept session" "$(yes_if grep -qx dev-b "$d/told")"
 expect "sync: every remote command goes through sh -c" "$(yes_if no_bare)"
 expect "sync: every ssh call has keepalives" \
