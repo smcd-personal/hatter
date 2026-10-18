@@ -30,6 +30,9 @@ cat > "$work/bin/ssh" <<'STUB'
 n=$(($# - 1)); printf '%s ' "${@:1:$n}" >> "$STUB_DIR/sshargs"; echo >> "$STUB_DIR/sshargs"
 [[ -e "$STUB_DIR/down" ]] && { echo "ssh: connect to host: Connection refused" >&2; exit 255; }
 cmd="${*: -1}"
+# hatter sends every command as `sh -c '<script>'`, for any login shell.
+# Unwrap it, and note any that came bare.
+if [[ "$cmd" == "sh -c "* ]]; then eval "set -- $cmd"; cmd="$3"; else echo "$cmd" >> "$STUB_DIR/bare"; fi
 srv="$STUB_DIR/server"
 touch "$srv"
 case "$cmd" in
@@ -72,7 +75,9 @@ cat > "$work/bin/cmux" <<'STUB'
 case "$*" in
     "list-windows --json")              echo '[{"id":"W1"}]' ;;
     "tree --all --json")                cat "$STUB_DIR/tree.json" ;;
-    "workspace-group list --window W1 --json") cat "$STUB_DIR/groups.json" ;;
+    "workspace-group list --window W1 --json")
+        [[ -z "${STUB_GROUPS_FAIL:-}" ]] || exit 1
+        cat "$STUB_DIR/groups.json" ;;
     "workspace list --window W1 --json")
         jq -c '{workspaces: .windows[0].workspaces}' "$STUB_DIR/tree.json" ;;
     "rpc remote.tmux.pane_surfaces"*)   echo '{"panes":[]}' ;;
@@ -115,7 +120,7 @@ EOF
     : > "$d/log"
     r="$d/rhome/.tmux/resurrect"
     mkdir -p "$r" "$d/rhome/.local/bin"
-    printf 'pane\tdev-a\t0\t1\nwindow\tdev-a\t0\tw\npane\tdev-b\t0\t1\nwindow\tdev-b\t0\tw\nstate\tdev-a\tdev-b\n' \
+    printf 'pane\tdev-a\t0\t1\nwindow\tdev-a\t0\tw\npane\tdev-b\t0\t1\nwindow\tdev-b\t0\tw\ngrouped_session\tdev-b\tdev-a\nstate\tdev-a\tdev-b\n' \
         > "$r/tmux_resurrect_old.txt"
     ln -s tmux_resurrect_old.txt "$r/last"
     cat > "$d/rhome/.local/bin/hat-save" <<'EOF'
@@ -137,8 +142,11 @@ hatter_in() {
     env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
         STUB_DIR="$d" STUB_TBIN="$work/tbin" /bin/bash "$hatter" "$@" < /dev/null > "$d/out" 2>&1
 }
-# The sessions the server's `last` snapshot would bring back.
-in_last() { awk -F '\t' '$1 == "pane" { print $2 }' "$d/rhome/.tmux/resurrect/last" | sort -u; }
+# The sessions the server's `last` snapshot would bring back, from any line.
+in_last() { awk -F '\t' '$1 == "pane" || $1 == "window" || $1 == "grouped_session" { print $2 }' \
+                "$d/rhome/.tmux/resurrect/last" | sort -u; }
+old_snapshot_intact() { [ "$(wc -l < "$d/rhome/.tmux/resurrect/tmux_resurrect_old.txt" | tr -d ' ')" = 6 ]; }
+no_bare() { [ ! -e "$d/bare" ]; }
 last_is() { [ "$(in_last | tr '\n' ' ')" = "$1 " ]; }
 hasnt() { ! has "$@"; }
 has_all() { local g="$1" s; shift; for s in "$@"; do has "$g" "$s" || return 1; done; }
@@ -191,6 +199,7 @@ expect "sync: a group cmux does not show is left alone" "$(yes_if has H dev-h)"
 expect "sync: a running session no group records is reported" \
     "$(yes_if grep -q "'dev-x' is running but in no group" "$d/out")"
 expect "sync: the server is told about the kept session" "$(yes_if grep -qx dev-b "$d/told")"
+expect "sync: every remote command goes through sh -c" "$(yes_if no_bare)"
 expect "sync: every ssh call has keepalives" \
     "$(yes_if bash -c '! grep -v "ServerAliveInterval=10 -o ServerAliveCountMax=3" "$1"' _ "$d/sshargs")"
 [[ "$fails" == 0 ]] || cat "$d/out"
@@ -209,6 +218,16 @@ printf 'dev-x\n' > "$d/server"
 hatter_in sync || true
 expect "sync: with no recorded session running, none is dropped" \
     "$(yes_if has_all G dev-a dev-c)"
+# Nothing recorded runs, though no more than half would go: G's two are down,
+# and H's three, which cmux does not show, are not counted as going.
+setup none-few
+jq '.groups.G.sessions = {"dev-a": {"windows": []}, "dev-b": {"windows": []}}
+    | .groups.H.sessions = {"dev-h1": {}, "dev-h2": {}, "dev-h3": {}}' \
+    "$d/home/.config/hatter/config.json" > "$d/c" && mv "$d/c" "$d/home/.config/hatter/config.json"
+printf 'dev-x\n' > "$d/server"
+hatter_in sync || true
+expect "sync: with no recorded session running, none is dropped, even when few would go" \
+    "$(yes_if all_of has_all G dev-a dev-b -- says "none is dropped this pass")"
 # One of seven going is a close, not a reboot: dropped.
 setup one-gone
 printf 'dev-a\ndev-b\ndev-c\ndev-l\n%s\n' "$Q" > "$d/server"
@@ -250,6 +269,10 @@ STUB_TMUX_ERR=1 hatter_in list || true
 expect "list: a tmux that cannot be read is unknown, not empty" \
     "$(yes_if bash -c 'grep -q "live state unknown: error connecting" "$1" && ! grep -q "not running" "$1"' _ "$d/out")"
 
+STUB_GROUPS_FAIL=1 hatter_in list || true
+expect "list: groups cmux could not read are unknown, so nothing is called loose" \
+    "$(yes_if all_of lacks "in no cmux group" -- says "dev-b  (1 tabs)  - running, not in cmux")"
+
 # Two hats on one server: a running session no group records is listed once,
 # under the hat its prefix names.
 setup shared
@@ -270,6 +293,7 @@ expect "rm: kills the tmux session" "$(yes_if grep -qx "kill dev-b" "$d/log")"
 expect "rm: takes a fresh snapshot" "$(yes_if grep -qx save "$d/log")"
 expect "rm: the snapshot a reboot restores no longer holds it" \
     "$(yes_if last_is "dev-a dev-x")"
+expect "rm: ...and every remote command went through sh -c" "$(yes_if no_bare)"
 expect "rm: forgets the entry" "$(yes_if hasnt G dev-b)"
 expect "rm: tells the server" "$(yes_if bash -c '! grep -qx dev-b "$1" && grep -qx dev-a "$1"' _ "$d/told")"
 
@@ -286,6 +310,33 @@ expect "rm: ...and the snapshot a reboot restores no longer holds it" \
     "$(yes_if last_is "dev-a")"
 expect "rm: ...keeping the rest of the snapshot" \
     "$(yes_if grep -q "^state" "$d/rhome/.tmux/resurrect/last")"
+expect "rm: ...in a new file, the old snapshot untouched" "$(yes_if old_snapshot_intact)"
+
+# No hat-save on the server, so taking the session out of `last` is all that
+# keeps it from coming back. Names are matched as strings: removing "1" leaves
+# "01", and regex characters and a backslash mean nothing special.
+odd_case() {  # odd_case <name to remove> <names in the snapshot...>
+    local gone="$1" n; shift
+    setup "odd-$RANDOM"
+    rm "$d/rhome/.local/bin/hat-save"
+    r="$d/rhome/.tmux/resurrect"
+    rm "$r/last" "$r/tmux_resurrect_old.txt"
+    for n in "$@"; do printf 'pane\t%s\t0\t1\nwindow\t%s\t0\tw\ngrouped_session\t%s\tx\n' "$n" "$n" "$n"; done \
+        > "$r/tmux_resurrect_old.txt"
+    ln -s tmux_resurrect_old.txt "$r/last"
+    printf '%s\n' "$@" > "$d/server"
+    jq --arg s "$gone" '.groups.G.sessions[$s] = {"windows": []}' "$d/home/.config/hatter/config.json" > "$d/c" \
+        && mv "$d/c" "$d/home/.config/hatter/config.json"
+    hatter_in rm "$gone" || true
+}
+odd_case 1 01 1 dev-a
+expect "rm: removing session 1 leaves 01 in the snapshot" "$(yes_if last_is "01 dev-a")"
+odd_case 'dev-[a]*.+' 'dev-[a]*.+' dev-aa dev-a
+expect "rm: a name with regex characters is taken out alone" "$(yes_if last_is "dev-a dev-aa")"
+odd_case "dev-q\\z" "dev-q\\z" dev-qz dev-a
+expect "rm: a name with a backslash is taken out alone" "$(yes_if last_is "dev-a dev-qz")"
+expect "rm: ...from a new file, the old one untouched" \
+    "$(yes_if [ "$(wc -l < "$d/rhome/.tmux/resurrect/tmux_resurrect_old.txt" | tr -d ' ')" = 9 ])"
 
 setup rm-q
 printf 'dev-a\n%s\n' "$Q" > "$d/server"
