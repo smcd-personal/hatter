@@ -901,8 +901,10 @@ groups_in_window() {
 }
 
 group_ref_in_window() {
+    # A failed read is "not found", never an exit: set -e and pipefail would
+    # otherwise end the caller here without a word.
     cmux_json workspace-group list --window "$1" 2>/dev/null \
-        | jq -r --arg n "$2" '.groups[]? | select(.name == $n) | .id' | head -1
+        | jq -r --arg n "$2" '.groups[]? | select(.name == $n) | .id' 2>/dev/null | head -1 || true
 }
 
 titles_in_window() {
@@ -1083,12 +1085,14 @@ ensure_cmux_group() {
     name=$(group_display "$1")
     ref=$(group_ref_in_window "$win" "$name")
     if [[ -z "$ref" ]]; then
+        local err=""
         info "Creating workspace group '$name'" >&2
-        cmux_group_create "$win" "$name" || true
+        err=$(cmux_group_create "$win" "$name" 2>&1 >/dev/null) || true
         sleep 0.4
         ref=$(group_ref_in_window "$win" "$name")
     fi
-    [[ -n "$ref" ]] || die "could not create or find workspace group: $name"
+    [[ -n "$ref" ]] || die "could not create or find workspace group: $name${err:+
+  cmux said: $err}"
     group_managed "$1" && cmux_group_to_top "$ref" "$win"
     printf '%s' "$ref"
 }
@@ -1106,14 +1110,24 @@ cmux_group_create() {
     local win="$1" name="$2" from="${3:-}" key
     key="hatter:$win:$name:$(( $(date +%s) / 60 ))"
     if [[ -n "$from" ]]; then
-        cmux workspace-group create --name "$name" --from "$from" --idempotency-key "$key" >/dev/null 2>&1
+        cmux workspace-group create --name "$name" --from "$from" --idempotency-key "$key" >/dev/null
     else
         cmux focus-window --window "$win" >/dev/null 2>&1 || true
-        cmux workspace-group create --name "$name" --idempotency-key "$key" >/dev/null 2>&1
+        cmux workspace-group create --name "$name" --idempotency-key "$key" >/dev/null
     fi
 }
-cmux_group_add()  { cmux workspace-group add --group "$1" --workspace "$2" >/dev/null 2>&1; }
-cmux_group_move() { cmux workspace-group move "$1" --to-index "$2" >/dev/null 2>&1; }
+cmux_group_add()    { cmux workspace-group add --group "$1" --workspace "$2" >/dev/null 2>&1; }
+cmux_group_move()   { cmux workspace-group move "$1" --to-index "$2" >/dev/null 2>&1; }
+cmux_group_rename() { cmux workspace-group rename "$1" --name "$2" >/dev/null 2>&1; }
+# cmux_group_style <ref> color|icon|pin|collapse [value]
+cmux_group_style() {
+    case "$2" in
+        color)    cmux workspace-group set-color "$1" --hex "$3" ;;
+        icon)     cmux workspace-group set-icon "$1" --symbol "$3" ;;
+        pin)      cmux workspace-group pin "$1" ;;
+        collapse) cmux workspace-group collapse "$1" ;;
+    esac >/dev/null 2>&1
+}
 # Only ever for a group with no running session in it. The flag removes the
 # anchor cmux made for an anchor-only group; a group with members is never
 # dissolved without it, so nothing in it is set loose.
@@ -1210,11 +1224,11 @@ apply_group_style() {
     collapsed=$(cfg --arg g "$group" '.groups[$g].collapsed // false')
 
     [[ -n "$color" && "$color" != "null" ]] && \
-        cmux workspace-group set-color "$ref" --hex "$color" >/dev/null 2>&1 || true
+        cmux_group_style "$ref" color "$color" || true
     [[ -n "$icon" && "$icon" != "null" ]] && \
-        cmux workspace-group set-icon "$ref" --symbol "$icon" >/dev/null 2>&1 || true
-    [[ "$pinned" == "true" ]] && cmux workspace-group pin "$ref" >/dev/null 2>&1 || true
-    [[ "$collapsed" == "true" ]] && cmux workspace-group collapse "$ref" >/dev/null 2>&1 || true
+        cmux_group_style "$ref" icon "$icon" || true
+    [[ "$pinned" == "true" ]] && cmux_group_style "$ref" pin || true
+    [[ "$collapsed" == "true" ]] && cmux_group_style "$ref" collapse || true
     return 0
 }
 
@@ -2509,7 +2523,7 @@ cmd_new() {
         die "no cmux workspace appeared for '$session'"
     fi
 
-    cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null
+    cmux_group_add "$gref" "$wref" || die "cmux would not put '$session' into group '$(group_display "$group")'"
     apply_group_style "$group" "$gref"
     discard_stray_workspace "$win"
     cmux workspace select --workspace "$wref" >/dev/null 2>&1 || \
@@ -3012,7 +3026,7 @@ cmd_repair() {
             # It was the group's only member, and closing it took the group too.
             gref=$(ensure_cmux_group "$gname" "$win")
         fi
-        if ! cmux workspace-group add --group "$gref" --workspace "$new" >/dev/null 2>&1; then
+        if ! cmux_group_add "$gref" "$new"; then
             warn "could not put '$session' back in group '$gname'"
             gname=""
         fi
@@ -3742,7 +3756,7 @@ cmd_group() {
             if [[ -n "$win" ]]; then
                 gref=$(group_ref_in_window "$win" "$old_name")
                 [[ -n "$gref" ]] && \
-                    cmux workspace-group rename "$gref" --name "$new_name" >/dev/null 2>&1 || true
+                    cmux_group_rename "$gref" "$new_name" || true
             fi
 
             backup_config
@@ -3825,7 +3839,7 @@ settle_ungrouped() {
 
     # 2. cmux: each loose workspace of a running session goes into the group
     # the config records it in. "<workspace id>\x1f<group key>" per line.
-    local placed g ids name ref changed=0
+    local placed g ids name ref changed=0 done_n
     placed=$(jq -r --argjson g "$groups_json" --arg live "$live" \
                    --argjson rec "$(cfg -c --arg l "$hat" '[.groups | to_entries[] | select(.value.hat == $l)
                                         | .key as $k | .value.sessions | keys[]? | {key: ., value: $k}] | from_entries')" '
@@ -3836,22 +3850,31 @@ settle_ungrouped() {
         | [.id, $rec[.title]] | join("\u001f")' <<<"$ws_json")
     while IFS= read -r g; do
         [[ -z "$g" ]] && continue
-        ids=$(AWK_G="$g" awk -F '\037' '$2 == ENVIRON["AWK_G"] { print $1 }' <<<"$placed")
+        ids=$(AWK_G="$g" awk -F '\037' '($2 "") == (ENVIRON["AWK_G"] "") { print $1 }' <<<"$placed")
         name=$(group_display "$g")
         ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+        changed=1 done_n=0
+        if [[ -z "$ref" ]]; then
+            # What the caller read may be seconds old, and another hatter may
+            # have made the group since: look again right before making one.
+            groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || continue
+            ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+        fi
         if [[ -z "$ref" ]]; then
             info "Creating workspace group '$name' in $hat's window"
-            cmux_group_create "$win" "$name" "$(paste -sd , - <<<"$ids")" \
-                || warn "could not create group '$name' in $hat's window"
-            groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups_json='{}'
-            ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+            if cmux_group_create "$win" "$name" "$(paste -sd , - <<<"$ids")" 2>/dev/null; then
+                groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups_json='{}'
+                ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+                [[ -n "$ref" ]] && done_n=$(wc -l <<<"$ids" | tr -d ' ')
+            fi
+            [[ -n "$ref" ]] || warn "could not create group '$name' in $hat's window"
         else
             while IFS= read -r s; do
-                cmux_group_add "$ref" "$s" || warn "could not put a workspace into group '$name'"
+                if cmux_group_add "$ref" "$s"; then done_n=$((done_n + 1))
+                else warn "could not put a workspace into group '$name'"; fi
             done <<<"$ids"
         fi
-        changed=1
-        echo "  $hat / $name: put back $(wc -l <<<"$ids" | tr -d ' ') loose workspace(s)"
+        [[ "$done_n" == 0 ]] || echo "  $hat / $name: put back $done_n loose workspace(s)"
         [[ -n "$ref" ]] && apply_group_style "$g" "$ref"
     done < <(awk -F '\037' '{ print $2 }' <<<"$placed" | sort -u)
 
@@ -3880,9 +3903,21 @@ settle_ungrouped() {
         | [($m | length), ([$m[] | $t[.] // "" | select(. as $x | $l | index($x))] | length)]
         | map(tostring) | join(" ")' <<<"$now" 2>/dev/null) || return 0
     [[ "$busy" == 0 ]] || return 0
+    # A group cmux will not remove - one holding a workspace that is not a
+    # session, say - is tried once and then left until its members change,
+    # rather than on every autosave tick.
+    local marker sig
+    marker="${XDG_STATE_HOME:-$HOME/.local/state}/hatter/unassigned-rm.${win//[^A-Za-z0-9_-]/_}"
+    sig="$ref:$(jq -r --arg r "$ref" '[.groups[]? | select(.id == $r) | .member_workspace_ids[]?] | join(",")' <<<"$now")"
+    [[ "$(cat "$marker" 2>/dev/null)" == "$sig" ]] && return 0
     info "Removing the empty '$UNASSIGNED' group from $hat's window"
-    cmux_group_remove "$ref" "$members" \
-        || warn "could not remove the empty group '$UNASSIGNED' from $hat's window"
+    if cmux_group_remove "$ref" "$members"; then
+        rm -f "$marker"
+    else
+        mkdir -p "${marker%/*}" 2>/dev/null && printf '%s\n' "$sig" > "$marker" 2>/dev/null || true
+        warn "cmux would not remove the group '$UNASSIGNED' from $hat's window (it holds a workspace"
+        warn "that is not a hatter session); leaving it until what is in it changes"
+    fi
     return 0
 }
 
@@ -4329,7 +4364,10 @@ cmd_restore() {
                     warn "no workspace appeared for '$session'"
                     continue
                 fi
-                cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null 2>&1 || true
+                if ! cmux_group_add "$gref" "$wref"; then
+                    warn "could not put '$session' into group '$(group_display "$group")'"
+                    continue
+                fi
                 echo "  ok  $hat / $(group_display "$group") / $session -> $wref"
             done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
             apply_group_style "$group" "$gref"
