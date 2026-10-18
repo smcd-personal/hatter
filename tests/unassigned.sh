@@ -64,7 +64,8 @@ case "$1 ${2:-}" in
     "list-windows --json") jq -c '[.windows[] | {id}]' "$d/tree.json" ;;
     "tree --all")          cat "$d/tree.json" ;;
     "workspace list")      jq -c --arg w "$(arg --window "$@")" '{workspaces: [.windows[] | select(.id == $w) | .workspaces[]]}' "$d/tree.json" ;;
-    "workspace-group list") cat "$d/groups.$(arg --window "$@").json" ;;
+    "workspace-group list") [[ -z "${STUB_GROUPS_FAIL:-}" ]] || exit 1
+                           cat "$d/groups.$(arg --window "$@").json" ;;
     "workspace-group create")
         echo "$*" >> "$log"
         name=$(arg --name "$@"); from=$(arg --from "$@"); w=$(win_of_ws "${from%%,*}")
@@ -80,10 +81,15 @@ case "$1 ${2:-}" in
                            | if .id == $g then .member_workspace_ids += [$ws] else . end)' ;;
     "workspace-group ungroup")
         echo "$*" >> "$log"
+        # STUB_FLAG_FAIL: cmux refuses --remove-generated-anchor (no such anchor).
+        [[ -n "${STUB_FLAG_FAIL:-}" && "$*" == *--remove-generated-anchor* ]] && exit 1
         edit "$(win_of_group "$3")" --arg g "$3" '.groups |= map(select(.id != $g))' ;;
     "workspace-group move")
         echo "$*" >> "$log"
-        edit "$(win_of_group "$3")" --arg g "$3" '.groups |= ((map(select(.id == $g))) + map(select(.id != $g)))' ;;
+        # STUB_NO_MOVE: cmux takes the move and does nothing.
+        [[ -n "${STUB_NO_MOVE:-}" ]] && exit 0
+        edit "$(win_of_group "$3")" --arg g "$3" --argjson i "$(arg --to-index "$@")" '
+            .groups |= (map(select(.id != $g)) as $rest | $rest[:$i] + map(select(.id == $g)) + $rest[$i:])' ;;
     "workspace-group "*)   echo "$*" >> "$log" ;;
     "rpc "*)               echo '{"panes":[]}' ;;
     *) echo "stub cmux: unexpected: $*" >&2; exit 1 ;;
@@ -102,9 +108,23 @@ setup() {
 groups() { printf '%s\n' "$2" > "$d/groups.$1.json"; }
 cfg_of() { jq -r "$1" < "$d/home/.config/hatter/config.json"; }
 hatter_in() {
-    env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
+    env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" XDG_STATE_HOME="$d/state" PATH="$work/bin:$PATH" \
         STUB_DIR="$d" /bin/bash "$hatter" "$@" < /dev/null > "$d/out" 2>&1
 }
+logged() { grep -qF -- "$1" "$d/log"; }
+unlogged() { ! logged "$1"; }
+says() { grep -qF -- "$1" "$d/out"; }
+# all_of <check> [args] -- <check> [args] ...: every check passes.
+all_of() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        if [ "$1" = -- ]; then "${args[@]}" || return 1; args=()
+        else args+=("$1"); fi
+        shift
+    done
+    [ ${#args[@]} -eq 0 ] || "${args[@]}"
+}
+is() { [ "$(cfg_of "$1")" = "$2" ]; }
 
 ONE_HAT='{"version": 3,
   "hats": {"dev": {"ssh": "dev@dev.example.com", "remote_dir": "$HOME"}},
@@ -268,6 +288,133 @@ hatter_in hat rename ops ops2 || true
 expect "hat rename carries the hat's Unassigned with it" \
     "$(yes_if [ "$(cfg_of '[(.groups | has("Unassigned@ops")), .groups["Unassigned@ops2"].hat] | map(tostring) | join(" ")')" \
                 = "false ops2" ])"
+
+
+# --- review fixes ---------------------------------------------------------------
+UCFG() { jq --argjson s "$1" '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true, "sessions": $s}' <<<"$ONE_HAT"; }
+
+# A workspace made on purpose never lands in Unassigned while a real group exists,
+# whatever order the config lists them in.
+setup pick "$(jq '.groups = ({"Unassigned@dev": {"hat": "dev", "name": "Unassigned", "managed": true,
+                                                 "sessions": {"dev-x": {}}}} + .groups)' <<<"$ONE_HAT")" "$ONE_TREE"
+expect "the group picked for a new workspace is a real one" "$(yes_if [ "$(in_lib 'hat_pick_group dev')" = G ])"
+setup pick-only "$(UCFG '{"dev-x": {}}' | jq 'del(.groups.G)')" "$ONE_TREE"
+expect "...and Unassigned only when the hat has no other group" \
+    "$(yes_if [ "$(in_lib 'hat_pick_group dev')" = Unassigned@dev ])"
+
+# Remembering a session moves it within its own hat only.
+setup own-hat "$(jq '.hats.ops = {"ssh": "ops@ops.example.com"}
+                     | .groups.O = {"hat": "ops", "sessions": {"dev-s": {"windows": [{"name": "ops-side"}]}}}
+                     | .groups.Real = {"hat": "dev", "sessions": {}}
+                     | .groups.G.sessions["dev-s"] = {"windows": [{"name": "dev-side"}]}' <<<"$ONE_HAT")" "$ONE_TREE"
+in_lib 'remember_session Real dev-s'
+expect "a move leaves another hat's group of the same name alone" \
+    "$(yes_if all_of is '.groups.O.sessions["dev-s"].windows[0].name' ops-side \
+                 -- is '.groups.Real.sessions["dev-s"].windows[0].name' dev-side \
+                 -- is '.groups.G.sessions | has("dev-s")' false)"
+
+# An Unassigned entry whose session no longer runs is dropped even though cmux
+# shows no Unassigned group; one still running stays and goes back into cmux.
+setup stale "$(UCFG '{"dev-x": {"windows": []}, "dev-z": {"windows": []}}')" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in sync || true
+expect "a stale Unassigned entry is dropped when cmux shows no Unassigned" \
+    "$(yes_if all_of is '.groups["Unassigned@dev"].sessions | keys | join(",")' dev-x \
+                 -- says "dev / Unassigned / dev-z  dropped (not running)")"
+expect "...and the running one goes into a new cmux Unassigned" \
+    "$(yes_if logged "workspace-group create --name Unassigned --from ws-x")"
+
+# Recording checks the server once more: a session the caller saw that has
+# since ended is not recorded.
+setup recheck "$ONE_HAT" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-r\n' > "$d/server.dev"
+in_lib "settle_ungrouped dev '' \$'dev-a\ndev-r\ndev-gone'" >/dev/null || true
+expect "a session gone since the caller looked is not recorded, a running one is" \
+    "$(yes_if is '.groups["Unassigned@dev"].sessions | keys | join(",")' dev-r)"
+
+# A loose workspace whose session a real group records goes back into that
+# group, not into Unassigned.
+setup back "$(jq '.groups.G.sessions["dev-x"] = {"windows": []}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in sync || true
+expect "a loose workspace a real group records goes back into it" \
+    "$(yes_if all_of logged "workspace-group add --group g-G --workspace ws-x" \
+                 -- is '.groups | has("Unassigned@dev")' false -- is '.groups.G.sessions | has("dev-x")' true)"
+setup back-new "$(jq '.groups.H = {"hat": "dev", "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in sync || true
+expect "...and its group is made in cmux if cmux has none" \
+    "$(yes_if all_of logged "workspace-group create --name H --from ws-x" -- is '.groups | has("Unassigned@dev")' false)"
+expect "creates carry an idempotency key" "$(yes_if logged "--idempotency-key hatter:W1:H:")"
+
+# A user's own group called Unassigned is folded into the hat's managed one.
+setup migrate "$(jq '.groups.Unassigned = {"hat": "dev", "color": "#112233",
+                                            "sessions": {"dev-m": {"windows": []}, "dev-a": {"windows": []}}}
+                     | .hats.dev.default_group = "Unassigned"' <<<"$ONE_HAT")" "$ONE_TREE"
+hatter_in group list || true
+expect "an old group named Unassigned is migrated into the managed one" \
+    "$(yes_if all_of is '.groups | has("Unassigned")' false \
+                 -- is '.groups["Unassigned@dev"] | [.managed, .name, .color] | map(tostring) | join(" ")' "true Unassigned #112233" \
+                 -- is '.groups["Unassigned@dev"].sessions | keys | join(",")' dev-m \
+                 -- is '.groups.G.sessions | has("dev-a")' true \
+                 -- is '.hats.dev | has("default_group")' false)"
+expect "group list shows it by name, with its key" \
+    "$(yes_if grep -q "^Unassigned	\[hat: dev, hatter's own; key Unassigned@dev\]  dev-m" "$d/out")"
+setup migrate-nohat "$(jq '.groups.Unassigned = {"sessions": {"dev-m": {}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+hatter_in group list || true
+expect "...but one with no hat is left as it is" \
+    "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+
+# A window whose groups cannot be read is unknown, not empty: nothing is made.
+setup unread "$ONE_HAT" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+STUB_GROUPS_FAIL=1 hatter_in sync || true
+expect "a failed groups read creates no group" "$(yes_if unlogged "workspace-group create")"
+expect "...and says why" "$(yes_if says "could not read the window's groups")"
+
+# Top placement: below a pinned group, and tried once when cmux will not move it.
+setup pinned "$(UCFG '{"dev-x": {"windows": []}}')" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "is_pinned": true, "member_workspace_ids": ["ws-a"]},
+                       {"id": "g-P", "name": "P", "member_workspace_ids": []},
+                       {"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in sync || true
+expect "Unassigned goes to the top below a pinned group" \
+    "$(yes_if all_of logged "workspace-group move g-U --to-index 1" \
+                 -- bash -c '[ "$(jq -r "[.groups[].id] | join(\",\")" "$1")" = g-G,g-U,g-P ]' _ "$d/groups.W1.json")"
+setup stuck "$(UCFG '{"dev-x": {"windows": []}}')" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]},
+                       {"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+STUB_NO_MOVE=1 hatter_in sync || true
+expect "a move cmux does not make is warned about" "$(yes_if says "did not move group 'Unassigned'")"
+: > "$d/log"
+STUB_NO_MOVE=1 hatter_in sync || true
+expect "...once: the next sync neither moves nor warns" \
+    "$(yes_if all_of unlogged "workspace-group move" -- bash -c '! grep -q "did not move" "$1"' _ "$d/out")"
+
+# Removing an empty Unassigned never sets a member loose.
+setup keep-member "$ONE_HAT" '{"windows": [{"id": "W1", "workspaces": [
+  {"id": "ws-a", "title": "dev-a", "panes": []}, {"id": "ws-t", "title": "local shell", "panes": []}]}]}'
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]},
+                       {"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-t"]}]}'
+printf 'dev-a\n' > "$d/server.dev"
+STUB_FLAG_FAIL=1 hatter_in sync || true
+expect "an empty Unassigned with a member is not plainly ungrouped" \
+    "$(yes_if all_of logged "workspace-group ungroup g-U --remove-generated-anchor" \
+                 -- bash -c '! grep -qx "workspace-group ungroup g-U" "$1"' _ "$d/log")"
+setup no-member "$ONE_HAT" '{"windows": [{"id": "W1", "workspaces": [{"id": "ws-a", "title": "dev-a", "panes": []}]}]}'
+groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]},
+                       {"id": "g-U", "name": "Unassigned", "member_workspace_ids": []}]}'
+printf 'dev-a\n' > "$d/server.dev"
+STUB_FLAG_FAIL=1 hatter_in sync || true
+expect "...while one with no members at all is" "$(yes_if grep -qx "workspace-group ungroup g-U" "$d/log")"
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "PASS unassigned"

@@ -1084,8 +1084,7 @@ ensure_cmux_group() {
     ref=$(group_ref_in_window "$win" "$name")
     if [[ -z "$ref" ]]; then
         info "Creating workspace group '$name'" >&2
-        cmux focus-window --window "$win" >/dev/null 2>&1 || true
-        cmux workspace-group create --name "$name" >/dev/null
+        cmux_group_create "$win" "$name" || true
         sleep 0.4
         ref=$(group_ref_in_window "$win" "$name")
     fi
@@ -1094,17 +1093,61 @@ ensure_cmux_group() {
     printf '%s' "$ref"
 }
 
+# --- group changes in cmux. Every change hatter makes to cmux's groups goes
+# through these, so there is one place to see, and to change, how.
+
+# cmux_group_create <window> <name> [workspace ids, comma-separated]
+# With workspaces, the group is made from them and cmux places it in their
+# window, so the window is not focused. Without, cmux makes an anchor-only
+# group in the focused window. The idempotency key makes two hatters creating
+# the same group at once - the rack holds no lock - get one group. It changes
+# every minute, so a group removed and needed again later is made anew.
+cmux_group_create() {
+    local win="$1" name="$2" from="${3:-}" key
+    key="hatter:$win:$name:$(( $(date +%s) / 60 ))"
+    if [[ -n "$from" ]]; then
+        cmux workspace-group create --name "$name" --from "$from" --idempotency-key "$key" >/dev/null 2>&1
+    else
+        cmux focus-window --window "$win" >/dev/null 2>&1 || true
+        cmux workspace-group create --name "$name" --idempotency-key "$key" >/dev/null 2>&1
+    fi
+}
+cmux_group_add()  { cmux workspace-group add --group "$1" --workspace "$2" >/dev/null 2>&1; }
+cmux_group_move() { cmux workspace-group move "$1" --to-index "$2" >/dev/null 2>&1; }
+# Only ever for a group with no running session in it. The flag removes the
+# anchor cmux made for an anchor-only group; a group with members is never
+# dissolved without it, so nothing in it is set loose.
+cmux_group_remove() {
+    local ref="$1" members="$2"
+    cmux workspace-group ungroup "$ref" --remove-generated-anchor >/dev/null 2>&1 && return 0
+    [[ "$members" == 0 ]] && cmux workspace-group ungroup "$ref" >/dev/null 2>&1
+}
+
 # cmux_group_to_top <group ref> <window> [groups json]: Unassigned sits at the
-# top of its hat's window. cmux lists a window's groups in sidebar order, so a
-# group already first is left alone rather than moved on every run.
+# top of its hat's window, below any group pinned there. cmux's help gives
+# `workspace-group move --to-index` and lists groups by index; hatter takes the
+# list to be in sidebar order. A group already in place is left alone. If cmux
+# does not move it, that is said once and not tried again until the window's
+# groups change, rather than on every autosave tick.
 cmux_group_to_top() {
-    local ref="$1" win="$2" groups="${3:-}" first
-    [[ -n "$groups" ]] || groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups=""
-    [[ -n "$groups" ]] || groups='{}'
-    first=$(jq -r '.groups[0].id // empty' <<<"$groups" 2>/dev/null) || first=""
-    [[ "$first" == "$ref" ]] && return 0
-    cmux workspace-group move "$ref" --to-index 0 >/dev/null 2>&1 \
-        || warn "could not move group '$UNASSIGNED' to the top of the window"
+    local ref="$1" win="$2" groups="${3:-}" order at want marker
+    [[ -n "$groups" ]] || groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || return 0
+    order=$(jq -r '[.groups[]?.id] | join(",")' <<<"$groups" 2>/dev/null) || return 0
+    IFS=' ' read -r at want < <(jq -r --arg r "$ref" '
+        [.groups[]? | .id] as $ids
+        | [($ids | index($r)), ([.groups[]? | select(.id != $r and (.is_pinned // false))] | length)]
+        | map(tostring) | join(" ")' <<<"$groups" 2>/dev/null) || return 0
+    [[ "$at" != null && "$at" != "$want" ]] || return 0
+    marker="${XDG_STATE_HOME:-$HOME/.local/state}/hatter/unassigned-top.${win//[^A-Za-z0-9_-]/_}"
+    [[ "$(cat "$marker" 2>/dev/null)" == "$order" ]] && return 0
+    cmux_group_move "$ref" "$want" || true
+    groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups='{}'
+    if [[ "$(jq -r --arg r "$ref" '[.groups[]?.id] | index($r) | tostring' <<<"$groups")" == "$want" ]]; then
+        rm -f "$marker"
+    else
+        mkdir -p "${marker%/*}" 2>/dev/null && printf '%s\n' "$order" > "$marker" 2>/dev/null || true
+        warn "cmux did not move group '$UNASSIGNED' to the top of the window; leaving it where it is"
+    fi
     return 0
 }
 
@@ -3726,23 +3769,37 @@ cmd_group() {
     esac
 }
 
-# unassigned_settle <hat> <window> <live sessions> [windows] [groups] [workspaces]
+# settle_ungrouped <hat> <window> <live sessions> [windows] [groups] [workspaces]
 #
-# No session runs outside a group. Every running session of <hat> that no group
-# records goes into the hat's Unassigned group, in the config and in cmux, and
-# Unassigned is removed once it is empty, from both. It changes cmux, so no
-# snapshot may be held. The JSON arguments are what the caller has already
-# read, and any left empty is read here: the session -> tabs map sync builds
-# from tmux, and the window's groups and workspaces. In steady state, with all
-# three given, it makes no cmux call at all.
-unassigned_settle() {
+# No session runs outside a group. A running session of <hat> that no group
+# records is recorded in the hat's Unassigned group; then every workspace cmux
+# shows loose in the hat's window goes into the group the config records it
+# in, Unassigned or a real one; and Unassigned is removed once it is empty,
+# from the config and cmux both. It changes cmux, so no snapshot may be held.
+#
+# The JSON arguments are what the caller has already read: the session -> tabs
+# map sync builds from tmux, and the window's groups and workspaces. Any left
+# empty is read here; "-" for the groups means the caller could not read them,
+# and then cmux is not touched at all. In steady state, with all three given,
+# it makes no cmux call and no extra ssh call.
+settle_ungrouped() {
     local hat="$1" win="$2" live="$3" wjson="${4:-}" groups_json="${5:-}" ws_json="${6:-}"
-    local key host s windows entries='{}'
+    local key host s windows entries='{}' fresh un
     [[ -n "$live" ]] || return 0
     key=$(unassigned_key "$hat")
     host=$(hat_ssh "$hat")
 
-    # 1. The config: record each one in Unassigned, with its tabs in tmux order.
+    # 1. The config. The caller's list may be minutes old (the rack's is), so
+    # anything about to be recorded is checked against the server once more.
+    un=$(hat_unrecorded "$hat" "$live")
+    if [[ -n "$un" ]]; then
+        if fresh=$(hat_live_sessions "$host" 2>/dev/null); then
+            live="$fresh"
+            un=$(hat_unrecorded "$hat" "$live")
+        else
+            un=""
+        fi
+    fi
     while IFS= read -r s; do
         [[ -z "$s" ]] && continue
         if [[ -n "$wjson" ]]; then
@@ -3753,71 +3810,79 @@ unassigned_settle() {
         fi
         entries=$(jq -c --arg s "$s" --argjson w "${windows:-[]}" '.[$s] = {windows: $w}' <<<"$entries")
         echo "  $hat / $UNASSIGNED / $s  (running, was in no group)"
-    done < <(hat_unrecorded "$hat" "$live")
+    done <<<"$un"
     if [[ "$entries" != '{}' ]]; then
         group_exists "$key" || register_group "$key" "$hat"
         jq_write --arg g "$key" --argjson e "$entries" '.groups[$g].sessions += $e'
     fi
-
-    [[ -n "$win" ]] || return 0
-    [[ -n "$groups_json" ]] || groups_json=$(window_groups_json "$win" 2>/dev/null) || groups_json=""
-    [[ -n "$ws_json" ]] || ws_json=$(window_ws_json "$win" 2>/dev/null) || ws_json=""
-    [[ -n "$groups_json" && -n "$ws_json" ]] || return 0
-
-    # 2. cmux: a loose workspace whose session Unassigned records goes into it.
-    local mine ref loose id
-    mine=$(cfg --arg g "$key" '.groups[$g].sessions // {} | keys[]')
-    ref=$(jq -r --arg n "$UNASSIGNED" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
-    loose=$(jq -r --argjson g "$groups_json" --arg m "$mine" '
-        ([$g.groups[]?.member_workspace_ids[]?]) as $in
-        | ($m | split("\n")) as $mine
-        | .workspaces[]?
-        | select((.id as $i | $in | index($i) | not) and (.title as $t | $mine | index($t)))
-        | .id' <<<"$ws_json")
-    if [[ -n "$loose" ]]; then
-        if [[ -z "$ref" ]]; then
-            # Made from the workspaces themselves, so cmux places it in their
-            # window without the window being focused.
-            info "Creating workspace group '$UNASSIGNED' in $hat's window"
-            cmux workspace-group create --name "$UNASSIGNED" --from "$(paste -sd , - <<<"$loose")" \
-                >/dev/null 2>&1 || warn "could not create group '$UNASSIGNED' in $hat's window"
-            groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups_json='{}'
-            ref=$(jq -r --arg n "$UNASSIGNED" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
-        else
-            while IFS= read -r id; do
-                cmux workspace-group add --group "$ref" --workspace "$id" >/dev/null 2>&1 \
-                    || warn "could not put a workspace into group '$UNASSIGNED'"
-            done <<<"$loose"
-            groups_json=""
-        fi
-        [[ -n "$ref" ]] && apply_group_style "$key" "$ref"
-    fi
-
-    # 3. Empty: out of the config, and out of cmux unless a running session is
-    # still in it, which is the next sync's to record.
     if group_exists "$key" && [[ "$(cfg --arg g "$key" '.groups[$g].sessions | length')" == 0 ]]; then
         jq_write "$PRUNE_UNASSIGNED"
     fi
-    [[ -n "$ref" ]] || return 0
-    [[ -n "$groups_json" ]] || groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups_json='{}'
-    if ! group_exists "$key"; then
-        local busy
-        busy=$(jq -r --argjson ws "$ws_json" --arg r "$ref" --arg live "$live" '
-            ($live | split("\n")) as $l
-            | ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
-            | [.groups[]? | select(.id == $r) | .member_workspace_ids[]? | $t[.] // ""
-               | select(. as $x | $l | index($x))] | length' <<<"$groups_json" 2>/dev/null) || busy=1
-        if [[ "$busy" == 0 ]]; then
-            info "Removing the empty '$UNASSIGNED' group from $hat's window"
-            cmux workspace-group ungroup "$ref" --remove-generated-anchor >/dev/null 2>&1 \
-                || cmux workspace-group ungroup "$ref" >/dev/null 2>&1 \
-                || warn "could not remove the empty group '$UNASSIGNED' from $hat's window"
+
+    [[ -n "$win" && "$groups_json" != "-" ]] || return 0
+    [[ -n "$groups_json" ]] || groups_json=$(window_groups_json "$win" 2>/dev/null) || return 0
+    [[ -n "$ws_json" ]] || ws_json=$(window_ws_json "$win" 2>/dev/null) || return 0
+
+    # 2. cmux: each loose workspace of a running session goes into the group
+    # the config records it in. "<workspace id>\x1f<group key>" per line.
+    local placed g ids name ref changed=0
+    placed=$(jq -r --argjson g "$groups_json" --arg live "$live" \
+                   --argjson rec "$(cfg -c --arg l "$hat" '[.groups | to_entries[] | select(.value.hat == $l)
+                                        | .key as $k | .value.sessions | keys[]? | {key: ., value: $k}] | from_entries')" '
+        ([$g.groups[]?.member_workspace_ids[]?]) as $in
+        | ($live | split("\n")) as $l
+        | .workspaces[]?
+        | select((.id as $i | $in | index($i) | not) and (.title as $t | $l | index($t)) and $rec[.title] != null)
+        | [.id, $rec[.title]] | join("\u001f")' <<<"$ws_json")
+    while IFS= read -r g; do
+        [[ -z "$g" ]] && continue
+        ids=$(AWK_G="$g" awk -F '\037' '$2 == ENVIRON["AWK_G"] { print $1 }' <<<"$placed")
+        name=$(group_display "$g")
+        ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+        if [[ -z "$ref" ]]; then
+            info "Creating workspace group '$name' in $hat's window"
+            cmux_group_create "$win" "$name" "$(paste -sd , - <<<"$ids")" \
+                || warn "could not create group '$name' in $hat's window"
+            groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups_json='{}'
+            ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+        else
+            while IFS= read -r s; do
+                cmux_group_add "$ref" "$s" || warn "could not put a workspace into group '$name'"
+            done <<<"$ids"
         fi
+        changed=1
+        echo "  $hat / $name: put back $(wc -l <<<"$ids" | tr -d ' ') loose workspace(s)"
+        [[ -n "$ref" ]] && apply_group_style "$g" "$ref"
+    done < <(awk -F '\037' '{ print $2 }' <<<"$placed" | sort -u)
+
+    # 3. Unassigned in cmux, from a fresh look whenever anything moved.
+    if [[ "$changed" == 1 ]]; then
+        groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || return 0
+        ws_json=$(cmux_json workspace list --window "$win" 2>/dev/null) || return 0
+    fi
+    ref=$(jq -r --arg n "$UNASSIGNED" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
+    [[ -n "$ref" ]] || return 0
+    if group_exists "$key"; then
+        cmux_group_to_top "$ref" "$win" "$groups_json"
         return 0
     fi
 
-    # 4. At the top of the window.
-    cmux_group_to_top "$ref" "$win" "$groups_json"
+    # Empty in the config: out of cmux as well, unless a running session is
+    # still in it, which is the next sync's to record. Read again right before,
+    # so nothing moved in since is set loose.
+    local now busy members
+    now=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || return 0
+    ws_json=$(cmux_json workspace list --window "$win" 2>/dev/null) || return 0
+    IFS=' ' read -r members busy < <(jq -r --argjson ws "$ws_json" --arg r "$ref" --arg live "$live" '
+        ($live | split("\n")) as $l
+        | ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
+        | [.groups[]? | select(.id == $r) | .member_workspace_ids[]?] as $m
+        | [($m | length), ([$m[] | $t[.] // "" | select(. as $x | $l | index($x))] | length)]
+        | map(tostring) | join(" ")' <<<"$now" 2>/dev/null) || return 0
+    [[ "$busy" == 0 ]] || return 0
+    info "Removing the empty '$UNASSIGNED' group from $hat's window"
+    cmux_group_remove "$ref" "$members" \
+        || warn "could not remove the empty group '$UNASSIGNED' from $hat's window"
     return 0
 }
 
@@ -3910,11 +3975,19 @@ sync_once() {
             | reduce .[] as $x ({}; .[$x.s] += [$x.w])' < "$tmp/ssh.$i")
 
         # A read that failed is unknown, not empty: no group is found there,
-        # which changes nothing, and nothing is said about where a session is.
-        local gread=1 wread=1
+        # which changes nothing, nothing is said about where a session is, and
+        # settling is told not to touch cmux for this hat ("-"), so it cannot
+        # make a second Unassigned.
+        local gread=1 wread=1 cmux_read=1
         groups_json=$(window_groups_json "$w" 2>/dev/null) || { groups_json='{"groups":[]}'; gread=0; }
         ws_json=$(window_ws_json "$w" 2>/dev/null) || { ws_json='{"workspaces":[]}'; wread=0; }
-        wjsons[$i]="$wjson" gjsons[$i]="$groups_json" wsjsons[$i]="$ws_json"
+        [[ "$gread" == 1 && "$wread" == 1 ]] || cmux_read=0
+        if [[ "$cmux_read" == 1 ]]; then
+            wjsons[$i]="$wjson" gjsons[$i]="$groups_json" wsjsons[$i]="$ws_json"
+        else
+            wjsons[$i]="$wjson" gjsons[$i]="-" wsjsons[$i]=""
+            warn "$hat: could not read the window's groups from cmux; its layout is left as it is"
+        fi
 
         while IFS= read -r gname; do
             [[ -z "$gname" ]] && continue
@@ -3998,7 +4071,18 @@ sync_once() {
         # its sessions, and dropping the rest would forget them for good. So when
         # none of the hat's recorded sessions is running, or more than half of
         # them would go at once, nothing is dropped this pass.
-        local rg rs shown grouped place total=0 running=0 drops=0 hold=0 unseen=""
+        # Unassigned is rebuilt like any group this pass rewrites, even when
+        # cmux does not show it: a session cmux now shows in another group
+        # leaves it, and one no longer running is dropped, as anywhere else.
+        ukey=$(unassigned_key "$hat")
+        if [[ "$cmux_read" == 1 ]] && group_exists "$ukey" \
+           && ! jq -e --arg g "$ukey" 'has($g)' <<<"$patch" >/dev/null; then
+            patch=$(jq -c --arg g "$ukey" --argjson cur "$(cfg -c --arg g "$ukey" '.groups[$g]')" '
+                .[$g] = {color: $cur.color, icon: $cur.icon, pinned: ($cur.pinned // false),
+                         collapsed: ($cur.collapsed // false), sessions: {}}' <<<"$patch")
+        fi
+
+        local rg rs rn shown grouped place total=0 running=0 drops=0 hold=0 unseen=""
         shown=$(jq -r '.workspaces[]?.title // empty' <<<"$ws_json")
         grouped=$(jq -r --argjson ws "$ws_json" '
             ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
@@ -4026,34 +4110,21 @@ sync_once() {
         while IFS=$'\x1f' read -r rg rs; do
             [[ -z "$rs" ]] && continue
             place=$(session_place "$rs" "$live" "$shown" "$grouped")
+            rn=$(group_display "$rg")
             jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null || {
-                [[ "$place" == "not running" ]] || echo "  $hat / $rg / $rs  kept ($place)"
+                [[ "$place" == "not running" ]] || echo "  $hat / $rn / $rs  kept ($place)"
                 continue
             }
             if [[ "$place" == "not running" && "$hold" == 0 ]]; then
-                echo "  $hat / $rg / $rs  dropped (not running)"
+                echo "  $hat / $rn / $rs  dropped (not running)"
                 continue
             fi
-            echo "  $hat / $rg / $rs  kept ($place)"
+            echo "  $hat / $rn / $rs  kept ($place)"
             patch=$(jq -c --arg g "$rg" --arg s "$rs" \
                           --argjson e "$(cfg -c --arg g "$rg" --arg s "$rs" '.groups[$g].sessions[$s]')" \
                           '.[$g].sessions[$s] = $e' <<<"$patch")
         done <<<"$unseen"
 
-        # Unassigned holds only what is in no other group. When cmux does not
-        # show it, so that the pass above left it alone, a session cmux now
-        # shows in another group still leaves it.
-        ukey=$(unassigned_key "$hat")
-        if group_exists "$ukey" && ! jq -e --arg g "$ukey" 'has($g)' <<<"$patch" >/dev/null; then
-            patch=$(jq -c --arg g "$ukey" --arg seen "$seen" \
-                          --argjson cur "$(cfg -c --arg g "$ukey" '.groups[$g]')" '
-                ($seen | split("\n")) as $seen
-                | .[$g] = {color: $cur.color, icon: $cur.icon,
-                           pinned: ($cur.pinned // false), collapsed: ($cur.collapsed // false),
-                           sessions: ($cur.sessions // {}
-                                      | with_entries(select(.key as $k | $seen | index($k) | not)))}' \
-                          <<<"$patch")
-        fi
     done
     rm -rf "$tmp"
     cmux_snapshot_drop
@@ -4088,7 +4159,7 @@ sync_once() {
     # no group goes into its hat's Unassigned, and an empty Unassigned goes.
     for ((i = 0; i < n; i++)); do
         [[ -n "${lives[$i]}" ]] || continue
-        unassigned_settle "${hats[$i]}" "${wins[$i]}" "${lives[$i]}" \
+        settle_ungrouped "${hats[$i]}" "${wins[$i]}" "${lives[$i]}" \
             "${wjsons[$i]}" "${gjsons[$i]}" "${wsjsons[$i]}"
     done
 
@@ -4268,7 +4339,7 @@ cmd_restore() {
         # the ones no group records go into Unassigned rather than run loose.
         local live
         live=$(hat_live_sessions "$host") || live=""
-        unassigned_settle "$hat" "$win" "$live"
+        settle_ungrouped "$hat" "$win" "$live"
         discard_stray_workspace "$win"
     done <<<"$hats"
 
@@ -5470,7 +5541,7 @@ edit_settle_unassigned() {
     cmux_snapshot_drop
     [[ -n "$win" ]] || return 0
     # A subshell: nothing in it may take the rack down.
-    ( unassigned_settle "$hat" "$win" "$live" ) >/dev/null 2>&1 || true
+    ( settle_ungrouped "$hat" "$win" "$live" ) >/dev/null 2>&1 || true
     return 0
 }
 
@@ -5601,7 +5672,7 @@ edit_workspaces() {
                     "running, not in cmux")
                         state="$state  ${C_YL}not in cmux${C_R} ${C_DIM}restore --missing mirrors it${C_R}" ;;
                     "running, in no cmux group")
-                        state="$state  ${C_YL}in no cmux group${C_R} ${C_DIM}restore puts it back${C_R}" ;;
+                        state="$state  ${C_YL}in no cmux group${C_R} ${C_DIM}sync puts it back${C_R}" ;;
                 esac
             else
                 state=$(printf '%s✗ not running%s  %sre-create with restore%s' \
@@ -6084,19 +6155,23 @@ hatter group <subcommand>
 A group is a project or area inside one hat. Group names are free text and do
 not take the hat prefix; the workspaces inside them do.
 
-No workspace runs outside a group. Each hat has a group hatter manages itself,
-shown as Unassigned at the top of the hat's window, which holds every running
-session on that hat that no group records: one created on the server
-directly, one mirrored in loose, one forgotten while still running. sync,
-restore, the autosave timer and the rack put such sessions there, and remove
-Unassigned, from cmux and the config, once it is empty. Move a workspace out
-of it as out of any group: drag it in cmux and sync, or
-`hatter new <session> --group <name>`.
+No workspace runs outside a group. sync, restore, the autosave timer and the
+rack each settle a hat's window: a workspace cmux shows loose goes back into
+the group the config records it in, and a running session that no group
+records goes into Unassigned. Each hat has an Unassigned group, which hatter
+manages itself, shown at the top of the hat's window (below any group pinned
+there). It holds sessions created on the server directly, mirrored in loose,
+or forgotten while still running. It is removed, from cmux and the config,
+once it is empty, and an entry in it is dropped like any other once its
+session stops. Move a workspace out of it as out of any group: drag it in
+cmux and sync, or `hatter new <session> --group <name>`. A new workspace goes
+to Unassigned only when its hat has no other group.
 
 Group names are config keys, unique across hats, while every hat's window has
 its own Unassigned; so its key is Unassigned@<hat>, the hat's Unassigned, and
 the entry is marked managed. `group rm` and `group rename` refuse it, and no
-other group may be called Unassigned.
+other group may be called Unassigned; a group already called that, from before
+hatter kept its own, is folded into its hat's Unassigned on the next run.
 
 Subcommands:
   list                          Groups, their hats, and their sessions
@@ -6165,7 +6240,7 @@ only detaches it, and its tmux session runs on. So a recorded session that cmux
 no longer shows in a group, but that is still running on its server, keeps its
 entry. sync says where it is: "kept (running, not in cmux)", which `hatter
 restore --missing` mirrors again, or "kept (running, in no cmux group)", which
-`hatter restore` puts back in its group. An entry is dropped only when its
+sync then puts back in its group in cmux. An entry is dropped only when its
 session is no longer running on the server: "dropped (not running)". To close
 a workspace for good, use `hatter rm`.
 
