@@ -2513,7 +2513,8 @@ heal_hat_drags() {
     second=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
     drag_report "$report" "$second"
 
-    local moved=0 kind orphan ws to from wid name screen rc why
+    local moved=0 kind orphan ws to from wid name screen rc why errf
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-screen.XXXXXX") || return 0
     while IFS=$'\t' read -r kind orphan ws to from wid name; do
         [[ "$kind" == move ]] || continue
         grep -qxF "$(printf 'move\t%s\t%s\t%s\t%s\t%s\t%s' "$orphan" "$ws" "$to" "$from" "$wid" "$name")" \
@@ -2521,22 +2522,32 @@ heal_hat_drags() {
         # A dragged tab has nothing behind it, so it shows nothing. One that
         # shows anything is something else, whatever its title says - and one
         # cmux cannot read is not known to be blank.
+        # The screen is stdout alone: a notice cmux prints on stderr must not
+        # read as text on a blank tab. stderr is only the reason for a failure.
         rc=0
         screen=$(cmux read-screen --surface "$orphan" --workspace "$ws" --window "$win" \
-            </dev/null 2>&1) || rc=$?
+            </dev/null 2>"$errf") || rc=$?
+        [[ "$rc" == 0 ]] || screen=$(cat "$errf" 2>/dev/null; printf '%s' "$screen")
         why=$(drag_not_blank "$rc" "$screen")
         if [[ -n "$why" ]]; then
-            drag_refuse "$report" "$orphan" "$to" "$from" "$wid" "$name" "it is not plainly blank: $why"
+            # A tab showing text is not a dragged tab, so it is not recorded as
+            # one: repair goes on to fix the workspace its own way.
+            local held=held
+            [[ "$rc" != 0 ]] || held=""
+            drag_refuse "$report" "$held" "$host" "$orphan" "$to" "$from" "$wid" "$name" \
+                "it is not plainly blank: $why"
             continue
         fi
         # Moving a session's last window ends the session. The drag asked for
         # that, but it is too much to do unasked.
         if [[ "$(awk -F '\t' -v s="$from" '$1 == "W" && $2 == s' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
-            drag_refuse "$report" "$orphan" "$to" "$from" "$wid" "$name" "it is the last tab of '$from'"
+            drag_refuse "$report" held "$host" "$orphan" "$to" "$from" "$wid" "$name" \
+                "it is the last tab of '$from'"
             continue
         fi
         heal_move "$host" "$win" "$orphan" "$ws" "$to" "$from" "$wid" "$name" && moved=1
     done <<<"$second"
+    rm -f "$errf"
 
     # The server's pane registry is keyed on windows that have just changed
     # session.
@@ -2569,17 +2580,19 @@ drag_not_blank() {
 
 # Dragged tabs the healer paired but left alone, one per line:
 #   orphan  to-session  from-session  window-id
-# repair reads it so it never re-mirrors over a dragged tab: re-mirroring
-# drops the blank tab, and with it the only record of where it was dropped.
+# Only those still likely to be real drags (see drag_refuse's "held"). repair
+# reads it so it never re-mirrors over one: re-mirroring drops the blank tab,
+# and with it the only record of where it was dropped.
 HEAL_REFUSED=""
 
-# drag_refuse <report> <orphan> <to> <from> <window-id> <name> <reason>
-# With "report", always says so. With "once" (the autosave timer), says so the
-# first time for each blank tab, so a stuck drag reaches the log without
-# filling it every minute.
+# drag_refuse <report> <held> <host> <orphan> <to> <from> <window-id> <name> <reason>
+# "held" records the pair in HEAL_REFUSED; empty means the reason itself shows
+# it is no drag. With report "report", always says so. With "once" (the
+# autosave timer), says so the first time for each blank tab, so a stuck drag
+# reaches the log without filling it every minute.
 drag_refuse() {
-    local report="$1" orphan="$2" to="$3" from="$4" wid="$5" name="$6" reason="$7" seen
-    HEAL_REFUSED+="$orphan"$'\t'"$to"$'\t'"$from"$'\t'"$wid"$'\n'
+    local report="$1" held="$2" host="$3" orphan="$4" to="$5" from="$6" wid="$7" name="$8" reason="$9" seen
+    [[ -z "$held" ]] || HEAL_REFUSED+="$orphan"$'\t'"$to"$'\t'"$from"$'\t'"$wid"$'\n'
     case "$report" in
         report) ;;
         once)
@@ -2591,8 +2604,11 @@ drag_refuse() {
                 && mv "$seen.tmp" "$seen" 2>/dev/null || true ;;
         *) return 0 ;;
     esac
+    # The reason quotes the tab's screen, which may hold escape sequences.
+    reason=$(printf '%s' "$reason" | tr -d '[:cntrl:]')
     warn "the tab '${name:-tmux window}' dragged into '$to' was left alone: $reason.
-  Its window is still in '$from'. Move it with: tmux move-window -s '=$from:$wid' -t '=$to:'"
+  Its window is still in '$from'. Move it with:
+    ssh $host \"tmux move-window -s '=$from:$wid' -t '=$to:'\""
     return 0
 }
 

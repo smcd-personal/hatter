@@ -69,6 +69,8 @@ case "$*" in
       unavailable) echo 'Error: surface_unavailable: The terminal surface is no longer available; reopen it or create a new terminal session.' >&2; exit 1 ;;
       text)  printf 'user@mac ~ %% \n' ;;
       blank) printf '   \n\n' ;;
+      # Blank, with a notice on stderr: the screen is still blank.
+      noisy) printf '   \n\n'; echo 'Warning: a newer cmux is available' >&2 ;;
     esac ;;
   close-surface*) echo "close $*" >> "$log" ;;
   close-workspace*) echo "close-workspace $*" >> "$log" ;;
@@ -132,7 +134,11 @@ expect "a tab showing text is neither moved nor closed" "$([[ -z "$log" ]] && ec
 
 expect "a tab showing text: the warning says what it shows, and how to move it by hand" \
     "$(grep -q 'it shows "user@mac' "$work/run-text/out" \
-        && grep -qF "tmux move-window -s '=dev-a:@2' -t '=dev-b:'" "$work/run-text/out" && echo y)"
+        && grep -qF "ssh dev@example.com \"tmux move-window -s '=dev-a:@2' -t '=dev-b:'\"" "$work/run-text/out" && echo y)"
+
+log=$(run noisy noisy)
+expect "a blank tab with a notice on cmux's stderr is still moved" \
+    "$(grep -q '^move' <<<"$log" && echo y)"
 
 log=$(run fail fail)
 expect "a tab cmux cannot read is neither moved nor closed" "$([[ -z "$log" ]] && echo y)"
@@ -148,10 +154,17 @@ expect "the timer logs a left-alone tab once, not every pass" \
     "$([[ "$first" == 1 && "$second" == 0 ]] && echo y)"
 
 # repair over a left-alone drag stops; it must not re-mirror (close-workspace).
-log=$(HATTER_CMD="repair dev-b" run repair-refused text)
+log=$(HATTER_CMD="repair dev-b" run repair-refused fail)
 expect "repair stops at a left-alone drag instead of re-mirroring" \
     "$(grep -q 'was not re-mirrored' "$work/run-repair-refused/out" \
         && ! grep -q '^close-workspace' <<<"$log" && echo y)"
+log=$(HATTER_CMD="repair dev-a" run repair-from fail)
+expect "repair of the session a left-alone tab was dragged from stops too" \
+    "$(grep -q 'was not re-mirrored' "$work/run-repair-from/out" && echo y)"
+log=$(HATTER_CMD="repair dev-b" run repair-text text)
+expect "repair is not stopped by a tab that shows text (that is no drag)" \
+    "$(! grep -q 'was not re-mirrored' "$work/run-repair-text/out" \
+        && grep -qE 'has content|not running|blank on' "$work/run-repair-text/out" && echo y)"
 log=$(HATTER_CMD="repair dev-b" run repair-nodrag blank STUB_NODRAG=1)
 expect "repair with no drag goes on to its re-mirror checks" \
     "$(! grep -q 'was not re-mirrored' "$work/run-repair-nodrag/out" \
