@@ -490,7 +490,7 @@ ensure_pinned_tabs() {
     while IFS=$'\x1f' read -r name cwd; do
         [[ -z "$name" ]] && continue
         local wid
-        wid=$(awk -F'\t' -v n="$name" '$2==n {print $1; exit}' <<<"$live")
+        wid=$(AWK_N="$name" awk -F'\t' '$2==ENVIRON["AWK_N"] {print $1; exit}' <<<"$live")
         if [[ -n "$wid" ]]; then
             remote_sh "$host" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1" >/dev/null 2>&1 || true
             continue
@@ -827,7 +827,8 @@ find_hat_window() {
                 [[ -z "$t" ]] || printf 'group\t%s\t%s\n' "$w" "$t"
             done <<<"$(groups_in_window "$w")"
         done
-    } | awk -F '\t' -v hat="$hat" '
+    } | AWK_HAT="$hat" awk -F '\t' '
+        BEGIN { hat = ENVIRON["AWK_HAT"] }
         $1 == "want"  { want[$2] = 1; next }
         $1 == "mine"  { mine[$2] = 1; next }
         $1 == "win"   { order[++n] = $2; score[$2] = 0; next }
@@ -1668,7 +1669,7 @@ do_backfill() {
     [ -n "$panes" ] || { say "hat-restore: no tmux panes"; return 0; }
 
     local n=0 miss=0 pid cwd sid owner line ppid hops f
-    while IFS=$'\t' read -r pid cwd sid; do
+    while IFS=$'\x1f' read -r pid cwd sid; do
         [ -n "$sid" ] || continue
 
         # Walk up the parent chain: the agent is a grandchild of the pane's
@@ -1701,7 +1702,7 @@ EOT
         fi
         n=$((n+1))
     done <<EOT
-$("${SHELL:-/bin/bash}" -lc "$(printf '%q' "$claude_bin") agents --json" 2>/dev/null | jq -r '.[]? | select((.sessionId // "") != "") | [(.pid|tostring), (.cwd // ""), .sessionId] | @tsv' 2>/dev/null)
+$("${SHELL:-/bin/bash}" -lc "$(printf '%q' "$claude_bin") agents --json" 2>/dev/null | jq -r '.[]? | select((.sessionId // "") != "") | [(.pid|tostring), (.cwd // ""), .sessionId] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null)
 EOT
 
     say "hat-restore: backfilled $n agent(s); $miss not traceable to a tmux pane"
@@ -1765,7 +1766,7 @@ entries=$(cat "$PANES"/*.json 2>/dev/null \
               | sort_by(.session, .window)
               | .[] | [.session, (.window|tostring), .name, .cwd,
                        (.kind // "shell"), (.session_id // ""), (.state // "live")]
-              | @tsv' 2>/dev/null) || entries=""
+              | map(. // "" | tostring) | join("\u001f")' 2>/dev/null) || entries=""
 [ -n "$entries" ] || { say "hat-restore: no usable entries"; exit 0; }
 
 run() {
@@ -1782,7 +1783,7 @@ have_session() {
 }
 
 made=0 skipped=0 unwanted=0
-while IFS=$'\t' read -r s w n cwd kind sid state; do
+while IFS=$'\x1f' read -r s w n cwd kind sid state; do
     [ -n "$s" ] || continue
     if [ -f "$KEEP" ] && ! grep -qxF -- "$s" "$KEEP"; then
         [ "$dry" = 1 ] && printf '  would leave closed: %s:%s  (not in the client config)\n' "$s" "$w"
@@ -2373,7 +2374,7 @@ cmd_tab_pin() {
     tab_target "$2"
     line=$(remote_sh "$TAB_HOST" \
         "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}	#{window_index}	#{window_name}' 2>/dev/null" \
-        | awk -F'\t' -v t="$tab" '$2==t {print; exit} $3==t && !n {n=$0} END {if (n) print n}' | head -n 1)
+        | AWK_T="$tab" awk -F'\t' 'BEGIN {t = ENVIRON["AWK_T"]} $2==t {print; exit} $3==t && !n {n=$0} END {if (n) print n}' | head -n 1)
     [[ -n "$line" ]] || die "no tab '$tab' in '$TAB_SESSION' - give its index or its name"
     IFS=$'\t' read -r wid idx name <<<"$line"
     if [[ "$action" == pin ]]; then
@@ -2512,7 +2513,7 @@ DRAG_PLAN_JQ='
   | (if ($named | length) == 1 and $twins == 1 then $named[0] else null end) as $h
   | if $h == null then ["orphan", $o.surface, $o.ws, $o.session, $o.title]
     else ["move", $o.surface, $o.ws, $o.session, $h.session, $h.window, $h.name] end
-  | @tsv'
+  | map(. // "" | tostring) | join("\u001f")'
 
 drag_plan() { jq -r "$DRAG_PLAN_JQ"; }
 
@@ -2524,7 +2525,7 @@ drag_facts() {
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-drag.XXXXXX")
     while IFS= read -r title; do
         [[ -n "$title" ]] || continue
-        awk -F '\t' -v s="$title" '$1 == "S" && $2 == s { f = 1 } END { exit !f }' <<<"$state" || continue
+        AWK_S="$title" awk -F '\t' '$1 == "S" && $2 == ENVIRON["AWK_S"] { f = 1 } END { exit !f }' <<<"$state" || continue
         printf '%s' "$title" > "$tmp/t.$k"
         ( cmux_pane_map "$host" "$title" > "$tmp/m.$k" || true ) &
         k=$((k + 1))
@@ -2622,9 +2623,9 @@ heal_hat_drags() {
     drag_report "$report" "$second"
 
     local moved=0 kind orphan ws to from wid name
-    while IFS=$'\t' read -r kind orphan ws to from wid name; do
+    while IFS=$'\x1f' read -r kind orphan ws to from wid name; do
         [[ "$kind" == move ]] || continue
-        grep -qxF "$(printf 'move\t%s\t%s\t%s\t%s\t%s\t%s' "$orphan" "$ws" "$to" "$from" "$wid" "$name")" \
+        grep -qxF "$(printf 'move\037%s\037%s\037%s\037%s\037%s\037%s' "$orphan" "$ws" "$to" "$from" "$wid" "$name")" \
             <<<"$first" || continue
         # A dragged tab has nothing behind it, so it shows nothing. One that
         # shows anything is something else, whatever its title says - and one
@@ -2637,7 +2638,7 @@ heal_hat_drags() {
         fi
         # Moving a session's last window ends the session. The drag asked for
         # that, but it is too much to do unasked.
-        if [[ "$(awk -F '\t' -v s="$from" '$1 == "W" && $2 == s' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
+        if [[ "$(AWK_S="$from" awk -F '\t' '$1 == "W" && $2 == ENVIRON["AWK_S"]' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
             [[ -z "$report" ]] || warn "'${name:-tmux window}' is the last tab of '$from'; move it with: tmux move-window -s '=$from:$wid' -t '=$to:'"
             continue
         fi
@@ -2654,7 +2655,7 @@ heal_hat_drags() {
 drag_report() {
     local report="$1" plan="$2" kind orphan ws session title
     [[ -n "$report" ]] || return 0
-    while IFS=$'\t' read -r kind orphan ws session title; do
+    while IFS=$'\x1f' read -r kind orphan ws session title; do
         [[ "$kind" == orphan ]] || continue
         warn "the tab '$title' in '$session' has no tmux window of its own, and none was clearly its window"
     done <<<"$plan"
@@ -3540,7 +3541,7 @@ sync_once() {
         live=$(awk -F '\t' '$1 == "S" { print $2 }' "$tmp/ssh.$i")
         groups_json=$(window_groups_json "${wins[$i]}" 2>/dev/null || echo '{"groups":[]}')
         ws_json=$(window_ws_json "${wins[$i]}" 2>/dev/null || echo '{"workspaces":[]}')
-        while IFS=$'\t' read -r wref title; do
+        while IFS=$'\x1f' read -r wref title; do
             [[ -z "$wref" || -z "$title" ]] && continue
             grep -qxF "$title" <<<"$live" || continue
             ( cmux_pane_map "${hosts[$i]}" "$title" > "$tmp/map.${wref//[^A-Za-z0-9_-]/_}" || true ) &
@@ -3548,7 +3549,7 @@ sync_once() {
             [[ $((jobs % 8)) -ne 0 ]] || wait
         done < <(jq -r --argjson ws "$ws_json" '
             ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
-            | .groups[]?.member_workspace_ids[]? | [., ($t[.] // "")] | @tsv' <<<"$groups_json")
+            | .groups[]?.member_workspace_ids[]? | [., ($t[.] // "")] | map(. // "" | tostring) | join("\u001f")' <<<"$groups_json")
     done
     wait
 
@@ -3590,7 +3591,7 @@ sync_once() {
             if group_exists "$gname"; then
                 owner=$(group_hat "$gname")
             else
-                owner=$(awk -F '\t' -v g="$gname" '$1 == g { print $2; exit }' <<<"$adopt")
+                owner=$(AWK_G="$gname" awk -F '\t' '$1 == ENVIRON["AWK_G"] { print $2; exit }' <<<"$adopt")
                 if [[ -z "$owner" ]]; then
                     info "Adopting group '$gname' under hat '$hat'"
                     adopt+="$gname"$'\t'"$hat"$'\n'
@@ -4253,7 +4254,7 @@ creds_rows() {
             (($a.usage.fiveHour.resetsAt | eta) | floor | tostring),
             (($a.usage.sevenDay.resetsAt  | eta) | floor | tostring),
             (if $a.active then "active" else "" end) ]
-        | @tsv' 2>/dev/null || true
+        | map(. // "" | tostring) | join("\u001f")' 2>/dev/null || true
 }
 
 # Neither Anthropic nor OpenAI publishes a colour convention for these windows,
@@ -4332,7 +4333,7 @@ creds_gauges() {
 # Accept a letter, a cswap slot number, or any unique substring of an email.
 creds_resolve() {
     local sel="$1" letter slot email rest hit="" n=0
-    while IFS=$'\t' read -r letter slot email rest; do
+    while IFS=$'\x1f' read -r letter slot email rest; do
         [[ -z "$email" ]] && continue
         if [[ "$sel" == "$letter" || "$sel" == "$slot" || "$sel" == "$email" ]]; then
             printf '%s' "$email"; return 0
@@ -4392,7 +4393,7 @@ cmd_creds() {
             local letter slot email label r5 r7 e5 e7 active holders
             echo "Credentials (on this Mac, in the Keychain via cswap):"
             echo "  bars are capacity left, then time to the window reset"
-            while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
+            while IFS=$'\x1f' read -r letter slot email label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 holders=$(creds_hats_holding "$email")
                 printf '  %s %s %-28s %s%s%s\n' \
@@ -4597,7 +4598,7 @@ edit_refresh_all() {
 }
 
 edit_session_field() {
-    awk -F'\t' -v s="$2" -v c="$3" '$1==s {print $c; exit}' "$(edit_sessions_file "$1")" 2>/dev/null
+    AWK_S="$2" awk -F'\t' -v c="$3" '$1==ENVIRON["AWK_S"] {print $c; exit}' "$(edit_sessions_file "$1")" 2>/dev/null
 }
 
 edit_windows() {
@@ -4705,7 +4706,7 @@ edit_top() {
         [[ "$cols" != "$lastcols" ]] && { dirty=1; lastcols="$cols"; }
         if [[ "$dirty" == 1 ]]; then
             CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
-            while IFS=$'\t' read -r letter slot email label r5 r7 e5 e7 active; do
+            while IFS=$'\x1f' read -r letter slot email label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
                 CICON[$nc]=$(creds_dot "$r5" "$r7")
