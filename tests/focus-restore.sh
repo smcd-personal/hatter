@@ -17,9 +17,11 @@ fail() { echo "FAIL: $*" >&2; fails=$((fails + 1)); }
 mkdir -p "$work/bin"
 
 # --- a stub cmux with state ---------------------------------------------------
-# Two windows. W1 is where the user is: workspace U1, pane P1. W2 is the dev
-# hat's window. Focus, each window's selected workspace and each workspace's
-# focused pane are files, so identify reports what the calls before it did.
+# Two windows. W1 is where the user is: workspace U1, pane P1, tab (surface)
+# T1. W2 is the dev hat's window. Focus, each window's selected workspace and
+# each workspace's focused pane and tab are files, so identify reports what the
+# calls before it did. Focusing a pane selects a tab of its own, so only a
+# focus-panel after it gets T1 back.
 cat > "$work/bin/cmux" <<'STUB'
 #!/usr/bin/env bash
 set -u
@@ -54,8 +56,9 @@ case "$verb" in
     "identify "*)
         f=$(cat "$st/focus"); s=$(cat "$st/sel-$f")
         p=$(cat "$st/pane-$s" 2>/dev/null || echo "P-$s")
-        jq -n --arg w "$f" --arg s "$s" --arg p "$p" \
-            '{caller: null, focused: {window_id: $w, workspace_id: $s, pane_id: $p}}' ;;
+        t=$(cat "$st/surf-$s" 2>/dev/null || echo "T-$s")
+        jq -n --arg w "$f" --arg s "$s" --arg p "$p" --arg t "$t" \
+            '{caller: null, focused: {window_id: $w, workspace_id: $s, pane_id: $p, surface_id: $t}}' ;;
     "focus-window "*)
         jq -e --arg w "$win" 'any(.windows[]; .id == $w)' "$st/tree.json" >/dev/null || exit 1
         echo "$win" > "$st/focus" ;;
@@ -65,7 +68,10 @@ case "$verb" in
         echo "$ws" > "$st/sel-$win" ;;
     "focus-pane "*)
         has_ws "$win" "$ws" || exit 1
-        arg --pane "$@" > "$st/pane-$ws" ;;
+        p=$(arg --pane "$@"); echo "$p" > "$st/pane-$ws"; echo "T-$p" > "$st/surf-$ws" ;;
+    "focus-panel "*)
+        has_ws "$win" "$ws" || exit 1
+        arg --panel "$@" > "$st/surf-$ws" ;;
     "ssh-tmux "*)
         # Mirrors into the focused window. STUB_GONE: a workspace closes too.
         f=$(cat "$st/focus")
@@ -96,6 +102,7 @@ EOF
     echo U1 > "$work/st/sel-W1"
     echo S0 > "$work/st/sel-W2"
     echo P1 > "$work/st/pane-U1"
+    echo T1 > "$work/st/surf-U1"
     : > "$work/st/calls"
     cat > "$work/cfg/hatter/config.json" <<'EOF'
 {"version":3,
@@ -112,15 +119,15 @@ hat() {
         STUB_DIR="$work/st" STUB_MIRROR=dev-new "$hatter" "$@" </dev/null
 }
 
-where() { printf '%s %s %s' "$(cat "$work/st/focus")" "$(cat "$work/st/sel-W1")" \
-                             "$(cat "$work/st/pane-U1" 2>/dev/null)"; }
+where() { printf '%s %s %s %s' "$(cat "$work/st/focus")" "$(cat "$work/st/sel-W1")" \
+                                "$(cat "$work/st/pane-U1" 2>/dev/null)" "$(cat "$work/st/surf-U1" 2>/dev/null)"; }
 ncalls() { grep -c -- "$1" "$work/st/calls" || true; }
 show() { sed 's/^/    /' "$work/st/calls" >&2; }
 
 # --- success: focus goes back, the window first, then the workspace ----------
 reset
 hat new dev-new --group Dev >/dev/null 2>&1 || fail "new: exited non-zero"
-[[ "$(where)" == "W1 U1 P1" ]] || { fail "new: focus left at '$(where)', want 'W1 U1 P1'"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "new: focus left at '$(where)', want 'W1 U1 P1 T1'"; show; }
 grep -qx -- '--id-format both identify --no-caller --json' "$work/st/calls" \
     || { fail "new: focus was never recorded"; show; }
 # The record is taken before the first change.
@@ -130,16 +137,17 @@ rec=$(grep -n -- 'identify' "$work/st/calls" | head -1 | cut -d: -f1 || true)
     || { fail "new: focus recorded at call ${rec:-never}, after the first change at ${first:-?}"; show; }
 want='focus-window --window W1
 select-workspace --workspace U1 --window W1
-focus-pane --pane P1 --workspace U1 --window W1'
-[[ "$(tail -3 "$work/st/calls")" == "$want" ]] \
-    || { fail "new: did not end by returning to W1 / U1 / P1"; show; }
+focus-pane --pane P1 --workspace U1 --window W1
+focus-panel --panel T1 --workspace U1 --window W1'
+[[ "$(tail -4 "$work/st/calls")" == "$want" ]] \
+    || { fail "new: did not end by returning to W1 / U1 / P1 / T1"; show; }
 [[ -z "$(ls "$work"/hatter-focus.* 2>/dev/null)" ]] || fail "new: left its focus record behind"
 
 # --- failure halfway: still restored, and the failure still reported ---------
 reset
 rc=0; STUB_FAIL=ssh-tmux hat new dev-new --group Dev >/dev/null 2>&1 || rc=$?
 [[ "$rc" -ne 0 ]] || fail "failed new: exited 0"
-[[ "$(where)" == "W1 U1 P1" ]] || { fail "failed new: focus left at '$(where)'"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "failed new: focus left at '$(where)'"; show; }
 
 # --- interrupted: the EXIT trap still restores --------------------------------
 reset
@@ -155,7 +163,7 @@ if [[ -s "$work/st/hung" ]]; then
     kill -TERM "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     kill "$(cat "$work/st/hung")" 2>/dev/null || true
-    [[ "$(where)" == "W1 U1 P1" ]] || { fail "interrupted new: focus left at '$(where)'"; show; }
+    [[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "interrupted new: focus left at '$(where)'"; show; }
 else
     kill "$pid" 2>/dev/null || true
     fail "interrupted new: never reached ssh-tmux"; show
@@ -176,6 +184,12 @@ hat new dev-new --group Dev --focus >/dev/null 2>&1 || fail "new --focus: exited
     || { fail "new --focus: want W2 S-new, got $(cat "$work/st/focus") $(cat "$work/st/sel-W2")"; show; }
 [[ "$(ncalls 'focus-window --window W1')" -eq 0 ]] || { fail "new --focus: went back to W1"; show; }
 [[ -z "$(ls "$work"/hatter-focus.* 2>/dev/null)" ]] || fail "new --focus: left its focus record behind"
+
+# --- --focus on a run that fails before it gets there: back as usual -----------
+reset
+rc=0; STUB_FAIL=ssh-tmux hat new dev-new --group Dev --focus >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] || fail "failed new --focus: exited 0"
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "failed new --focus: focus left at '$(where)'"; show; }
 
 # --- read-only commands make no focus calls -------------------------------------
 for cmd in list sync; do
@@ -205,11 +219,29 @@ PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="$wor
              grep -c "focus-window --window W1" "$STUB_DIR/calls" > "$STUB_DIR/inner-back" || true
              source "$LIB"; focus_restore' \
     || fail "nested: the run failed"
-[[ "$(cat "$work/outer-focus.seen" 2>/dev/null)" == "W1|U1|P1" ]] \
+[[ "$(cat "$work/outer-focus.seen" 2>/dev/null)" == "W1|U1|P1|T1" ]] \
     || fail "nested: the inner hatter did not record into the outer's record"
 [[ "$(cat "$work/st/inner-back")" == 0 ]] || fail "nested: the inner hatter restored on its own"
-[[ "$(where)" == "W1 U1 P1" ]] || { fail "nested: the outer hatter did not restore: '$(where)'"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "nested: the outer hatter did not restore: '$(where)'"; show; }
 [[ "$(ncalls 'focus-window --window W1')" -eq 1 ]] || { fail "nested: restored more than once"; show; }
+
+# --- a subshell's EXIT trap does not restore -----------------------------------
+# sync sets the EXIT trap inside `( cmd_sync )`, where $$ is still the outer
+# hatter's. The record has to outlive the subshell, and focus stay put until the
+# outer hatter restores.
+reset
+PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="$work/st" \
+    LIB="$work/hatter-lib.sh" OUT="$work/sub" \
+    bash -c 'source "$LIB"
+             cmux_change focus-window --window W2 >/dev/null
+             ( cmd_sync ) </dev/null >/dev/null 2>&1 || true
+             if [[ -f "$HATTER_FOCUS_FILE" ]]; then echo kept; else echo gone; fi > "$OUT"
+             cat "$STUB_DIR/focus" >> "$OUT"
+             focus_restore' \
+    || fail "subshell: the run failed"
+[[ "$(tr '\n' ' ' < "$work/sub")" == "kept W2 " ]] \
+    || { fail "subshell: after ( cmd_sync ) want 'kept W2', got '$(tr '\n' ' ' < "$work/sub")'"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "subshell: the outer restore did not happen: '$(where)'"; show; }
 
 # The rack runs sync in a subshell, and sync sets the one EXIT trap there. That
 # trap unlocks the config, and must leave the rack's own cache alone.
@@ -225,55 +257,112 @@ PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="$wor
 # A record whose owner has exited belongs to no one: the run restores itself.
 reset
 true & dead=$!; wait "$dead"
+# Records left by killed hatters go at startup; a live one, and anything not
+# named exactly hatter-focus.<pid>, stay.
+sleep 30 & live=$!
+for f in "hatter-focus.$dead" "hatter-focus.$live" hatter-focus.x1 hatter-focusX.1; do
+    echo 'W9|X|P|T' > "$work/$f"
+done
+hat list >/dev/null 2>&1 || fail "stale records: list failed"
+[[ ! -e "$work/hatter-focus.$dead" ]] || fail "stale records: a dead hatter's record was kept"
+for f in "hatter-focus.$live" hatter-focus.x1 hatter-focusX.1; do
+    [[ -e "$work/$f" ]] || fail "stale records: removed $f"
+done
+kill "$live" 2>/dev/null || true; wait "$live" 2>/dev/null || true
+rm -f "$work/hatter-focus.$live" "$work/hatter-focus.x1" "$work/hatter-focusX.1"
+reset
 env PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="$work/st" \
     STUB_MIRROR=dev-new HATTER_FOCUS_OWNER="$dead" HATTER_FOCUS_FILE="$work/dead-focus" \
     "$hatter" new dev-new --group Dev </dev/null >/dev/null 2>&1 || fail "dead owner: the run failed"
-[[ "$(where)" == "W1 U1 P1" ]] || { fail "dead owner: focus left at '$(where)'"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "dead owner: focus left at '$(where)'"; show; }
 
 # --- every cmux change goes through cmux_change --------------------------------
-# Lists each cmux call at command position, outside comments, heredocs and
-# strings, as "<line> <function> <cmux|cmux_json> <verb>". Only reads may call
-# cmux directly; focus_restore is the one exception, being the restore itself.
-scan() {
-    awk '
-    function verb_of(rest,   a) {
-        split(rest, a, /[ \t]+/)
-        if (a[1] == "workspace" || a[1] == "workspace-group") return a[1] " " a[2]
-        return a[1]
-    }
-    {
-        line = $0
-        if (term != "") { if (line == term) term = ""; next }
-        if (match(line, /<<-?'\''?[A-Z_]+'\''?/)) {
-            t = substr(line, RSTART, RLENGTH); gsub(/[<'\''-]/, "", t); term = t
-        }
-        if (line ~ /^[[:space:]]*#/) next
-        if (match(line, /^[a-z_][a-z_0-9]*\(\)/)) fn = substr(line, 1, RLENGTH - 2)
-        # A line with an odd number of quotes is part of a string that spans
-        # lines, such as a die message that tells the user what to type.
-        if (gsub(/"/, "\"", line) % 2 == 1) next
-        s = line; off = 0
-        while (match(s, /(^|[;&|!({]|\$\(|then |do |else )[[:space:]]*cmux(_json)? [a-z][a-z-]*( [a-z][a-z-]*)?/)) {
-            m = substr(s, RSTART, RLENGTH)
-            before = substr(line, 1, off + RSTART)
-            off += RSTART + RLENGTH - 1
-            s = substr(s, RSTART + RLENGTH)
-            if (gsub(/"/, "\"", before) % 2 == 1) continue
-            sub(/^.*cmux/, "cmux", m)
-            tool = (m ~ /^cmux_json /) ? "cmux_json" : "cmux"
-            sub(/^cmux(_json)? /, "", m)
-            printf "%d\t%s\t%s\t%s\n", NR, fn, tool, verb_of(m)
-        }
-    }' "$1"
+# cmux-calls.awk lists every cmux call as "<line> <function> <tool> <verb>",
+# wherever it sits in a command and never in a comment, string or heredoc. Only
+# reads may call cmux directly. focus_restore is the restore itself, and
+# cmux_change and cmux_json pass on a verb they were given ("?").
+reads='^(list-windows|tree|read-screen|identify|list-panes|list-pane-surfaces|list-panels|current-window|current-workspace|workspace list|workspace-group list|rpc remote\.tmux\.pane_surfaces)$'
+bare() {
+    awk -f "$here/cmux-calls.awk" "$1" | awk -F '\t' -v r="$reads" '
+        $4 ~ r { next }
+        $2 == "focus_restore" && $4 ~ /^(focus-window|select-workspace|focus-pane|focus-panel)$/ { next }
+        ($2 == "cmux_change" || $2 == "cmux_json") && $4 == "?" { next }
+        { print }'
 }
-reads='^(list-windows|tree|rpc|read-screen|identify|list-panes|list-pane-surfaces|current-window|current-workspace|workspace list|workspace-group list)$'
-raw=$(scan "$hatter" | awk -F '\t' -v r="$reads" '$2 != "focus_restore" && $4 !~ r')
+raw=$(bare "$hatter")
 if [[ -n "$raw" ]]; then
-    fail "cmux changed directly, not through cmux_change (line, function, verb):"
+    fail "cmux changed directly, not through cmux_change (line, function, tool, verb):"
     printf '%s\n' "$raw" | sed 's/^/    /' >&2
 fi
 # The scan has to see calls for that to mean anything.
-[[ "$(scan "$hatter" | wc -l | tr -d ' ')" -ge 10 ]] || fail "the scan found almost no cmux calls"
+[[ "$(awk -f "$here/cmux-calls.awk" "$hatter" | wc -l | tr -d ' ')" -ge 10 ]] \
+    || fail "the scan found almost no cmux calls"
+
+# The scan itself, on small files: each "bad" one hides one bare change, the
+# "good" one has none.
+mkdir -p "$work/scan"
+cat > "$work/scan/bad-if" <<'FIXTURE'
+f() { if cmux close-workspace --workspace "$w"; then :; fi; }
+FIXTURE
+cat > "$work/scan/bad-elif" <<'FIXTURE'
+f() { if false; then :; elif cmux new-window; then :; fi; }
+FIXTURE
+cat > "$work/scan/bad-while" <<'FIXTURE'
+f() { while cmux focus-window --window "$w"; do break; done; }
+FIXTURE
+cat > "$work/scan/bad-until" <<'FIXTURE'
+f() { until cmux ssh-tmux "$host"; do sleep 1; done; }
+FIXTURE
+cat > "$work/scan/bad-not" <<'FIXTURE'
+f() { ! cmux select-workspace --workspace "$w" || true; }
+FIXTURE
+cat > "$work/scan/bad-command" <<'FIXTURE'
+f() { command cmux new-window >/dev/null; }
+FIXTURE
+cat > "$work/scan/bad-continued" <<'FIXTURE'
+f() {
+    cmux \
+        focus-window --window "$w"
+}
+FIXTURE
+cat > "$work/scan/bad-oddquotes" <<'FIXTURE'
+f() {
+    local msg="a message that
+  spans lines"; cmux new-window
+}
+FIXTURE
+cat > "$work/scan/bad-rpc" <<'FIXTURE'
+f() { cmux rpc workspace.close '{"id":"x"}' >/dev/null; }
+FIXTURE
+cat > "$work/scan/bad-substitution" <<'FIXTURE'
+f() { x="$(cmux --id-format both close-surface --surface "$s")"; }
+FIXTURE
+cat > "$work/scan/bad-json" <<'FIXTURE'
+f() { cmux_json workspace close "$w"; }
+FIXTURE
+cat > "$work/scan/good" <<'FIXTURE'
+# cmux new-window, in a comment
+f() {
+    command -v cmux >/dev/null 2>&1 || need cmux
+    die "run: cmux ssh-tmux $host"
+    local back="The session is safe. Bring it back with:
+    cmux ssh-tmux $host"
+    echo 'cmux focus-window --window W1'
+    cat <<'USAGE'
+cmux close-workspace --workspace x
+USAGE
+    cmux_change new-window
+    cmux rpc remote.tmux.pane_surfaces '{}'
+    x=$(cmux_json workspace list --window "$w")
+    case "$1" in a) cmux list-windows --json ;; esac
+}
+FIXTURE
+for f in "$work"/scan/bad-*; do
+    n=$(bare "$f" | wc -l | tr -d ' ')
+    [[ "$n" -eq 1 ]] || { fail "scan: $(basename "$f"): $n bare changes found, want 1"; bare "$f" >&2; }
+done
+n=$(bare "$work/scan/good" | wc -l | tr -d ' ')
+[[ "$n" -eq 0 ]] || { fail "scan: good: $n bare changes found, want 0"; bare "$work/scan/good" >&2; }
 
 [[ "$fails" -eq 0 ]] || { echo "$fails failure(s)" >&2; exit 1; }
 echo "PASS focus-restore"

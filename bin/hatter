@@ -44,9 +44,18 @@ HATTER_FOCUS_KEEP=0
 if [[ ! "${HATTER_FOCUS_OWNER:-}" =~ ^[0-9]+$ || -z "${HATTER_FOCUS_FILE:-}" ]] \
    || ! kill -0 "$HATTER_FOCUS_OWNER" 2>/dev/null; then
     HATTER_FOCUS_OWNER=$$
-    HATTER_FOCUS_FILE="${TMPDIR:-/tmp}"
-    HATTER_FOCUS_FILE="${HATTER_FOCUS_FILE%/}/hatter-focus.$$"
-    [[ ! -e "$HATTER_FOCUS_FILE" && ! -L "$HATTER_FOCUS_FILE" ]] || rm -f "$HATTER_FOCUS_FILE"
+    _dir="${TMPDIR:-/tmp}"; _dir="${_dir%/}"; [[ -n "$_dir" ]] || _dir=/tmp
+    HATTER_FOCUS_FILE="$_dir/hatter-focus.$$"
+    # Records left by a hatter that was killed before its EXIT trap ran: only
+    # this exact name, a pid that is no longer running, and a file of our own.
+    for _f in "$_dir"/hatter-focus.*; do
+        [[ "${_f##*/hatter-focus.}" =~ ^[0-9]+$ && -f "$_f" && -O "$_f" && ! -L "$_f" ]] || continue
+        if [[ "$_f" == "$HATTER_FOCUS_FILE" ]] || ! kill -0 "${_f##*/hatter-focus.}" 2>/dev/null; then
+            rm -f "$_f"
+        fi
+    done
+    [[ ! -L "$HATTER_FOCUS_FILE" ]] || rm -f "$HATTER_FOCUS_FILE"
+    unset _dir _f
 fi
 export HATTER_FOCUS_OWNER HATTER_FOCUS_FILE
 
@@ -656,13 +665,14 @@ cmux_change() {
     cmux "$@"
 }
 
-# What has focus now, as "<window>|<workspace>|<pane>"; fails when cmux cannot
-# say. One call: identify reports all three.
+# What has focus now, as "<window>|<workspace>|<pane>|<surface>"; fails when
+# cmux cannot say. One call: identify reports all four.
 focus_now() {
     have_cmux || return 1
     cmux --id-format both identify --no-caller --json 2>/dev/null \
         | jq -er '.focused | select(.window_id != null)
-                  | [.window_id, (.workspace_id // ""), (.pane_id // "")] | join("|")' 2>/dev/null
+                  | [.window_id, (.workspace_id // ""), (.pane_id // ""), (.surface_id // "")]
+                  | join("|")' 2>/dev/null
 }
 
 # Record focus, once per run. A failed look is recorded as "-" so that the run
@@ -677,16 +687,20 @@ focus_save() {
 }
 
 # Put focus back as focus_save found it, and forget the record, so that a later
-# change records afresh. Only the outermost hatter restores. Nothing is sent
-# when focus never moved. A workspace the run closed is gone, and then the
-# window is as close as it gets.
+# change records afresh. Nothing is sent when focus never moved. A workspace
+# the run closed is gone, and then the window is as close as it gets.
+#
+# Only the outermost hatter restores, and only in its own shell, never in a
+# subshell: `( cmd_sync )` sets the EXIT trap inside the subshell, and $$ there
+# is still the parent's. BASH_SUBSHELL, unlike BASHPID, is in bash 3.2.
 focus_restore() {
-    local f="$HATTER_FOCUS_FILE" saved="" win="" ws="" pane="" now
-    [[ "$HATTER_FOCUS_OWNER" == "$$" && -n "$f" && -f "$f" && -O "$f" && ! -L "$f" ]] || return 0
+    local f="$HATTER_FOCUS_FILE" saved="" win="" ws="" pane="" surface="" now
+    [[ "$BASH_SUBSHELL" == 0 && "$HATTER_FOCUS_OWNER" == "$$" ]] || return 0
+    [[ -n "$f" && -f "$f" && -O "$f" && ! -L "$f" ]] || return 0
     IFS= read -r saved < "$f" || true
     rm -f "$f"
     [[ "$HATTER_FOCUS_KEEP" != 1 ]] || return 0
-    IFS='|' read -r win ws pane <<<"$saved" || true
+    IFS='|' read -r win ws pane surface <<<"$saved" || true
     [[ -n "$win" && "$win" != - ]] || return 0
     now=$(focus_now) || now=""
     [[ "$now" != "$saved" ]] || return 0
@@ -695,6 +709,9 @@ focus_restore() {
     cmux select-workspace --workspace "$ws" --window "$win" >/dev/null 2>&1 || return 0
     [[ -n "$pane" ]] || return 0
     cmux focus-pane --pane "$pane" --workspace "$ws" --window "$win" >/dev/null 2>&1 || true
+    # The pane's selected tab, if it is still there.
+    [[ -n "$surface" ]] || return 0
+    cmux focus-panel --panel "$surface" --workspace "$ws" --window "$win" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -705,6 +722,9 @@ focus_restore() {
 hatter_on_exit() {
     local rc="${1:-0}"
     set +e
+    # --focus asks to stay where a run went, which only means anything when it
+    # got there: a run that failed goes back.
+    [[ "$rc" == 0 ]] || HATTER_FOCUS_KEEP=0
     focus_restore
     hatter_unlock
     exit "$rc"
