@@ -81,6 +81,7 @@ case "$*" in
     "workspace list --window W1 --json")
         jq -c '{workspaces: .windows[0].workspaces}' "$STUB_DIR/tree.json" ;;
     "rpc remote.tmux.pane_surfaces"*)   echo '{"panes":[]}' ;;
+    "workspace-group "*)                echo "$*" >> "$STUB_DIR/log" ;;
     *) echo "stub cmux: unexpected: $*" >&2; exit 1 ;;
 esac
 STUB
@@ -186,6 +187,8 @@ expect "sync: it is reported as running, not in cmux" \
 expect "sync: a running session cmux shows loose keeps its entry" "$(yes_if has G dev-l)"
 expect "sync: it is reported as running, in no cmux group" \
     "$(yes_if grep -q "dev-l  kept (running, in no cmux group)" "$d/out")"
+expect "sync: ...and put back into its group in cmux" \
+    "$(yes_if grep -q "^workspace-group add --group g-1 --workspace ws-l$" "$d/log")"
 expect "sync: a session gone from cmux and the server is dropped" "$(yes_if hasnt G dev-c)"
 expect "sync: a session cmux still shows but that is not running is dropped" \
     "$(yes_if hasnt G dev-d)"
