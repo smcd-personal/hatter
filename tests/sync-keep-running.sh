@@ -129,5 +129,31 @@ hatter_in sync || true
 expect "sync: an unreachable server leaves the config untouched" \
     "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
 
+# --- rm: the deliberate way to forget ----------------------------------------
+setup rm
+printf 'dev-a\ndev-b\ndev-x\n' > "$d/server"
+hatter_in rm dev-b || true
+expect "rm: kills the tmux session" "$(yes_if grep -qx "kill dev-b" "$d/log")"
+expect "rm: forgets the entry" \
+    "$(yes_if [ "$(cfg_of '.groups.G.sessions | has("dev-b")')" = false ])"
+expect "rm: tells the server" "$(yes_if bash -c '! grep -qx dev-b "$1" && grep -qx dev-a "$1"' _ "$d/told")"
+
+hatter_in rm dev-a --keep-running || true
+expect "rm --keep-running: forgets the entry" \
+    "$(yes_if [ "$(cfg_of '.groups.G.sessions | has("dev-a")')" = false ])"
+expect "rm --keep-running: leaves the session running" \
+    "$(yes_if bash -c '! grep -q "kill dev-a" "$1" && grep -qx dev-a "$2"' _ "$d/log" "$d/server")"
+
+hatter_in rm dev-x || true
+expect "rm: ends a running session no group records" "$(yes_if grep -qx "kill dev-x" "$d/log")"
+
+setup rm-down
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+touch "$d/down"
+rc=0; hatter_in rm dev-b || rc=$?
+expect "rm: an unreachable server fails" "$(yes_if [ "$rc" != 0 ])"
+expect "rm: an unreachable server changes nothing" \
+    "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "PASS sync-keep-running"

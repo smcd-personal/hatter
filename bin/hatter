@@ -3337,6 +3337,76 @@ cmd_key() {
     return $failed
 }
 
+# remote_kill_session <host> <session>: prints "killed" or "not running".
+# Non-zero when the server cannot be reached.
+remote_kill_session() {
+    local out
+    out=$(remote_sh "$1" "if tmux has-session -t $(sq "=$2") 2>/dev/null; then
+            tmux kill-session -t $(sq "=$2") && echo killed
+        else echo 'not running'; fi" 2>/dev/null) || return 1
+    case "$out" in killed|'not running') printf '%s\n' "$out" ;; *) return 1 ;; esac
+}
+
+# Drop a session from every group that records it.
+forget_session() {
+    backup_config
+    jq_write --arg s "$1" '.groups |= map_values(if .sessions then del(.sessions[$s]) else . end)'
+}
+
+# The deliberate way to close a workspace. Sync keeps a session that is still
+# running even when cmux no longer shows it, so forgetting one has to be asked
+# for: by default the tmux session is killed too, so nothing is left running
+# unrecorded. --keep-running forgets the entry only.
+cmd_rm() {
+    local session="" keep=0 a
+    for a in "$@"; do
+        case "$a" in
+            --keep-running) keep=1 ;;
+            -*) die "unknown flag: $a  (try: hatter help rm)" ;;
+            *)  [[ -z "$session" ]] || die "usage: hatter rm <session> [--keep-running]"
+                session="$a" ;;
+        esac
+    done
+    [[ -n "$session" ]] || die "usage: hatter rm <session> [--keep-running]"
+
+    # A session no group records can still be ended: its prefix names the hat.
+    local group hat host
+    group=$(session_group "$session")
+    if [[ -n "$group" ]]; then
+        hat=$(group_hat "$group")
+    else
+        [[ "$keep" == 0 ]] || die "no recorded session named '$session', so nothing to forget"
+        hat=$(session_hat "$session")
+        [[ -n "$hat" ]] || die "no recorded session named '$session', and no hat is called '${session%%-*}'"
+    fi
+    host=$(hat_ssh "$hat")
+
+    if [[ "$keep" == 1 ]]; then
+        forget_session "$session"
+        info "Forgot '$session' (group '$group'); its tmux session was not touched"
+        echo "  If it is still running, 'hatter list' shows it as in no group, and a"
+        echo "  sync records it again if cmux shows it in a group."
+        return 0
+    fi
+
+    local result
+    [[ -n "$host" ]] || die "hat '$hat' has no ssh destination; nothing changed (--keep-running forgets the entry only)"
+    result=$(remote_kill_session "$host" "$session") \
+        || die "could not reach $host to end '$session'; nothing changed.
+  --keep-running forgets the entry and leaves the server alone."
+    [[ -z "$group" ]] || forget_session "$session"
+    case "$result:${group:+recorded}" in
+        killed:recorded) info "Killed tmux session '$session' on $host and forgot it (group '$group')" ;;
+        killed:)         info "Killed tmux session '$session' on $host (it was in no group)" ;;
+        *:recorded)      info "Forgot '$session' (group '$group'); it was not running on $host" ;;
+        *)               die "'$session' is neither recorded nor running on $host" ;;
+    esac
+    # Tell the server now, or a reboot before the next sync brings it back.
+    tell_server_sessions "$host" 2>/dev/null \
+        || warn "$host: could not tell the server what to bring back after a reboot"
+    return 0
+}
+
 cmd_rename() {
     # Rename a session everywhere at once: on the server, in cmux, in the config.
     local old="${1:-}" new="${2:-}"
@@ -5416,9 +5486,8 @@ edit_workspaces() {
             d|D)
                 [[ $n -eq 0 ]] && continue
                 if edit_confirm "kill tmux session '$ws' and forget it? this ends everything running in it"; then
-                    remote_sh "$(hat_ssh "$hat")" "tmux kill-session -t $(sq "=$ws")" >/dev/null 2>&1 || true
-                    jq_write --arg g "$group" --arg s "$ws" 'del(.groups[$g].sessions[$s])'
-                    info "Deleted workspace '$ws'"
+                    # A subshell: rm dies when the server cannot be reached.
+                    ( cmd_rm "$ws" ) || warn "nothing was deleted"
                     edit_fetch_hat "$hat"; edit_pause
                 fi ;;
         esac
@@ -5528,6 +5597,7 @@ Commands:
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
+  rm <session>           End a workspace and forget it (--keep-running: forget only)
   repair <session>       Bring back a workspace cmux shows blank, in its place
   resize <hat|session>   Bring tabs stuck at 80x24 up to the window's size
   hat <subcommand>       Manage hats (shell servers)
@@ -5809,6 +5879,27 @@ renames the tmux session, so after doing it by hand just run `hatter sync`.
   hatter rename dev-website-parser dev-website-grid
 USAGE
     ;;
+    rm|remove) cat <<'USAGE'
+hatter rm <session> [--keep-running]
+
+End a workspace on purpose: kill its tmux session on the server and drop it
+from the config, then tell the server, so a reboot does not bring it back.
+Closing a workspace in cmux is not enough: sync keeps a session that is still
+running (see: hatter help sync).
+
+A running session that no group records is ended the same way; its name's
+prefix says which hat it is on. If the server cannot be reached, nothing is
+changed.
+
+  --keep-running   Forget the config entry only; the tmux session runs on.
+                   `hatter list` then shows it as running in no group, and a
+                   sync records it again if cmux shows it in a group.
+
+The rack's workspace screen does the same with d.
+
+  hatter rm dev-website-parser
+USAGE
+    ;;
     hat) cat <<'USAGE'
 hatter hat <subcommand>
 
@@ -6037,7 +6128,7 @@ shift || true
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|resize|shortcuts|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|resize|shortcuts|rm|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -6076,6 +6167,7 @@ case "$cmd" in
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
+    rm)        [[ $# -gt 0 ]] || { usage_cmd rm; exit 1; };        cmd_rm "$@" ;;
     repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
     resize)    [[ $# -gt 0 ]] || { usage_cmd resize; exit 1; };    cmd_resize "$@" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;
