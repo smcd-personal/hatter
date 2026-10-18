@@ -392,16 +392,50 @@ host_recorded_sessions() {
         | .sessions | keys[]?'
 }
 
+# A remote sh fragment that sets $list to the server's tmux sessions, one per
+# line, or $lerr to why it could not tell. A server with no tmux running has no
+# sessions; tmux missing, or a socket it cannot use, is an error, so that a
+# broken tmux is never read as "nothing is running".
+REMOTE_LIST_SH='list="" lerr=""
+if ! command -v tmux >/dev/null 2>&1; then
+    lerr="tmux is not installed"
+elif ! list=$(tmux list-sessions -F "#{session_name}" 2>&1); then
+    case "$list" in
+        *"no server running"*|*"error connecting to"*"No such file or directory"*) ;;
+        *) lerr=$(printf "%s\n" "$list" | head -n 1) ;;
+    esac
+    list=""
+fi'
+
 # hat_live_sessions <host>: the tmux sessions running there, one per line.
-# Non-zero when the server cannot be reached, which is not the same as a
-# server with no sessions: callers must not treat the first as the second.
+# Returns 1 when the server cannot be reached and 2 when it answers but its
+# tmux cannot be read (the reason goes to stderr). Neither is the same as a
+# server with no sessions, and callers must not treat them as one.
 hat_live_sessions() {
     local out
-    out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" \
-            "tmux list-sessions -F '#S' 2>/dev/null; echo @@hatter-ok" 2>/dev/null) || true
+    out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" "$REMOTE_LIST_SH"'
+        if [ -n "$lerr" ]; then printf "@@hatter-err %s\n" "$lerr"
+        else [ -z "$list" ] || printf "%s\n" "$list"; echo @@hatter-ok; fi' 2>/dev/null) || true
+    if grep -q '^@@hatter-err ' <<<"$out"; then
+        sed -n 's/^@@hatter-err //p' <<<"$out" | head -n 1 >&2
+        return 2
+    fi
     grep -qx '@@hatter-ok' <<<"$out" || return 1
     grep -vx '@@hatter-ok' <<<"$out" || true
     return 0
+}
+
+# Where a session stands, worded once for sync, list and the rack:
+#   session_place <session> <live> <shown> <grouped>
+# <live> is the server's running sessions, <shown> the titles cmux shows in the
+# hat's window and <grouped> those of them in a group; "?" for <shown> means
+# cmux could not be read. Prints one of:
+#   not running | running | running, in no cmux group | running, not in cmux
+session_place() {
+    grep -qxF -- "$1" <<<"$2" || { echo "not running"; return 0; }
+    if [[ "$3" == "?" ]] || grep -qxF -- "$1" <<<"$4"; then echo running
+    elif grep -qxF -- "$1" <<<"$3"; then echo "running, in no cmux group"
+    else echo "running, not in cmux"; fi
 }
 
 # hat_unrecorded <hat> <live sessions>: the running sessions that no hat on
@@ -782,6 +816,18 @@ titles_in_window() {
         return 0
     fi
     window_ws_json "$1" 2>/dev/null | jq -r '.workspaces[]?.title // empty'
+}
+
+# window_titles <window> [grouped]: the workspace titles cmux shows in a
+# window, or only those in one of its groups.
+window_titles() {
+    if [[ "${2:-}" != grouped ]]; then titles_in_window "$1"; return 0; fi
+    local ws gs
+    ws=$(window_ws_json "$1" 2>/dev/null) || return 0
+    gs=$(window_groups_json "$1" 2>/dev/null) || return 0
+    jq -r --argjson ws "$ws" '
+        ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
+        | .groups[]?.member_workspace_ids[]? | $t[.] // empty' <<<"$gs" 2>/dev/null || true
 }
 
 workspace_ref_by_title() {
@@ -3099,13 +3145,52 @@ cmd_key() {
     return $failed
 }
 
-# remote_kill_session <host> <session>: prints "killed" or "not running".
-# Non-zero when the server cannot be reached.
-remote_kill_session() {
+# A remote sh fragment that ends tmux session $s and makes sure a reboot does
+# not bring it back. Prints "killed" or "not running", or "@@hatter-err <why>".
+#
+# tmux-continuum restores the last tmux-resurrect snapshot when the server
+# starts, and that snapshot still holds the session. So a fresh one is taken
+# once it is gone (hat-save, when provisioned), and then the session is taken
+# out of whatever snapshot `last` points at. The second step is what covers
+# the last session on a server: hat-save keeps the old snapshot when nothing
+# is running, rather than save an empty one. The snapshot directory is read
+# before the kill, while the server that knows @resurrect-dir is still up.
+REMOTE_END_SH="$REMOTE_LIST_SH"'
+[ -z "$lerr" ] || { printf "@@hatter-err %s\n" "$lerr"; exit 0; }
+dir=$(tmux show-option -gqv @resurrect-dir 2>/dev/null) || dir=""
+if [ -z "$dir" ]; then
+    if [ -d "$HOME/.tmux/resurrect" ]; then dir="$HOME/.tmux/resurrect"
+    else dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"; fi
+fi
+case "$dir" in "\$HOME"*) dir="$HOME${dir#\$HOME}" ;; "~"*) dir="$HOME${dir#\~}" ;; esac
+if printf "%s\n" "$list" | grep -qxF -- "$s"; then
+    if ! e=$(tmux kill-session -t "=$s" 2>&1); then
+        printf "@@hatter-err could not end it: %s\n" "$(printf "%s\n" "$e" | head -n 1)"; exit 0
+    fi
+    echo killed
+    [ -x "$HOME/.local/bin/hat-save" ] && "$HOME/.local/bin/hat-save" >/dev/null 2>&1
+else
+    echo "not running"
+fi
+f=$(readlink "$dir/last" 2>/dev/null) || f=""
+case "$f" in "") exit 0 ;; /*) ;; *) f="$dir/$f" ;; esac
+strip() { S="$s" awk -F "\t" "!((\$1 == \"pane\" || \$1 == \"window\" || \$1 == \"grouped_session\") && \$2 == ENVIRON[\"S\"])" "$1"; }
+if [ -s "$f" ] && [ "$(strip "$f" | wc -l)" -ne "$(wc -l < "$f")" ]; then
+    new="tmux_resurrect_$(date +%Y%m%dT%H%M%S)-hatter-rm.txt"
+    strip "$f" > "$dir/$new.tmp" && mv "$dir/$new.tmp" "$dir/$new" && ln -sfn "$new" "$dir/last"
+fi
+exit 0'
+
+# remote_end_session <host> <session>: prints "killed" or "not running".
+# Returns 1 when the server cannot be reached, 2 when its tmux cannot be read
+# or would not end the session (the reason goes to stderr).
+remote_end_session() {
     local out
-    out=$(remote_sh "$1" "if tmux has-session -t $(sq "=$2") 2>/dev/null; then
-            tmux kill-session -t $(sq "=$2") && echo killed
-        else echo 'not running'; fi" 2>/dev/null) || return 1
+    out=$(remote_sh "$1" "s=$(sq "$2"); $REMOTE_END_SH" 2>/dev/null) || return 1
+    if grep -q '^@@hatter-err ' <<<"$out"; then
+        sed -n 's/^@@hatter-err //p' <<<"$out" | head -n 1 >&2
+        return 2
+    fi
     case "$out" in killed|'not running') printf '%s\n' "$out" ;; *) return 1 ;; esac
 }
 
@@ -3117,8 +3202,9 @@ forget_session() {
 
 # The deliberate way to close a workspace. Sync keeps a session that is still
 # running even when cmux no longer shows it, so forgetting one has to be asked
-# for: by default the tmux session is killed too, so nothing is left running
-# unrecorded. --keep-running forgets the entry only.
+# for. By default the tmux session is ended too, and kept out of what the
+# server brings back after a reboot; --keep-running forgets the config entry
+# and leaves the server exactly as it is. See: hatter help rm.
 cmd_rm() {
     local session="" keep=0 a
     for a in "$@"; do
@@ -3145,25 +3231,38 @@ cmd_rm() {
 
     if [[ "$keep" == 1 ]]; then
         forget_session "$session"
-        info "Forgot '$session' (group '$group'); its tmux session was not touched"
-        echo "  If it is still running, 'hatter list' shows it as in no group, and a"
-        echo "  sync records it again if cmux shows it in a group."
+        info "Forgot '$session' (group '$group'); the server was not touched"
+        echo "  If it is running it goes on running, and tmux-resurrect may bring it back"
+        echo "  after a reboot. hatter's own boot rebuild drops it once a sync has told the"
+        echo "  server what the config records."
         return 0
     fi
 
-    local result
+    local result="" rc=0 why errf
     [[ -n "$host" ]] || die "hat '$hat' has no ssh destination; nothing changed (--keep-running forgets the entry only)"
-    result=$(remote_kill_session "$host" "$session") \
-        || die "could not reach $host to end '$session'; nothing changed.
-  --keep-running forgets the entry and leaves the server alone."
-    [[ -z "$group" ]] || forget_session "$session"
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-rm.XXXXXX")
+    result=$(remote_end_session "$host" "$session" 2>"$errf") || rc=$?
+    why=$(head -n 1 "$errf"); rm -f "$errf"
+    case "$rc" in
+        0) ;;
+        2) die "tmux on $host could not end '$session': ${why:-no reason given}
+  Nothing was changed in the config. --keep-running forgets the entry only." ;;
+        *) die "could not reach $host to end '$session'; nothing changed.
+  --keep-running forgets the entry and leaves the server alone." ;;
+    esac
+    if [[ -n "$group" ]] && ! ( forget_session "$session" ); then
+        [[ "$result" == killed ]] || die "could not drop '$session' from the config"
+        die "killed '$session' on $host, but could not drop it from the config.
+  Finish with: hatter rm $session --keep-running"
+    fi
     case "$result:${group:+recorded}" in
         killed:recorded) info "Killed tmux session '$session' on $host and forgot it (group '$group')" ;;
         killed:)         info "Killed tmux session '$session' on $host (it was in no group)" ;;
         *:recorded)      info "Forgot '$session' (group '$group'); it was not running on $host" ;;
         *)               die "'$session' is neither recorded nor running on $host" ;;
     esac
-    # Tell the server now, or a reboot before the next sync brings it back.
+    # Tell the server now, or hat-restore brings it back after a reboot before
+    # the next sync has.
     tell_server_sessions "$host" 2>/dev/null \
         || warn "$host: could not tell the server what to bring back after a reboot"
     return 0
@@ -3655,23 +3754,50 @@ sync_once() {
         # detaches it, and its session runs on. One still running keeps its
         # entry; only one gone from the server as well is dropped. A group cmux
         # does not show at all is not rewritten, so its entries stay as they were.
-        local rg rs
-        while IFS=$'\t' read -r rg rs; do
+        #
+        # A server part-way through coming back from a reboot runs only some of
+        # its sessions, and dropping the rest would forget them for good. So when
+        # none of the hat's recorded sessions is running, or more than half of
+        # them would go at once, nothing is dropped this pass.
+        local rg rs shown grouped place total=0 running=0 drops=0 hold=0 unseen=""
+        shown=$(jq -r '.workspaces[]?.title // empty' <<<"$ws_json")
+        grouped=$(jq -r --argjson ws "$ws_json" '
+            ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
+            | .groups[]?.member_workspace_ids[]? | $t[.] // empty' <<<"$groups_json")
+        while IFS=$'\x1f' read -r rg rs; do
             [[ -z "$rs" ]] && continue
-            grep -qxF "$rs" <<<"$seen" && continue
-            if grep -qxF "$rs" <<<"$live"; then
-                echo "  $hat / $rg / $rs  kept (running, not in cmux)"
-                if jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null; then
-                    patch=$(jq -c --arg g "$rg" --arg s "$rs" \
-                                  --argjson e "$(cfg -c --arg g "$rg" --arg s "$rs" '.groups[$g].sessions[$s]')" \
-                                  '.[$g].sessions[$s] = $e' <<<"$patch")
-                fi
-            elif jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null; then
-                echo "  $hat / $rg / $rs  dropped (not running, not in cmux)"
+            total=$((total + 1))
+            grep -qxF -- "$rs" <<<"$live" && running=$((running + 1))
+            grep -qxF -- "$rs" <<<"$seen" && continue
+            unseen+="$rg"$'\x1f'"$rs"$'\n'
+            if ! grep -qxF -- "$rs" <<<"$live" && jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null; then
+                drops=$((drops + 1))
             fi
         done < <(cfg --arg l "$hat" '
             .groups | to_entries[] | select(.value.hat == $l)
-            | .key as $g | .value.sessions | keys[]? | [$g, .] | @tsv')
+            | .key as $g | .value.sessions | keys[]? | [$g, .] | map(. // "" | tostring) | join("\u001f")')
+        if [[ "$drops" -gt 0 ]] && { [[ "$running" == 0 ]] || [[ $((drops * 2)) -gt "$total" ]]; }; then
+            hold=1
+            echo "  $hat: $drops of its $total recorded sessions are not running - too many to be"
+            echo "    closed on purpose (a server still coming back?), so none is dropped this pass."
+            echo "    To forget one that is gone for good: hatter rm <session>"
+        fi
+        while IFS=$'\x1f' read -r rg rs; do
+            [[ -z "$rs" ]] && continue
+            place=$(session_place "$rs" "$live" "$shown" "$grouped")
+            jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null || {
+                [[ "$place" == "not running" ]] || echo "  $hat / $rg / $rs  kept ($place)"
+                continue
+            }
+            if [[ "$place" == "not running" && "$hold" == 0 ]]; then
+                echo "  $hat / $rg / $rs  dropped (not running)"
+                continue
+            fi
+            echo "  $hat / $rg / $rs  kept ($place)"
+            patch=$(jq -c --arg g "$rg" --arg s "$rs" \
+                          --argjson e "$(cfg -c --arg g "$rg" --arg s "$rs" '.groups[$g].sessions[$s]')" \
+                          '.[$g].sessions[$s] = $e' <<<"$patch")
+        done <<<"$unseen"
     done
     rm -rf "$tmp"
     cmux_snapshot_drop
@@ -3912,44 +4038,48 @@ cmd_list() {
     n=${#hats[@]}
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-list.XXXXXX")
     for ((i = 0; i < n; i++)); do
-        ( hat_live_sessions "$(hat_ssh "${hats[$i]}")" > "$tmp/$i" 2>/dev/null \
-            || rm -f "$tmp/$i" ) &
+        ( hat_live_sessions "$(hat_ssh "${hats[$i]}")" > "$tmp/$i" 2>"$tmp/$i.err" \
+            || mv "$tmp/$i" "$tmp/$i.failed" ) &
     done
     wait
     local cmux_up=0
     if cmux_alive; then cmux_up=1; cmux_snapshot; fi
 
-    local reached live win titles dg sess desc mark un
+    local reached live win shown grouped dg sess desc mark un why
     for ((i = 0; i < n; i++)); do
         hat="${hats[$i]}"
-        reached=0 live="" titles="" win=""
-        if [[ -f "$tmp/$i" ]]; then reached=1; live=$(cat "$tmp/$i"); fi
+        reached=0 live="" win="" shown="?" grouped="" why=""
+        if [[ -f "$tmp/$i" ]]; then
+            reached=1; live=$(cat "$tmp/$i")
+        else
+            why=$(head -n 1 "$tmp/$i.err" 2>/dev/null) || why=""
+            why="  (live state unknown: ${why:-server not reached})"
+        fi
         if [[ "$cmux_up" == 1 ]]; then
             win=$(find_hat_window "$hat")
-            [[ -n "$win" ]] && titles=$(titles_in_window "$win")
+            shown="" grouped=""
+            if [[ -n "$win" ]]; then
+                shown=$(window_titles "$win"); grouped=$(window_titles "$win" grouped)
+            fi
         fi
         dg=$(hat_default_group "$hat")
         printf 'window "%s"  ->  %s  [%s]%s%s\n' "$hat" "$(hat_ssh "$hat")" "$(hat_dir "$hat")" \
-            "${dg:+  (default group: $dg)}" \
-            "$([[ "$reached" == 1 ]] || echo "  (server not reached: live state unknown)")"
+            "${dg:+  (default group: $dg)}" "$why"
         while IFS= read -r group; do
             [[ -z "$group" ]] && continue
             printf '  group %s\n' "$group"
-            while IFS=$'\t' read -r sess desc; do
+            while IFS=$'\x1f' read -r sess desc; do
                 [[ -z "$sess" ]] && continue
                 mark=""
                 if [[ "$reached" == 1 ]]; then
-                    if ! grep -qxF "$sess" <<<"$live"; then
-                        mark="  - not running"
-                    elif [[ -n "$win" ]] && ! grep -qxF "$sess" <<<"$titles"; then
-                        mark="  - running, not in cmux"
-                    fi
+                    mark=$(session_place "$sess" "$live" "$shown" "$grouped")
+                    if [[ "$mark" == running ]]; then mark=""; else mark="  - $mark"; fi
                 fi
                 printf '    %s  (%s)%s\n' "$sess" "$desc" "$mark"
             done < <(cfg --arg g "$group" '.groups[$g].sessions | to_entries[]
                 | ([.value.windows[]? | select(.pinned) | .name] | join(", ")) as $p
                 | [.key, "\(.value.windows | length) tabs\(if $p == "" then "" else "; pinned: \($p)" end)"]
-                | @tsv')
+                | map(. // "" | tostring) | join("\u001f")')
         done < <(groups_of_hat "$hat")
         if [[ "$reached" == 1 ]]; then
             un=$(hat_unrecorded "$hat" "$live")
@@ -5127,21 +5257,28 @@ edit_groups() {
 
 # --- level 3: workspaces ----------------------------------------------------
 
-# The titles cmux shows in a hat's window, for marking a running session that
-# no workspace shows. Empty when cmux cannot say, and then nothing is marked.
-edit_cmux_titles() {
+# What cmux shows in a hat's window, for session_place: EDIT_SHOWN, every
+# title, and EDIT_GROUPED, those in a group. EDIT_SHOWN is "?" when cmux
+# cannot say, and then nothing is marked.
+EDIT_SHOWN="?"
+EDIT_GROUPED=""
+edit_cmux_places() {
     local win
+    EDIT_SHOWN="?" EDIT_GROUPED=""
     cmux_alive || return 0
     cmux_snapshot
     win=$(find_hat_window "$1")
-    [[ -n "$win" ]] && titles_in_window "$win"
+    EDIT_SHOWN=""
+    if [[ -n "$win" ]]; then
+        EDIT_SHOWN=$(window_titles "$win"); EDIT_GROUPED=$(window_titles "$win" grouped)
+    fi
     cmux_snapshot_drop
     return 0
 }
 
 edit_workspaces() {
-    local hat="$1" group="$2" SEL=1 n ws i tabs att state titles
-    titles=$(edit_cmux_titles "$hat")
+    local hat="$1" group="$2" SEL=1 n ws i tabs att state place
+    edit_cmux_places "$hat"
     while :; do
         WSS=(); n=0
         while IFS= read -r ws; do
@@ -5162,8 +5299,13 @@ edit_workspaces() {
             if [[ -n "$tabs" ]]; then
                 state=$(printf '%s● running%s  %s tab(s)' "$C_GR" "$C_R" "$tabs")
                 [[ "$att" == "1" ]] && state="$state  ${C_DIM}attached${C_R}"
-                [[ -n "$titles" ]] && ! grep -qxF "$ws" <<<"$titles" \
-                    && state="$state  ${C_YL}not in cmux${C_R} ${C_DIM}restore --missing mirrors it${C_R}"
+                place=$(session_place "$ws" "$ws" "$EDIT_SHOWN" "$EDIT_GROUPED")
+                case "$place" in
+                    "running, not in cmux")
+                        state="$state  ${C_YL}not in cmux${C_R} ${C_DIM}restore --missing mirrors it${C_R}" ;;
+                    "running, in no cmux group")
+                        state="$state  ${C_YL}in no cmux group${C_R} ${C_DIM}restore puts it back${C_R}" ;;
+                esac
             else
                 state=$(printf '%s✗ not running%s  %sre-create with restore%s' \
                         "$C_RD" "$C_R" "$C_DIM" "$C_R")
@@ -5184,7 +5326,7 @@ edit_workspaces() {
             enter|right|l)
                 [[ $n -gt 0 ]] && { edit_tabs "$hat" "$group" "$ws" || return 1; }
                 : ;;
-            !) edit_fetch_hat "$hat"; titles=$(edit_cmux_titles "$hat") ;;
+            !) edit_fetch_hat "$hat"; edit_cmux_places "$hat" ;;
             a|A)
                 edit_ask "new workspace name (a bare name gets the '$hat-' prefix)"
                 if [[ -n "$EDIT_REPLY" ]]; then
@@ -5206,11 +5348,23 @@ edit_workspaces() {
                 edit_fetch_hat "$hat"; edit_pause ;;
             d|D)
                 [[ $n -eq 0 ]] && continue
-                if edit_confirm "kill tmux session '$ws' and forget it? this ends everything running in it"; then
-                    # A subshell: rm dies when the server cannot be reached.
-                    ( cmd_rm "$ws" ) || warn "nothing was deleted"
-                    edit_fetch_hat "$hat"; edit_pause
-                fi ;;
+                # Ending it is the usual case; forgetting only is for an entry
+                # whose server is gone, or a session to keep but stop tracking.
+                printf '  %sremove %s:%s [k]ill it and forget it / [f]orget only, leave it running / [N]o ' \
+                    "$C_YL" "$ws" "$C_R" >&2
+                edit_readkey
+                # A subshell: rm dies on whatever it could not do, and says what
+                # that was - including when it ended the session but could not
+                # finish.
+                case "$KEY" in
+                    k|K) printf 'kill\n' >&2
+                         ( cmd_rm "$ws" ) || warn "rm did not finish - see above"
+                         edit_fetch_hat "$hat"; edit_pause ;;
+                    f|F) printf 'forget only\n' >&2
+                         ( cmd_rm "$ws" --keep-running ) || warn "rm did not finish - see above"
+                         edit_fetch_hat "$hat"; edit_pause ;;
+                    *)   printf 'no\n' >&2 ;;
+                esac ;;
         esac
     done
 }
@@ -5578,19 +5732,27 @@ USAGE
 hatter rm <session> [--keep-running]
 
 End a workspace on purpose: kill its tmux session on the server and drop it
-from the config, then tell the server, so a reboot does not bring it back.
-Closing a workspace in cmux is not enough: sync keeps a session that is still
-running (see: hatter help sync).
+from the config. Closing a workspace in cmux is not enough: sync keeps a
+session that is still running (see: hatter help sync).
+
+A server brings sessions back after a reboot two ways, and rm closes both:
+tmux-resurrect's last snapshot (it takes a new one, and takes the session out
+of the snapshot `last` points at, which matters for the last session on a
+server), and hat-restore's list of what the config records (it tells the
+server the new list).
 
 A running session that no group records is ended the same way; its name's
-prefix says which hat it is on. If the server cannot be reached, nothing is
-changed.
+prefix says which hat it is on. If the server cannot be reached, or its tmux
+cannot be read, nothing is changed.
 
-  --keep-running   Forget the config entry only; the tmux session runs on.
-                   `hatter list` then shows it as running in no group, and a
-                   sync records it again if cmux shows it in a group.
+  --keep-running   Forget the config entry only, and leave the server exactly
+                   as it is: the session runs on, and tmux-resurrect may bring
+                   it back after a reboot. Use it for an entry whose server is
+                   gone, or a session you want to keep but stop tracking.
+                   `hatter list` then shows it, if running, as in no group.
 
-The rack's workspace screen does the same with d.
+The rack's workspace screen does both with d: k ends and forgets, f forgets
+only.
 
   hatter rm dev-website-parser
 USAGE
@@ -5666,9 +5828,10 @@ open. Takes no options.
 
 Each server is asked which sessions are running, so nothing can hide:
 
-  not running              recorded, but its tmux session is gone
-  running, not in cmux     recorded and running, but no workspace shows it
-  running, in no group     running on the server, but no group records it
+  not running                recorded, but its tmux session is gone
+  running, not in cmux       recorded and running, but no workspace shows it
+  running, in no cmux group  recorded and running, shown loose in cmux
+  running, in no group       running on the server, but no group records it
 
 A hat whose server cannot be reached says so, and its sessions go unmarked.
 For a per-hat summary, use `hatter hat status`.
@@ -5687,9 +5850,16 @@ left as they are rather than being emptied.
 Not being in cmux is not the same as being gone. Closing a mirrored workspace
 only detaches it, and its tmux session runs on. So a recorded session that cmux
 no longer shows in a group, but that is still running on its server, keeps its
-entry, and sync reports it as "kept (running, not in cmux)"; `hatter restore
---missing` mirrors it again. An entry is dropped only when its session is gone
-from the server too. To close a workspace for good, use `hatter rm`.
+entry. sync says where it is: "kept (running, not in cmux)", which `hatter
+restore --missing` mirrors again, or "kept (running, in no cmux group)", which
+`hatter restore` puts back in its group. An entry is dropped only when its
+session is no longer running on the server: "dropped (not running)". To close
+a workspace for good, use `hatter rm`.
+
+A server still coming back from a reboot may run only some of its sessions.
+So when none of a hat's recorded sessions is running, or more than half of
+them would be dropped at once, sync drops none of them that pass and says so.
+`hatter rm` forgets one that is gone for good.
 
 Sessions running on a server that no group records are reported as well, and
 `hatter list` marks both kinds.
@@ -5834,7 +6004,7 @@ shift || true
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|resize|shortcuts|rm|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -5871,7 +6041,7 @@ case "$cmd" in
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
-    rm)        [[ $# -gt 0 ]] || { usage_cmd rm; exit 1; };        cmd_rm "$@" ;;
+    rm|remove) [[ $# -gt 0 ]] || { usage_cmd rm; exit 1; };        cmd_rm "$@" ;;
     repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
     resize)    [[ $# -gt 0 ]] || { usage_cmd resize; exit 1; };    cmd_resize "$@" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;
