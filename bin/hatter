@@ -3942,7 +3942,7 @@ cmd_group() {
     case "$sub" in
         list|"")
             cfg '.groups | to_entries[]
-                 | "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys | join(", "))"'
+                 | "\(.key)\t[hat: \(.value.hat)\(if .value.managed then ", managed by hatter" else "" end)]  \(.value.sessions | keys | join(", "))"'
             ;;
         add|set)
             local name="${1:-}" hat=""
@@ -3954,6 +3954,8 @@ cmd_group() {
                 esac
             done
             [[ -n "$name" ]] || die "usage: hatter group add <Name> --hat <prefix>"
+            group_name_reserved "$name" && \
+                die "'$UNASSIGNED' is hatter's own group, kept for workspaces in no group - pick another name"
             if [[ -z "$hat" ]]; then
                 [[ -t 0 ]] || die "--hat is required"
                 read -r -p "  hat prefix for '$name': " hat
@@ -3972,6 +3974,11 @@ cmd_group() {
                 die "usage: hatter group rename <old> <new>"
             group_exists "$old_name" || die "unknown group: $old_name"
             group_exists "$new_name" && die "a group named '$new_name' already exists"
+            group_managed "$old_name" && \
+                die "'$old_name' is hatter's own group and keeps its name. Move its workspaces
+  into a real group instead: hatter new <session> --group <name>"
+            group_name_reserved "$new_name" && \
+                die "'$UNASSIGNED' is hatter's own group, kept for workspaces in no group - pick another name"
 
             local hat win gref
             hat=$(group_hat "$old_name")
@@ -3994,6 +4001,10 @@ cmd_group() {
         rm|remove)
             local name="${1:-}"
             [[ -n "$name" ]] || die "usage: hatter group rm <Name>"
+            group_managed "$name" && \
+                die "'$name' is hatter's own group: hatter removes it once it is empty.
+  Move its workspaces into a real group (hatter new <session> --group <name>),
+  or end them (hatter rm <session>)."
             backup_config
             jq_write --arg g "$name" 'del(.groups[$g])'
             info "Removed '$name' from config (cmux group left untouched)"
@@ -4611,7 +4622,11 @@ cmd_list() {
             "${dg:+  (default group: $dg)}" "$why"
         while IFS= read -r group; do
             [[ -z "$group" ]] && continue
-            printf '  group %s\n' "$group"
+            if group_managed "$group"; then
+                printf '  group %s  (hatter'"'"'s own: workspaces in no group)\n' "$(group_display "$group")"
+            else
+                printf '  group %s\n' "$group"
+            fi
             while IFS=$'\x1f' read -r sess desc; do
                 [[ -z "$sess" ]] && continue
                 mark=""
@@ -5795,8 +5810,9 @@ edit_groups() {
             count=$(cfg --arg g "$g" '.groups[$g].sessions | length')
             dg=""
             [[ "$(hat_default_group "$hat")" == "$g" ]] && dg="  ${C_CY}(default)${C_R}"
+            group_managed "$g" && dg="$dg  ${C_DIM}(hatter's own: workspaces in no group)${C_R}"
             ROW_LABEL=""; ROW_ICON="$ICON_GROUP"
-            edit_row $((i+1)) "$SEL" "$g" 28 \
+            edit_row $((i+1)) "$SEL" "$(group_display "$g")" 28 \
                 "$(printf '%s%s workspace(s)%s%s' "$C_DIM" "$count" "$C_R" "$dg")"
             i=$((i+1))
         done
@@ -5823,7 +5839,9 @@ edit_groups() {
                 : ;;
             a|A)
                 edit_ask "new group name"
-                if [[ -n "$EDIT_REPLY" ]]; then
+                if group_name_reserved "$EDIT_REPLY"; then
+                    warn "'$UNASSIGNED' is hatter's own group - pick another name"
+                elif [[ -n "$EDIT_REPLY" ]]; then
                     register_group "$EDIT_REPLY" "$hat"
                     local w; w=$(ensure_hat_window "$hat")
                     ensure_cmux_group "$EDIT_REPLY" "$w" >/dev/null
@@ -5831,12 +5849,19 @@ edit_groups() {
                 edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
+                if group_managed "$g"; then
+                    warn "'$(group_display "$g")' is hatter's own group and keeps its name"; edit_pause; continue
+                fi
                 edit_ask "new name for group '$g'"
-                [[ -n "$EDIT_REPLY" ]] && { cmd_group rename "$g" "$EDIT_REPLY" || true; edit_pause; } ;;
+                # A subshell: rename dies on a name it refuses.
+                [[ -n "$EDIT_REPLY" ]] && { ( cmd_group rename "$g" "$EDIT_REPLY" ) || true; edit_pause; } ;;
             d|D)
                 [[ $n -eq 0 ]] && continue
+                if group_managed "$g"; then
+                    warn "'$(group_display "$g")' is hatter's own group: it goes once it is empty"; edit_pause; continue
+                fi
                 if edit_confirm "forget group '$g'? (config only - workspaces keep running)"; then
-                    cmd_group rm "$g" || true; edit_pause
+                    ( cmd_group rm "$g" ) || true; edit_pause
                 fi ;;
         esac
     done
@@ -5874,7 +5899,7 @@ edit_workspaces() {
         done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$hat › $group" "WORKSPACES" \
+        edit_header "$hat › $(group_display "$group")" "WORKSPACES" \
             "a workspace is a tmux session named <hat>-<subproject>, shown as one" \
             "entry in the cmux sidebar. Its tabs are the tmux windows inside it."
 
@@ -5982,7 +6007,7 @@ edit_tabs() {
         done < <(edit_windows "$hat" "$ws")
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$hat › $group › $ws" "TABS" \
+        edit_header "$hat › $(group_display "$group") › $ws" "TABS" \
             "a tab is a tmux window inside the workspace. It survives losing the" \
             "client, and closing it here closes it everywhere." \
             "A pinned tab 📌 comes back first on restore, even if it was closed."

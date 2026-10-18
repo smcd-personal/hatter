@@ -175,6 +175,24 @@ expect "a move between real groups leaves no copy behind" \
 expect "...and an empty real group stays" \
     "$(yes_if [ "$(cfg_of '.groups | has("Real")')" = true ])"
 
+# The group commands leave it to hatter.
+refused() { [ "$1" != 0 ] && grep -q "hatter's own group" "$d/out"; }
+setup guards "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
+                      "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+rc=0; hatter_in group rm Unassigned@dev || rc=$?
+expect "group rm refuses Unassigned" "$(yes_if refused "$rc")"
+rc=0; hatter_in group rename Unassigned@dev Real || rc=$?
+expect "group rename refuses Unassigned" "$(yes_if refused "$rc")"
+rc=0; hatter_in group rename G Unassigned || rc=$?
+expect "group rename refuses the name Unassigned" "$(yes_if refused "$rc")"
+rc=0; hatter_in group add Unassigned --hat dev || rc=$?
+expect "group add refuses the name Unassigned" "$(yes_if refused "$rc")"
+expect "...and none of them changed the config" \
+    "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+hatter_in list || true
+expect "list shows it as Unassigned, first, as hatter's own" \
+    "$(yes_if bash -c 'grep "^  group" "$1" | head -1 | grep -q "^  group Unassigned  (hatter.s own"' _ "$d/out")"
 setup forget "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
                       "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
 hatter_in rm dev-x --keep-running || true
