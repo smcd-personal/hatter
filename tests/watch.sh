@@ -19,10 +19,15 @@ case "$1" in
     if [[ -n "${STUB_REFUSE:-}" ]]; then echo "Error: ERROR: Authentication required" >&2; exit 1; fi
     echo '[]' ;;
   events)
+    echo "events" >> "$STUB_CALLS"
+    if [[ -n "${STUB_EVENTS_FAIL:-}" ]]; then echo "Error: boom" >&2; exit 1; fi
+    if [[ -n "${STUB_EVENTS_HANG:-}" ]]; then exec sleep "$STUB_EVENTS_HANG"; fi
     while IFS= read -r l; do
       case "$l" in
         "SLEEP "*) sleep "${l#SLEEP }" ;;
         TOUCH)     sleep 1; touch "$STUB_SELF" ;;
+        LOCK)      mkdir "$STUB_LOCK" ;;
+        UNLOCK)    rmdir "$STUB_LOCK" ;;
         *)         printf '%s\n' "$l" ;;
       esac
     done < "$STUB_EVENTS" ;;
@@ -43,8 +48,10 @@ watch() {
     mkdir -p "$d/config/hatter"
     echo '{"version":3,"hats":{},"groups":{}}' > "$d/config/hatter/config.json"
     cat > "$d/events"
+    : > "$d/calls"
     env XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_EVENTS="$d/events" \
-        STUB_SELF="$work/self/hatter" HATTER_WATCH_DRY=1 HATTER_WATCH_ONCE=1 "$@" \
+        STUB_SELF="$work/self/hatter" STUB_LOCK="$d/config/hatter/.lock" STUB_CALLS="$d/calls" \
+        HATTER_WATCH_DRY=1 HATTER_WATCH_ONCE=1 "$@" \
         /bin/bash "$work/self/hatter" autosave watch 2>&1 </dev/null \
         | sed -E 's/^[0-9-]+ [0-9:]+ watch: //' || true
 }
@@ -114,6 +121,61 @@ $drag
 SLEEP 2")
 expect "a reinstalled hatter makes the watcher stand down" \
     "$(grep -q 'hatter was updated; restarting' <<<"$out" && ! grep -q '^heal WS-B' <<<"$out" && echo y)" "$out"
+
+# A hatter command holding the config lock is changing cmux: the sync waits for
+# it, and is dropped (the timer has it) if the stream ends first.
+out=$(watch locked <<<"$ack
+SLEEP 2
+LOCK
+$(ev workspace.created WS-C '' '')
+SLEEP 3
+UNLOCK
+SLEEP 2")
+expect "a sync waits for a command's lock, then runs" \
+    "$([[ "$(grep -c '^sync' <<<"$out")" == 2 ]] && echo y)" "$out"
+out=$(watch locked-out <<<"$ack
+SLEEP 2
+LOCK
+$(ev workspace.created WS-C '' '')
+SLEEP 3")
+expect "no sync while the lock is held" \
+    "$([[ "$(grep -c '^sync' <<<"$out")" == 1 ]] && echo y)" "$out"
+
+# A stream that fails at once backs off and says so once. Not HATTER_WATCH_ONCE:
+# this is the retry loop, stopped after 9 seconds. (Not with an alarm: bash
+# handles SIGALRM itself.)
+d="$work/failing"; mkdir -p "$d/config/hatter"; : > "$d/calls"
+echo '{"version":3,"hats":{},"groups":{}}' > "$d/config/hatter/config.json"
+env XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_CALLS="$d/calls" STUB_EVENTS_FAIL=1 \
+    HATTER_WATCH_DRY=1 /bin/bash "$work/self/hatter" autosave watch > "$d/out" 2>&1 </dev/null &
+wpid=$!
+sleep 9
+kill -TERM "$wpid" 2>/dev/null || true
+wait "$wpid" 2>/dev/null || true
+out=$(cat "$d/out")
+expect "a failing stream is reported once" \
+    "$([[ "$(grep -c 'event stream ended: Error: boom' <<<"$out")" == 1 ]] && echo y)" "$out"
+expect "a failing stream backs off (at most 2 tries in 9s)" \
+    "$([[ "$(grep -c '^events' "$d/calls")" -le 2 ]] && echo y)" "$(cat "$d/calls")"
+
+# Killed, the watcher takes its stream and fifo with it.
+# The stream is a sleep of a length only this run uses, so nothing else matches.
+hang="100.$$"
+d="$work/killed"; mkdir -p "$d/config/hatter" "$d/tmp"; : > "$d/calls"
+echo '{"version":3,"hats":{},"groups":{}}' > "$d/config/hatter/config.json"
+env XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_CALLS="$d/calls" STUB_EVENTS_HANG="$hang" \
+    TMPDIR="$d/tmp" HATTER_WATCH_DRY=1 /bin/bash "$work/self/hatter" autosave watch \
+    > "$d/out" 2>&1 </dev/null &
+wpid=$!
+sleep 3
+kill -TERM "$wpid" 2>/dev/null || true
+wait "$wpid" 2>/dev/null || true
+sleep 1
+left=$(pgrep -f "sleep $hang" || true)
+expect "a killed watcher leaves no stream running" "$([[ -z "$left" ]] && echo y)" "left: $left"
+expect "a killed watcher leaves no fifo behind" \
+    "$([[ -z "$(ls -A "$d/tmp")" ]] && echo y)" "$(ls -la "$d/tmp")"
+[[ -z "$left" ]] || kill $left 2>/dev/null || true
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"

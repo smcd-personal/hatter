@@ -4976,10 +4976,16 @@ watch_updated() {
 WATCH_SELF=""
 WATCH_SELF_MTIME=""
 
-# Act on what watch_stream collected (its heals, heal_all and sync). Heal
-# first, so the sync records where the tabs were dropped.
+# Act on what watch_stream collected (its heals, heal_all and sync), and
+# clear what was done. Heal first, so the sync records where the tabs were
+# dropped.
+#
+# A hatter command holding the config lock is usually changing cmux, and a
+# sync that reads cmux mid-change can write that half-way layout back after
+# the command ends. So the sync waits, and runs at the first quiet second
+# after the lock goes. A lock old enough to be stale does not hold it up.
 watch_act() {
-    local w sf
+    local w sf mtime
     if [[ "$heal_all" == 1 ]]; then
         watch_heal
     elif [[ -n "$heals" ]]; then
@@ -4987,21 +4993,28 @@ watch_act() {
             [[ -z "$w" ]] || watch_heal "$w" "$sf"
         done < <(printf '%s' "$heals" | sort -u)
     fi
-    [[ "$sync" == 0 ]] || watch_sync
+    heals=""; heal_all=0
+    [[ "$sync" == 1 ]] || return 0
+    if [[ -d "$LOCK_DIR" ]]; then
+        mtime=$(lock_mtime "$LOCK_DIR")
+        [[ "$mtime" -gt 0 && $(( $(date +%s) - mtime )) -gt "$LOCK_STALE_SECONDS" ]] || return 0
+    fi
+    watch_sync
+    sync=0
     return 0
 }
 
 # One connection to the stream. Returns 0 when the stream ended, 3 when hatter
 # was updated underneath it.
 watch_stream() {
-    local dir fifo pid line kind w sf heals="" heal_all=0 sync=0 since=0 now fails=0 last=0 rc=0
+    local dir fifo line kind w sf heals="" heal_all=0 sync=0 since=0 now fails=0 last=0 rc=0
     dir=$(mktemp -d "${TMPDIR:-/tmp}/hatter-watch.XXXXXX") || return 0
+    WATCH_DIR=$dir
     fifo="$dir/events"
-    mkfifo "$fifo" || { rmdir "$dir"; return 0; }
+    mkfifo "$fifo" || { watch_cleanup; return 0; }
     cmux events --category workspace --category surface \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
         | jq -nR --unbuffered -r "$WATCH_JQ" > "$fifo" &
-    pid=$!
     exec 3<"$fifo"
     while :; do
         if IFS= read -r -t "$WATCH_QUIET" line <&3; then
@@ -5028,30 +5041,50 @@ watch_stream() {
             last=$now
             [[ "$fails" -lt 3 ]] || break
         fi
-        # A quiet moment: act on what came in.
-        watch_act
-        heals=""; heal_all=0; sync=0; since=0
+        # A quiet moment: act on what came in. The fifo stays out of the
+        # commands it runs (an ssh master left running would hold it open).
+        watch_act 3<&-
+        since=0
         if watch_updated; then rc=3; break; fi
     done
     # What came in just before the stream ended is still owed.
-    [[ "$rc" != 0 ]] || watch_act
-    exec 3<&-
-    kill "$pid" 2>/dev/null || true
-    pkill -P $$ -x cmux 2>/dev/null || true
+    [[ "$rc" != 0 ]] || watch_act 3<&-
     WATCH_STREAM_ERR=$(grep -m 1 '[^[:space:]]' "$dir/err" 2>/dev/null || true)
-    rm -f "$fifo" "$dir/err"
-    rmdir "$dir" 2>/dev/null || true
+    watch_cleanup
     return "$rc"
 }
 WATCH_STREAM_ERR=""
+WATCH_DIR=""
+
+# Ends the stream and removes its fifo. Also the TERM/INT trap, so a watcher
+# that is killed does not leave cmux events and jq running behind it: they are
+# its direct children, and nothing else it starts is (the heal and the sync
+# run in subshells).
+watch_cleanup() {
+    exec 3<&- 2>/dev/null || true
+    pkill -P $$ 2>/dev/null || true
+    if [[ -n "$WATCH_DIR" ]]; then
+        rm -f "$WATCH_DIR/events" "$WATCH_DIR/err"
+        rmdir "$WATCH_DIR" 2>/dev/null || true
+    fi
+    WATCH_DIR=""
+    return 0
+}
 
 # What `hatter autosave watch` runs, and what launchd keeps running. Never
 # returns on its own except to pick up a new hatter, or once the stream ends
 # under HATTER_WATCH_ONCE (the tests).
 watch_run() {
-    local backoff=5 said="" msg rc
-    have_cmux || die "the cmux CLI is not on PATH, and the watcher needs it"
+    local backoff=5 said="" said_stream="" msg rc started
+    if ! have_cmux; then
+        # launchd would restart it at once; once a minute is plenty.
+        watch_log "the cmux CLI is not on PATH; the watcher needs it"
+        [[ -n "${HATTER_WATCH_ONCE:-}" ]] || sleep 60
+        return 0
+    fi
     mkdir -p "$AUTOSAVE_DIR"
+    trap 'watch_cleanup; exit 143' TERM
+    trap 'watch_cleanup; exit 130' INT
     WATCH_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
     WATCH_SELF_MTIME=$(lock_mtime "$WATCH_SELF")
     watch_log "following cmux events"
@@ -5069,12 +5102,23 @@ watch_run() {
             continue
         fi
         [[ -z "$said" ]] || watch_log "cmux is answering again"
-        said=""; backoff=5
+        said=""
+        started=$(date +%s)
         rc=0; watch_stream || rc=$?
         if [[ "$rc" == 3 ]]; then watch_log "hatter was updated; restarting"; return 0; fi
         [[ -z "${HATTER_WATCH_ONCE:-}" ]] || return 0
-        [[ -z "$WATCH_STREAM_ERR" ]] || watch_log "the event stream ended: $WATCH_STREAM_ERR"
-        sleep 2
+        if [[ $(( $(date +%s) - started )) -ge 30 ]]; then
+            # It ran a while, so this is a fresh failure: say it, retry soon.
+            backoff=5; said_stream=""
+        fi
+        # A stream that keeps failing at once (a cmux without events, a
+        # refusal only the stream gets) backs off and is said once.
+        msg="the event stream ended${WATCH_STREAM_ERR:+: $WATCH_STREAM_ERR}"
+        [[ "$msg" == "$said_stream" ]] || watch_log "$msg"
+        said_stream=$msg
+        sleep "$backoff"
+        backoff=$((backoff * 2)); [[ "$backoff" -le 60 ]] || backoff=60
+        if watch_updated; then watch_log "hatter was updated; restarting"; return 0; fi
     done
 }
 
@@ -5238,13 +5282,13 @@ autosave_heal() {
     return 0
 }
 
-# autosave_sync <who> - pick up anything changed inside cmux. A subshell:
+# autosave_sync <who> [note] - pick up anything changed inside cmux. A subshell:
 # cmd_sync dies on a dead socket, and the caller has to carry on. Its error
 # goes to the log once, when it first appears or changes, rather than every
 # time. The timer and the watcher share the record, so neither repeats what
 # the other already said.
 autosave_sync() {
-    local who="$1" err state="$AUTOSAVE_DIR/sync-state"
+    local who="$1" note="${2:-}" err state="$AUTOSAVE_DIR/sync-state"
     CMUX_ALIVE=""
     if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
         if [[ "$(sed -n 1p "$state" 2>/dev/null)" != ok ]]; then
@@ -5255,7 +5299,7 @@ autosave_sync() {
         err=$(printf '%s\n' "$err" | sed -n 's/^error: //p; s/^  !! //p' | head -n 1)
         [[ -n "$err" ]] || err="sync exited non-zero with no message"
         if [[ "$(sed -n 3p "$state" 2>/dev/null)" != "$err" ]]; then
-            warn "$who: sync failed: $err"
+            warn "$who: sync failed${note:+, $note}: $err"
         fi
         printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
     fi
@@ -5277,7 +5321,7 @@ cmd_autosave() {
             # Tabs dragged between workspaces first, so the sync records where
             # they were dropped.
             autosave_heal autosave
-            autosave_sync autosave
+            autosave_sync autosave "snapshotting anyway"
             hatter_lock 0 || return 0          # a command is mid-write; try next minute
             local f
             f=$(autosave_snapshot) || true
