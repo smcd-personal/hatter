@@ -23,6 +23,7 @@ case "\$1" in
         echo "\$s" >> "\$r"; echo "created \$s" >> "$work/log" ;;
     new-window) echo "new-window \$*" >> "$work/log" ;;
     list-sessions) cat "\$r" ;;
+    rename-session) echo "rename \$*" >> "$work/log" ;;
     *) echo "stub tmux: unexpected: \$*" >&2; exit 1 ;;
 esac
 EOF
@@ -158,6 +159,45 @@ grep -q "Group: *B1$" <<<"$out" || fail "new notes in b's window: not on b: $out
 setup2
 if out=$(run 'cmd_new notes'); then fail "new notes with no window: guessed: $out"; fi
 grep -q "recorded on more than one server" <<<"$out" || fail "new notes with no window: wrong error: $out"
+
+# A window whose hat records no such name is no answer either.
+setup2
+if out=$(STUB_HAT=c run 'tab_target notes'); then fail "tab notes in c's window: guessed: $out"; fi
+grep -q "recorded on more than one server" <<<"$out" || fail "tab notes in c's window: wrong error: $out"
+
+# Hats on one server share the session: no refusal, the first recorder as before.
+setup2
+jq '.hats.b.ssh = "u@a.example.com"' "$work/cfg/hatter/config.json" > "$work/c.json" \
+    && mv "$work/c.json" "$work/cfg/hatter/config.json"
+out=$(run 'tab_target notes; echo "=> $TAB_HAT"') || fail "tab notes, one server: $out"
+grep -q '^=> a$' <<<"$out" || fail "tab notes, one server: $out"
+
+# Flags tab does not know are refused, not taken for a tab name; after --,
+# anything is a name.
+setup2
+if out=$(run 'cmd_tab notes --hat=b'); then fail "tab --hat=b: taken as a tab name: $out"; fi
+grep -q "unknown flag: --hat=b" <<<"$out" || fail "tab --hat=b: wrong error: $out"
+out=$(run 'cmd_tab --hat b -- notes --odd') || fail "tab -- --odd: $out"
+grep -q "new-window.*--odd" "$work/log" || fail "tab -- --odd: no tab named --odd: $(cat "$work/log")"
+
+# tab pin takes --hat too.
+setup2
+out=$(run 'cmd_tab pin notes 0 --hat b' 2>&1) || true
+! grep -q "recorded on more than one server" <<<"$out" || fail "tab pin --hat b: ignored --hat: $out"
+
+# rename: the window's hat, refusal without one, and --hat.
+setup2
+out=$(STUB_HAT=b run 'cmd_rename notes jot') || fail "rename notes in b's window: $out"
+[[ "$(jq -r '[.groups.A1.sessions, .groups.B1.sessions] | map(keys | join(",")) | join(" ")' \
+      "$work/cfg/hatter/config.json")" == "a-x,notes a-x,jot" ]] \
+    || fail "rename notes in b's window: renamed the wrong one: $(cat "$work/cfg/hatter/config.json")"
+setup2
+if out=$(run 'cmd_rename notes jot'); then fail "rename notes with no window: guessed: $out"; fi
+grep -q "hatter rename notes jot --hat" <<<"$out" || fail "rename with no window: wrong error: $out"
+setup2
+out=$(run 'cmd_rename notes jot --hat a') || fail "rename --hat a: $out"
+[[ "$(jq -r '.groups.A1.sessions | keys | join(",")' "$work/cfg/hatter/config.json")" == "a-x,jot" ]] \
+    || fail "rename --hat a: $(cat "$work/cfg/hatter/config.json")"
 
 # rm ends a session, so the window is no answer: it still wants --hat.
 setup2
