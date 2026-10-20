@@ -77,7 +77,7 @@ got=$(PATH="$nocmux" /bin/bash "$hatter" tab dev 2>&1 | awk '$2 == "/" { printf 
 check "a hat's workspace listing follows the saved order" "dev-z2 dev-z1 dev-a " "$got"
 
 # --- the class: no reader sorts groups or sessions --------------------------------
-got=$(grep -nE '\.(groups|sessions)( // \{\})? *\| *keys\[\]' "$hatter" || true)
+got=$(grep -nE '\.(groups|sessions)( // \{\})? *\| *keys([^_a-z]|$)' "$hatter" || true)
 check "no jq walks groups or sessions with sorting keys" "" "$got"
 
 [[ "$fails" -eq 0 ]] || { echo "$fails failed"; exit 1; }

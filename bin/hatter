@@ -4121,8 +4121,8 @@ cmd_group() {
         list|"")
             cfg '.groups | to_entries[]
                  | if .value.managed
-                   then "\(.value.name // .key)\t[hat: \(.value.hat), hatter'"'"'s own; key \(.key)]  \(.value.sessions | keys | join(", "))"
-                   else "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys | join(", "))" end'
+                   then "\(.value.name // .key)\t[hat: \(.value.hat), hatter'"'"'s own; key \(.key)]  \(.value.sessions | keys_unsorted | join(", "))"
+                   else "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys_unsorted | join(", "))" end'
             ;;
         add|set)
             local name="${1:-}" hat=""
@@ -7139,7 +7139,8 @@ hatter restore [hat|group ...]
 Rebuild from the config after a Mac or shell-server reboot: recreate missing
 tmux sessions and their tabs, find or open each hat's window, re-mirror, put the
 workspaces back in their groups in their saved order, and re-apply styling.
-Idempotent.
+Idempotent. Groups it creates follow the saved order; a group already in the
+window keeps its place.
 
 With no arguments, every hat. Hats with nothing recorded, or whose server is
 unreachable, are skipped rather than failing the run.
