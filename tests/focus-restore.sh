@@ -281,7 +281,7 @@ env PATH="$work/bin:$PATH" XDG_CONFIG_HOME="$work/cfg" TMPDIR="$work" STUB_DIR="
 # wherever it sits in a command and never in a comment, string or heredoc. Only
 # reads may call cmux directly. focus_restore is the restore itself, and
 # cmux_change and cmux_json pass on a verb they were given ("?").
-reads='^(list-windows|tree|read-screen|identify|list-panes|list-pane-surfaces|list-panels|current-window|current-workspace|workspace list|workspace-group list|rpc remote\.tmux\.pane_surfaces)$'
+reads='^(list-windows|tree|events|read-screen|identify|list-panes|list-pane-surfaces|list-panels|current-window|current-workspace|workspace list|workspace-group list|rpc remote\.tmux\.pane_surfaces)$'
 bare() {
     awk -f "$here/cmux-calls.awk" "$1" | awk -F '\t' -v r="$reads" '
         $4 ~ r { next }
