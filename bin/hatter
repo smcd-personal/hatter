@@ -3056,7 +3056,7 @@ heal_hat_drags() {
     if [[ -n "$onlysf" ]]; then
         # cmux has just said this surface was dropped here, so the drag is
         # over: no second look, but nothing moves except that tab.
-        second=$(awk -F '\t' -v s="$(upper "$onlysf")" '$1 == "move" && toupper($2) == s' <<<"$first")
+        second=$(AWK_S="$(upper "$onlysf")" awk -F '\037' '$1 == "move" && toupper($2) == ENVIRON["AWK_S"]' <<<"$first")
         [[ -n "$second" ]] || return 0
     else
         # A tab mid-drag, or a mirror mid-reconnect, can look like this for a
