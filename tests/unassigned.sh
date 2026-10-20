@@ -538,6 +538,64 @@ expect "rm of a session two hats on one server record ends it once and forgets b
     "$(yes_if all_of logged "kill dev notes" -- is '.groups.G.sessions | has("notes")' false \
                   -- is '.groups.D2.sessions | has("notes")' false)"
 
+# --- Unassigned is never "adopted" (#90) ----------------------------------------
+# The config has no Unassigned (its last session was forgotten) but cmux still
+# shows one. Sync removes it, and does not report taking in a new group.
+setup un-stale "$ONE_HAT" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": []},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\n' > "$d/server.dev"
+hatter_in sync || true
+expect "sync says nothing of adopting a leftover empty Unassigned" \
+    "$(yes_if bash -c '! grep -q "Adopting group .Unassigned" "$1"' _ "$d/out")"
+expect "...removes it from cmux and leaves none in the config" \
+    "$(yes_if all_of logged "workspace-group ungroup g-U" -- is '.groups | has("Unassigned@dev")' false)"
+
+# Still holding a running session: recorded again as the managed group, and
+# still not announced as adopted.
+setup un-held "$ONE_HAT" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in sync || true
+expect "a leftover Unassigned holding a session is recorded as managed, not adopted" \
+    "$(yes_if all_of is '.groups["Unassigned@dev"] | [.managed, (.sessions | keys | join(","))] | join(" ")' "true dev-x" \
+                  -- bash -c '! grep -q "Adopting group .Unassigned" "$1"' _ "$d/out")"
+# A user group cmux shows and the config lacks is still adopted, and said so.
+setup un-user "$ONE_HAT" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-N", "name": "New", "member_workspace_ids": ["ws-x"]},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in sync || true
+expect "a user's group cmux shows is adopted, and said so" \
+    "$(yes_if all_of says "Adopting group 'New' under hat 'dev'" -- is '.groups.New.managed // false' false)"
+
+# rm of Unassigned's last session takes the group out of cmux itself, so the
+# next sync finds nothing to clean up.
+setup un-rm "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
+                     "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in rm dev-x || true
+expect "rm of Unassigned's last session removes the group from cmux at once" \
+    "$(yes_if all_of logged "kill dev dev-x" -- logged "workspace-group ungroup g-U" \
+                  -- is '.groups | has("Unassigned@dev")' false)"
+: > "$d/log"
+hatter_in sync || true
+expect "...and the next sync has nothing to adopt or remove" \
+    "$(yes_if all_of bash -c '! grep -q "Unassigned" "$1"' _ "$d/out" -- unlogged "ungroup")"
+
+# rm of a session in a user group leaves cmux's Unassigned alone.
+setup un-rm-other "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
+                     "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in rm dev-a || true
+expect "rm of a session in another group leaves Unassigned in cmux" \
+    "$(yes_if all_of logged "kill dev dev-a" -- unlogged "ungroup")"
+
 # Every change to cmux's groups goes through the helpers.
 expect "no group change bypasses the helpers" \
     "$(yes_if bash -c 'sed "/^# --- group changes in cmux/,/^# cmux_group_to_top/d" "$1" \
