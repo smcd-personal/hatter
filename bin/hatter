@@ -2120,6 +2120,23 @@ fi
 dir="${dir//\$HOME/$HOME}"
 dir="${dir//\~/$HOME}"
 
+# resurrect writes a pane's scrollback to pane_contents/pane-<session>:<w>.<p>.
+# A / in the session name makes that a path into a folder resurrect never
+# creates, so the write fails and the scrollback is lost. Make the folder. Its
+# own clean-up, a plain `rm dir/*`, never empties a folder, so also delete
+# this pane's old file in save and restore: a pane with nothing on screen
+# must not get the last one's scrollback back. A `..` could reach outside
+# pane_contents, so those panes are left alone.
+case "$dir" in
+    /*) tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null \
+        | while IFS= read -r id; do
+            case "$id" in */*) ;; *) continue ;; esac
+            case "$id" in *..*) continue ;; esac
+            f="$dir/save/pane_contents/pane-$id"
+            mkdir -p "${f%/*}" && rm -f -- "$f" "$dir/restore/pane_contents/pane-$id"
+        done ;;
+esac
+
 prev=$(readlink "$dir/last" 2>/dev/null) || prev=""
 "$save" quiet || exit $?
 now=$(readlink "$dir/last" 2>/dev/null) || now=""
