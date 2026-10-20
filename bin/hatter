@@ -2722,7 +2722,7 @@ cmd_new() {
 
     cmux_group_add "$gref" "$wref" || die "cmux would not put '$session' into group '$(group_display "$group")'"
     apply_group_style "$group" "$gref"
-    [[ "$had_un" == 0 ]] || drop_unassigned_now "$hat"
+    [[ "$had_un" == 0 ]] || drop_unassigned_now "$hat" "$win"
     discard_stray_workspace "$win"
     # Without --focus the run ends back where it started, so selecting the new
     # workspace would only flash it.
@@ -3710,8 +3710,15 @@ cmd_rm() {
     fi
     host=$(hat_ssh "$hat")
 
+    # Its window, found while the config still records the session.
+    local unwin=""
+    if [[ -n "$group" && "$group" == "$(unassigned_key "$hat")" ]] && cmux_alive; then
+        unwin=$(find_hat_window "$hat" 2>/dev/null) || unwin=""
+    fi
+
     if [[ "$keep" == 1 ]]; then
         forget_session "$session" "$hat"
+        drop_unassigned_now "$hat" "$unwin"
         info "Forgot '$session' (group '$group'); the server was not touched"
         echo "  If it is running it goes on running, and tmux-resurrect may bring it back"
         echo "  after a reboot. While it runs, the next sync records it again: in its group"
@@ -3742,7 +3749,7 @@ cmd_rm() {
         *:recorded)      info "Forgot '$session' (group '$group'); it was not running on $host" ;;
         *)               die "'$session' is neither recorded nor running on $host" ;;
     esac
-    [[ "$group" != "$(unassigned_key "$hat")" ]] || drop_unassigned_now "$hat"
+    drop_unassigned_now "$hat" "$unwin"
     # Tell the server now, or hat-restore brings it back after a reboot before
     # the next sync has.
     tell_server_sessions "$host" 2>/dev/null \
@@ -4321,17 +4328,18 @@ cmux_drop_unassigned() {
     return 0
 }
 
-# drop_unassigned_now <hat>: a command has just taken the last session out of
-# <hat>'s Unassigned, which went from the config with it. Take it out of cmux
-# now too, rather than leave the next sync to find it. Best effort: a failure
-# here leaves that to sync and never fails the command.
+# drop_unassigned_now <hat> <window>: a command has just taken the last session
+# out of <hat>'s Unassigned, which went from the config with it. Take it out of
+# cmux now too, rather than leave the next sync to find it. The caller finds
+# the window before the config changes: with the session gone from it, another
+# hat's window can look as much like this hat's. Best effort: a failure here
+# leaves that to sync and never fails the command.
 drop_unassigned_now() {
-    local hat="$1" live win
+    local hat="$1" win="$2" live
+    [[ -n "$win" ]] || return 0
     ! group_exists "$(unassigned_key "$hat")" || return 0
     cmux_alive || return 0
     live=$(hat_live_sessions "$(hat_ssh "$hat")" 2>/dev/null) || return 0
-    win=$(find_hat_window "$hat" 2>/dev/null) || return 0
-    [[ -n "$win" ]] || return 0
     ( cmux_drop_unassigned "$hat" "$win" "$live" ) || true
     return 0
 }
@@ -6688,10 +6696,10 @@ there). It holds sessions created on the server directly, mirrored in loose,
 or forgotten while still running. It is removed, from cmux and the config,
 once it is empty: at once when `hatter rm` or `hatter new` takes its last
 session out, otherwise at the next sync. An entry in it is dropped like any
-other once its session stops. Move a workspace out of it as out of any group: drag it in
-cmux and sync, or `hatter new <session> --group <name>`; with no --group,
-`hatter new` takes it to the hat's default or first real group, since making
-or attaching a workspace on purpose places it. A new workspace goes to
+other once its session stops. Move a workspace out of it as out of any
+group: drag it in cmux and sync, or `hatter new <session> --group <name>`;
+with no --group, `hatter new` takes it to the hat's default or first real
+group, since making or attaching a workspace on purpose places it. A new workspace goes to
 Unassigned only when its hat has no other group, and a cmux Unassigned that
 cmux will not remove is left until what is in it changes.
 

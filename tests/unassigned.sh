@@ -596,6 +596,48 @@ hatter_in rm dev-a || true
 expect "rm of a session in another group leaves Unassigned in cmux" \
     "$(yes_if all_of logged "kill dev dev-a" -- unlogged "ungroup")"
 
+# rm of one of two Unassigned sessions: the group still has one, so it stays.
+setup un-rm-one "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
+                     "sessions": {"dev-x": {"windows": []}, "dev-y": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\ndev-y\n' > "$d/server.dev"
+hatter_in rm dev-x || true
+expect "rm of one of two Unassigned sessions leaves the group in cmux and the config" \
+    "$(yes_if all_of logged "kill dev dev-x" -- unlogged "ungroup" \
+                  -- is '.groups["Unassigned@dev"].sessions | keys | join(",")' dev-y)"
+
+# rm of a session in a user group is no business of Unassigned's, even a
+# leftover one the config has already dropped: that is sync's to settle.
+setup un-rm-user "$ONE_HAT" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": []},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\n' > "$d/server.dev"
+hatter_in rm dev-a || true
+expect "rm of a session in a user group leaves a leftover Unassigned to sync" \
+    "$(yes_if all_of logged "kill dev dev-a" -- unlogged "ungroup")"
+
+# rm --keep-running of Unassigned's last session, not running: dropped at once.
+setup un-rm-keep "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
+                     "sessions": {"dev-z": {"windows": []}}}' <<<"$ONE_HAT")" \
+    '{"windows": [{"id": "W1", "workspaces": [{"id": "ws-a", "title": "dev-a", "panes": []}]}]}'
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": []},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\n' > "$d/server.dev"
+hatter_in rm dev-z --keep-running || true
+expect "rm --keep-running of Unassigned's last session drops the group from cmux" \
+    "$(yes_if all_of logged "workspace-group ungroup g-U" -- is '.groups | has("Unassigned@dev")' false)"
+
+# ...but not while that session still runs in it: sync records it again.
+setup un-rm-keep-live "$(jq '.groups["Unassigned@dev"] = {"hat": "dev", "name": "Unassigned", "managed": true,
+                     "sessions": {"dev-x": {"windows": []}}}' <<<"$ONE_HAT")" "$ONE_TREE"
+groups W1 '{"groups": [{"id": "g-U", "name": "Unassigned", "member_workspace_ids": ["ws-x"]},
+                       {"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
+printf 'dev-a\ndev-x\n' > "$d/server.dev"
+hatter_in rm dev-x --keep-running || true
+expect "rm --keep-running leaves an Unassigned holding the running session" \
+    "$(yes_if unlogged "ungroup")"
+
 # Every change to cmux's groups goes through the helpers.
 expect "no group change bypasses the helpers" \
     "$(yes_if bash -c 'sed "/^# --- group changes in cmux/,/^# cmux_group_to_top/d" "$1" \
