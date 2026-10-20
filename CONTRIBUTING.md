@@ -73,6 +73,12 @@ You need `ssh`, `jq` and a server running `tmux`. The cmux commands need
 - **Always pass an explicit target** (`--window`, `--workspace`) to client
   commands. A default target is whatever happens to be focused, not the
   caller.
+- **Every cmux change goes through `cmux_change`**, never a bare `cmux`.
+  Some cmux commands have no target flag, so hatter has to move focus to
+  use them; `cmux_change` records where focus was first, and the EXIT trap
+  puts it back however the run ends. Only reads call `cmux` directly.
+  `tests/focus-restore.sh` fails on a bare change. If you add an EXIT
+  trap, call `hatter_on_exit` from it.
 - **No secrets, ever.** Credentials go through the OS keychain and an ssh
   pipe; nothing is written to disk. Keep it that way.
 - **Examples use `example.com`.** No real hostnames or usernames in code,

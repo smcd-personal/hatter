@@ -35,6 +35,30 @@ export CMUX_QUIET=1
 HATTER_LAUNCH_WORKSPACE="${CMUX_WORKSPACE_ID:-}"
 unset CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID
 
+# Where cmux focus was before this run first changed cmux, so the run can put it
+# back (see focus_save). One record per outermost hatter: a hatter started by
+# another one, while that one is still running, finds these set and shares its
+# record rather than restoring on its own. A leftover from a dead hatter, or a
+# file another run left under a reused pid, is not trusted.
+HATTER_FOCUS_KEEP=0
+if [[ ! "${HATTER_FOCUS_OWNER:-}" =~ ^[0-9]+$ || -z "${HATTER_FOCUS_FILE:-}" ]] \
+   || ! kill -0 "$HATTER_FOCUS_OWNER" 2>/dev/null; then
+    HATTER_FOCUS_OWNER=$$
+    _dir="${TMPDIR:-/tmp}"; _dir="${_dir%/}"; [[ -n "$_dir" ]] || _dir=/tmp
+    HATTER_FOCUS_FILE="$_dir/hatter-focus.$$"
+    # Records left by a hatter that was killed before its EXIT trap ran: only
+    # this exact name, a pid that is no longer running, and a file of our own.
+    for _f in "$_dir"/hatter-focus.*; do
+        [[ "${_f##*/hatter-focus.}" =~ ^[0-9]+$ && -f "$_f" && -O "$_f" && ! -L "$_f" ]] || continue
+        if [[ "$_f" == "$HATTER_FOCUS_FILE" ]] || ! kill -0 "${_f##*/hatter-focus.}" 2>/dev/null; then
+            rm -f "$_f"
+        fi
+    done
+    [[ ! -L "$HATTER_FOCUS_FILE" ]] || rm -f "$HATTER_FOCUS_FILE"
+    unset _dir _f
+fi
+export HATTER_FOCUS_OWNER HATTER_FOCUS_FILE
+
 # ---------------------------------------------------------------- utilities
 
 die()  { echo "error: $*" >&2; exit 1; }
@@ -630,6 +654,102 @@ $(cmux_probe_err_quoted)
 # id this script stores or passes around is a UUID.
 cmux_json() { have_cmux || return 1; cmux --id-format both "$@" --json; }
 
+# ------------------------------------------- focus: leave it where it was found
+#
+# Some cmux commands act on the focused window and take no target:
+# `workspace-group create` and `ssh-tmux`. So hatter focuses a hat's window
+# before them, and `new-window` focuses the window it opens. Left there, a run
+# pulls the user out of whatever they were doing, often mid-keystroke, and
+# worst when the timer or an agent is the one running hatter.
+#
+# So every change to cmux goes through cmux_change. Before the run's first
+# change that can move focus it records the focused window, that window's
+# selected workspace and the focused pane; the EXIT trap (success, failure or
+# interrupt) puts all three back. A run that only reads cmux, or only restyles
+# and renames, never records, so it costs nothing. `hatter new --focus` is the
+# one way to stay where a command went.
+#
+# The record is a file, not a variable: most changes happen inside $( ), and a
+# variable set there never reaches the shell whose EXIT trap restores it.
+
+# cmux_change <cmux args...> - any cmux command that changes something
+cmux_change() {
+    case "$1 ${2:-}" in
+        # These leave focus where it is. Anything not listed may move it, so a
+        # new verb is covered until someone shows it does not.
+        "workspace-group set-color"|"workspace-group set-icon"|"workspace-group pin"|\
+        "workspace-group collapse"|"workspace-group rename"|"workspace-group add"|\
+        "rename-workspace "*|"reorder-workspace "*) ;;
+        *) focus_save ;;
+    esac
+    cmux "$@"
+}
+
+# What has focus now, as "<window>|<workspace>|<pane>|<surface>"; fails when
+# cmux cannot say. One call: identify reports all four.
+focus_now() {
+    have_cmux || return 1
+    cmux --id-format both identify --no-caller --json 2>/dev/null \
+        | jq -er '.focused | select(.window_id != null)
+                  | [.window_id, (.workspace_id // ""), (.pane_id // ""), (.surface_id // "")]
+                  | join("|")' 2>/dev/null
+}
+
+# Record focus, once per run. A failed look is recorded as "-" so that the run
+# does not ask again before every change. noclobber, so a file planted at the
+# path is never written through.
+focus_save() {
+    [[ -n "$HATTER_FOCUS_FILE" && ! -e "$HATTER_FOCUS_FILE" ]] || return 0
+    local now
+    now=$(focus_now) || now="-"
+    ( set -C; printf '%s\n' "$now" > "$HATTER_FOCUS_FILE" ) 2>/dev/null || true
+    return 0
+}
+
+# Put focus back as focus_save found it, and forget the record, so that a later
+# change records afresh. Nothing is sent when focus never moved. A workspace
+# the run closed is gone, and then the window is as close as it gets.
+#
+# Only the outermost hatter restores, and only in its own shell, never in a
+# subshell: `( cmd_sync )` sets the EXIT trap inside the subshell, and $$ there
+# is still the parent's. BASH_SUBSHELL, unlike BASHPID, is in bash 3.2.
+focus_restore() {
+    local f="$HATTER_FOCUS_FILE" saved="" win="" ws="" pane="" surface="" now
+    [[ "$BASH_SUBSHELL" == 0 && "$HATTER_FOCUS_OWNER" == "$$" ]] || return 0
+    [[ -n "$f" && -f "$f" && -O "$f" && ! -L "$f" ]] || return 0
+    IFS= read -r saved < "$f" || true
+    rm -f "$f"
+    [[ "$HATTER_FOCUS_KEEP" != 1 ]] || return 0
+    IFS='|' read -r win ws pane surface <<<"$saved" || true
+    [[ -n "$win" && "$win" != - ]] || return 0
+    now=$(focus_now) || now=""
+    [[ "$now" != "$saved" ]] || return 0
+    cmux focus-window --window "$win" >/dev/null 2>&1 || return 0
+    [[ -n "$ws" ]] || return 0
+    cmux select-workspace --workspace "$ws" --window "$win" >/dev/null 2>&1 || return 0
+    [[ -n "$pane" ]] || return 0
+    cmux focus-pane --pane "$pane" --workspace "$ws" --window "$win" >/dev/null 2>&1 || true
+    # The pane's selected tab, if it is still there.
+    [[ -n "$surface" ]] || return 0
+    cmux focus-panel --panel "$surface" --workspace "$ws" --window "$win" >/dev/null 2>&1 || true
+    return 0
+}
+
+# The one EXIT trap: put focus back, then let go of the config lock. Anything
+# that sets its own EXIT trap must call this from it. set -e is off in here, and
+# the run's own exit status is kept: a failed restore must not turn a success
+# into a failure, or the other way round.
+hatter_on_exit() {
+    local rc="${1:-0}"
+    set +e
+    # --focus asks to stay where a run went, which only means anything when it
+    # got there: a run that failed goes back.
+    [[ "$rc" == 0 ]] || HATTER_FOCUS_KEEP=0
+    focus_restore
+    hatter_unlock
+    exit "$rc"
+}
+
 cmux_pane_map() {
     cmux rpc remote.tmux.pane_surfaces \
         "$(jq -nc --arg h "$1" --arg s "$2" '{host: $h, session: $s}')" 2>/dev/null
@@ -898,7 +1018,7 @@ ensure_hat_window() {
         local before after
         before=$(window_ids)
         info "Opening a new cmux window for hat '$hat'" >&2
-        cmux new-window >/dev/null
+        cmux_change new-window >/dev/null
         sleep 0.6
         after=$(window_ids)
         w=$(comm -13 <(sort <<<"$before") <(sort <<<"$after") | head -1)
@@ -909,7 +1029,7 @@ ensure_hat_window() {
         NEW_WINDOW_STRAY="$w"
     fi
 
-    cmux focus-window --window "$w" >/dev/null 2>&1 || true
+    cmux_change focus-window --window "$w" >/dev/null 2>&1 || true
     printf '%s' "$w"
 }
 
@@ -919,8 +1039,8 @@ ensure_cmux_group() {
     ref=$(group_ref_in_window "$win" "$name")
     if [[ -z "$ref" ]]; then
         info "Creating workspace group '$name'" >&2
-        cmux focus-window --window "$win" >/dev/null 2>&1 || true
-        cmux workspace-group create --name "$name" >/dev/null
+        cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
+        cmux_change workspace-group create --name "$name" >/dev/null
         sleep 0.4
         ref=$(group_ref_in_window "$win" "$name")
     fi
@@ -932,9 +1052,9 @@ mirror_hat() {
     # mirror_hat <hat> <window> - mirrors into the (focused) target window
     local hat="$1" win="$2" host
     host=$(hat_ssh "$hat")
-    cmux focus-window --window "$win" >/dev/null 2>&1 || true
+    cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
     info "Mirroring $host into the '$hat' window"
-    cmux ssh-tmux "$host" --no-focus >/dev/null
+    cmux_change ssh-tmux "$host" --no-focus >/dev/null
 }
 
 wait_for_workspace() {
@@ -946,7 +1066,7 @@ wait_for_workspace() {
         # the mirror may have landed in another window; pull it over
         ref=$(workspace_ref_by_title "$title")
         if [[ -n "$ref" ]]; then
-            cmux move-workspace-to-window --workspace "$ref" --window "$win" >/dev/null 2>&1 || true
+            cmux_change move-workspace-to-window --workspace "$ref" --window "$win" >/dev/null 2>&1 || true
             sleep 0.3
             ref=$(workspace_ref_by_title "$title" "$win")
             [[ -n "$ref" ]] && break
@@ -966,7 +1086,7 @@ discard_stray_workspace() {
     if [[ "${count:-0}" -gt 1 ]]; then
         while IFS= read -r id; do
             [[ -z "$id" ]] && continue
-            cmux close-workspace --workspace "$id" >/dev/null 2>&1 || true
+            cmux_change close-workspace --workspace "$id" >/dev/null 2>&1 || true
         done < <(cmux_json workspace list --window "$win" 2>/dev/null \
                  | jq -r '.workspaces[]? | select(.title == "~") | .id')
     fi
@@ -987,11 +1107,11 @@ apply_group_style() {
     collapsed=$(cfg --arg g "$group" '.groups[$g].collapsed // false')
 
     [[ -n "$color" && "$color" != "null" ]] && \
-        cmux workspace-group set-color "$ref" --hex "$color" >/dev/null 2>&1 || true
+        cmux_change workspace-group set-color "$ref" --hex "$color" >/dev/null 2>&1 || true
     [[ -n "$icon" && "$icon" != "null" ]] && \
-        cmux workspace-group set-icon "$ref" --symbol "$icon" >/dev/null 2>&1 || true
-    [[ "$pinned" == "true" ]] && cmux workspace-group pin "$ref" >/dev/null 2>&1 || true
-    [[ "$collapsed" == "true" ]] && cmux workspace-group collapse "$ref" >/dev/null 2>&1 || true
+        cmux_change workspace-group set-icon "$ref" --symbol "$icon" >/dev/null 2>&1 || true
+    [[ "$pinned" == "true" ]] && cmux_change workspace-group pin "$ref" >/dev/null 2>&1 || true
+    [[ "$collapsed" == "true" ]] && cmux_change workspace-group collapse "$ref" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -2205,6 +2325,9 @@ cmd_new() {
             --hat) hat="$2"; shift 2 ;;
             --ssh|--host) ssh_dest="$2"; shift 2 ;;
             --dir) dir="$2"; shift 2 ;;
+            # Land on the new workspace, rather than going back to where this
+            # was run from.
+            --focus|--go) HATTER_FOCUS_KEEP=1; shift ;;
             *) die "unknown flag: $1" ;;
         esac
     done
@@ -2286,11 +2409,15 @@ cmd_new() {
         die "no cmux workspace appeared for '$session'"
     fi
 
-    cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null
+    cmux_change workspace-group add --group "$gref" --workspace "$wref" >/dev/null
     apply_group_style "$group" "$gref"
     discard_stray_workspace "$win"
-    cmux workspace select --workspace "$wref" >/dev/null 2>&1 || \
-        cmux select-workspace --workspace "$wref" >/dev/null
+    # Without --focus the run ends back where it started, so selecting the new
+    # workspace would only flash it.
+    if [[ "$HATTER_FOCUS_KEEP" == 1 ]]; then
+        cmux_change workspace select --workspace "$wref" >/dev/null 2>&1 || \
+            cmux_change select-workspace --workspace "$wref" --window "$win" >/dev/null
+    fi
 
     echo
     echo "  Hat:        $hat  ($host)"
@@ -2739,7 +2866,7 @@ heal_move() {
         if jq -e --arg w "$wid" --arg o "$orphan" '
                 any(.panes[]?; .window_id == $w) and all(.panes[]?; .surface_id != $o)' \
                 <<<"$map" >/dev/null 2>&1; then
-            cmux close-surface --surface "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
+            cmux_change close-surface --surface "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
                 || warn "moved tab '$label' into '$to', but could not close its blank copy"
             info "Moved tab '$label' into '$to': it was dragged there in cmux, but tmux had kept it in '$from'"
             HEAL_MOVED+="$to"$'\n'
@@ -2843,7 +2970,7 @@ cmd_repair() {
     fi
 
     info "Detaching '$session' from cmux (its tmux session keeps running)"
-    cmux close-workspace --workspace "$ws" >/dev/null 2>&1 \
+    cmux_change close-workspace --workspace "$ws" >/dev/null 2>&1 \
         || die "cmux would not close the workspace - nothing was changed"
     # Wait until it is really gone, or the wait below could take the old one
     # for the re-mirrored one.
@@ -2870,22 +2997,22 @@ cmd_repair() {
             # It was the group's only member, and closing it took the group too.
             gref=$(ensure_cmux_group "$gname" "$win")
         fi
-        if ! cmux workspace-group add --group "$gref" --workspace "$new" >/dev/null 2>&1; then
+        if ! cmux_change workspace-group add --group "$gref" --workspace "$new" >/dev/null 2>&1; then
             warn "could not put '$session' back in group '$gname'"
             gname=""
         fi
         if group_exists "$gname"; then apply_group_style "$gname" "$gref"; fi
         if [[ -z "$gname" ]]; then :
         elif [[ -n "$after" ]]; then
-            cmux reorder-workspace --workspace "$new" --after "$after" --window "$win" >/dev/null 2>&1 \
+            cmux_change reorder-workspace --workspace "$new" --after "$after" --window "$win" >/dev/null 2>&1 \
                 || warn "could not move '$session' back to its old place"
         elif [[ -n "$before" ]]; then
-            cmux reorder-workspace --workspace "$new" --before "$before" --window "$win" >/dev/null 2>&1 \
+            cmux_change reorder-workspace --workspace "$new" --before "$before" --window "$win" >/dev/null 2>&1 \
                 || warn "could not move '$session' back to its old place"
         fi
         [[ -z "$gname" ]] || info "Back in '$gname', where it was"
     elif [[ -n "$prev" ]]; then
-        cmux reorder-workspace --workspace "$new" --after "$prev" --window "$win" >/dev/null 2>&1 \
+        cmux_change reorder-workspace --workspace "$new" --after "$prev" --window "$win" >/dev/null 2>&1 \
             || warn "could not move '$session' back to its old place"
     fi
 
@@ -3204,7 +3331,7 @@ cmd_rename() {
     wref=$(workspace_ref_by_title "$new")
     [[ -z "$wref" ]] && wref=$(workspace_ref_by_title "$old")
     if [[ -n "$wref" ]]; then
-        cmux rename-workspace --workspace "$wref" "$new" >/dev/null 2>&1 || true
+        cmux_change rename-workspace --workspace "$wref" "$new" >/dev/null 2>&1 || true
     fi
 
     info "Renamed '$old' -> '$new' (hat: $hat, group: $group)"
@@ -3546,7 +3673,7 @@ cmd_group() {
             if [[ -n "$win" ]]; then
                 gref=$(group_ref_in_window "$win" "$old_name")
                 [[ -n "$gref" ]] && \
-                    cmux workspace-group rename "$gref" --name "$new_name" >/dev/null 2>&1 || true
+                    cmux_change workspace-group rename "$gref" --name "$new_name" >/dev/null 2>&1 || true
             fi
 
             backup_config
@@ -3733,10 +3860,12 @@ sync_once() {
     if [[ "$HATTER_LOCK_HELD" != 1 ]]; then
         hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
         held=1
-        trap hatter_unlock EXIT
+        # Usually already set, but sync also runs in a subshell, which does
+        # not inherit the trap.
+        trap 'hatter_on_exit $?' EXIT
     fi
     if [[ "$(cksum < "$CONFIG")" != "$stamp" ]]; then
-        if [[ "$held" == 1 ]]; then hatter_unlock; trap - EXIT; fi
+        if [[ "$held" == 1 ]]; then hatter_unlock; fi
         return 1
     fi
     backup_config
@@ -3750,7 +3879,7 @@ sync_once() {
             | .groups[$e.key].pinned    = $e.value.pinned
             | .groups[$e.key].collapsed = $e.value.collapsed
             | .groups[$e.key].sessions  = $e.value.sessions)'
-    if [[ "$held" == 1 ]]; then hatter_unlock; trap - EXIT; fi
+    if [[ "$held" == 1 ]]; then hatter_unlock; fi
 
     # Once per server, after every hat on it is recorded and the config holds
     # it - and all at once.
@@ -3913,7 +4042,7 @@ cmd_restore() {
                     warn "no workspace appeared for '$session'"
                     continue
                 fi
-                cmux workspace-group add --group "$gref" --workspace "$wref" >/dev/null 2>&1 || true
+                cmux_change workspace-group add --group "$gref" --workspace "$wref" >/dev/null 2>&1 || true
                 echo "  ok  $hat / $group / $session -> $wref"
             done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
             apply_group_style "$group" "$gref"
@@ -4121,6 +4250,9 @@ cmd_autosave() {
             ( heal_dragged_tabs "" once ) 2>&1 | while IFS= read -r line; do
                 echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: $line"
             done || true
+            # Closing a healed tab can move focus. Put it back now rather than
+            # after the sync: the user may have gone somewhere else by then.
+            focus_restore
             if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
                 if [[ "$(sed -n 1p "$state" 2>/dev/null)" != ok ]]; then
                     [[ -s "$state" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: sync ok again"
@@ -4135,7 +4267,6 @@ cmd_autosave() {
                 printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
             fi
             hatter_lock 0 || return 0          # a command is mid-write; try next minute
-            trap hatter_unlock EXIT
             local f
             f=$(autosave_snapshot) || true
             [[ -n "$f" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave -> $(basename "$f")"
@@ -4510,6 +4641,14 @@ edit_cleanup() {
     printf '\033[?25h'                       # cursor back on
 }
 
+# The rack's EXIT trap. Not folded into hatter_on_exit: the rack's subshells
+# (a sync) set that one as their own trap, and must not clear the rack's cache.
+edit_on_exit() {
+    local rc="$1"
+    edit_cleanup || true
+    hatter_on_exit "$rc"
+}
+
 # Read one keypress. Arrow keys arrive as ESC [ A..D, so a bare ESC has to be
 # told apart from the start of a sequence by a short timeout. bash 3.2's read
 # only takes whole-second timeouts, hence -t 1.
@@ -4532,6 +4671,10 @@ edit_read_pending() {
 
 edit_readkey() {
     local k rest
+    # The rack runs for as long as it is open. Each action it ran is over by the
+    # time it waits for a key, so focus goes back now, not when the rack closes:
+    # the rack's own terminal has to have it for the key to arrive at all.
+    focus_restore
     IFS= read -rsn1 k < /dev/tty || { KEY=quit; return; }
     case "$k" in
         $'\e')
@@ -4552,7 +4695,7 @@ edit_readkey() {
     esac
 }
 
-edit_ask()   { printf '\033[?25h  %s: ' "$1" >&2; read -r EDIT_REPLY < /dev/tty; printf '\033[?25l'; }
+edit_ask()   { focus_restore; printf '\033[?25h  %s: ' "$1" >&2; read -r EDIT_REPLY < /dev/tty; printf '\033[?25l'; }
 edit_pause() { printf '\n  %spress any key%s ' "$C_DIM" "$C_R" >&2; edit_readkey; }
 edit_confirm() {
     printf '  %s%s%s [y/N] ' "$C_YL" "$1" "$C_R" >&2
@@ -5280,7 +5423,8 @@ cmd_rack() {
     [[ -t 0 && -t 1 ]] || die "the rack needs an interactive terminal"
     colour_setup
     EDIT_CACHE=$(mktemp -d "${TMPDIR:-/tmp}/hatter-edit.XXXXXX")
-    trap edit_cleanup EXIT INT TERM
+    trap edit_cleanup INT TERM
+    trap 'edit_on_exit $?' EXIT
     edit_refresh_all
     edit_top
     printf '\033[H\033[2J\033[?25h'
@@ -5319,6 +5463,7 @@ Commands:
 
 Run `hatter` with no arguments to open the rack, or without cmux, to attach.
 Run `hatter <command>` or `hatter help <command>` for a command's options.
+A command that changes cmux puts focus back where it found it when it is done.
 
 Config: ~/.config/hatter/config.json
 USAGE
@@ -5416,6 +5561,8 @@ Options:
                      no <hat>- prefix and the group is also new.
   --ssh user@host    Register an unknown hat's destination without prompting.
   --dir <path>       Remote working directory for a newly registered hat.
+  --focus, --go      Stay on the new workspace when done. Without it, cmux
+                     focus goes back to the window and workspace you were in.
 
 A bare name is auto-prefixed once the hat is known:
   hatter dev-atlas --group "Atlas"
@@ -5806,12 +5953,14 @@ case "$cmd" in
     *) need cmux ;;
 esac
 
+# Unlocks the config and puts cmux focus back, however the run ends.
+trap 'hatter_on_exit $?' EXIT
+
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
     rack|edit|list|ls|help|""|-h|--help|autosave|attach|resize|shortcuts|sync|_drag-plan|_drag-heal) ;;
-    *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment"
-       trap hatter_unlock EXIT ;;
+    *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
 # `hatter <command> --help` always explains the command.
