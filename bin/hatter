@@ -3383,7 +3383,7 @@ hat_workspaces() {
     return 0
 }
 
-# A numbered menu on stderr. Prints the choice; an empty answer or end of
+# A numbered menu on stderr. Prints the choice; an empty answer, Esc or end of
 # input picks nothing and returns non-zero.
 pick_one() {
     local prompt="$1" a i=1
@@ -3391,8 +3391,8 @@ pick_one() {
     local -a opts=("$@")
     for a in "${opts[@]}"; do printf '  %2d) %s\n' "$i" "$a" >&2; i=$((i+1)); done
     while true; do
-        printf '%s' "$prompt" >&2
-        IFS= read -r a || { echo >&2; return 1; }
+        ask_line "${prompt%: }" || return 1
+        a="$EDIT_REPLY"
         [[ -n "$a" ]] || return 1
         if [[ "$a" =~ ^[0-9]+$ ]] && [[ "$a" -ge 1 && "$a" -le ${#opts[@]} ]]; then
             printf '%s' "${opts[$((a-1))]}"
@@ -3457,8 +3457,8 @@ $(printf '%s\n' "$list" | sed 's/^/    /')"
     session=$(pick_one "workspace on '$hat': " "${choices[@]}") || exit 0
     if [[ "$session" == "+ new workspace" ]]; then
         local name
-        printf '  name (becomes %s-<name>): ' "$hat" >&2
-        IFS= read -r name || exit 0
+        ask_line "name (becomes $hat-<name>), Esc to cancel" || exit 0
+        name="$EDIT_REPLY"
         [[ -n "$name" ]] || exit 0
         session=$(hat_session_name "$hat" "$(tmux_session_name "$name")")
     fi
@@ -5472,7 +5472,48 @@ edit_readkey() {
     esac
 }
 
-edit_ask()   { focus_restore; printf '\033[?25h  %s: ' "$1" >&2; read -r EDIT_REPLY < /dev/tty; printf '\033[?25l'; }
+# One line of input from the terminal, into EDIT_REPLY. Esc cancels: it
+# returns 1 with EDIT_REPLY empty, so a caller drops the whole action with
+# `|| continue`. A blank answer is a normal reply and returns 0. A lone Esc is
+# told from an arrow key or other escape sequence by edit_read_pending; those
+# are ignored rather than typed in.
+ask_line() {
+    local k rest rc=0
+    EDIT_REPLY=""
+    printf '\033[?25h  %s: ' "$1" >&2
+    while true; do
+        IFS= read -rsn1 k < /dev/tty || { rc=1; break; }
+        case "$k" in
+            '') break ;;
+            $'\e')
+                rest=$(edit_read_pending 2)
+                [[ -z "$rest" ]] && { rc=1; break; }
+                # A sequence can arrive in pieces over a slow link: take the
+                # rest of it, up to its final letter or ~, so none is typed in.
+                local n=0
+                while [[ "$rest" == '['* && "$rest" != *[A-Za-z~] && $n -lt 6 ]]; do
+                    rest+=$(edit_read_pending 1); n=$((n+1))
+                done
+                continue ;;
+            $'\x04') rc=1; break ;;
+            $'\x7f'|$'\b')
+                if [[ -n "$EDIT_REPLY" ]]; then
+                    EDIT_REPLY="${EDIT_REPLY%?}"; printf '\b \b' >&2
+                fi ;;
+            [[:cntrl:]]) ;;
+            *) EDIT_REPLY+="$k"; printf '%s' "$k" >&2 ;;
+        esac
+    done
+    printf '\033[?25l' >&2
+    if [[ $rc -ne 0 ]]; then
+        EDIT_REPLY=""
+        printf ' %s(cancelled)%s\n' "${C_DIM:-}" "${C_R:-}" >&2
+    else
+        printf '\n' >&2
+    fi
+    return $rc
+}
+edit_ask() { focus_restore; ask_line "$1"; }
 edit_pause() { printf '\n  %spress any key%s ' "$C_DIM" "$C_R" >&2; edit_readkey; }
 edit_confirm() {
     printf '  %s%s%s [y/N] ' "$C_YL" "$1" "$C_R" >&2
@@ -5789,11 +5830,12 @@ edit_top() {
                 : ;;
             !) edit_refresh_all ;;
             A)
-                edit_ask "new hat name (the session prefix)"; local nh_name="$EDIT_REPLY"
+                edit_ask "new hat name (the session prefix)" || continue
+                local nh_name="$EDIT_REPLY"
                 [[ -z "$nh_name" ]] && continue
-                edit_ask "ssh destination (user@host)"; local nhost="$EDIT_REPLY"
-                edit_ask "remote dir [\$HOME]"; local dir="${EDIT_REPLY:-\$HOME}"
-                edit_ask "default group for new workspaces"; local g="$EDIT_REPLY"
+                edit_ask "ssh destination (user@host)" || continue; local nhost="$EDIT_REPLY"
+                edit_ask "remote dir [\$HOME]" || continue; local dir="${EDIT_REPLY:-\$HOME}"
+                edit_ask "default group for new workspaces" || continue; local g="$EDIT_REPLY"
                 if [[ -n "$g" ]] && group_name_reserved "$g"; then
                     warn "'$UNASSIGNED' is hatter's own group - pick another default group"; edit_pause; continue
                 fi
@@ -5802,7 +5844,7 @@ edit_top() {
                 edit_fetch_hat "$nh_name"; edit_pause ;;
             R)
                 [[ -z "$hat" ]] && continue
-                edit_ask "new name for hat '$hat'"
+                edit_ask "new name for hat '$hat'" || continue
                 [[ -n "$EDIT_REPLY" ]] && { cmd_hat rename "$hat" "$EDIT_REPLY" || true; edit_refresh_all; }
                 edit_pause ;;
             D)
@@ -6055,7 +6097,7 @@ edit_groups() {
                 [[ $n -gt 0 ]] && { edit_workspaces "$hat" "$g" || return 1; }
                 : ;;
             a|A)
-                edit_ask "new group name"
+                edit_ask "new group name" || continue
                 if group_name_reserved "$EDIT_REPLY"; then
                     warn "'$UNASSIGNED' is hatter's own group - pick another name"
                 elif [[ -n "$EDIT_REPLY" ]]; then
@@ -6069,7 +6111,7 @@ edit_groups() {
                 if group_managed "$g"; then
                     warn "'$(group_display "$g")' is hatter's own group and keeps its name"; edit_pause; continue
                 fi
-                edit_ask "new name for group '$g'"
+                edit_ask "new name for group '$g'" || continue
                 # A subshell: rename dies on a name it refuses.
                 [[ -n "$EDIT_REPLY" ]] && { ( cmd_group rename "$g" "$EDIT_REPLY" ) || true; edit_pause; } ;;
             d|D)
@@ -6157,7 +6199,7 @@ edit_workspaces() {
                 : ;;
             !) edit_fetch_hat "$hat"; edit_cmux_places "$hat" ;;
             a|A)
-                edit_ask "new workspace name (a bare name gets the '$hat-' prefix)"
+                edit_ask "new workspace name (a bare name gets the '$hat-' prefix)" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
                     cmd_new "$EDIT_REPLY" --group "$group" --hat "$hat" || true
                     edit_fetch_hat "$hat"
@@ -6165,7 +6207,7 @@ edit_workspaces() {
                 edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
-                edit_ask "new name for workspace '$ws'"
+                edit_ask "new name for workspace '$ws'" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
                     cmd_rename "$ws" "$EDIT_REPLY" || true; edit_fetch_hat "$hat"
                 fi
@@ -6248,11 +6290,11 @@ edit_tabs() {
             enter|right|l) : ;;                       # tabs are the leaf level
             !) : ;;
             a|A)
-                edit_ask "name for the new tab (blank for the shell default)"
+                edit_ask "name for the new tab (blank for the shell default)" || continue
                 cmd_tab "$ws" "$EDIT_REPLY" || true; edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
-                edit_ask "new name for tab '${NAMES[$((SEL-1))]}'"
+                edit_ask "new name for tab '${NAMES[$((SEL-1))]}'" || continue
                 [[ -n "$EDIT_REPLY" ]] && remote_sh "$(hat_ssh "$hat")" \
                     "tmux rename-window -t $(sq "=$ws:$idx") $(sq "$EDIT_REPLY")" >/dev/null 2>&1 || true ;;
             p|P)
@@ -6698,7 +6740,8 @@ each one, and live status is shown where it exists:
   tabs        active, dead, running command, pane count, working directory
 
 Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
-goes back a level, `q` quits from anywhere. Takes no options.
+goes back a level, `q` quits from anywhere. Esc at a question cancels the whole
+action. Takes no options.
 
 `hatter` on its own opens the rack. `hatter edit` is the old name and still
 works.
