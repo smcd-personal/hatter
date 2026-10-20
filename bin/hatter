@@ -440,7 +440,7 @@ session_group() {
 hat_session_name() {
     local hat="$1" name="$2" host
     if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
-    if [[ -n "$(session_group "$name")" && "$(session_hat "$name")" == "$hat" ]]; then
+    if [[ -n "$(session_group "$name" "$hat")" ]]; then
         printf '%s' "$name"; return 0
     fi
     host=$(hat_ssh "$hat")
@@ -2845,13 +2845,10 @@ $listing
   hatter tab <workspace> [tab-name]"
     fi
 
-    local group hat host
-    group=$(session_group "$session")
-    if [[ -n "$group" ]]; then
-        hat=$(group_hat "$group")
-    else
-        hat=$(session_hat "$session")
-    fi
+    # The hat first, then its group: two hats may each record the name.
+    local group="" hat host
+    hat=$(session_hat "$session")
+    [[ -z "$hat" ]] || group=$(session_group "$session" "$hat")
 
     if [[ -z "$hat" ]]; then
         # A bare workspace name typed inside a cmux window: try this hat's
@@ -2862,9 +2859,9 @@ $listing
         local cur="" found=""
         cur=$(current_hat || true)
         [[ -n "$cur" ]] && found=$(hat_session_name "$cur" "$session")
-        if [[ -n "$found" && ( "$found" == "$session" || -n "$(session_group "$found")" ) ]]; then
+        if [[ -n "$found" && ( "$found" == "$session" || -n "$(session_group "$found" "$cur")" ) ]]; then
             session="$found"
-            group=$(session_group "$session")
+            group=$(session_group "$session" "$cur")
             hat="$cur"
             info "taking '$session' from this window"
         fi
@@ -3652,11 +3649,18 @@ remote_end_session() {
     case "$out" in killed|'not running') printf '%s\n' "$out" ;; *) return 1 ;; esac
 }
 
-# Drop a session from every group that records it.
+# forget_session <session> <hat>: drop a session from every group that records
+# it on <hat>'s server. Hats that share an ssh destination share its tmux, so
+# there the name is one session; a hat on another server that records the same
+# name has a session of its own, and keeps its entry.
 forget_session() {
     backup_config
-    jq_write --arg s "$1" '.groups |= map_values(if .sessions then del(.sessions[$s]) else . end)
-                           | '"$PRUNE_UNASSIGNED"
+    jq_write --arg s "$1" --arg l "$2" '
+        (.hats[$l].ssh // "") as $h
+        | [.hats | to_entries[] | select(.key == $l or ($h != "" and .value.ssh == $h)) | .key] as $same
+        | .groups |= map_values(if .sessions and ((.hat // "") as $x | $same | index($x))
+                                then del(.sessions[$s]) else . end)
+        | '"$PRUNE_UNASSIGNED"
 }
 
 # The deliberate way to close a workspace. Sync keeps a session that is still
@@ -3665,31 +3669,46 @@ forget_session() {
 # server brings back after a reboot; --keep-running forgets the config entry
 # and leaves the server exactly as it is. See: hatter help rm.
 cmd_rm() {
-    local session="" keep=0 a
-    for a in "$@"; do
-        case "$a" in
-            --keep-running) keep=1 ;;
-            -*) die "unknown flag: $a  (try: hatter help rm)" ;;
-            *)  [[ -z "$session" ]] || die "usage: hatter rm <session> [--keep-running]"
-                session="$a" ;;
+    local session="" keep=0 want="" usage="usage: hatter rm <session> [--hat <hat>] [--keep-running]"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --keep-running) keep=1; shift ;;
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "$usage"
+                   want="$2"; shift 2 ;;
+            -*) die "unknown flag: $1  (try: hatter help rm)" ;;
+            *)  [[ -z "$session" ]] || die "$usage"
+                session="$1"; shift ;;
         esac
     done
-    [[ -n "$session" ]] || die "usage: hatter rm <session> [--keep-running]"
+    [[ -n "$session" ]] || die "$usage"
 
-    # A session no group records can still be ended: its prefix names the hat.
-    local group hat host
-    group=$(session_group "$session")
-    if [[ -n "$group" ]]; then
-        hat=$(group_hat "$group")
+    # Which hat. A session no group records can still be ended: its prefix
+    # names the hat. A name need not carry a prefix, and hats on two servers
+    # can each record it: those are two sessions, and which one to end is not
+    # a guess to make.
+    local group="" hat host both
+    if [[ -n "$want" ]]; then
+        hat_exists "$want" || die "unknown hat: $want"
+        hat="$want"
     else
-        [[ "$keep" == 0 ]] || die "no recorded session named '$session', so nothing to forget"
+        both=$(cfg --arg s "$session" --arg p "${session%%-*}" '
+            . as $c
+            | ([.groups[] | select(.sessions[$s]?) | .hat // empty] | unique) as $hs
+            | if ($hs | index($p)) then empty
+              else ($hs | map($c.hats[.].ssh // "") | unique | select(length > 1) | $hs | join(", ")) end')
+        [[ -z "$both" ]] || die "'$session' is recorded on more than one server (hats: $both).
+  Say which: hatter rm $session --hat <hat>"
         hat=$(session_hat "$session")
+    fi
+    [[ -z "$hat" ]] || group=$(session_group "$session" "$hat")
+    if [[ -z "$group" ]]; then
+        [[ "$keep" == 0 ]] || die "no recorded session named '$session'${want:+ on hat '$want'}, so nothing to forget"
         [[ -n "$hat" ]] || die "no recorded session named '$session', and no hat is called '${session%%-*}'"
     fi
     host=$(hat_ssh "$hat")
 
     if [[ "$keep" == 1 ]]; then
-        forget_session "$session"
+        forget_session "$session" "$hat"
         info "Forgot '$session' (group '$group'); the server was not touched"
         echo "  If it is running it goes on running, and tmux-resurrect may bring it back"
         echo "  after a reboot. While it runs, the next sync records it again: in its group"
@@ -3709,7 +3728,7 @@ cmd_rm() {
         *) die "could not reach $host to end '$session'; nothing changed.
   --keep-running forgets the entry and leaves the server alone." ;;
     esac
-    if [[ -n "$group" ]] && ! ( forget_session "$session" ); then
+    if [[ -n "$group" ]] && ! ( forget_session "$session" "$hat" ); then
         [[ "$result" == killed ]] || die "could not drop '$session' from the config"
         die "killed '$session' on $host, but could not drop it from the config.
   Finish with: hatter rm $session --keep-running"
@@ -6168,10 +6187,10 @@ edit_workspaces() {
                 # finish.
                 case "$KEY" in
                     k|K) printf 'kill\n' >&2
-                         ( cmd_rm "$ws" ) || warn "rm did not finish - see above"
+                         ( cmd_rm "$ws" --hat "$hat" ) || warn "rm did not finish - see above"
                          edit_fetch_hat "$hat"; edit_pause ;;
                     f|F) printf 'forget only\n' >&2
-                         ( cmd_rm "$ws" --keep-running ) || warn "rm did not finish - see above"
+                         ( cmd_rm "$ws" --hat "$hat" --keep-running ) || warn "rm did not finish - see above"
                          edit_fetch_hat "$hat"; edit_pause ;;
                     *)   printf 'no\n' >&2 ;;
                 esac ;;
@@ -6568,7 +6587,7 @@ renames the tmux session, so after doing it by hand just run `hatter sync`.
 USAGE
     ;;
     rm|remove) cat <<'USAGE'
-hatter rm <session> [--keep-running]
+hatter rm <session> [--hat <hat>] [--keep-running]
 
 End a workspace on purpose: kill its tmux session on the server and drop it
 from the config. Closing a workspace in cmux is not enough: sync keeps a
@@ -6584,6 +6603,10 @@ A running session that no group records is ended the same way; its name's
 prefix says which hat it is on. If the server cannot be reached, or its tmux
 cannot be read, nothing is changed.
 
+  --hat <hat>      The hat whose session it is. Needed only when hats on more
+                   than one server record the name and its prefix names none
+                   of them: those are different sessions, and rm will not
+                   pick one. Entries on other servers are never touched.
   --keep-running   Forget the config entry only, and leave the server exactly
                    as it is: the session runs on, and tmux-resurrect may bring
                    it back after a reboot. Use it for an entry whose server is

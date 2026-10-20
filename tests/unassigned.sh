@@ -41,6 +41,12 @@ case "$cmd" in
         s=$(sed -n "s/.*list-windows -t '=\([^']*\)'.*/\1/p" <<<"$cmd")
         grep -qxF "$s" "$srv" && printf '@1\tw-%s\t/srv\t\n' "$s" ;;
     *rename-session*)       echo "$cmd" >> "$STUB_DIR/log" ;;
+    *kill-session*)         # rm: the script starts s='<session>';
+        s=$(sed -n "1s/^s='\([^']*\)';.*/\1/p" <<<"$cmd")
+        if grep -qxF "$s" "$srv"; then
+            grep -vxF "$s" "$srv" > "$srv.new" || true; mv "$srv.new" "$srv"
+            echo "kill ${dest%%@*} $s" >> "$STUB_DIR/log"; echo killed
+        else echo "not running"; fi ;;
     *has-session*)
         s=$(sed -n "s/.*has-session -t '=\([^']*\)'.*/\1/p" <<<"$cmd")
         grep -qxF "$s" "$srv" || exit 1 ;;
@@ -501,10 +507,41 @@ setup same-name "$(jq '.hats.ops = {"ssh": "ops@ops.example.com"}
 expect "a session two hats record belongs to the hat its prefix names" \
     "$(yes_if all_of [ "$(in_lib 'session_hat dev-s')" = dev ] -- [ "$(in_lib 'session_group dev-s dev')" = G ])"
 
+# A name hats on two servers record, with no prefix to choose, is two
+# sessions: rm ends neither without --hat, and with it ends and forgets only
+# that hat's. Hats sharing a server share the session, so both forget it.
+TWO_SERVERS=$(jq '.hats.ops = {"ssh": "ops@ops.example.com"}
+                  | .groups.O = {"hat": "ops", "sessions": {"notes": {}}}
+                  | .groups.G.sessions.notes = {}' <<<"$ONE_HAT")
+setup rm-two "$TWO_SERVERS" "$ONE_TREE"
+printf 'dev-a\nnotes\n' > "$d/server.dev"; printf 'notes\n' > "$d/server.ops"
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+rc=0; hatter_in rm notes || rc=$?
+expect "rm refuses a name recorded on two servers, and changes nothing" \
+    "$(yes_if all_of [ "$rc" != 0 ] -- says "--hat" -- unlogged "kill " \
+                  -- same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+hatter_in rm notes --hat ops || true
+expect "rm --hat ends and forgets only that hat's session" \
+    "$(yes_if all_of logged "kill ops notes" -- unlogged "kill dev" \
+                  -- is '.groups.O.sessions | has("notes")' false -- is '.groups.G.sessions | has("notes")' true)"
+setup rm-two-keep "$TWO_SERVERS" "$ONE_TREE"
+hatter_in rm notes --hat dev --keep-running || true
+expect "rm --hat --keep-running forgets only that hat's entry" \
+    "$(yes_if all_of is '.groups.G.sessions | has("notes")' false -- is '.groups.O.sessions | has("notes")' true \
+                  -- unlogged "kill ")"
+setup rm-shared "$(jq '.hats.dev2 = {"ssh": "dev@dev.example.com"}
+                       | .groups.D2 = {"hat": "dev2", "sessions": {"notes": {}}}
+                       | .groups.G.sessions.notes = {}' <<<"$ONE_HAT")" "$ONE_TREE"
+printf 'dev-a\nnotes\n' > "$d/server.dev"
+hatter_in rm notes || true
+expect "rm of a session two hats on one server record ends it once and forgets both" \
+    "$(yes_if all_of logged "kill dev notes" -- is '.groups.G.sessions | has("notes")' false \
+                  -- is '.groups.D2.sessions | has("notes")' false)"
+
 # Every change to cmux's groups goes through the helpers.
 expect "no group change bypasses the helpers" \
     "$(yes_if bash -c 'sed "/^# --- group changes in cmux/,/^# cmux_group_to_top/d" "$1" \
-                       | grep -v "^ *#" | grep -q "cmux workspace-group \(add\|rename\|set-\|pin\|collapse\|create\|move\|ungroup\)" && exit 1
+                       | grep -v "^ *#" | grep -q "cmux\(_change\)\? workspace-group \(add\|rename\|set-\|pin\|collapse\|create\|move\|ungroup\)" && exit 1
                        grep -q "^# --- group changes in cmux" "$1"' _ "$hatter")"
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
