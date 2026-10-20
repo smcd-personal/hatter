@@ -112,4 +112,56 @@ if out=$(STUB_HAT=dev run 'tab_target nothing'); then
 fi
 grep -q "no workspace named 'nothing'" <<<"$out" || fail "tab nothing: wrong error: $out"
 
+# --- a bare name two servers' hats record (#89) -------------------------------
+# Hats a and b sit on different servers and each record 'notes'. a comes first
+# in the config, so taking the first recorder would always land on a.
+setup2() {
+    cat > "$work/cfg/hatter/config.json" <<'EOF'
+{"version":3,
+ "hats":{"a":{"ssh":"u@a.example.com"},"b":{"ssh":"u@b.example.com"}},
+ "groups":{"A1":{"hat":"a","sessions":{"notes":{},"a-x":{}}},
+           "B1":{"hat":"b","sessions":{"notes":{},"a-x":{}}}}}
+EOF
+    : > "$work/log"; printf 'notes\na-x\n' > "$work/running.txt"
+}
+
+setup2
+out=$(STUB_HAT=b run 'tab_target notes; echo "=> $TAB_SESSION $TAB_HAT $TAB_GROUP"') \
+    || fail "tab notes in b's window: $out"
+grep -q '^=> notes b B1$' <<<"$out" || fail "tab notes in b's window: want b's session: $out"
+
+setup2
+out=$(STUB_HAT=a run 'tab_target notes; echo "=> $TAB_SESSION $TAB_HAT $TAB_GROUP"') \
+    || fail "tab notes in a's window: $out"
+grep -q '^=> notes a A1$' <<<"$out" || fail "tab notes in a's window: $out"
+
+setup2
+if out=$(run 'cmd_tab notes'); then fail "tab notes with no window: guessed: $out"; fi
+grep -q "recorded on more than one server" <<<"$out" || fail "tab notes with no window: wrong error: $out"
+grep -q -- '--hat' <<<"$out" || fail "tab notes with no window: does not say --hat: $out"
+! grep -q 'new-window' "$work/log" || fail "tab notes with no window: made a tab: $(cat "$work/log")"
+
+setup2
+out=$(run 'cmd_tab notes --hat b') || fail "tab notes --hat b: $out"
+grep -q 'u@b.example.com' <<<"$out" || fail "tab notes --hat b: not on b: $out"
+grep -q 'new-window' "$work/log" || fail "tab notes --hat b: made no tab"
+
+# The prefix still names its hat, whichever window this is typed in.
+setup2
+out=$(STUB_HAT=b run 'tab_target a-x; echo "=> $TAB_HAT"') || fail "tab a-x: $out"
+grep -q '^=> a$' <<<"$out" || fail "tab a-x in b's window: the prefix should win: $out"
+
+# new reattaches the window's hat's session, not the first recorder's.
+setup2
+out=$(STUB_HAT=b run 'cmd_new notes') || fail "new notes in b's window: $out"
+grep -q "Group: *B1$" <<<"$out" || fail "new notes in b's window: not on b: $out"
+setup2
+if out=$(run 'cmd_new notes'); then fail "new notes with no window: guessed: $out"; fi
+grep -q "recorded on more than one server" <<<"$out" || fail "new notes with no window: wrong error: $out"
+
+# rm ends a session, so the window is no answer: it still wants --hat.
+setup2
+if out=$(STUB_HAT=b run 'cmd_rm notes'); then fail "rm notes in b's window: guessed: $out"; fi
+grep -q "hatter rm notes --hat" <<<"$out" || fail "rm notes in b's window: wrong error: $out"
+
 echo "ok: bare names"
