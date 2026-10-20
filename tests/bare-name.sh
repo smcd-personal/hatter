@@ -95,23 +95,6 @@ out=$(run 'cmd_new dev-main') || fail "new dev-main: $out"
 grep -q 'tmux: *dev-main$' <<<"$out" || fail "new dev-main: renamed:
 $out"
 
-# --- tab: a bare name typed in a hat's window ---------------------------------
-setup scratch
-out=$(STUB_HAT=dev run 'tab_target scratch; echo "=> $TAB_SESSION $TAB_HAT"') \
-    || fail "tab scratch (running, unprefixed): $out"
-grep -q '^=> scratch dev$' <<<"$out" || fail "tab scratch: $out"
-
-setup dev-main
-out=$(STUB_HAT=dev run 'tab_target main; echo "=> $TAB_SESSION $TAB_HAT"') \
-    || fail "tab main (prefixed, recorded): $out"
-grep -q '^=> dev-main dev$' <<<"$out" || fail "tab main: $out"
-
-setup
-if out=$(STUB_HAT=dev run 'tab_target nothing'); then
-    fail "tab nothing: matched a session that does not exist: $out"
-fi
-grep -q "no workspace named 'nothing'" <<<"$out" || fail "tab nothing: wrong error: $out"
-
 # --- new: moving Unassigned's last session out drops the group now (#90) -----
 setup_un() {
     setup "$@"
@@ -131,5 +114,22 @@ setup scratch
 out=$(run 'drop_unassigned_now() { echo "drop-unassigned $1"; }; cmd_new scratch --group Atlas') \
     || fail "new scratch: $out"
 ! grep -q 'drop-unassigned' <<<"$out" || fail "new scratch with no Unassigned: dropped one: $out"
+
+# --- tab: a bare name typed in a hat's window ---------------------------------
+setup scratch
+out=$(STUB_HAT=dev run 'tab_target scratch; echo "=> $TAB_SESSION $TAB_HAT"') \
+    || fail "tab scratch (running, unprefixed): $out"
+grep -q '^=> scratch dev$' <<<"$out" || fail "tab scratch: $out"
+
+setup dev-main
+out=$(STUB_HAT=dev run 'tab_target main; echo "=> $TAB_SESSION $TAB_HAT"') \
+    || fail "tab main (prefixed, recorded): $out"
+grep -q '^=> dev-main dev$' <<<"$out" || fail "tab main: $out"
+
+setup
+if out=$(STUB_HAT=dev run 'tab_target nothing'); then
+    fail "tab nothing: matched a session that does not exist: $out"
+fi
+grep -q "no workspace named 'nothing'" <<<"$out" || fail "tab nothing: wrong error: $out"
 
 echo "ok: bare names"
