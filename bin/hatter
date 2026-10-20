@@ -5487,8 +5487,14 @@ ask_line() {
             '') break ;;
             $'\e')
                 rest=$(edit_read_pending 2)
-                [[ -n "$rest" ]] && continue
-                rc=1; break ;;
+                [[ -z "$rest" ]] && { rc=1; break; }
+                # A sequence can arrive in pieces over a slow link: take the
+                # rest of it, up to its final letter or ~, so none is typed in.
+                local n=0
+                while [[ "$rest" == '['* && "$rest" != *[A-Za-z~] && $n -lt 6 ]]; do
+                    rest+=$(edit_read_pending 1); n=$((n+1))
+                done
+                continue ;;
             $'\x04') rc=1; break ;;
             $'\x7f'|$'\b')
                 if [[ -n "$EDIT_REPLY" ]]; then

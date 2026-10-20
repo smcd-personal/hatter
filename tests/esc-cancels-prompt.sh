@@ -44,9 +44,16 @@ def drain(seconds, stop=None):
     return out
 
 drain(0.5)
-for b in keys:
-    os.write(fd, bytes([b]))
-    time.sleep(0.05)
+# A terminal sends an escape sequence in one write; anything else, one key at a time.
+chunks, i = [], 0
+while i < len(keys):
+    if keys[i] == 0x1b and i + 1 < len(keys) and keys[i + 1] == 0x5b:
+        chunks.append(keys[i:i + 3]); i += 3
+    else:
+        chunks.append(keys[i:i + 1]); i += 1
+for c in chunks:
+    os.write(fd, c)
+    time.sleep(0.15)
 out = drain(3, b'RESULT')
 os.kill(pid, signal.SIGKILL)
 os.waitpid(pid, 0)
