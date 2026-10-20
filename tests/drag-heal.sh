@@ -80,6 +80,8 @@ STUB
 cat > "$work/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
 cmd="${*: -1}"
+# hatter sends every command as `sh -c '<script>'`; take the script out.
+[[ "$cmd" == "sh -c "* ]] && { eval "set -- $cmd"; cmd="$3"; }
 case "$cmd" in
   *list-sessions*)
     wid=@2; [[ "${STUB_SECOND:-}" == newid && -f "$STUB_DIR/pass2" ]] && wid=@5

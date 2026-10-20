@@ -26,7 +26,7 @@ jobs:
       - name: shellcheck
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh tests/drag-plan.sh tests/drag-heal.sh tests/focus-restore.sh
+          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh tests/drag-plan.sh tests/drag-heal.sh tests/sync-keep-running.sh tests/hat-restore-names.sh tests/focus-restore.sh tests/unassigned.sh
 
       - name: Help runs with no config and no cmux
         run: |
