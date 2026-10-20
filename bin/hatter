@@ -3223,6 +3223,87 @@ backup_offer() {
     return 0
 }
 
+# The autosave timer's own backup, so the config leaves the machine without
+# anyone remembering to. It pushes when the config has drifted a long way from
+# the pushed copy, or when anything at all has sat unpushed for a week. "The
+# pushed copy" is the upstream tracking ref, which a successful push moves; its
+# commit date stands in for when it was pushed, since a backup commits and
+# pushes together.
+AUTO_BACKUP_PCT=10         # push once more than this share of lines changed
+AUTO_BACKUP_DAYS=7         # push anything pending once the last push is this old
+AUTO_BACKUP_RETRY=3600     # after a failed push, wait this long before the next
+
+# How far the config has drifted from the pushed copy, as a whole percentage:
+# lines added plus lines removed, over the lines in the pushed copy. A config
+# the remote has never seen is 100.
+backup_drift_pct() {
+    local base changed
+    base=$(git -C "$CONFIG_DIR" show '@{u}:config.json' 2>/dev/null | wc -l | tr -d ' ') || base=0
+    [[ "$base" -gt 0 ]] || { echo 100; return 0; }
+    changed=$(git -C "$CONFIG_DIR" diff --numstat '@{u}' -- config.json 2>/dev/null \
+        | awk '{ n += $1 + $2 } END { print n + 0 }')
+    echo $(( changed * 100 / base ))
+}
+
+# Prints why a backup is due and returns 0, or returns 1 when it is not.
+backup_auto_due() {
+    [[ -d "$CONFIG_DIR/.git" ]] && command -v git >/dev/null 2>&1 || return 1
+    [[ "$(cfg '.prefs.auto_backup // "on"')" != off ]] || return 1
+    git -C "$CONFIG_DIR" remote get-url origin >/dev/null 2>&1 || return 1
+    backup_pending || return 1
+
+    local pct pushed age
+    pct=$(backup_drift_pct)
+    if [[ "$pct" -gt "$AUTO_BACKUP_PCT" ]]; then
+        printf '%s%% of the config changed\n' "$pct"
+        return 0
+    fi
+    pushed=$(git -C "$CONFIG_DIR" log -1 --format=%ct '@{u}' 2>/dev/null) || pushed=0
+    age=$(( $(date +%s) - ${pushed:-0} ))
+    if [[ "$age" -ge $(( AUTO_BACKUP_DAYS * 86400 )) ]]; then
+        printf 'last push %s days ago\n' "$(( age / 86400 ))"
+        return 0
+    fi
+    return 1
+}
+
+# Commit and push if due. Never prompts: ssh runs in batch mode with a connect
+# timeout, so a remote that wants a password, or is down, cannot hang the
+# timer. A failed push waits AUTO_BACKUP_RETRY before the next try, and is
+# logged once per run of failures rather than once a minute. The state file
+# holds: ok|failed, epoch, time, reason or error.
+backup_auto() {
+    local reason st now prev when out err
+    reason=$(backup_auto_due) || return 0
+    st="$AUTOSAVE_DIR/backup-state"
+    now=$(date +%s)
+    prev=$(sed -n 1p "$st" 2>/dev/null) || prev=""
+    if [[ "$prev" == failed ]]; then
+        when=$(sed -n 2p "$st" 2>/dev/null) || when=0
+        [[ "$when" =~ ^[0-9]+$ ]] || when=0
+        [[ $(( now - when )) -ge "$AUTO_BACKUP_RETRY" ]] || return 0
+    fi
+
+    out=$(
+        export GIT_TERMINAL_PROMPT=0
+        export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=2"
+        backup_commit_push "hatter auto backup: $reason" 2>&1
+    ) || true
+
+    # Whatever backup_commit_push said, the upstream is the judge: anything
+    # still pending means the push did not land.
+    if backup_pending; then
+        err=$(printf '%s\n' "$out" | grep -v '^==> ' | sed 's/^  !! //' | sed '/^$/d' | tail -n 1)
+        [[ -n "$err" ]] || err="push failed with no message"
+        [[ "$prev" == failed ]] || warn "auto backup failed, retrying hourly: $err"
+        printf 'failed\n%s\n%s\n%s\n' "$now" "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$st" 2>/dev/null || true
+        return 0
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: backed up ($reason)"
+    printf 'ok\n%s\n%s\n%s\n' "$now" "$(date '+%Y-%m-%d %H:%M:%S')" "$reason" > "$st" 2>/dev/null || true
+    return 0
+}
+
 cmd_hat() {
     local sub="${1:-list}"; shift || true
     case "$sub" in
@@ -3799,10 +3880,12 @@ cmd_list() {
 #              minute so that renames done inside cmux are caught too. At most
 #              one is *kept* per 8-hour window, and at most 8 windows, so the
 #              directory holds roughly the last two and a half days and never
-#              grows. Nothing here touches git.
+#              grows. Snapshots never touch git.
 #
 #   backup     `hatter backup` - a real git commit, pushed to the dotfiles
-#              remote, kept forever. That is the deliberate checkpoint.
+#              remote, kept forever. That is the deliberate checkpoint; the
+#              timer also takes one when the config has drifted or sat
+#              unpushed for a week (backup_auto, `hatter help autosave`).
 #
 # Autosaves are for "undo the last hour", backups are for "what did this look
 # like last month".
@@ -3955,6 +4038,8 @@ cmd_autosave() {
             local f
             f=$(autosave_snapshot) || true
             [[ -n "$f" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave -> $(basename "$f")"
+            # Still under the lock, so nothing writes the config mid-commit.
+            backup_auto || true
             return 0 ;;
         now|snapshot)
             local f; f=$(autosave_snapshot) || true
@@ -4015,6 +4100,14 @@ cmd_autosave() {
                 [[ -n "$(sed -n 3p "$st")" ]] && printf '      error: %s\n' "$(sed -n 3p "$st")"
             else
                 printf '  last sync: none recorded yet\n'
+            fi
+            local bst="$AUTOSAVE_DIR/backup-state"
+            if [[ "$(cfg '.prefs.auto_backup // "on"')" == off ]]; then
+                printf '  auto backup: off  (prefs.auto_backup)\n'
+            elif [[ -s "$bst" ]]; then
+                printf '  auto backup: %s at %s, %s\n' "$(sed -n 1p "$bst")" "$(sed -n 3p "$bst")" "$(sed -n 4p "$bst")"
+            else
+                printf '  auto backup: none yet (pushes past %s%% drift, or a week)\n' "$AUTO_BACKUP_PCT"
             fi
             printf '  snapshots: %s of %s\n' "$(autosave_files | wc -l | tr -d ' ')" "$AUTOSAVE_KEEP"
             printf '  directory: %s\n' "$AUTOSAVE_DIR" ;;
@@ -5169,13 +5262,15 @@ hatter autosave [subcommand]
 Snapshots of config.json, kept separately from git.
 
   run                Move dragged tabs (see: hatter help repair), sync from the
-                     live client, then snapshot (what the timer runs)
+                     live client, snapshot, then back up if due (what the
+                     timer runs)
   now                Snapshot only, no sync
   list               Show the checkpoints and the rolling save
   restore <n|latest> Roll the config back to one of them
   install            Install the launchd timer (every 60s)
   uninstall          Remove the timer, keeping the snapshots
-  status             Is the timer loaded, and how many snapshots exist
+  status             Is the timer loaded, how many snapshots exist, and the
+                     last auto backup
 
 Two layers, on purpose:
 
@@ -5191,6 +5286,17 @@ Two layers, on purpose:
 Neither touches git. `hatter backup [message]` is the deliberate checkpoint:
 a real commit, pushed to the dotfiles remote, kept forever. Autosaves are for
 "undo the last hour"; backups are for "what did this look like last month".
+
+The timer also takes a backup by itself, without asking, when one is due:
+
+  - the config differs from the last pushed copy by more than 10% of its
+    lines (added plus removed), or
+  - anything is unpushed and the last push is more than 7 days old.
+
+Nothing is pushed when nothing changed. ssh runs in batch mode, so a remote
+that wants a password is skipped, not waited on; after a failed push it tries
+again an hour later. Turn it off with "prefs": {"auto_backup": "off"} in the
+config.
 
 After rolling back, `hatter restore` applies the config to the client.
 USAGE

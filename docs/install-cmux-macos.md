@@ -131,7 +131,10 @@ hatter autosave status
 ```
 
 That installs a launchd timer that runs every 60 seconds. It syncs first, so it
-also picks up renames you made inside cmux.
+also picks up renames you made inside cmux. Once `hatter backup` has a remote
+to push to, the timer also pushes a backup by itself when the config has
+changed a lot or sat unpushed for a week; `hatter help autosave` has the
+rules.
 
 ## 7. Optional: Claude logins
 
