@@ -142,8 +142,10 @@ LOCK_STALE_SECONDS=300
 
 # BSD and GNU stat spell this differently, and a lock whose age cannot be read
 # is treated as fresh - clearing a lock you cannot date is how two writers end
-# up in the config at once.
-lock_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# up in the config at once. GNU first: GNU stat takes -f too, as "filesystem
+# status", and prints a number that is not the file's mtime. BSD stat refuses
+# -c outright.
+lock_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 hatter_lock() {
     local tries="${1:-0}" i=0 age owner mtime
