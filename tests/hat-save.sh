@@ -17,7 +17,8 @@ grep -q '^# hat-save' "$work/hat-save" || fail "could not extract hat-save from 
 # tmux: STUB_SESSIONS unset means no server; set but empty means a server with
 # no sessions. STUB_RDIR is what @resurrect-dir reads as, STUB_DEF what
 # default-size reads as, STUB_WINDOWS the window sizes, one per line.
-# set-option calls go to STUB_LOG.
+# set-option calls go to STUB_LOG. STUB_PANES is the pane list, one
+# <session>:<window>.<pane> per line.
 mkdir -p "$work/bin"
 cat > "$work/bin/tmux" <<'EOF'
 #!/usr/bin/env bash
@@ -34,6 +35,8 @@ case "$1" in
         esac ;;
     list-windows)
         [ -z "${STUB_WINDOWS:-}" ] || printf '%s\n' "$STUB_WINDOWS" ;;
+    list-panes)
+        [ -z "${STUB_PANES:-}" ] || printf '%s\n' "$STUB_PANES" ;;
     set-option)
         echo "$*" >> "$STUB_LOG" ;;
     *) echo "stub tmux: unexpected: $*" >&2; exit 1 ;;
@@ -53,6 +56,19 @@ n=\$(ls "\$dir" | wc -l | tr -d ' ')
 f="tmux_resurrect_\$n.txt"
 printf '%s' "\${STUB_CONTENT:-}" > "\$dir/\$f"
 ln -fs "\$f" "\$dir/last"
+# Scrollback, as resurrect saves it: one file per pane that has any, written
+# with >, then the folder cleared with a plain rm, which skips folders.
+# STUB_BLANK lists the panes with nothing on screen.
+pc="\$dir/save/pane_contents"
+mkdir -p "\$pc"
+printf '%s\n' "\${STUB_PANES:-}" | while IFS= read -r id; do
+    [ -n "\$id" ] || continue
+    printf '%s\n' "\${STUB_BLANK:-}" | grep -qxF -- "\$id" && continue
+    printf 'scrollback of %s\n' "\$id" > "\$pc/pane-\$id" 2>/dev/null \
+        || echo "\$id" >> "$work/capture-failed"
+done
+tar cf "\$dir/pane_contents.tar" -C "\$dir/save" ./pane_contents
+rm "\$pc"/* 2>/dev/null || true
 EOF
 chmod +x "$save_dir/save.sh"
 
@@ -98,7 +114,8 @@ printf 'pane\tgood\n' > "$odir/tmux_resurrect_good.txt"
 ln -s tmux_resurrect_good.txt "$odir/last"
 STUB_SESSIONS="main" STUB_RDIR='$HOME/snaps' STUB_SAVE_DIR="$odir" STUB_CONTENT="" run >/dev/null
 [ "$(readlink "$odir/last")" = tmux_resurrect_good.txt ] || fail "@resurrect-dir: last left on the empty snapshot"
-[ "$(ls "$odir" | wc -l | tr -d ' ')" = 3 ] || fail "@resurrect-dir: save.sh did not write there"
+snaps=("$odir"/tmux_resurrect_*)
+[ "${#snaps[@]}" = 2 ] || fail "@resurrect-dir: save.sh did not write there"
 
 # --- the server dies mid-save: the empty snapshot does not become `last` ---------
 reset
@@ -144,5 +161,38 @@ size_case 80x24 80x24 80x24
 rm -f "$rec"; reset
 (unset STUB_SESSIONS; STUB_WINDOWS=180x57 run >/dev/null)
 [ ! -e "$rec" ] || fail "size: recorded with no server"
+
+# --- scrollback of a session with / in its name is saved (#84) -----------------
+pc="$rdir/save/pane_contents"
+archived() { tar tf "$rdir/pane_contents.tar" | sed 's#^\./pane_contents/##' | grep -v -e '^$' -e '/$' | LC_ALL=C sort | tr '\n' ' '; }
+panes=$'Proj/General:0.0\nplain:0.0\n/proj:1.0'
+
+reset; rm -f "$work/capture-failed"
+STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES="$panes" run >/dev/null
+[ ! -e "$work/capture-failed" ] || fail "slash: capture failed for: $(tr '\n' ' ' < "$work/capture-failed")"
+[ "$(archived)" = "pane-/proj:1.0 pane-Proj/General:0.0 pane-plain:0.0 " ] \
+    || fail "slash: archive holds '$(archived)'"
+
+# Left over from the save before: a pane blank now must not get it back, in
+# save or in restore. resurrect's rm leaves files in folders, so these stay.
+reset
+mkdir -p "$pc/pane-Proj" "$rdir/restore/pane_contents/pane-Proj"
+echo old > "$pc/pane-Proj/General:0.0"
+echo old > "$rdir/restore/pane_contents/pane-Proj/General:0.0"
+STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES="$panes" STUB_BLANK="Proj/General:0.0" run >/dev/null
+[ ! -e "$pc/pane-Proj/General:0.0" ] || fail "slash: a blank pane kept its old scrollback in save"
+[ ! -e "$rdir/restore/pane_contents/pane-Proj/General:0.0" ] || fail "slash: a blank pane kept its old scrollback in restore"
+case "$(archived)" in *General*) fail "slash: old scrollback archived: $(archived)" ;; esac
+
+# Sessions without / need nothing: no folders appear.
+reset
+STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES=$'plain:0.0\nother:1.0' run >/dev/null
+[ -z "$(find "$pc" -mindepth 1 -type d)" ] || fail "slash: folders made with no / in any name"
+
+# A name with .. never reaches outside pane_contents.
+reset
+mkdir -p "$rdir/save"; echo keep > "$rdir/save/evil:0.0"
+STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES='a/../../evil:0.0' run >/dev/null
+[ "$(cat "$rdir/save/evil:0.0")" = keep ] || fail "slash: a .. name deleted a file outside pane_contents"
 
 echo "ok: hat-save"
