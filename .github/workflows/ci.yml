@@ -101,15 +101,16 @@ jobs:
           tmux has-session -t =ci-one || fail "hatter attach ci-one did not start it"
 
           # Bare hatter, with no cmux: the picker. ci-one is running and
-          # ci-two is recorded, so ci has two workspaces and asks.
+          # ci-two is recorded, so ci has two workspaces and asks. Recorded
+          # ones come first, in their saved order, so ci-two is 1.
           tmux new-session -d -s phone2 -x 80 -y 24 "hatter; sleep 30"
           for i in $(seq 20); do
             tmux capture-pane -p -t phone2 | grep -q "workspace on 'ci'" && break; sleep 1
           done
           tmux capture-pane -p -t phone2
-          tmux send-keys -t phone2 2 Enter
+          tmux send-keys -t phone2 1 Enter
           for i in $(seq 20); do tmux has-session -t =ci-two 2>/dev/null && break; sleep 1; done
-          tmux has-session -t =ci-two || fail "picking 2 did not attach ci-two"
+          tmux has-session -t =ci-two || fail "picking 1 did not attach ci-two"
           echo PASS
           EOF
           docker run --rm -v "$PWD:/src:ro" -v "$RUNNER_TEMP/ci:/ci:ro" \
