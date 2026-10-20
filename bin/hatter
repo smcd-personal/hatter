@@ -2532,14 +2532,17 @@ drag_suspect() {
 # Sessions heal_dragged_tabs moved a tab into, one per line.
 HEAL_MOVED=""
 
-# heal_dragged_tabs [hat] [report]
+# heal_dragged_tabs [hat] [report|once]
 # Put every dragged tab's tmux window where the tab was dropped, then close the
 # blank tab: cmux draws the moved window as a new tab of its own. Every hat when
-# none is named. With "report", says which blank tabs it could not pair.
+# none is named. With "report", says which blank tabs it could not pair or left
+# alone, and why; with "once", only says each left-alone tab once (see
+# drag_refuse). Afterwards HEAL_MOVED and HEAL_REFUSED say what it did.
 heal_dragged_tabs() {
     local only="${1:-}" report="${2:-}" hat w tree seen="" i tmp
     local hats=() wins=() hosts=()
     HEAL_MOVED=""
+    HEAL_REFUSED=""
     cmux_alive || return 0
     cmux_snapshot
     tree="$CMUX_SNAP_TREE"
@@ -2574,7 +2577,7 @@ heal_hat_drags() {
     drag_suspect "$win" "$tree" "$state" || return 0
 
     first=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || {
-        [[ -z "$report" ]] || warn "could not work out which tabs were dragged on $host"
+        [[ "$report" != report ]] || warn "could not work out which tabs were dragged on $host"
         return 0
     }
     grep -q '^move' <<<"$first" || { drag_report "$report" "$first"; return 0; }
@@ -2588,7 +2591,8 @@ heal_hat_drags() {
     second=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
     drag_report "$report" "$second"
 
-    local moved=0 kind orphan ws to from wid name
+    local moved=0 kind orphan ws to from wid name screen rc why errf
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-screen.XXXXXX") || return 0
     while IFS=$'\t' read -r kind orphan ws to from wid name; do
         [[ "$kind" == move ]] || continue
         grep -qxF "$(printf 'move\t%s\t%s\t%s\t%s\t%s\t%s' "$orphan" "$ws" "$to" "$from" "$wid" "$name")" \
@@ -2596,20 +2600,32 @@ heal_hat_drags() {
         # A dragged tab has nothing behind it, so it shows nothing. One that
         # shows anything is something else, whatever its title says - and one
         # cmux cannot read is not known to be blank.
-        local screen
-        if ! screen=$(cmux read-screen --surface "$orphan" --workspace "$ws" --window "$win" \
-                </dev/null 2>/dev/null) || [[ "$screen" =~ [^[:space:]] ]]; then
-            [[ -z "$report" ]] || warn "the tab '${name:-tmux window}' in '$to' is not plainly blank, so it was left alone"
+        # The screen is stdout alone: a notice cmux prints on stderr must not
+        # read as text on a blank tab. stderr is only the reason for a failure.
+        rc=0
+        screen=$(cmux read-screen --surface "$orphan" --workspace "$ws" --window "$win" \
+            </dev/null 2>"$errf") || rc=$?
+        [[ "$rc" == 0 ]] || screen=$(cat "$errf" 2>/dev/null; printf '%s' "$screen")
+        why=$(drag_not_blank "$rc" "$screen")
+        if [[ -n "$why" ]]; then
+            # A tab showing text is not a dragged tab, so it is not recorded as
+            # one: repair goes on to fix the workspace its own way.
+            local held=held
+            [[ "$rc" != 0 ]] || held=""
+            drag_refuse "$report" "$held" "$host" "$orphan" "$to" "$from" "$wid" "$name" \
+                "it is not plainly blank: $why"
             continue
         fi
         # Moving a session's last window ends the session. The drag asked for
         # that, but it is too much to do unasked.
         if [[ "$(awk -F '\t' -v s="$from" '$1 == "W" && $2 == s' <<<"$state" | wc -l | tr -d ' ')" -le 1 ]]; then
-            [[ -z "$report" ]] || warn "'${name:-tmux window}' is the last tab of '$from'; move it with: tmux move-window -s '=$from:$wid' -t '=$to:'"
+            drag_refuse "$report" held "$host" "$orphan" "$to" "$from" "$wid" "$name" \
+                "it is the last tab of '$from'"
             continue
         fi
         heal_move "$host" "$win" "$orphan" "$ws" "$to" "$from" "$wid" "$name" && moved=1
     done <<<"$second"
+    rm -f "$errf"
 
     # The server's pane registry is keyed on windows that have just changed
     # session.
@@ -2618,9 +2634,65 @@ heal_hat_drags() {
     return 0
 }
 
+# drag_not_blank <read-screen status> <read-screen output>
+# Empty when the tab is plainly blank; otherwise why it is not, short enough
+# for one log line.
+#
+# A dragged tab is the tmux window's own container surface, which cmux stopped
+# routing to a terminal when it mirrored the window's panes into it. Carried to
+# another workspace it has no terminal at all, so cmux refuses to read it with
+# surface_unavailable. A local shell always has a terminal behind it, so that
+# refusal is as blank as a tab gets; any other failure is not known to be.
+drag_not_blank() {
+    local rc="$1" screen="$2" line
+    if [[ "$rc" != 0 ]]; then
+        grep -q 'surface_unavailable' <<<"$screen" && return 0
+        line=$(printf '%s\n' "$screen" | grep -m 1 '[^[:space:]]' || true)
+        printf 'cmux could not read it (exit %s%s)' "$rc" "${line:+: ${line:0:80}}"
+        return 0
+    fi
+    line=$(printf '%s\n' "$screen" | grep -m 1 '[^[:space:]]' || true)
+    [[ -z "$line" ]] || printf 'it shows "%s"' "${line:0:80}"
+    return 0
+}
+
+# Dragged tabs the healer paired but left alone, one per line:
+#   orphan  to-session  from-session  window-id
+# Only those still likely to be real drags (see drag_refuse's "held"). repair
+# reads it so it never re-mirrors over one: re-mirroring drops the blank tab,
+# and with it the only record of where it was dropped.
+HEAL_REFUSED=""
+
+# drag_refuse <report> <held> <host> <orphan> <to> <from> <window-id> <name> <reason>
+# "held" records the pair in HEAL_REFUSED; empty means the reason itself shows
+# it is no drag. With report "report", always says so. With "once" (the
+# autosave timer), says so the first time for each blank tab, so a stuck drag
+# reaches the log without filling it every minute.
+drag_refuse() {
+    local report="$1" held="$2" host="$3" orphan="$4" to="$5" from="$6" wid="$7" name="$8" reason="$9" seen
+    [[ -z "$held" ]] || HEAL_REFUSED+="$orphan"$'\t'"$to"$'\t'"$from"$'\t'"$wid"$'\n'
+    case "$report" in
+        report) ;;
+        once)
+            seen="$AUTOSAVE_DIR/drag-refused"
+            grep -qxF "$orphan" "$seen" 2>/dev/null && return 0
+            mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+            # Surface ids are never reused; the last few are all worth keeping.
+            { tail -n 99 "$seen" 2>/dev/null; echo "$orphan"; } > "$seen.tmp" 2>/dev/null \
+                && mv "$seen.tmp" "$seen" 2>/dev/null || true ;;
+        *) return 0 ;;
+    esac
+    # The reason quotes the tab's screen, which may hold escape sequences.
+    reason=$(printf '%s' "$reason" | tr -d '[:cntrl:]')
+    warn "the tab '${name:-tmux window}' dragged into '$to' was left alone: $reason.
+  Its window is still in '$from'. Move it with:
+    ssh $host \"tmux move-window -s '=$from:$wid' -t '=$to:'\""
+    return 0
+}
+
 drag_report() {
     local report="$1" plan="$2" kind orphan ws session title
-    [[ -n "$report" ]] || return 0
+    [[ "$report" == report ]] || return 0
     while IFS=$'\t' read -r kind orphan ws session title; do
         [[ "$kind" == orphan ]] || continue
         warn "the tab '$title' in '$session' has no tmux window of its own, and none was clearly its window"
@@ -2701,6 +2773,12 @@ cmd_repair() {
         ( cmd_sync ) >/dev/null 2>&1 || warn "sync did not finish - run 'hatter sync'"
         info "Repaired '$session'"
         return 0
+    fi
+    # A dragged tab it left alone is still the fault, and re-mirroring would
+    # drop the blank tab and leave its window showing nowhere.
+    if awk -F '\t' -v s="$session" '$2 == s || $3 == s { f = 1 } END { exit !f }' <<<"$HEAL_REFUSED"; then
+        die "'$session' was not re-mirrored: a tab dragged there or from there is the fault.
+  Move its window as shown above, and it appears in cmux at once."
     fi
 
     # Only a fault in cmux's view is ours to fix. A session that is gone, or
@@ -4017,7 +4095,7 @@ cmd_autosave() {
             mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
             # Tabs dragged between workspaces first, so the sync records where
             # they were dropped. A subshell, for the same reason as the sync.
-            ( heal_dragged_tabs ) 2>&1 | while IFS= read -r line; do
+            ( heal_dragged_tabs "" once ) 2>&1 | while IFS= read -r line; do
                 echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: $line"
             done || true
             if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
@@ -5392,9 +5470,12 @@ window there as a new tab, at the end. Nothing is re-mirrored. The autosave
 timer does the same once a minute, so a dragged tab is usually fixed before
 you ask. A tab is only moved when its window is certain: the blank tab's
 title names exactly one window that cmux no longer shows anywhere, and the
-tab really is blank. A local shell sitting in a mirrored workspace is never
-taken for one. A session's last tab is left where it is, since moving it
-would end that session: repair says how to move it.
+tab really is blank, or has no terminal behind it at all. A local shell
+sitting in a mirrored workspace is never taken for one. A session's last tab
+is left where it is, since moving it would end that session. Whenever a
+dragged tab is left alone, repair says why and gives the tmux command that
+moves it, and does not go on to re-mirror: that would lose the blank tab, and
+the window would show nowhere. The timer logs it once.
 
 The other way: the window did move, but cmux has stopped painting it, and
 nothing on the tmux side helps. For that, repair checks the session has
@@ -5750,7 +5831,7 @@ case "$cmd" in
     shortcuts) cmd_shortcuts "$@" ;;
     # Not for people: the dragged-tab planner, and the healer, for the tests.
     _drag-plan) drag_plan ;;
-    _drag-heal) heal_dragged_tabs "${1:-}" report ;;
+    _drag-heal) heal_dragged_tabs "${1:-}" "${2:-report}" ;;
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
