@@ -3363,13 +3363,16 @@ cmd_repair() {
 # Plain ssh, not SSH_OPTS: an interactive login that happens to become the
 # ControlMaster holds the socket for every short-lived hatter call after it,
 # and those would then die with the terminal.
+# attach_session <hat> <session> [window]: a window index selects that tab first.
 attach_session() {
-    local hat="$1" session="$2" dest dir cmd
+    local hat="$1" session="$2" window="${3:-}" dest dir cmd
     [[ -t 0 && -t 1 ]] || die "attach needs a terminal - '$session' is on hat '$hat'"
     dest=$(hat_ssh "$hat")
     [[ -n "$dest" ]] || die "hat '$hat' has no ssh destination"
     dir=$(hat_dir "$hat")
     cmd="tmux new-session -A -s $(sq "$session") -c $(sq_dir "$dir")"
+    [[ ! "$window" =~ ^[0-9]+$ ]] || \
+        cmd="tmux select-window -t $(sq "=$session:$window") 2>/dev/null; $cmd"
     # mosh survives a phone sleeping, roaming and changing networks, where ssh
     # drops. It runs the command itself rather than through a shell, so the
     # shell that expands "$HOME" is asked for by name.
@@ -3486,6 +3489,360 @@ $(printf '%s\n' "$list" | sed 's/^/    /')"
         session=$(hat_session_name "$hat" "$(tmux_session_name "$name")")
     fi
     attach_session "$hat" "$session"
+}
+
+# --------------------------------------------------------------------- find
+
+# `hatter find` sends this to every hat over ssh and runs it there with bash,
+# so a hat needs nothing installed beyond what provision already put there (jq,
+# tmux, the pane registry). It searches the Claude sessions of that account:
+# by default those running in a tmux window the registry knows, and with --all
+# also the closed ones whose transcript changed in the last N days.
+#
+# A running session is matched on what it is doing now: its title, its last
+# prompt, its window name, and the last 10k characters of conversation. Only
+# user and assistant text counts there; the raw tail of a transcript is mostly
+# tool output and request blobs, which would crowd the conversation out. A
+# closed session is matched anywhere in its transcript, since the point of
+# --all is to find old work.
+#
+# Prints one line per match, fields separated by \037 (a tab would let read
+# collapse the empty fields of a closed session):
+#   score state mtime session window window_id session_id cwd window_name title snippet
+# score is 2 when every term is in the title, prompt or window name, 1 when
+# some are only in the conversation, 0 when only in a closed session's older
+# history. A line "@@hatter-err <why>" means the hat could not be searched,
+# and "@@hatter-ok" ends every run that got going, so a hat that printed
+# neither was not reached.
+# read, not $(cat <<...): bash 3.2 misparses a case inside a command
+# substitution.
+read -r -d '' FIND_SH <<'HATFIND' || true
+#!/usr/bin/env bash
+# hat-find [--all] [--days N] <term>...
+set -uo pipefail
+trap 'echo @@hatter-ok' EXIT
+
+all=0 days=7
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --all)  all=1; shift ;;
+        --days) days="${2:-7}"; shift 2 ;;
+        --)     shift; break ;;
+        *)      break ;;
+    esac
+done
+case "$days" in ''|*[!0-9]*) days=7 ;; esac
+[ $# -gt 0 ] || exit 0
+command -v jq >/dev/null 2>&1 || { echo "@@hatter-err jq is not installed"; exit 0; }
+
+# Terms reach awk through the environment: -v would expand backslashes in them.
+HF_TERMS=$(printf '%s\037' "$@")
+export HF_TERMS
+
+# Where the transcripts are. A login profile may move them with
+# CLAUDE_CONFIG_DIR, and ssh runs this without one, so ask the account's own
+# login shell, as hat-launch does, giving a slow profile 10 seconds.
+cfg="${CLAUDE_CONFIG_DIR:-}"
+if [ -z "$cfg" ]; then
+    login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+    [ -x "${login_shell:-}" ] || login_shell="${SHELL:-/bin/bash}"
+    to=""; command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
+    cfg=$($to "$login_shell" -lc 'printf "HATCFG<%s>" "${CLAUDE_CONFIG_DIR:-}"' </dev/null 2>/dev/null) || cfg=""
+    case "$cfg" in
+        *"HATCFG<"*) cfg=${cfg##*HATCFG<}; cfg=${cfg%%>*} ;;
+        *) cfg="" ;;
+    esac
+fi
+[ -n "$cfg" ] || cfg="$HOME/.claude"
+proj="$cfg/projects"
+[ -d "$proj" ] || exit 0
+
+PANES="${XDG_STATE_HOME:-$HOME/.local/state}/hatter/panes"
+
+clean() { tr '\t\n\r\037' '    '; }
+
+# The last value of a field on lines of one type, e.g. the title Claude gave
+# the conversation. Such lines are rewritten as it goes, so the last one wins.
+last_of() {
+    grep -F "\"type\":\"$2\"" "$1" 2>/dev/null | tail -n 1 \
+        | jq -j --arg k "$3" '.[$k] // empty' 2>/dev/null | clean
+}
+
+# The last 10k characters of what was said, from the transcript's last 3 MB.
+# A cut line at the start of that is skipped by fromjson?.
+convo() {
+    tail -c 3000000 "$1" 2>/dev/null | jq -rR '
+        fromjson? | select(.type == "user" or .type == "assistant")
+        | select((.isMeta // false) | not) | select((.isSidechain // false) | not)
+        | .message.content
+        | if type == "string" then .
+          elif type == "array" then [.[]? | select(.type == "text") | .text] | join(" ")
+          else empty end
+        | select(length > 0)' 2>/dev/null | clean | tail -c 10000
+}
+
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+
+# score <head> <text> <closed>: prints "<score>\t<snippet>", or nothing when a
+# term is missing. A closed session has already matched every term somewhere in
+# its transcript, so for it a miss here still scores 0.
+score() {
+    printf '%s\037%s' "$1" "$2" | HF_CLOSED="$3" awk -v RS='\001' '
+        BEGIN { n = split(ENVIRON["HF_TERMS"], t, "\037") }
+        {
+            split($0, f, "\037"); head = tolower(f[1]); text = f[2]; low = tolower(text)
+            inhead = 1; ok = 1
+            for (i = 1; i <= n; i++) {
+                if (t[i] == "") continue
+                w = tolower(t[i])
+                if (!index(head, w)) { inhead = 0; if (!index(low, w)) ok = 0 }
+            }
+        }
+        END {
+            if (inhead) { printf "2\t\n"; exit }
+            if (!ok) { if (ENVIRON["HF_CLOSED"] == 1) printf "0\t\n"; exit }
+            # The last mention of the first term found in the text: the
+            # nearest thing to what the session is doing now.
+            for (i = 1; i <= n; i++) {
+                w = tolower(t[i]); if (w == "") continue
+                p = 0; s = low
+                while ((k = index(s, w)) > 0) { p += k; s = substr(s, k + 1) }
+                if (p) break
+            }
+            from = p > 60 ? p - 60 : 1
+            snip = substr(text, from, 160)
+            gsub(/  +/, " ", snip)
+            printf "1\t%s%s\n", (from > 1 ? "..." : ""), snip
+        }'
+}
+
+# One session: <state> <session> <window> <window_id> <sid> <cwd> <name> <file>
+emit() {
+    local title prompt text r
+    title=$(last_of "$8" custom-title customTitle)
+    [ -n "$title" ] || title=$(last_of "$8" ai-title aiTitle)
+    prompt=$(last_of "$8" last-prompt lastPrompt)
+    text=$(convo "$8")
+    r=$(score "$title $prompt $7" "$text" "$([ "$1" = closed ] && echo 1 || echo 0)")
+    [ -n "$r" ] || return 0
+    printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+        "${r%%	*}" "$1" "$(mtime_of "$8")" "$2" "$3" "$4" "$5" \
+        "$(printf '%s' "$6" | clean)" "$(printf '%s' "$7" | clean)" \
+        "${title:-$prompt}" "${r#*	}"
+}
+
+transcript() {
+    local t
+    for t in "$proj"/*/"$1".jsonl; do [ -f "$t" ] && { printf '%s' "$t"; return 0; }; done
+    return 1
+}
+
+# Running sessions: registry entries whose tmux window is still there.
+live_ids=""
+windows=$(tmux list-windows -a -F '#{session_name}	#{window_index}	#{window_id}' 2>/dev/null) || windows=""
+if [ -n "$windows" ] && [ -d "$PANES" ]; then
+    for p in "$PANES"/*.json; do
+        [ -f "$p" ] || continue
+        # \037-joined, not @tsv, which would escape a backslash in a name.
+        IFS=$'\037' read -r kind s w sid cwd name <<EOF
+$(jq -j '[.kind // "", .session // "", (.window // "" | tostring), .session_id // "", .cwd // "", .name // ""] | join("\u001f")' "$p" 2>/dev/null)
+EOF
+        [ "${kind:-}" = claude ] && [ -n "${sid:-}" ] || continue
+        wid=$(printf '%s\n' "$windows" | HF_S="$s" HF_W="$w" awk -F '\t' '$1 == ENVIRON["HF_S"] && $2 == ENVIRON["HF_W"] { print $3; exit }')
+        [ -n "$wid" ] || continue
+        t=$(transcript "$sid") || continue
+        live_ids="$live_ids $sid "
+        emit live "$s" "$w" "$wid" "$sid" "$cwd" "$name" "$t"
+    done
+fi
+
+[ "$all" = 1 ] || exit 0
+
+# Closed sessions. Only <project>/<id>.jsonl: subagent transcripts sit deeper,
+# under <project>/<id>/subagents/, and are not sessions of their own. Each term
+# narrows the list with one grep over the files left.
+list=$(find "$proj" -mindepth 2 -maxdepth 2 -name '*.jsonl' -mtime -"$days" 2>/dev/null)
+for term in "$@"; do
+    [ -n "$list" ] || break
+    list=$(printf '%s\n' "$list" | tr '\n' '\0' | xargs -0 grep -l -i -F -e "$term" -- 2>/dev/null)
+done
+[ -n "$list" ] || exit 0
+while IFS= read -r t; do
+    sid=$(basename "$t" .jsonl)
+    case "$live_ids" in *" $sid "*) continue ;; esac
+    cwd=$(grep -m 1 -F '"cwd":' "$t" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null)
+    emit closed "" "" "" "$sid" "$cwd" "" "$t"
+done <<EOF
+$list
+EOF
+exit 0
+HATFIND
+
+# find_age <epoch> -> "5m", "3h", "2d"
+find_age() {
+    local d=$(( $(date +%s) - $1 ))
+    if   (( d < 3600 ));  then printf '%dm' $(( d / 60 ))
+    elif (( d < 86400 )); then printf '%dh' $(( d / 3600 ))
+    else printf '%dd' $(( d / 86400 )); fi
+}
+
+# Put a running session's tab in front: its hat's window, its workspace, the
+# tab for its tmux window. Fails when cmux does not show the session.
+find_focus() {
+    local hat="$1" dest="$2" session="$3" wid="$4" win wref surface
+    cmux_alive || return 1
+    win=$(find_hat_window "$hat")
+    [[ -n "$win" ]] || return 1
+    wref=$(workspace_ref_by_title "$session" "$win")
+    [[ -n "$wref" ]] || return 1
+    surface=$(cmux_pane_map "$dest" "$session" | jq -r --arg w "$wid" \
+        '.panes[]? | select(.window_id == $w) | .surface_id' 2>/dev/null | head -n 1) || surface=""
+    HATTER_FOCUS_KEEP=1
+    cmux_change focus-window --window "$win" >/dev/null 2>&1 || return 1
+    cmux_change select-workspace --workspace "$wref" --window "$win" >/dev/null 2>&1 || return 1
+    [[ -z "$surface" ]] || \
+        cmux_change focus-panel --panel "$surface" --workspace "$wref" --window "$win" >/dev/null 2>&1 || true
+    return 0
+}
+
+cmd_find() {
+    local all=0 days=7 only="" limit=20 a
+    local -a terms=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)  all=1; shift ;;
+            --days) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--days needs a number of days"
+                    all=1; days="$2"; shift 2 ;;
+            --limit) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--limit needs a number (0 for all)"
+                    limit="$2"; shift 2 ;;
+            --hat)  [[ -n "${2:-}" ]] || die "--hat needs a hat name"
+                    hat_exists "$2" || die "no hat named '$2'"
+                    only="$2"; shift 2 ;;
+            --)     shift; terms+=("$@"); break ;;
+            -*)     die "unknown option: $1  (try: hatter help find)" ;;
+            *)      terms+=("$1"); shift ;;
+        esac
+    done
+    [[ ${#terms[@]} -gt 0 ]] || { usage_cmd find; exit 1; }
+    colour_setup
+
+    # One search per ssh destination: hats that share an account share its
+    # transcripts and its tmux server.
+    local -a dests=() hats_of=()
+    local hat dest i found
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        [[ -z "$only" || "$hat" == "$only" ]] || continue
+        dest=$(hat_ssh "$hat")
+        [[ -n "$dest" ]] || continue
+        found=""
+        for ((i = 0; i < ${#dests[@]}; i++)); do
+            [[ "${dests[$i]}" == "$dest" ]] && { found=$i; break; }
+        done
+        if [[ -n "$found" ]]; then
+            hats_of[$found]="${hats_of[$found]} $hat"
+        else
+            dests+=("$dest"); hats_of+=("$hat")
+        fi
+    done < <(hat_names)
+    [[ ${#dests[@]} -gt 0 ]] || die "no hats to search"
+
+    local args="exec bash -s --"
+    [[ "$all" == 1 ]] && args+=" --all --days $days"
+    args+=" --"
+    for a in "${terms[@]}"; do args+=" $(sq "$a")"; done
+
+    local tmp
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-find.XXXXXX")
+    info "Searching $( [[ "$all" == 1 ]] && echo "live and closed (last ${days}d)" || echo live ) Claude sessions on ${#dests[@]} hat(s)..." >&2
+    for ((i = 0; i < ${#dests[@]}; i++)); do
+        printf '%s\n' "$FIND_SH" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
+            "${dests[$i]}" "$(posix_sh "$args")" > "$tmp/$i" 2>/dev/null &
+    done
+    wait
+
+    # Each match, prefixed with the hat it belongs to and its destination's index.
+    local line score state mtime session window wid sid cwd name title snip owner h
+    for ((i = 0; i < ${#dests[@]}; i++)); do
+        if ! grep -qx '@@hatter-ok' "$tmp/$i"; then
+            warn "could not reach ${hats_of[$i]# } (${dests[$i]}) - not searched"
+            continue
+        fi
+        while IFS= read -r line; do
+            case "$line" in
+                "@@hatter-err "*) warn "${hats_of[$i]# }: ${line#@@hatter-err }"; continue ;;
+                ""|@@hatter-ok) continue ;;
+            esac
+            IFS=$'\037' read -r score state mtime session window wid sid cwd name title snip <<<"$line"
+            # A session belongs to the hat that records it or whose prefix it
+            # carries; otherwise to the first hat on that account.
+            owner=""
+            if [[ -n "$session" ]]; then
+                h=$(session_hat "$session" 2>/dev/null || true)
+                [[ " ${hats_of[$i]} " == *" $h "* ]] && owner="$h"
+            fi
+            [[ -n "$owner" ]] || { owner="${hats_of[$i]# }"; owner="${owner%% *}"; }
+            printf '%s\037%s\037%s\n' "$owner" "$i" "$line"
+        done < "$tmp/$i"
+    done > "$tmp/all"
+
+    # Best first: every term in the title, then live before closed, then newest.
+    sort -t $'\037' -k3,3nr -k4,4r -k5,5nr "$tmp/all" > "$tmp/sorted"
+    local n total
+    total=$(grep -c '' "$tmp/sorted" || true)
+    n=$total
+    if [[ "$limit" -gt 0 && "$n" -gt "$limit" ]]; then
+        n=$limit
+        head -n "$n" "$tmp/sorted" > "$tmp/top" && mv "$tmp/top" "$tmp/sorted"
+    fi
+    if [[ "$n" -eq 0 ]]; then
+        rm -rf "$tmp"
+        echo "  no session matches: ${terms[*]}" >&2
+        exit 1
+    fi
+
+    local -a rows=()
+    local k=0 di where
+    while IFS= read -r line; do
+        rows+=("$line"); k=$((k + 1))
+        IFS=$'\037' read -r owner di score state mtime session window wid sid cwd name title snip <<<"$line"
+        if [[ "$state" == live ]]; then
+            where="$session:$window${name:+ ($name)}"
+        else
+            where="${C_DIM}closed${C_R}  $(edit_short_path "$cwd" 2>/dev/null || printf '%s' "$cwd")"
+        fi
+        printf '  %2d) %s%s%s  %s  %s%s ago%s\n' "$k" "$C_B" "$owner" "$C_R" "$where" "$C_DIM" "$(find_age "$mtime")" "$C_R"
+        printf '      %s\n' "$(edit_trunc "${title:-(untitled)}" 100)"
+        [[ -z "$snip" ]] || printf '      %s%s%s\n' "$C_DIM" "$(edit_trunc "$snip" 100)" "$C_R"
+    done < "$tmp/sorted"
+    rm -rf "$tmp"
+    [[ "$total" -le "$n" ]] || \
+        printf '  %s... and %d more: add a term to narrow it, or --limit 0 for all%s\n' "$C_DIM" $((total - n)) "$C_R"
+
+    [[ -t 0 && -t 1 ]] || return 0
+    local pick
+    while true; do
+        ask_line "open which (1-$n), Esc to skip" || return 0
+        pick="$EDIT_REPLY"
+        [[ -n "$pick" ]] || return 0
+        [[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le "$n" ]] && break
+        echo "  pick a number from 1 to $n" >&2
+    done
+    IFS=$'\037' read -r owner di score state mtime session window wid sid cwd name title snip <<<"${rows[$((pick - 1))]}"
+    dest="${dests[$di]}"
+
+    if [[ "$state" != live ]]; then
+        echo
+        echo "  Closed. To resume it on $owner ($dest):"
+        echo "    cd $(sq "$cwd") && claude --resume $sid"
+        return 0
+    fi
+    if have_cmux; then
+        find_focus "$owner" "$dest" "$session" "$wid" && return 0
+        warn "cmux does not show '$session' - open it with: hatter new $session --focus"
+        return 0
+    fi
+    attach_session "$owner" "$session" "$window"
 }
 
 # Termux:Widget lists the scripts under ~/.shortcuts as home-screen buttons.
@@ -6632,6 +6989,7 @@ Commands:
   new <session>          Create or reattach a workspace  ("new" is optional)
   tab <session> [name]   Add a tab to a workspace
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
+  find <terms>...        Find the Claude session working on something, and go to it
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
   rm <session>           End a workspace and forget it (--keep-running: forget only)
@@ -6878,6 +7236,29 @@ tools/install-windows.ps1 - gets in.
 
 The key is checked with ssh-keygen first, and each hat reports "added",
 "present" (already there, whatever its comment) or "unreachable".
+USAGE
+    ;;
+    find) cat <<'USAGE'
+hatter find [--all] [--days N] [--hat <hat>] [--limit N] <term>...
+
+Search the Claude sessions on every hat and list the matches, best first. At a
+terminal, pick one to go to its tab in cmux (or, without cmux, to attach to it
+over ssh).
+
+A running session matches when every term, case-insensitive, appears in its
+title, its last prompt, its tab name or the last 10k characters of its
+conversation (what you and Claude wrote, not tool output). Sessions whose title,
+prompt or tab name has every term come first.
+
+  --all        Also search closed sessions changed in the last 7 days, matching
+               anywhere in the transcript. Picking one prints the command that
+               resumes it. Subagent transcripts are skipped.
+  --days N     With --all, look back N days instead (implies --all)
+  --hat <hat>  Search only this hat
+  --limit N    List the best N (default 20; 0 lists every match)
+
+Running sessions are the ones in a hat's pane registry (see provision) whose
+tmux window is still open.
 USAGE
     ;;
     attach) cat <<'USAGE'
@@ -7232,7 +7613,7 @@ shift || true
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -7245,7 +7626,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|resize|shortcuts|sync|_drag-plan|_drag-heal) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|resize|shortcuts|sync|_drag-plan|_drag-heal) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -7273,6 +7654,7 @@ case "$cmd" in
     tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
     attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
+    find)      cmd_find "$@" ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     rm|remove) [[ $# -gt 0 ]] || { usage_cmd rm; exit 1; };        cmd_rm "$@" ;;
