@@ -193,5 +193,18 @@ log=$(run mapped blank STUB_MAPPED=1)
 expect "a dropped tab cmux has mapped is never closed (that would kill the window)" \
     "$(grep -q '^move' <<<"$log" && ! grep -q '^close' <<<"$log" && echo y)"
 
+# A drop event names the workspace and surface (the watcher, #69): only that
+# tab moves, and with no second look, since cmux has said the drag is over.
+log=$(HATTER_CMD="_drag-heal dev report ws-b s-new" run event-match blank)
+expect "a drop event for the dragged tab: its window is moved and the tab closed" \
+    "$(grep -q "^move .*'=dev-a:@2' .*'=dev-b:'" <<<"$log" && grep -q '^close .*--surface s-new ' <<<"$log" && echo y)"
+expect "a drop event: no second look" "$([[ ! -f "$work/run-event-match/pass2" ]] && echo y)"
+log=$(HATTER_CMD="_drag-heal dev report ws-b S-NEW" run event-case blank)
+expect "a drop event's ids match whatever their case" "$(grep -q '^move' <<<"$log" && echo y)"
+log=$(HATTER_CMD="_drag-heal dev report ws-b s-3" run event-other blank)
+expect "a drop event for another tab moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
+log=$(HATTER_CMD="_drag-heal dev report ws-gone s-new" run event-nows blank)
+expect "a drop event for a workspace in no window moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
+
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"

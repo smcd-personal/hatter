@@ -129,6 +129,9 @@ sq_dir() {
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 
+# cmux prints UUIDs in upper case, but nothing promises it.
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+
 # The autosave timer syncs from the live client once a minute, and a sync is a
 # read-then-write of the whole config. Without a lock it can be reading while an
 # interactive command writes, and then put the pre-change version back. mkdir is
@@ -139,8 +142,10 @@ LOCK_STALE_SECONDS=300
 
 # BSD and GNU stat spell this differently, and a lock whose age cannot be read
 # is treated as fresh - clearing a lock you cannot date is how two writers end
-# up in the config at once.
-lock_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# up in the config at once. GNU first: GNU stat takes -f too, as "filesystem
+# status", and prints a number that is not the file's mtime. BSD stat refuses
+# -c outright.
+lock_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
 
 hatter_lock() {
     local tries="${1:-0}" i=0 age owner mtime
@@ -3038,25 +3043,36 @@ drag_suspect() {
 # Sessions heal_dragged_tabs moved a tab into, one per line.
 HEAL_MOVED=""
 
-# heal_dragged_tabs [hat] [report|once]
+# heal_dragged_tabs [hat] [report|once] [workspace surface]
 # Put every dragged tab's tmux window where the tab was dropped, then close the
 # blank tab: cmux draws the moved window as a new tab of its own. Every hat when
 # none is named. With "report", says which blank tabs it could not pair or left
 # alone, and why; with "once", only says each left-alone tab once (see
 # drag_refuse). Afterwards HEAL_MOVED and HEAL_REFUSED say what it did.
+#
+# A workspace and surface come from cmux's own drop event (see the watcher):
+# only the window holding that workspace is looked at, and only that surface
+# is moved. A workspace no longer in any window means there is nothing to do.
 heal_dragged_tabs() {
-    local only="${1:-}" report="${2:-}" hat w tree seen="" i tmp
+    local only="${1:-}" report="${2:-}" onlyws="${3:-}" onlysf="${4:-}" onlywin="" hat w tree seen="" i tmp
     local hats=() wins=() hosts=()
     HEAL_MOVED=""
     HEAL_REFUSED=""
     cmux_alive || return 0
     cmux_snapshot
     tree="$CMUX_SNAP_TREE"
+    if [[ -n "$onlyws" ]]; then
+        onlywin=$(jq -r --arg ws "$(upper "$onlyws")" '
+            first(.windows[]? | select(any(.workspaces[]?; (.id | ascii_upcase) == $ws)) | .id) // empty' \
+            <<<"$tree" 2>/dev/null || true)
+        [[ -n "$onlywin" ]] || { cmux_snapshot_drop; return 0; }
+    fi
     while IFS= read -r hat; do
         [[ -n "$hat" ]] || continue
         [[ -z "$only" || "$hat" == "$only" ]] || continue
         w=$(find_hat_window "$hat") || continue
         [[ -n "$w" ]] || continue
+        [[ -z "$onlywin" || "$(upper "$w")" == "$(upper "$onlywin")" ]] || continue
         # Hats sharing a server share its window; one look is enough.
         grep -qxF "$w" <<<"$seen" && continue
         seen+="$w"$'\n'
@@ -3071,14 +3087,14 @@ heal_dragged_tabs() {
     done
     wait
     for ((i = 0; i < ${#hats[@]}; i++)); do
-        heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" || true
+        heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" "$onlysf" || true
     done
     rm -rf "$tmp"
     return 0
 }
 
 heal_hat_drags() {
-    local host="$1" win="$2" tree="$3" state="$4" report="$5" first second
+    local host="$1" win="$2" tree="$3" state="$4" report="$5" onlysf="${6:-}" first second
     [[ -n "$state" ]] || return 0
     drag_suspect "$win" "$tree" "$state" || return 0
 
@@ -3088,14 +3104,21 @@ heal_hat_drags() {
     }
     grep -q '^move' <<<"$first" || { drag_report "$report" "$first"; return 0; }
 
-    # A tab mid-drag, or a mirror mid-reconnect, can look like this for a
-    # moment. Act only on what is still true a little later.
-    sleep 2
-    tree=$(cmux_json tree --all 2>/dev/null) || return 0
-    state=$(remote_tmux_state "$host" 2>/dev/null || true)
-    [[ -n "$state" ]] || return 0
-    second=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
-    drag_report "$report" "$second"
+    if [[ -n "$onlysf" ]]; then
+        # cmux has just said this surface was dropped here, so the drag is
+        # over: no second look, but nothing moves except that tab.
+        second=$(AWK_S="$(upper "$onlysf")" awk -F '\037' '$1 == "move" && toupper($2) == ENVIRON["AWK_S"]' <<<"$first")
+        [[ -n "$second" ]] || return 0
+    else
+        # A tab mid-drag, or a mirror mid-reconnect, can look like this for a
+        # moment. Act only on what is still true a little later.
+        sleep 2
+        tree=$(cmux_json tree --all 2>/dev/null) || return 0
+        state=$(remote_tmux_state "$host" 2>/dev/null || true)
+        [[ -n "$state" ]] || return 0
+        second=$(drag_facts "$win" "$host" "$tree" "$state" | drag_plan) || return 0
+        drag_report "$report" "$second"
+    fi
 
     local moved=0 kind orphan ws to from wid name screen rc why errf
     errf=$(mktemp "${TMPDIR:-/tmp}/hatter-screen.XXXXXX") || return 0
@@ -3447,7 +3470,7 @@ hat_workspaces() {
     return 0
 }
 
-# A numbered menu on stderr. Prints the choice; an empty answer or end of
+# A numbered menu on stderr. Prints the choice; an empty answer, Esc or end of
 # input picks nothing and returns non-zero.
 pick_one() {
     local prompt="$1" a i=1
@@ -3455,8 +3478,8 @@ pick_one() {
     local -a opts=("$@")
     for a in "${opts[@]}"; do printf '  %2d) %s\n' "$i" "$a" >&2; i=$((i+1)); done
     while true; do
-        printf '%s' "$prompt" >&2
-        IFS= read -r a || { echo >&2; return 1; }
+        ask_line "${prompt%: }" || return 1
+        a="$EDIT_REPLY"
         [[ -n "$a" ]] || return 1
         if [[ "$a" =~ ^[0-9]+$ ]] && [[ "$a" -ge 1 && "$a" -le ${#opts[@]} ]]; then
             printf '%s' "${opts[$((a-1))]}"
@@ -3521,8 +3544,8 @@ $(printf '%s\n' "$list" | sed 's/^/    /')"
     session=$(pick_one "workspace on '$hat': " "${choices[@]}") || exit 0
     if [[ "$session" == "+ new workspace" ]]; then
         local name
-        printf '  name (becomes %s-<name>): ' "$hat" >&2
-        IFS= read -r name || exit 0
+        ask_line "name (becomes $hat-<name>), Esc to cancel" || exit 0
+        name="$EDIT_REPLY"
         [[ -n "$name" ]] || exit 0
         session=$(hat_session_name "$hat" "$(tmux_session_name "$name")")
     fi
@@ -4972,6 +4995,207 @@ AUTOSAVE_WINDOW=28800      # 8 hours, in seconds
 AUTOSAVE_KEEP=8            # windows retained -> ~64 hours of history
 AUTOSAVE_PLIST="$HOME/Library/LaunchAgents/org.hatter.autosave.plist"
 AUTOSAVE_LABEL="org.hatter.autosave"
+WATCH_PLIST="$HOME/Library/LaunchAgents/org.hatter.watch.plist"
+WATCH_LABEL="org.hatter.watch"
+
+# ------------------------------------------------------------------ watcher
+#
+# The timer looks once a minute. The watcher follows cmux's own event stream
+# (`cmux events`), so a dragged tab is healed as soon as it is dropped and a
+# layout change is synced a second later. The timer stays: renames and group
+# changes send no event, and it covers any time the watcher was down.
+#
+# What a drag looks like on the stream (cmux 0.64): the tab's surface closes
+# in its old workspace with origin "detach", and the same surface id is created
+# in the new one with origin "detach_attach". Nothing else sends that origin.
+
+WATCH_QUIET=1        # seconds with no event before acting on what came in
+WATCH_MAX_WAIT=5     # but never hold an action longer than this
+
+# One cmux event in, at most one line out:
+#   full                    the stream (re)connected; anything may have happened
+#   heal<TAB>workspace<TAB>surface   a tab was dropped into that workspace
+#                           (drop events carry no window id)
+#   sync                    the layout changed
+# and "eof" once the stream ends. Heartbeats are asked for and dropped here:
+# they keep a stream whose reader has gone from outliving it for long.
+WATCH_JQ='(inputs | fromjson? | objects
+           | if .type == "ack" then "full"
+             elif .type != "event" then empty
+             elif .name == "surface.created" and .payload.origin? == "detach_attach"
+               then "heal\t\(.workspace_id // "")\t\(.surface_id // .payload.surface_id? // "")"
+             elif ((.name // "") | tostring | test("^(workspace[.](created|closed|reordered)|surface[.](created|closed))$"))
+               then "sync"
+             else empty end), "eof"'
+
+watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') watch: $*"; }
+
+# HATTER_WATCH_DRY prints what the watcher would do instead of doing it; the
+# tests drive the event handling with it.
+watch_heal() {
+    if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then echo "heal ${1:-all}${2:+ $2}"; return 0; fi
+    autosave_heal watch "${1:-}" "${2:-}"
+}
+watch_sync() {
+    if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then echo "sync"; return 0; fi
+    autosave_sync watch
+}
+
+# Installing hatter replaces the file. A watcher that keeps running would keep
+# running the old code, so it stands down and launchd starts the new one.
+watch_updated() {
+    [[ -n "$WATCH_SELF" ]] || return 1
+    [[ "$(lock_mtime "$WATCH_SELF")" != "$WATCH_SELF_MTIME" ]]
+}
+
+WATCH_SELF=""
+WATCH_SELF_MTIME=""
+
+# Act on what watch_stream collected (its heals, heal_all and sync), and
+# clear what was done. Heal first, so the sync records where the tabs were
+# dropped.
+#
+# A hatter command holding the config lock is usually changing cmux, and a
+# sync that reads cmux mid-change can write that half-way layout back after
+# the command ends. So the sync waits, and runs at the first quiet second
+# after the lock goes. A lock old enough to be stale does not hold it up.
+watch_act() {
+    local w sf mtime
+    if [[ "$heal_all" == 1 ]]; then
+        watch_heal
+    elif [[ -n "$heals" ]]; then
+        while IFS=$'\t' read -r w sf; do
+            [[ -z "$w" ]] || watch_heal "$w" "$sf"
+        done < <(printf '%s' "$heals" | sort -u)
+    fi
+    heals=""; heal_all=0
+    [[ "$sync" == 1 ]] || return 0
+    if [[ -d "$LOCK_DIR" ]]; then
+        mtime=$(lock_mtime "$LOCK_DIR")
+        [[ "$mtime" -gt 0 && $(( $(date +%s) - mtime )) -gt "$LOCK_STALE_SECONDS" ]] || return 0
+    fi
+    watch_sync
+    sync=0
+    return 0
+}
+
+# One connection to the stream. Returns 0 when the stream ended, 3 when hatter
+# was updated underneath it.
+watch_stream() {
+    local dir fifo line kind w sf heals="" heal_all=0 sync=0 since=0 now fails=0 last=0 rc=0
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/hatter-watch.XXXXXX") || return 0
+    WATCH_DIR=$dir
+    fifo="$dir/events"
+    mkfifo "$fifo" || { watch_cleanup; return 0; }
+    cmux events --category workspace --category surface \
+            --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
+        | jq -nR --unbuffered -r "$WATCH_JQ" > "$fifo" &
+    exec 3<"$fifo"
+    while :; do
+        if IFS= read -r -t "$WATCH_QUIET" line <&3; then
+            fails=0
+            case "$line" in
+                full) heal_all=1; sync=1 ;;
+                heal$'\t'*)
+                    IFS=$'\t' read -r kind w sf <<<"$line"
+                    if [[ -n "$w" && -n "$sf" ]]; then heals+="$w"$'\t'"$sf"$'\n'; else heal_all=1; fi
+                    sync=1 ;;
+                sync) sync=1 ;;
+                eof) break ;;
+            esac
+            now=$(date +%s)
+            [[ "$since" != 0 ]] || since=$now
+            # A steady trickle of events must not hold an action forever.
+            [[ $((now - since)) -lt $WATCH_MAX_WAIT ]] && continue
+        else
+            # bash 3.2 answers a timeout and the end of the stream alike.
+            # Timeouts take a second each, so several failures inside one
+            # second mean the stream is gone even without its "eof".
+            now=$(date +%s)
+            if [[ "$now" == "$last" ]]; then fails=$((fails + 1)); else fails=1; fi
+            last=$now
+            [[ "$fails" -lt 3 ]] || break
+        fi
+        # A quiet moment: act on what came in. The fifo stays out of the
+        # commands it runs (an ssh master left running would hold it open).
+        watch_act 3<&-
+        since=0
+        if watch_updated; then rc=3; break; fi
+    done
+    # What came in just before the stream ended is still owed.
+    [[ "$rc" != 0 ]] || watch_act 3<&-
+    WATCH_STREAM_ERR=$(grep -m 1 '[^[:space:]]' "$dir/err" 2>/dev/null || true)
+    watch_cleanup
+    return "$rc"
+}
+WATCH_STREAM_ERR=""
+WATCH_DIR=""
+
+# Ends the stream and removes its fifo. Also the TERM/INT trap, so a watcher
+# that is killed does not leave cmux events and jq running behind it: they are
+# its direct children, and nothing else it starts is (the heal and the sync
+# run in subshells).
+watch_cleanup() {
+    exec 3<&- 2>/dev/null || true
+    pkill -P $$ 2>/dev/null || true
+    if [[ -n "$WATCH_DIR" ]]; then
+        rm -f "$WATCH_DIR/events" "$WATCH_DIR/err"
+        rmdir "$WATCH_DIR" 2>/dev/null || true
+    fi
+    WATCH_DIR=""
+    return 0
+}
+
+# What `hatter autosave watch` runs, and what launchd keeps running. Never
+# returns on its own except to pick up a new hatter, or once the stream ends
+# under HATTER_WATCH_ONCE (the tests).
+watch_run() {
+    local backoff=5 said="" said_stream="" msg rc started
+    if ! have_cmux; then
+        # launchd would restart it at once; once a minute is plenty.
+        watch_log "the cmux CLI is not on PATH; the watcher needs it"
+        [[ -n "${HATTER_WATCH_ONCE:-}" ]] || sleep 60
+        return 0
+    fi
+    mkdir -p "$AUTOSAVE_DIR"
+    trap 'watch_cleanup; exit 143' TERM
+    trap 'watch_cleanup; exit 130' INT
+    WATCH_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    WATCH_SELF_MTIME=$(lock_mtime "$WATCH_SELF")
+    watch_log "following cmux events"
+    while :; do
+        CMUX_ALIVE=""
+        if ! cmux_alive; then
+            # Said once per reason, not once per retry.
+            msg="$(cmux_refusal_summary); retrying"
+            [[ "$msg" == "$said" ]] || watch_log "$msg"
+            said=$msg
+            [[ -z "${HATTER_WATCH_ONCE:-}" ]] || return 0
+            sleep "$backoff"
+            backoff=$((backoff * 2)); [[ "$backoff" -le 60 ]] || backoff=60
+            if watch_updated; then watch_log "hatter was updated; restarting"; return 0; fi
+            continue
+        fi
+        [[ -z "$said" ]] || watch_log "cmux is answering again"
+        said=""
+        started=$(date +%s)
+        rc=0; watch_stream || rc=$?
+        if [[ "$rc" == 3 ]]; then watch_log "hatter was updated; restarting"; return 0; fi
+        [[ -z "${HATTER_WATCH_ONCE:-}" ]] || return 0
+        if [[ $(( $(date +%s) - started )) -ge 30 ]]; then
+            # It ran a while, so this is a fresh failure: say it, retry soon.
+            backoff=5; said_stream=""
+        fi
+        # A stream that keeps failing at once (a cmux without events, a
+        # refusal only the stream gets) backs off and is said once.
+        msg="the event stream ended${WATCH_STREAM_ERR:+: $WATCH_STREAM_ERR}"
+        [[ "$msg" == "$said_stream" ]] || watch_log "$msg"
+        said_stream=$msg
+        sleep "$backoff"
+        backoff=$((backoff * 2)); [[ "$backoff" -le 60 ]] || backoff=60
+        if watch_updated; then watch_log "hatter was updated; restarting"; return 0; fi
+    done
+}
 
 # BSD date takes -r for an epoch, GNU date takes -d @.
 autosave_stamp() {
@@ -5018,11 +5242,9 @@ autosave_snapshot() {
     printf '%s\n' "${made:-$latest}"
 }
 
-autosave_install() {
-    mkdir -p "$(dirname "$AUTOSAVE_PLIST")" "$AUTOSAVE_DIR"
-    local self extra d
-    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-
+# The PATH a launchd job of hatter's runs with.
+launchd_path() {
+    local extra d
     # launchd starts from a bare PATH, and cmux lives inside its .app bundle
     # rather than anywhere standard - so the directories are taken from where
     # the tools actually are on this machine, not guessed.
@@ -5038,6 +5260,14 @@ autosave_install() {
             *) extra="$extra$d:" ;;
         esac
     done
+    printf '%s' "$extra$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+}
+
+autosave_install() {
+    mkdir -p "$(dirname "$AUTOSAVE_PLIST")" "$AUTOSAVE_DIR"
+    local self path
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    path=$(launchd_path)
     # launchd starts with a bare environment, so PATH has to carry jq, cmux and
     # ssh explicitly. SSH_AUTH_SOCK is inherited from the user's launchd
     # session, which is where the agent socket already lives.
@@ -5056,7 +5286,7 @@ autosave_install() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>$extra$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>$path</string>
     <key>HOME</key><string>$HOME</string>
   </dict>
   <key>StartInterval</key><integer>60</integer>
@@ -5070,12 +5300,88 @@ PLIST
     launchctl bootstrap "gui/$(id -u)" "$AUTOSAVE_PLIST"
     info "Autosave timer installed: every 60s, $AUTOSAVE_PLIST"
     info "Log: $AUTOSAVE_DIR/autosave.log"
+
+    # The watcher: always running, restarted by launchd whenever it exits
+    # (cmux quit, or hatter was reinstalled and it stood down to pick that up).
+    cat > "$WATCH_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$WATCH_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$self</string>
+    <string>autosave</string>
+    <string>watch</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>$path</string>
+    <key>HOME</key><string>$HOME</string>
+  </dict>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$AUTOSAVE_DIR/watch.log</string>
+  <key>StandardErrorPath</key><string>$AUTOSAVE_DIR/watch.log</string>
+</dict>
+</plist>
+PLIST
+    launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$WATCH_PLIST"
+    info "Watcher installed: follows cmux events, $WATCH_PLIST"
+    info "Log: $AUTOSAVE_DIR/watch.log"
 }
 
 autosave_uninstall() {
     launchctl bootout "gui/$(id -u)/$AUTOSAVE_LABEL" 2>/dev/null || true
-    rm -f "$AUTOSAVE_PLIST"
-    info "Autosave timer removed (existing snapshots kept)"
+    launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
+    rm -f "$AUTOSAVE_PLIST" "$WATCH_PLIST"
+    info "Autosave timer and watcher removed (existing snapshots kept)"
+}
+
+# autosave_heal <who> [window surface] - the drag healer, its lines logged.
+# A subshell, for the same reason as the sync below.
+autosave_heal() {
+    local who="$1"
+    CMUX_ALIVE=""
+    ( heal_dragged_tabs "" once "${2:-}" "${3:-}" ) 2>&1 | while IFS= read -r line; do
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $who: $line"
+    done || true
+    # Closing a healed tab can move focus. Put it back now rather than after
+    # the sync: the user may have gone somewhere else by then.
+    focus_restore
+    return 0
+}
+
+# autosave_sync <who> [note] - pick up anything changed inside cmux. A subshell:
+# cmd_sync dies on a dead socket, and the caller has to carry on. Its error
+# goes to the log once, when it first appears or changes, rather than every
+# time. The timer and the watcher share the record, so neither repeats what
+# the other already said.
+autosave_sync() {
+    local who="$1" note="${2:-}" err state="$AUTOSAVE_DIR/sync-state"
+    CMUX_ALIVE=""
+    if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
+        if [[ "$(sed -n 1p "$state" 2>/dev/null)" != ok ]]; then
+            [[ -s "$state" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') $who: sync ok again"
+        fi
+        printf 'ok\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$state" 2>/dev/null || true
+    else
+        err=$(printf '%s\n' "$err" | sed -n 's/^error: //p; s/^  !! //p' | head -n 1)
+        [[ -n "$err" ]] || err="sync exited non-zero with no message"
+        if [[ "$(sed -n 3p "$state" 2>/dev/null)" != "$err" ]]; then
+            warn "$who: sync failed${note:+, $note}: $err"
+        fi
+        printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
+    fi
+    # Settling a window into its groups can move focus as well: making or
+    # moving a group is not a change cmux_change knows to be safe.
+    focus_restore
+    return 0
 }
 
 cmd_autosave() {
@@ -5086,36 +5392,11 @@ cmd_autosave() {
             # snapshot. Sync failures must not stop the snapshot.
             # sync takes the config lock itself, only for its final write; the
             # lock is held below just for the snapshot.
-            # A subshell: cmd_sync dies on a dead socket, and the snapshot has
-            # to happen anyway. Its error goes to the log once, when it first
-            # appears or changes, rather than once a minute.
-            local err state
-            state="$AUTOSAVE_DIR/sync-state"
             mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
             # Tabs dragged between workspaces first, so the sync records where
-            # they were dropped. A subshell, for the same reason as the sync.
-            ( heal_dragged_tabs "" once ) 2>&1 | while IFS= read -r line; do
-                echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: $line"
-            done || true
-            # Closing a healed tab can move focus. Put it back now rather than
-            # after the sync: the user may have gone somewhere else by then.
-            focus_restore
-            if err=$( ( cmd_sync ) 2>&1 >/dev/null ); then
-                if [[ "$(sed -n 1p "$state" 2>/dev/null)" != ok ]]; then
-                    [[ -s "$state" ]] && echo "$(date '+%Y-%m-%d %H:%M:%S') autosave: sync ok again"
-                fi
-                printf 'ok\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" > "$state" 2>/dev/null || true
-            else
-                err=$(printf '%s\n' "$err" | sed -n 's/^error: //p; s/^  !! //p' | head -n 1)
-                [[ -n "$err" ]] || err="sync exited non-zero with no message"
-                if [[ "$(sed -n 3p "$state" 2>/dev/null)" != "$err" ]]; then
-                    warn "autosave: sync failed, snapshotting anyway: $err"
-                fi
-                printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
-            fi
-            # Settling a window into its groups can move focus as well: making
-            # or moving a group is not a change cmux_change knows to be safe.
-            focus_restore
+            # they were dropped.
+            autosave_heal autosave
+            autosave_sync autosave "snapshotting anyway"
             hatter_lock 0 || return 0          # a command is mid-write; try next minute
             local f
             f=$(autosave_snapshot) || true
@@ -5168,6 +5449,7 @@ cmd_autosave() {
             cp "$f" "$CONFIG"
             info "Config rolled back to $(basename "$f")  (previous saved as $CONFIG.bak)"
             info "Apply it to the client with: hatter restore" ;;
+        watch)     watch_run ;;
         install)   autosave_install ;;
         uninstall) autosave_uninstall ;;
         status)
@@ -5175,6 +5457,15 @@ cmd_autosave() {
                 info "Timer: loaded, every 60s"
             else
                 info "Timer: not installed  (install with: hatter autosave install)"
+            fi
+            local wpid
+            wpid=$(launchctl print "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null | awk '$1 == "pid" { print $3; exit }')
+            if [[ -n "$wpid" ]]; then
+                info "Watcher: running (pid $wpid), follows cmux events"
+            elif launchctl print "gui/$(id -u)/$WATCH_LABEL" >/dev/null 2>&1; then
+                info "Watcher: loaded but not running  (log: $AUTOSAVE_DIR/watch.log)"
+            else
+                info "Watcher: not installed  (install with: hatter autosave install)"
             fi
             local st="$AUTOSAVE_DIR/sync-state"
             if [[ -s "$st" ]]; then
@@ -5193,7 +5484,7 @@ cmd_autosave() {
             fi
             printf '  snapshots: %s of %s\n' "$(autosave_files | wc -l | tr -d ' ')" "$AUTOSAVE_KEEP"
             printf '  directory: %s\n' "$AUTOSAVE_DIR" ;;
-        *) die "unknown autosave subcommand: $sub (run|now|list|restore|install|uninstall|status)" ;;
+        *) die "unknown autosave subcommand: $sub (run|watch|now|list|restore|install|uninstall|status)" ;;
     esac
 }
 
@@ -5545,7 +5836,48 @@ edit_readkey() {
     esac
 }
 
-edit_ask()   { focus_restore; printf '\033[?25h  %s: ' "$1" >&2; read -r EDIT_REPLY < /dev/tty; printf '\033[?25l'; }
+# One line of input from the terminal, into EDIT_REPLY. Esc cancels: it
+# returns 1 with EDIT_REPLY empty, so a caller drops the whole action with
+# `|| continue`. A blank answer is a normal reply and returns 0. A lone Esc is
+# told from an arrow key or other escape sequence by edit_read_pending; those
+# are ignored rather than typed in.
+ask_line() {
+    local k rest rc=0
+    EDIT_REPLY=""
+    printf '\033[?25h  %s: ' "$1" >&2
+    while true; do
+        IFS= read -rsn1 k < /dev/tty || { rc=1; break; }
+        case "$k" in
+            '') break ;;
+            $'\e')
+                rest=$(edit_read_pending 2)
+                [[ -z "$rest" ]] && { rc=1; break; }
+                # A sequence can arrive in pieces over a slow link: take the
+                # rest of it, up to its final letter or ~, so none is typed in.
+                local n=0
+                while [[ "$rest" == '['* && "$rest" != *[A-Za-z~] && $n -lt 6 ]]; do
+                    rest+=$(edit_read_pending 1); n=$((n+1))
+                done
+                continue ;;
+            $'\x04') rc=1; break ;;
+            $'\x7f'|$'\b')
+                if [[ -n "$EDIT_REPLY" ]]; then
+                    EDIT_REPLY="${EDIT_REPLY%?}"; printf '\b \b' >&2
+                fi ;;
+            [[:cntrl:]]) ;;
+            *) EDIT_REPLY+="$k"; printf '%s' "$k" >&2 ;;
+        esac
+    done
+    printf '\033[?25l' >&2
+    if [[ $rc -ne 0 ]]; then
+        EDIT_REPLY=""
+        printf ' %s(cancelled)%s\n' "${C_DIM:-}" "${C_R:-}" >&2
+    else
+        printf '\n' >&2
+    fi
+    return $rc
+}
+edit_ask() { focus_restore; ask_line "$1"; }
 edit_pause() { printf '\n  %spress any key%s ' "$C_DIM" "$C_R" >&2; edit_readkey; }
 edit_confirm() {
     printf '  %s%s%s [y/N] ' "$C_YL" "$1" "$C_R" >&2
@@ -5862,11 +6194,12 @@ edit_top() {
                 : ;;
             !) edit_refresh_all ;;
             A)
-                edit_ask "new hat name (the session prefix)"; local nh_name="$EDIT_REPLY"
+                edit_ask "new hat name (the session prefix)" || continue
+                local nh_name="$EDIT_REPLY"
                 [[ -z "$nh_name" ]] && continue
-                edit_ask "ssh destination (user@host)"; local nhost="$EDIT_REPLY"
-                edit_ask "remote dir [\$HOME]"; local dir="${EDIT_REPLY:-\$HOME}"
-                edit_ask "default group for new workspaces"; local g="$EDIT_REPLY"
+                edit_ask "ssh destination (user@host)" || continue; local nhost="$EDIT_REPLY"
+                edit_ask "remote dir [\$HOME]" || continue; local dir="${EDIT_REPLY:-\$HOME}"
+                edit_ask "default group for new workspaces" || continue; local g="$EDIT_REPLY"
                 if [[ -n "$g" ]] && group_name_reserved "$g"; then
                     warn "'$UNASSIGNED' is hatter's own group - pick another default group"; edit_pause; continue
                 fi
@@ -5875,7 +6208,7 @@ edit_top() {
                 edit_fetch_hat "$nh_name"; edit_pause ;;
             R)
                 [[ -z "$hat" ]] && continue
-                edit_ask "new name for hat '$hat'"
+                edit_ask "new name for hat '$hat'" || continue
                 [[ -n "$EDIT_REPLY" ]] && { cmd_hat rename "$hat" "$EDIT_REPLY" || true; edit_refresh_all; }
                 edit_pause ;;
             D)
@@ -6128,7 +6461,7 @@ edit_groups() {
                 [[ $n -gt 0 ]] && { edit_workspaces "$hat" "$g" || return 1; }
                 : ;;
             a|A)
-                edit_ask "new group name"
+                edit_ask "new group name" || continue
                 if group_name_reserved "$EDIT_REPLY"; then
                     warn "'$UNASSIGNED' is hatter's own group - pick another name"
                 elif [[ -n "$EDIT_REPLY" ]]; then
@@ -6142,7 +6475,7 @@ edit_groups() {
                 if group_managed "$g"; then
                     warn "'$(group_display "$g")' is hatter's own group and keeps its name"; edit_pause; continue
                 fi
-                edit_ask "new name for group '$g'"
+                edit_ask "new name for group '$g'" || continue
                 # A subshell: rename dies on a name it refuses.
                 [[ -n "$EDIT_REPLY" ]] && { ( cmd_group rename "$g" "$EDIT_REPLY" ) || true; edit_pause; } ;;
             d|D)
@@ -6230,7 +6563,7 @@ edit_workspaces() {
                 : ;;
             !) edit_fetch_hat "$hat"; edit_cmux_places "$hat" ;;
             a|A)
-                edit_ask "new workspace name (a bare name gets the '$hat-' prefix)"
+                edit_ask "new workspace name (a bare name gets the '$hat-' prefix)" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
                     cmd_new "$EDIT_REPLY" --group "$group" --hat "$hat" || true
                     edit_fetch_hat "$hat"
@@ -6238,7 +6571,7 @@ edit_workspaces() {
                 edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
-                edit_ask "new name for workspace '$ws'"
+                edit_ask "new name for workspace '$ws'" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
                     ( cmd_rename "$ws" "$EDIT_REPLY" --hat "$hat" ) || true; edit_fetch_hat "$hat"
                 fi
@@ -6321,12 +6654,12 @@ edit_tabs() {
             enter|right|l) : ;;                       # tabs are the leaf level
             !) : ;;
             a|A)
-                edit_ask "name for the new tab (blank for the shell default)"
+                edit_ask "name for the new tab (blank for the shell default)" || continue
                 # A subshell: tab dies on a session it cannot add to.
                 ( cmd_tab --hat "$hat" -- "$ws" "$EDIT_REPLY" ) || true; edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
-                edit_ask "new name for tab '${NAMES[$((SEL-1))]}'"
+                edit_ask "new name for tab '${NAMES[$((SEL-1))]}'" || continue
                 [[ -n "$EDIT_REPLY" ]] && remote_sh "$(hat_ssh "$hat")" \
                     "tmux rename-window -t $(sq "=$ws:$idx") $(sq "$EDIT_REPLY")" >/dev/null 2>&1 || true ;;
             p|P)
@@ -6439,13 +6772,22 @@ Snapshots of config.json, kept separately from git.
   run                Move dragged tabs (see: hatter help repair), sync from the
                      live client, snapshot, then back up if due (what the
                      timer runs)
+  watch              Follow cmux events: move a dragged tab the moment it is
+                     dropped, and sync a second after any layout change
+                     (what the watcher runs; stays in the foreground)
   now                Snapshot only, no sync
   list               Show the checkpoints and the rolling save
   restore <n|latest> Roll the config back to one of them
-  install            Install the launchd timer (every 60s)
-  uninstall          Remove the timer, keeping the snapshots
-  status             Is the timer loaded, how many snapshots exist, and the
-                     last auto backup
+  install            Install the launchd timer (every 60s) and the watcher
+                     (always running)
+  uninstall          Remove both, keeping the snapshots
+  status             Are the timer and watcher loaded, how many snapshots
+                     exist, and the last auto backup
+
+The watcher reacts at once but only to what cmux reports: renames and group
+changes send no event, so the timer still catches those within a minute, and
+anything that happened while the watcher was down. It restarts itself when
+hatter is reinstalled. Log: ~/.config/hatter/autosave/watch.log
 
 Two layers, on purpose:
 
@@ -6581,8 +6923,8 @@ in its old session. The dropped tab has nothing behind it, and the old
 workspace no longer shows the window. repair moves the tmux window into the
 session the tab was dropped on and closes the blank tab, and cmux shows the
 window there as a new tab, at the end. Nothing is re-mirrored. The autosave
-timer does the same once a minute, so a dragged tab is usually fixed before
-you ask. A tab is only moved when its window is certain: the blank tab's
+watcher does the same the moment a tab is dropped (see: hatter help autosave),
+so a dragged tab is usually fixed before you ask. A tab is only moved when its window is certain: the blank tab's
 title names exactly one window that cmux no longer shows anywhere, and the
 tab really is blank, or has no terminal behind it at all. A local shell
 sitting in a mirrored workspace is never taken for one. A session's last tab
@@ -6778,7 +7120,8 @@ each one, and live status is shown where it exists:
   tabs        active, dead, running command, pane count, working directory
 
 Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
-goes back a level, `q` quits from anywhere. Takes no options.
+goes back a level, `q` quits from anywhere. Esc at a question cancels the whole
+action. Takes no options.
 
 `hatter` on its own opens the rack. `hatter edit` is the old name and still
 works.
@@ -7037,7 +7380,7 @@ case "$cmd" in
     shortcuts) cmd_shortcuts "$@" ;;
     # Not for people: the dragged-tab planner, and the healer, for the tests.
     _drag-plan) drag_plan ;;
-    _drag-heal) heal_dragged_tabs "${1:-}" "${2:-report}" ;;
+    _drag-heal) heal_dragged_tabs "${1:-}" "${2:-report}" "${3:-}" "${4:-}" ;;
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
