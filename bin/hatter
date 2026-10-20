@@ -1258,7 +1258,10 @@ ensure_cmux_group() {
 }
 
 # --- group changes in cmux. Every change hatter makes to cmux's groups goes
-# through these, so there is one place to see, and to change, how.
+# through these, so there is one place to see, and to change, how. Each sends
+# its command through cmux_change, whose list says which verbs leave focus
+# alone: add, rename and the styling do; create, move and ungroup are not
+# on it, so they record focus first and the run puts it back.
 
 # cmux_group_create <window> <name> [workspace ids, comma-separated]
 # With workspaces, the group is made from them and cmux places it in their
@@ -1270,22 +1273,22 @@ cmux_group_create() {
     local win="$1" name="$2" from="${3:-}" key
     key="hatter:$win:$name:$(( $(date +%s) / 60 ))"
     if [[ -n "$from" ]]; then
-        cmux workspace-group create --name "$name" --from "$from" --idempotency-key "$key" >/dev/null
+        cmux_change workspace-group create --name "$name" --from "$from" --idempotency-key "$key" >/dev/null
     else
-        cmux focus-window --window "$win" >/dev/null 2>&1 || true
-        cmux workspace-group create --name "$name" --idempotency-key "$key" >/dev/null
+        cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
+        cmux_change workspace-group create --name "$name" --idempotency-key "$key" >/dev/null
     fi
 }
-cmux_group_add()    { cmux workspace-group add --group "$1" --workspace "$2" >/dev/null 2>&1; }
-cmux_group_move()   { cmux workspace-group move "$1" --to-index "$2" >/dev/null 2>&1; }
-cmux_group_rename() { cmux workspace-group rename "$1" --name "$2" >/dev/null 2>&1; }
+cmux_group_add()    { cmux_change workspace-group add --group "$1" --workspace "$2" >/dev/null 2>&1; }
+cmux_group_move()   { cmux_change workspace-group move "$1" --to-index "$2" >/dev/null 2>&1; }
+cmux_group_rename() { cmux_change workspace-group rename "$1" --name "$2" >/dev/null 2>&1; }
 # cmux_group_style <ref> color|icon|pin|collapse [value]
 cmux_group_style() {
     case "$2" in
-        color)    cmux workspace-group set-color "$1" --hex "$3" ;;
-        icon)     cmux workspace-group set-icon "$1" --symbol "$3" ;;
-        pin)      cmux workspace-group pin "$1" ;;
-        collapse) cmux workspace-group collapse "$1" ;;
+        color)    cmux_change workspace-group set-color "$1" --hex "$3" ;;
+        icon)     cmux_change workspace-group set-icon "$1" --symbol "$3" ;;
+        pin)      cmux_change workspace-group pin "$1" ;;
+        collapse) cmux_change workspace-group collapse "$1" ;;
     esac >/dev/null 2>&1
 }
 # Only ever for a group with no running session in it. The flag removes the
@@ -1293,8 +1296,8 @@ cmux_group_style() {
 # dissolved without it, so nothing in it is set loose.
 cmux_group_remove() {
     local ref="$1" members="$2"
-    cmux workspace-group ungroup "$ref" --remove-generated-anchor >/dev/null 2>&1 && return 0
-    [[ "$members" == 0 ]] && cmux workspace-group ungroup "$ref" >/dev/null 2>&1
+    cmux_change workspace-group ungroup "$ref" --remove-generated-anchor >/dev/null 2>&1 && return 0
+    [[ "$members" == 0 ]] && cmux_change workspace-group ungroup "$ref" >/dev/null 2>&1
 }
 
 # cmux_group_to_top <group ref> <window> [groups json]: Unassigned sits at the
@@ -5018,6 +5021,9 @@ cmd_autosave() {
                 fi
                 printf 'failed\n%s\n%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$err" > "$state" 2>/dev/null || true
             fi
+            # Settling a window into its groups can move focus as well: making
+            # or moving a group is not a change cmux_change knows to be safe.
+            focus_restore
             hatter_lock 0 || return 0          # a command is mid-write; try next minute
             local f
             f=$(autosave_snapshot) || true
