@@ -248,7 +248,7 @@ migrate_unassigned() {
               .groups.Unassigned as $old
               | "\($n)@\($l)" as $k
               | ([.groups | to_entries[] | select(.key != "Unassigned" and .key != $k and .value.hat == $l)
-                  | .value.sessions // {} | keys[]]) as $elsewhere
+                  | .value.sessions // {} | keys_unsorted[]]) as $elsewhere
               | .groups[$k] = (($old | del(.sessions)) + (.groups[$k] // {}) + {hat: $l, name: $n, managed: true})
               | .groups[$k].sessions = ((($old.sessions // {}) + (.groups[$k].sessions // {}))
                                         | with_entries(select(.key as $x | $elsewhere | index($x) | not)))
@@ -377,7 +377,10 @@ hat_default_group() { cfg --arg l "$1" '.hats[$l].default_group // empty'; }
 
 group_exists() { [[ -n "$(cfg --arg g "$1" '.groups[$g] // empty')" ]]; }
 group_hat()  { cfg --arg g "$1" '.groups[$g].hat // empty'; }
-group_names()  { cfg '.groups | keys[]?'; }
+# Groups and their sessions are kept in the order cmux shows them, which sync
+# writes into the config (see SYNC_ORDER_JQ). jq's `keys` sorts, so every
+# reader walks them with `keys_unsorted` or `to_entries` instead.
+group_names()  { cfg '.groups | keys_unsorted[]?'; }
 # A hat's groups, its Unassigned group first: that is where it sits in cmux.
 groups_of_hat() {
     cfg --arg l "$1" '[.groups | to_entries[] | select(.value.hat == $l)]
@@ -547,7 +550,7 @@ host_recorded_sessions() {
     cfg --arg h "$1" '
         [.hats | to_entries[] | select(.value.ssh == $h) | .key] as $hats
         | .groups[] | select(.hat as $x | $hats | index($x))
-        | .sessions | keys[]?'
+        | .sessions | keys_unsorted[]?'
 }
 
 # A remote sh fragment that sets $list to the server's tmux sessions, one per
@@ -605,7 +608,7 @@ hat_unrecorded() {
     cfg --arg l "$1" --arg live "$2" '
         .hats[$l].ssh as $h
         | ([.hats | to_entries[] | select(.value.ssh == $h) | .key] | sort) as $hats
-        | ([.groups[] | select(.hat as $x | $hats | index($x)) | .sessions | keys[]?]) as $rec
+        | ([.groups[] | select(.hat as $x | $hats | index($x)) | .sessions | keys_unsorted[]?]) as $rec
         | $live | split("\n")[]
         | select(. != "" and (. as $s | $rec | index($s) | not))
         | select((split("-")[0]) as $p
@@ -1126,7 +1129,7 @@ find_hat_window() {
     # first window, as cmux lists them.
     {
         cfg --arg l "$hat" '
-            .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?' \
+            .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys_unsorted[]?' \
             | sed 's/^/want	/'
         # By the name cmux shows. Every window has an Unassigned, so it is no
         # evidence either way.
@@ -2841,7 +2844,7 @@ tab_target() {
         local listing
         listing=$(cfg --arg l "$session" '
             .groups | to_entries[] | select(.value.hat == $l)
-            | .key as $g | .value.sessions | keys[]? | "  \($g) / \(.)"')
+            | .key as $g | .value.sessions | keys_unsorted[]? | "  \($g) / \(.)"')
         die "'$session' is a hat, not a workspace - tabs live inside workspaces.
 ${listing:+
 Workspaces under the '$session' hat:
@@ -3386,7 +3389,8 @@ attach_session() {
 }
 
 # The workspaces a hat has: those the config records, plus any running on its
-# server that were never recorded. One per line, sorted, unique.
+# server that were never recorded. One per line, unique, recorded ones first in
+# the order cmux shows them.
 hat_workspaces() {
     local hat="$1" dest
     # Each stage can end non-zero without meaning anything (the last session
@@ -3394,7 +3398,7 @@ hat_workspaces() {
     # would turn that into a silent exit, so the group ends in an explicit 0.
     {
         cfg --arg l "$hat" '
-            .groups[] | select(.hat == $l) | .sessions | keys[]?'
+            .groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?'
         dest=$(hat_ssh "$hat")
         if [[ -n "$dest" ]]; then
             { remote_sessions "$dest" 2>/dev/null || true; } \
@@ -3405,7 +3409,7 @@ hat_workspaces() {
                   done
         fi
         return 0
-    } | sort -u | sed '/^$/d'
+    } | sed '/^$/d' | awk '!seen[$0]++'
     return 0
 }
 
@@ -3890,7 +3894,7 @@ cmd_shortcuts() {
             [[ -n "$session" ]] || continue
             shortcut_write "$dir" "$hat ${session#"$hat"-}" "$session" "$self" "$bash_bin"
             n=$((n+1))
-        done < <(cfg --arg l "$hat" '[.groups[] | select(.hat == $l) | .sessions | keys[]?] | unique[]')
+        done < <(cfg --arg l "$hat" '[.groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?] | unique[]')
     done < <(hat_names)
     info "Wrote $n shortcuts to $dir"
     return 0
@@ -4446,7 +4450,7 @@ cmd_hat() {
                         else . end)
                 '
             done < <(cfg --arg l "$old" '
-                .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys[]?')
+                .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys_unsorted[]?')
 
             backup_config
             jq_write --arg o "$old" --arg n "$new" --arg u "$UNASSIGNED" '
@@ -4474,8 +4478,8 @@ cmd_group() {
         list|"")
             cfg '.groups | to_entries[]
                  | if .value.managed
-                   then "\(.value.name // .key)\t[hat: \(.value.hat), hatter'"'"'s own; key \(.key)]  \(.value.sessions | keys | join(", "))"
-                   else "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys | join(", "))" end'
+                   then "\(.value.name // .key)\t[hat: \(.value.hat), hatter'"'"'s own; key \(.key)]  \(.value.sessions | keys_unsorted | join(", "))"
+                   else "\(.key)\t[hat: \(.value.hat)]  \(.value.sessions | keys_unsorted | join(", "))" end'
             ;;
         add|set)
             local name="${1:-}" hat=""
@@ -4594,7 +4598,7 @@ settle_ungrouped() {
         # recorded since (another hatter, say) stays where it was put.
         jq_write --arg g "$key" --arg l "$hat" --argjson e "$entries" '
             ([.groups | to_entries[] | select(.key != $g and .value.hat == $l)
-              | .value.sessions // {} | keys[]]) as $taken
+              | .value.sessions // {} | keys_unsorted[]]) as $taken
             | .groups[$g].sessions += ($e | with_entries(select(.key as $s | $taken | index($s) | not)))
             | '"$PRUNE_UNASSIGNED"
     fi
@@ -4611,7 +4615,7 @@ settle_ungrouped() {
     local placed g ids name ref changed=0 done_n
     placed=$(jq -r --argjson g "$groups_json" --arg live "$live" \
                    --argjson rec "$(cfg -c --arg l "$hat" '[.groups | to_entries[] | select(.value.hat == $l)
-                                        | .key as $k | .value.sessions | keys[]? | {key: ., value: $k}] | from_entries')" '
+                                        | .key as $k | .value.sessions | keys_unsorted[]? | {key: ., value: $k}] | from_entries')" '
         ([$g.groups[]?.member_workspace_ids[]?]) as $in
         | ($live | split("\n")) as $l
         | .workspaces[]?
@@ -4645,7 +4649,7 @@ settle_ungrouped() {
         fi
         [[ "$done_n" == 0 ]] || echo "  $hat / $name: put back $done_n loose workspace(s)"
         [[ -n "$ref" ]] && apply_group_style "$g" "$ref"
-    done < <(awk -F '\037' '{ print $2 }' <<<"$placed" | sort -u)
+    done < <(awk -F '\037' '!seen[$2]++ { print $2 }' <<<"$placed")
 
     # 3. Unassigned in cmux, from a fresh look whenever anything moved.
     if [[ "$changed" == 1 ]]; then
@@ -4701,6 +4705,19 @@ cmd_sync() {
     done
     die "the config kept changing while syncing - run 'hatter sync' again"
 }
+
+# The patch sync builds holds each window's groups in the order cmux shows
+# them, and each group's sessions likewise. This puts the config's groups in
+# that order: the synced ones first, as the patch has them, then the rest (a hat
+# with no window, a group cmux no longer shows) in the order they already had.
+# Readers only ever list one hat's groups at a time, so how hats interleave
+# does not matter.
+SYNC_ORDER_JQ='
+    ($p | keys_unsorted) as $order
+    | .groups |= (to_entries as $e
+        | [$order[] as $k | $e[] | select(.key == $k)]
+          + [$e[] | select(.key as $k | $order | index($k) | not)]
+        | from_entries)'
 
 # One pass of sync. Reading cmux and the servers is the slow part, so it runs
 # without the config lock, with the servers and cmux asked all at once; the lock
@@ -4904,7 +4921,7 @@ sync_once() {
             fi
         done < <(cfg --arg l "$hat" '
             .groups | to_entries[] | select(.value.hat == $l)
-            | .key as $g | .value.sessions | keys[]? | [$g, .] | map(. // "" | tostring) | join("\u001f")')
+            | .key as $g | .value.sessions | keys_unsorted[]? | [$g, .] | map(. // "" | tostring) | join("\u001f")')
         if [[ "$drops" -gt 0 ]] && { [[ "$running" == 0 ]] || [[ $((drops * 2)) -gt "$total" ]]; }; then
             hold=1
             echo "  $hat: $drops of its $total recorded sessions are not running - too many to be"
@@ -4958,7 +4975,7 @@ sync_once() {
             | .groups[$e.key].pinned    = $e.value.pinned
             | .groups[$e.key].collapsed = $e.value.collapsed
             | .groups[$e.key].sessions  = $e.value.sessions)
-        | '"$PRUNE_UNASSIGNED"
+        | '"$PRUNE_UNASSIGNED"' | '"$SYNC_ORDER_JQ"
     if [[ "$held" == 1 ]]; then hatter_unlock; fi
 
     # Now that the config holds what this pass found, every running session in
@@ -5025,7 +5042,7 @@ hat_missing() {
             if [[ -n "$win" ]] && ! grep -qxF "$session" <<<"$titles"; then
                 printf '%s\037not mirrored\n' "$session"
             fi
-        done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+        done < <(cfg --arg g "$group" '.groups[$g].sessions | keys_unsorted[]?')
     done < <(groups_of_hat "$hat")
 }
 
@@ -5068,7 +5085,7 @@ cmd_restore() {
 
         local want
         want=$(cfg --arg l "$hat" '
-            [ .groups[] | select(.hat == $l) | .sessions | keys[]? ] | length')
+            [ .groups[] | select(.hat == $l) | .sessions | keys_unsorted[]? ] | length')
         if [[ "${want:-0}" -eq 0 ]]; then
             echo "  $hat: nothing recorded, skipping"
             continue
@@ -5110,7 +5127,7 @@ cmd_restore() {
                 [[ -z "$session" ]] && continue
                 windows=$(cfg --arg g "$group" --arg s "$session" '.groups[$g].sessions[$s].windows // []')
                 ensure_remote_session "$host" "$session" "$dir" "$windows"
-            done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+            done < <(cfg --arg g "$group" '.groups[$g].sessions | keys_unsorted[]?')
         done < <(groups_of_hat "$hat")
 
         # 2. one window, one mirror pass
@@ -5118,8 +5135,10 @@ cmd_restore() {
         win=$(ensure_hat_window "$hat")
         mirror_hat "$hat" "$win"
 
-        # 3. put the workspaces back in their groups, restyle
-        local gref wref
+        # 3. put the workspaces back in their groups, in their recorded order,
+        # restyle. cmux mirrors sessions in tmux's order, so each one is moved
+        # to follow the one recorded before it.
+        local gref wref prev
         while IFS= read -r group; do
             [[ -z "$group" ]] && continue
             # An empty Unassigned is not created; settling below removes it.
@@ -5128,6 +5147,7 @@ cmd_restore() {
                 continue
             fi
             gref=$(ensure_cmux_group "$group" "$win")
+            prev=""
             while IFS= read -r session; do
                 [[ -z "$session" ]] && continue
                 wref=$(wait_for_workspace "$session" "$win" 20)
@@ -5139,8 +5159,13 @@ cmd_restore() {
                     warn "could not put '$session' into group '$(group_display "$group")'"
                     continue
                 fi
+                if [[ -n "$prev" ]]; then
+                    cmux_change reorder-workspace --workspace "$wref" --after "$prev" --window "$win" >/dev/null 2>&1 \
+                        || warn "could not put '$session' in its recorded place"
+                fi
+                prev="$wref"
                 echo "  ok  $hat / $(group_display "$group") / $session -> $wref"
-            done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+            done < <(cfg --arg g "$group" '.groups[$g].sessions | keys_unsorted[]?')
             apply_group_style "$group" "$gref"
         done < <(groups_of_hat "$hat")
 
@@ -6803,7 +6828,7 @@ edit_workspaces() {
         while IFS= read -r ws; do
             [[ -z "$ws" ]] && continue
             WSS[$n]="$ws"; n=$((n+1))
-        done < <(cfg --arg g "$group" '.groups[$g].sessions | keys[]?')
+        done < <(cfg --arg g "$group" '.groups[$g].sessions | keys_unsorted[]?')
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
         edit_header "$hat › $(group_display "$group")" "WORKSPACES" \
@@ -7453,6 +7478,9 @@ Record the live layout into the config: group membership, titles, colors,
 pin/collapse, and every session's tabs and working directories. Run it after
 renaming or rearranging anything in the cmux sidebar.
 
+Groups, workspaces and tabs are saved in the order the sidebar shows them, and
+list, edit, the pickers and restore all use that order.
+
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.
 
@@ -7491,7 +7519,9 @@ hatter restore [hat|group ...]
 
 Rebuild from the config after a Mac or shell-server reboot: recreate missing
 tmux sessions and their tabs, find or open each hat's window, re-mirror, put the
-workspaces back in their groups, and re-apply styling. Idempotent.
+workspaces back in their groups in their saved order, and re-apply styling.
+Idempotent. Groups it creates follow the saved order; a group already in the
+window keeps its place.
 
 With no arguments, every hat. Hats with nothing recorded, or whose server is
 unreachable, are skipped rather than failing the run.

@@ -40,8 +40,9 @@ connection, so a side project can live under your main hat as
 `dev-website-parser` and still land in the right place.
 
 **The server is the source of truth. The client is disposable.** Everything real
-runs in remote tmux. `hatter sync` records the live layout into
-`~/.config/hatter/config.json`; `hatter restore` rebuilds the client from it.
+runs in remote tmux. `hatter sync` records the live layout, in the order cmux
+shows it (`hatter help sync`), into `~/.config/hatter/config.json`;
+`hatter restore` rebuilds the client from it.
 Reboot your laptop, reinstall the OS, switch machines — clone the config and
 restore. Closing a workspace in the client does not forget it: sync keeps any
 session still running on its server, and `hatter rm` ends one for good
