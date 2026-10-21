@@ -432,6 +432,34 @@ session_hat() {
     return 0
 }
 
+# session_hat_typed <session> <how to say which> [here]: session_hat for a name
+# the user typed with no --hat. A bare name can be recorded by hats on several
+# servers, and those are different sessions, so the first one in the config is
+# a guess. The prefix still decides when it names one of them. Otherwise, with
+# "here", the hat of the window this was typed in decides when it records the
+# name. With nothing to go on, it dies rather than guess.
+session_hat_typed() {
+    local session="$1" say="$2" cur="" pick
+    if [[ "${3:-}" == here && "$(cfg --arg s "$session" \
+            '[.groups[] | select(.sessions[$s]?) | .hat // empty] | unique | length')" -gt 1 ]]; then
+        cur=$(current_hat || true)
+    fi
+    pick=$(cfg --arg s "$session" --arg p "${session%%-*}" --arg c "$cur" '
+        . as $cfg
+        | ([.groups[] | select(.sessions[$s]?) | .hat // empty] | unique) as $hs
+        | if ($hs | index($p)) then $p
+          elif $c != "" and ($hs | index($c)) then $c
+          elif ($hs | map($cfg.hats[.].ssh // "") | unique | length) > 1
+          then "?" + ($hs | join(", "))
+          else empty end')
+    if [[ "$pick" == "?"* ]]; then
+        die "'$session' is recorded on more than one server (hats: ${pick#?}).
+  Say which: $say"
+    fi
+    if [[ -n "$pick" ]]; then printf '%s' "$pick"; else session_hat "$session"; fi
+    return 0
+}
+
 # session_group <session> [hat]: the group that records it, among that hat's
 # groups when the hat is known.
 session_group() {
@@ -2649,7 +2677,7 @@ cmd_new() {
     if [[ -n "$hat" ]]; then
         hat_exists "$hat" || register_hat "$hat" "$ssh_dest" "$dir"
     else
-        hat=$(session_hat "$session") || true
+        hat=$(session_hat_typed "$session" "hatter new $session --hat <hat>" here) || exit 1
     fi
 
     if [[ -z "$hat" && -n "$group" ]] && group_exists "$group"; then
@@ -2785,24 +2813,38 @@ hat_status_row() {
 }
 
 cmd_tab() {
+    # --hat says whose workspace, for a name hats on several servers record.
+    local want="" args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "usage: hatter tab <session> [tab-name] [--hat <hat>]"
+                   want="$2"; shift 2 ;;
+            # Everything after -- is a name, even one that starts with -.
+            --) shift; args+=("$@"); break ;;
+            -*) die "unknown flag: $1  (try: hatter help tab)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    set -- ${args[@]+"${args[@]}"}
     case "${1:-}" in
-        pin|unpin) [[ $# -eq 3 ]] && { cmd_tab_pin "$@"; return; } ;;
+        pin|unpin) [[ $# -eq 3 ]] && { cmd_tab_pin "$1" "$2" "$3" "$want"; return; } ;;
     esac
     # Add a tab back to a workspace: in the mirror a tab IS a tmux window, so
     # creating one on the server makes it appear - no re-mirror needed.
     local session="${1:-}" name="${2:-}"
-    [[ -n "$session" ]] || die "usage: hatter tab <session> [tab-name]"
-    tab_target "$session"
+    [[ -n "$session" ]] || die "usage: hatter tab <session> [tab-name] [--hat <hat>]"
+    tab_target "$session" "$want"
     local nameopt=""
     [[ -n "$name" ]] && nameopt="-n $(sq "$name")"
     remote_sh "$TAB_HOST" "tmux new-window -t $(sq "=$TAB_SESSION") $nameopt -c $(sq_dir "$(hat_dir "$TAB_HAT")")"
     info "Added a tab to '$TAB_SESSION' on $TAB_HOST${name:+ (named '$name')}"
 }
 
-# hatter tab pin|unpin <session> <tab>   - <tab> is a window index or name
+# hatter tab pin|unpin <session> <tab> [--hat <hat>]   - <tab> is a window
+# index or name
 cmd_tab_pin() {
     local action="$1" tab="$3" line wid idx name
-    tab_target "$2"
+    tab_target "$2" "${4:-}"
     line=$(remote_sh "$TAB_HOST" \
         "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}$US#{window_index}$US#{window_name}' 2>/dev/null" \
         | AWK_T="$tab" awk -F'\037' 'BEGIN {t = ENVIRON["AWK_T"] ""} ($2 "")==t {print; exit} ($3 "")==t && !n {n=$0} END {if (n) print n}' | head -n 1)
@@ -2832,11 +2874,12 @@ cmd_tab_pin() {
     else info "Unpinned tab '${name:-$idx}' in '$TAB_SESSION'"; fi
 }
 
-# Resolve a workspace name the way `hatter tab` takes it. Sets TAB_SESSION,
-# TAB_GROUP (empty when no group records it), TAB_HAT and TAB_HOST, and dies
-# unless the session is running.
+# tab_target <session> [hat]: resolve a workspace name the way `hatter tab`
+# takes it, on <hat> when given. Sets TAB_SESSION, TAB_GROUP (empty when no
+# group records it), TAB_HAT and TAB_HOST, and dies unless the session is
+# running.
 tab_target() {
-    local session="$1"
+    local session="$1" want="${2:-}"
 
     # A hat is not a workspace. Catch the confusion explicitly rather than
     # failing later with advice that cannot help.
@@ -2850,12 +2893,18 @@ ${listing:+
 Workspaces under the '$session' hat:
 $listing
 }
-  hatter tab <workspace> [tab-name]"
+  hatter tab <workspace> [tab-name] [--hat <hat>]"
     fi
 
     # The hat first, then its group: two hats may each record the name.
     local group="" hat host
-    hat=$(session_hat "$session")
+    if [[ -n "$want" ]]; then
+        hat_exists "$want" || die "unknown hat: $want"
+        hat="$want"
+        session=$(hat_session_name "$hat" "$session")
+    else
+        hat=$(session_hat_typed "$session" "hatter tab $session --hat <hat>" here) || exit 1
+    fi
     [[ -z "$hat" ]] || group=$(session_group "$session" "$hat")
 
     if [[ -z "$hat" ]]; then
@@ -3228,7 +3277,7 @@ cmd_resize() {
         hat="$target"
     else
         session=$(tmux_session_name "$target")
-        hat=$(session_hat "$session")
+        hat=$(session_hat_typed "$session" "run it from that hat's window, or hatter resize <hat>" here) || exit 1
         [[ -n "$hat" ]] || die "'$target' is neither a hat nor a session hatter can place.
   Known hats: $(hat_names | tr '\n' ' ')"
     fi
@@ -3242,10 +3291,25 @@ cmd_resize() {
 }
 
 cmd_repair() {
-    local session="$1" hat host lines win="" ws="" w
+    local session="" want="" hat host lines win="" ws="" w
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "usage: hatter repair <session> [--hat <hat>]"
+                   want="$2"; shift 2 ;;
+            -*) die "unknown flag: $1  (try: hatter help repair)" ;;
+            *)  [[ -z "$session" ]] || die "usage: hatter repair <session> [--hat <hat>]"
+                session="$1"; shift ;;
+        esac
+    done
+    [[ -n "$session" ]] || die "usage: hatter repair <session> [--hat <hat>]"
     require_cmux repair
     session=$(tmux_session_name "$session")
-    hat=$(session_hat "$session")
+    if [[ -n "$want" ]]; then
+        hat_exists "$want" || die "unknown hat: $want"
+        hat="$want"
+    else
+        hat=$(session_hat_typed "$session" "hatter repair $session --hat <hat>" here) || exit 1
+    fi
     [[ -n "$hat" ]] || die "cannot tell which hat '$session' belongs to.
   Known hats: $(hat_names | tr '\n' ' ')"
     host=$(hat_ssh "$hat")
@@ -3455,7 +3519,7 @@ cmd_attach() {
 
     # A recorded session, or one whose prefix names a hat.
     if ! hat_exists "$target"; then
-        hat=$(session_hat "$target")
+        hat=$(session_hat_typed "$target" "hatter attach <hat>, and pick it there" here) || exit 1
         [[ -n "$hat" ]] || die "'$target' is neither a hat nor a workspace of one.
   Known hats: $(hat_names | tr '\n' ' ')"
         attach_session "$hat" "$target"
@@ -4069,20 +4133,13 @@ cmd_rm() {
     # Which hat. A session no group records can still be ended: its prefix
     # names the hat. A name need not carry a prefix, and hats on two servers
     # can each record it: those are two sessions, and which one to end is not
-    # a guess to make.
-    local group="" hat host both
+    # a guess to make, not even from the window it was typed in.
+    local group="" hat host
     if [[ -n "$want" ]]; then
         hat_exists "$want" || die "unknown hat: $want"
         hat="$want"
     else
-        both=$(cfg --arg s "$session" --arg p "${session%%-*}" '
-            . as $c
-            | ([.groups[] | select(.sessions[$s]?) | .hat // empty] | unique) as $hs
-            | if ($hs | index($p)) then empty
-              else ($hs | map($c.hats[.].ssh // "") | unique | select(length > 1) | $hs | join(", ")) end')
-        [[ -z "$both" ]] || die "'$session' is recorded on more than one server (hats: $both).
-  Say which: hatter rm $session --hat <hat>"
-        hat=$(session_hat "$session")
+        hat=$(session_hat_typed "$session" "hatter rm $session --hat <hat>") || exit 1
     fi
     [[ -z "$hat" ]] || group=$(session_group "$session" "$hat")
     if [[ -z "$group" ]]; then
@@ -4132,17 +4189,33 @@ cmd_rm() {
 
 cmd_rename() {
     # Rename a session everywhere at once: on the server, in cmux, in the config.
-    local old="${1:-}" new="${2:-}"
-    [[ -n "$old" && -n "$new" ]] || die "usage: hatter rename <old-session> <new-session>"
+    local old="" new="" want="" usage="usage: hatter rename <old-session> <new-session> [--hat <hat>]"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "$usage"
+                   want="$2"; shift 2 ;;
+            -*) die "unknown flag: $1  (try: hatter help rename)" ;;
+            *)  if [[ -z "$old" ]]; then old="$1"
+                elif [[ -z "$new" ]]; then new="$1"
+                else die "$usage"; fi
+                shift ;;
+        esac
+    done
+    [[ -n "$old" && -n "$new" ]] || die "$usage"
     local given="$new"
     new=$(tmux_session_name "$new")
     [[ "$new" == "$given" ]] || \
         warn "tmux cannot hold '.' or ':' in a session name - using '$new'"
 
     local group hat host
-    group=$(session_group "$old")
-    [[ -n "$group" ]] || die "no recorded session named '$old' (see: hatter list)"
-    hat=$(group_hat "$group")
+    if [[ -n "$want" ]]; then
+        hat_exists "$want" || die "unknown hat: $want"
+        hat="$want"
+    else
+        hat=$(session_hat_typed "$old" "hatter rename $old $new --hat <hat>" here) || exit 1
+    fi
+    group=$(session_group "$old" "$hat")
+    [[ -n "$group" ]] || die "no recorded session named '$old'${want:+ on hat '$want'} (see: hatter list)"
     host=$(hat_ssh "$hat")
 
     if remote_session_exists "$host" "$new"; then
@@ -6882,13 +6955,13 @@ edit_workspaces() {
                 [[ $n -eq 0 ]] && continue
                 edit_ask "new name for workspace '$ws'" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
-                    cmd_rename "$ws" "$EDIT_REPLY" || true; edit_fetch_hat "$hat"
+                    ( cmd_rename "$ws" "$EDIT_REPLY" --hat "$hat" ) || true; edit_fetch_hat "$hat"
                 fi
                 edit_pause ;;
             f|F)
                 [[ $n -eq 0 ]] && continue
                 # A subshell: repair dies on anything it cannot fix.
-                ( cmd_repair "$ws" ) || warn "repair did not finish"
+                ( cmd_repair "$ws" --hat "$hat" ) || warn "repair did not finish"
                 edit_fetch_hat "$hat"; edit_pause ;;
             d|D)
                 [[ $n -eq 0 ]] && continue
@@ -6964,7 +7037,8 @@ edit_tabs() {
             !) : ;;
             a|A)
                 edit_ask "name for the new tab (blank for the shell default)" || continue
-                cmd_tab "$ws" "$EDIT_REPLY" || true; edit_pause ;;
+                # A subshell: tab dies on a session it cannot add to.
+                ( cmd_tab --hat "$hat" -- "$ws" "$EDIT_REPLY" ) || true; edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
                 edit_ask "new name for tab '${NAMES[$((SEL-1))]}'" || continue
@@ -6974,9 +7048,9 @@ edit_tabs() {
                 [[ $n -eq 0 ]] && continue
                 # A subshell: cmd_tab_pin dies on a tab it cannot pin.
                 if [[ "${PINS[$((SEL-1))]}" == "1" ]]; then
-                    ( cmd_tab_pin unpin "$ws" "$idx" ) || edit_pause
+                    ( cmd_tab_pin unpin "$ws" "$idx" "$hat" ) || edit_pause
                 else
-                    ( cmd_tab_pin pin "$ws" "$idx" ) || edit_pause
+                    ( cmd_tab_pin pin "$ws" "$idx" "$hat" ) || edit_pause
                 fi ;;
             d|D)
                 [[ $n -eq 0 ]] && continue
@@ -7166,8 +7240,8 @@ and the name must say which hat it belongs to.
 USAGE
     ;;
     tab) cat <<'USAGE'
-hatter tab <session> [tab-name]
-hatter tab pin|unpin <session> <tab>
+hatter tab <session> [tab-name] [--hat <hat>]
+hatter tab pin|unpin <session> <tab> [--hat <hat>]
 
 Add a tab to a workspace. A tab is a tmux window, so this creates one on the
 server and the mirror picks it up. Inside the session, tmux's own `prefix + c`
@@ -7186,6 +7260,12 @@ pinned. cmux cannot pin a mirrored tab itself, so this is hatter's pin.
 Inside a cmux window, a bare name is resolved against that window's hat, so
 `hatter tab atlas` means dev-atlas while wearing dev - but only when that
 workspace already exists.
+
+A name need not carry a hat's prefix, so hats on two servers can each record
+one called notes. Then the window's hat decides, when it is one of them.
+Typed anywhere else, tab refuses rather than guess; --hat says which. new,
+attach, resize, repair and rename resolve such a name the same way. rm never takes
+it from the window: ending a session needs --hat.
 USAGE
     ;;
     resize) cat <<'USAGE'
@@ -7214,7 +7294,7 @@ before stays wrapped at 80 columns until it restarts.
 USAGE
     ;;
     repair) cat <<'USAGE'
-hatter repair <session>
+hatter repair <session> [--hat <hat>]
 
 Bring back a workspace that cmux shows blank. Dragging a tab between cmux
 workspaces can leave it like that, in one of two ways.
@@ -7325,7 +7405,7 @@ any other file there alone.
 USAGE
     ;;
     rename) cat <<'USAGE'
-hatter rename <old-session> <new-session>
+hatter rename <old-session> <new-session> [--hat <hat>]
 
 Rename a session in all three places at once: the tmux session on its server,
 the cmux workspace title, and the config. Renaming in the cmux sidebar also
@@ -7688,7 +7768,7 @@ case "$cmd" in
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     rm|remove) [[ $# -gt 0 ]] || { usage_cmd rm; exit 1; };        cmd_rm "$@" ;;
-    repair)    [[ $# -eq 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$1" ;;
+    repair)    [[ $# -ge 1 ]] || { usage_cmd repair; exit 1; };    cmd_repair "$@" ;;
     resize)    [[ $# -gt 0 ]] || { usage_cmd resize; exit 1; };    cmd_resize "$@" ;;
     provision) [[ $# -gt 0 ]] || { usage_cmd provision; exit 1; }; cmd_provision "$@" ;;
     backup)    cmd_backup "$@" ;;
