@@ -42,7 +42,9 @@ case "$cmd" in
         exec env -u XDG_STATE_HOME -u XDG_DATA_HOME HOME="$STUB_DIR/rhome" \
             PATH="$STUB_TBIN:$PATH" /bin/sh -c "$cmd" ;;
     *"list-sessions -F 'S"*)              # remote_tmux_state
-        while IFS= read -r s; do [[ -n "$s" ]] && printf 'S\t%s\n' "$s"; done < "$srv"
+        # $STUB_DIR/server-id, when present, names the tmux server instance.
+        id=$(cat "$STUB_DIR/server-id" 2>/dev/null || true)
+        while IFS= read -r s; do [[ -n "$s" ]] && printf 'S\t%s\t%s\n' "$s" "$id"; done < "$srv"
         while IFS= read -r s; do [[ -n "$s" ]] && printf 'W\t%s\t@1\tw-%s\t/srv\t\n' "$s" "$s"; done < "$srv" ;;
     *) echo "stub ssh: unexpected: $cmd" >&2; exit 1 ;;
 esac
@@ -140,7 +142,7 @@ has() {
             < "$d/home/.config/hatter/config.json")" = true ]
 }
 hatter_in() {
-    env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
+    env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" XDG_STATE_HOME="$d/state" PATH="$work/bin:$PATH" \
         STUB_DIR="$d" STUB_TBIN="$work/tbin" /bin/bash "$hatter" "$@" < /dev/null > "$d/out" 2>&1
 }
 # The sessions the server's `last` snapshot would bring back, from any line.
@@ -231,6 +233,44 @@ printf 'dev-x\n' > "$d/server"
 hatter_in sync || true
 expect "sync: with no recorded session running, none is dropped, even when few would go" \
     "$(yes_if all_of has_all G dev-a dev-b -- says "none is dropped this pass")"
+# --- sync: which tmux server a session last ran on (#65) ----------------------
+# A pass records what ran on which server instance. A session gone from the
+# instance it ran on ended; one last seen on an earlier instance was lost to a
+# restart, and is kept however few are missing.
+ALL7="dev-a\ndev-b\ndev-c\ndev-d\ndev-l\n$Q\n"
+setup ended
+echo 100.1 > "$d/server-id"; printf "$ALL7" > "$d/server"
+hatter_in sync || true
+expect "sync: a pass records the sessions seen on this server" \
+    "$(yes_if grep -qx "$(printf '100.1\tdev-c')" "$d/state/hatter/seen.dev@example.com")"
+grep -vx dev-d "$d/server" > "$d/s" && mv "$d/s" "$d/server"
+hatter_in sync || true
+expect "sync: a session that ended on the server it ran on is dropped" \
+    "$(yes_if all_of hasnt G dev-d -- says "dev-d  dropped (not running)")"
+
+setup restarted
+echo 100.1 > "$d/server-id"; printf "$ALL7" > "$d/server"
+hatter_in sync || true
+# The server restarts; the restore has brought back all but dev-d so far.
+echo 200.2 > "$d/server-id"; grep -vx dev-d "$d/server" > "$d/s" && mv "$d/s" "$d/server"
+hatter_in sync || true
+expect "sync: a session lost to a server restart is kept, though only one is missing" \
+    "$(yes_if all_of has G dev-d -- says "dev-d  kept (not running, and not seen ending on this tmux server" \
+                  -- lacks "none is dropped")"
+# Still missing a pass later, on the same new server: still kept.
+hatter_in sync || true
+expect "sync: ...and on the next pass too, since it never ran on the new server" "$(yes_if has G dev-d)"
+
+# The issue's case: the server comes back with one stray session and none of
+# the seven, and every one is kept.
+setup emptied
+echo 100.1 > "$d/server-id"; printf "$ALL7" > "$d/server"
+hatter_in sync || true
+echo 300.3 > "$d/server-id"; echo placeholder > "$d/server"
+hatter_in sync || true
+expect "sync: a server back empty but for a stray keeps all seven" \
+    "$(yes_if has_all G dev-a dev-b dev-c dev-d dev-l "$Q")"
+
 # One of seven going is a close, not a reboot: dropped.
 setup one-gone
 printf 'dev-a\ndev-b\ndev-c\ndev-l\n%s\n' "$Q" > "$d/server"

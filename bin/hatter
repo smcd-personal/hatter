@@ -666,8 +666,10 @@ tell_server_sessions() {
 # Every session on a server and every window in them, in one round trip:
 #   S<tab>session
 #   W<tab>session<tab>window id<tab>name<tab>cwd<tab>pinned
+# Each S line also carries which tmux server it came from (its pid and start
+# time), so sync can tell a session that ended from one a restart lost.
 remote_tmux_state() {
-    local sfmt=$'S\t#S'
+    local sfmt=$'S\t#S\t#{pid}.#{start_time}'
     local wfmt=$'W\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@hatter-pinned}'
     remote_sh "$1" "tmux list-sessions -F $(sq "$sfmt") 2>/dev/null || true
         tmux list-windows -a -F $(sq "$wfmt") 2>/dev/null || true"
@@ -4801,6 +4803,32 @@ drop_unassigned_now() {
     return 0
 }
 
+# Which sessions sync last saw running on each server, and on which tmux
+# server instance: "<instance>\t<session>" per line, in the state dir, not the
+# config. A recorded session that is not running is evidence of a close only
+# if it was seen on the instance running now. One last seen on an earlier
+# instance was lost to a restart, or is still waiting for the restore.
+seen_file() {
+    printf '%s/hatter/seen.%s' "${XDG_STATE_HOME:-$HOME/.local/state}" "${1//[^A-Za-z0-9_.@-]/_}"
+}
+# seen_record <host> <instance> <live sessions>
+seen_record() {
+    local f tmp
+    f=$(seen_file "$1")
+    mkdir -p "${f%/*}" 2>/dev/null || return 0
+    tmp="$f.$$"
+    { printf '%s\n' "$3" | awk -v i="$2" 'NF { print i "\t" $0 }' > "$tmp" && mv -f "$tmp" "$f"; } \
+        2>/dev/null || rm -f "$tmp"
+    return 0
+}
+# seen_ended <host> <instance> <session>: it ran on this very instance, so its
+# end was a close, not a restart. An unknown instance (an old tmux, a stub)
+# proves nothing either way, and sync falls back to counting.
+seen_ended() {
+    [[ -z "$2" ]] && return 0
+    grep -qxF -- "$2"$'\t'"$3" "$(seen_file "$1")" 2>/dev/null
+}
+
 cmd_sync() {
     # A dead socket makes every hat look empty; refuse rather than report a
     # no-op as success.
@@ -4878,7 +4906,7 @@ sync_once() {
 
     # Work out the new config, all in memory, saying what was found.
     local patch='{}' adopt="" w host gname gkey order recorded owner wjson seen ukey
-    local lives=() wjsons=() gjsons=() wsjsons=()
+    local lives=() wjsons=() gjsons=() wsjsons=() insts=() inst
     for ((i = 0; i < n; i++)); do
         hat="${hats[$i]}" w="${wins[$i]}" host="${hosts[$i]}"
         lives[$i]="" wjsons[$i]="" gjsons[$i]="" wsjsons[$i]=""
@@ -4894,6 +4922,8 @@ sync_once() {
         fi
         reached+="$host"$'\n'
         lives[$i]="$live"
+        inst=$(awk -F '\t' '$1 == "S" { print $3; exit }' "$tmp/ssh.$i")
+        insts[$i]="$inst"
         seen=""
         # Session -> its windows, in tmux order.
         wjson=$(jq -R -s '
@@ -5027,7 +5057,8 @@ sync_once() {
             grep -qxF -- "$rs" <<<"$live" && running=$((running + 1))
             grep -qxF -- "$rs" <<<"$seen" && continue
             unseen+="$rg"$'\x1f'"$rs"$'\n'
-            if ! grep -qxF -- "$rs" <<<"$live" && jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null; then
+            if ! grep -qxF -- "$rs" <<<"$live" && jq -e --arg g "$rg" 'has($g)' <<<"$patch" >/dev/null \
+               && seen_ended "$host" "$inst" "$rs"; then
                 drops=$((drops + 1))
             fi
         done < <(cfg --arg l "$hat" '
@@ -5047,7 +5078,9 @@ sync_once() {
                 [[ "$place" == "not running" ]] || echo "  $hat / $rn / $rs  kept ($place)"
                 continue
             }
-            if [[ "$place" == "not running" && "$hold" == 0 ]]; then
+            if [[ "$place" == "not running" ]] && ! seen_ended "$host" "$inst" "$rs"; then
+                place="not running, and not seen ending on this tmux server: restarted?"
+            elif [[ "$place" == "not running" && "$hold" == 0 ]]; then
                 echo "  $hat / $rn / $rs  dropped (not running)"
                 continue
             fi
@@ -5057,6 +5090,11 @@ sync_once() {
                           '.[$g].sessions[$s] = $e' <<<"$patch")
         done <<<"$unseen"
 
+    done
+    # What ran where, for the next pass: written only now, so every hat on a
+    # server is judged against the same earlier look.
+    for ((i = 0; i < n; i++)); do
+        [[ -n "${insts[$i]:-}" ]] && seen_record "${hosts[$i]}" "${insts[$i]}" "${lives[$i]}"
     done
     rm -rf "$tmp"
     cmux_snapshot_drop
@@ -7611,6 +7649,12 @@ restore --missing` mirrors again, or "kept (running, in no cmux group)", which
 sync then puts back in its group in cmux. An entry is dropped only when its
 session is no longer running on the server: "dropped (not running)". To close
 a workspace for good, use `hatter rm`.
+
+A session that is not running is dropped only if sync saw it running on the
+tmux server running now: then it ended, rather than being lost when the server
+restarted. One last seen on an earlier server is kept, "not seen ending on this
+tmux server", until a restore brings it back or `hatter rm` forgets it. With a
+tmux too old to say which server it is, sync falls back to counting.
 
 A server still coming back from a reboot may run only some of its sessions.
 So when none of a hat's recorded sessions is running, or more than half of
