@@ -96,6 +96,26 @@ out=$(run 'cmd_new dev-main') || fail "new dev-main: $out"
 grep -q 'tmux: *dev-main$' <<<"$out" || fail "new dev-main: renamed:
 $out"
 
+# --- new: moving Unassigned's last session out drops the group now (#90) -----
+setup_un() {
+    setup "$@"
+    jq '.groups["Unassigned@dev"] = {"hat":"dev","name":"Unassigned","managed":true,
+                                    "sessions":{"scratch":{}}}' \
+        "$work/cfg/hatter/config.json" > "$work/c.json" && mv "$work/c.json" "$work/cfg/hatter/config.json"
+}
+setup_un scratch
+out=$(run 'drop_unassigned_now() { echo "drop-unassigned $1"; }; cmd_new scratch --group Atlas') \
+    || fail "new scratch out of Unassigned: $out"
+grep -q '^drop-unassigned dev$' <<<"$out" || fail "new scratch: Unassigned not dropped from cmux: $out"
+[[ "$(jq -r '.groups | has("Unassigned@dev")' "$work/cfg/hatter/config.json")" == false ]] \
+    || fail "new scratch: Unassigned left in the config"
+
+# A hat with no Unassigned to begin with has none to drop.
+setup scratch
+out=$(run 'drop_unassigned_now() { echo "drop-unassigned $1"; }; cmd_new scratch --group Atlas') \
+    || fail "new scratch: $out"
+! grep -q 'drop-unassigned' <<<"$out" || fail "new scratch with no Unassigned: dropped one: $out"
+
 # --- tab: a bare name typed in a hat's window ---------------------------------
 setup scratch
 out=$(STUB_HAT=dev run 'tab_target scratch; echo "=> $TAB_SESSION $TAB_HAT"') \

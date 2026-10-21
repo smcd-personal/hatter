@@ -2740,6 +2740,8 @@ cmd_new() {
     [[ -n "$host" ]] || die "hat '$hat' has no ssh destination"
 
     ensure_remote_session "$host" "$session" "$d"
+    local had_un=0
+    group_exists "$(unassigned_key "$hat")" && had_un=1
     remember_session "$group" "$session"
 
     local win gref wref
@@ -2756,6 +2758,7 @@ cmd_new() {
 
     cmux_group_add "$gref" "$wref" || die "cmux would not put '$session' into group '$(group_display "$group")'"
     apply_group_style "$group" "$gref"
+    [[ "$had_un" == 0 ]] || drop_unassigned_now "$hat" "$win"
     discard_stray_workspace "$win"
     # Without --focus the run ends back where it started, so selecting the new
     # workspace would only flash it.
@@ -4148,8 +4151,15 @@ cmd_rm() {
     fi
     host=$(hat_ssh "$hat")
 
+    # Its window, found while the config still records the session.
+    local unwin=""
+    if [[ -n "$group" && "$group" == "$(unassigned_key "$hat")" ]] && cmux_alive; then
+        unwin=$(find_hat_window "$hat" 2>/dev/null) || unwin=""
+    fi
+
     if [[ "$keep" == 1 ]]; then
         forget_session "$session" "$hat"
+        drop_unassigned_now "$hat" "$unwin"
         info "Forgot '$session' (group '$group'); the server was not touched"
         echo "  If it is running it goes on running, and tmux-resurrect may bring it back"
         echo "  after a reboot. While it runs, the next sync records it again: in its group"
@@ -4180,6 +4190,7 @@ cmd_rm() {
         *:recorded)      info "Forgot '$session' (group '$group'); it was not running on $host" ;;
         *)               die "'$session' is neither recorded nor running on $host" ;;
     esac
+    drop_unassigned_now "$hat" "$unwin"
     # Tell the server now, or hat-restore brings it back after a reboot before
     # the next sync has.
     tell_server_sessions "$host" 2>/dev/null \
@@ -4735,12 +4746,19 @@ settle_ungrouped() {
         cmux_group_to_top "$ref" "$win" "$groups_json"
         return 0
     fi
+    cmux_drop_unassigned "$hat" "$win" "$live"
+    return 0
+}
 
-    # Empty in the config: out of cmux as well, unless a running session is
-    # still in it, which is the next sync's to record. Read again right before,
-    # so nothing moved in since is set loose.
-    local now busy members
+# cmux_drop_unassigned <hat> <window> <live sessions>: the config has no
+# Unassigned for <hat>, so take it out of cmux as well, unless a running
+# session is still in it, which is the next sync's to record. Read right
+# before, so nothing moved in since is set loose.
+cmux_drop_unassigned() {
+    local hat="$1" win="$2" live="$3" ref now ws_json busy members
     now=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || return 0
+    ref=$(jq -r --arg n "$UNASSIGNED" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$now")
+    [[ -n "$ref" ]] || return 0
     ws_json=$(cmux_json workspace list --window "$win" 2>/dev/null) || return 0
     IFS=' ' read -r members busy < <(jq -r --argjson ws "$ws_json" --arg r "$ref" --arg live "$live" '
         ($live | split("\n")) as $l
@@ -4764,6 +4782,22 @@ settle_ungrouped() {
         warn "cmux would not remove the group '$UNASSIGNED' from $hat's window (it holds a workspace"
         warn "that is not a hatter session); leaving it until what is in it changes"
     fi
+    return 0
+}
+
+# drop_unassigned_now <hat> <window>: a command has just taken the last session
+# out of <hat>'s Unassigned, which went from the config with it. Take it out of
+# cmux now too, rather than leave the next sync to find it. The caller finds
+# the window before the config changes: with the session gone from it, another
+# hat's window can look as much like this hat's. Best effort: a failure here
+# leaves that to sync and never fails the command.
+drop_unassigned_now() {
+    local hat="$1" win="$2" live
+    [[ -n "$win" ]] || return 0
+    ! group_exists "$(unassigned_key "$hat")" || return 0
+    cmux_alive || return 0
+    live=$(hat_live_sessions "$(hat_ssh "$hat")" 2>/dev/null) || return 0
+    ( cmux_drop_unassigned "$hat" "$win" "$live" ) || true
     return 0
 }
 
@@ -4898,7 +4932,11 @@ sync_once() {
             else
                 owner=$(AWK_G="$gkey" awk -F '\037' '($1 "") == (ENVIRON["AWK_G"] "") { print $2; exit }' <<<"$adopt")
                 if [[ -z "$owner" ]]; then
-                    info "Adopting group '$gname' under hat '$hat'"
+                    # Unassigned is the hat's own group, recorded again (as
+                    # managed) rather than taken in: an emptied one goes with
+                    # the prune and the settle below, so it is not announced.
+                    [[ "$gname" == "$UNASSIGNED" ]] \
+                        || info "Adopting group '$gname' under hat '$hat'"
                     adopt+="$gkey$US$hat"$'\n'
                     owner="$hat"
                 fi
@@ -7484,11 +7522,12 @@ records goes into Unassigned. Each hat has an Unassigned group, which hatter
 manages itself, shown at the top of the hat's window (below any group pinned
 there). It holds sessions created on the server directly, mirrored in loose,
 or forgotten while still running. It is removed, from cmux and the config,
-once it is empty, and an entry in it is dropped like any other once its
-session stops. Move a workspace out of it as out of any group: drag it in
-cmux and sync, or `hatter new <session> --group <name>`; with no --group,
-`hatter new` takes it to the hat's default or first real group, since making
-or attaching a workspace on purpose places it. A new workspace goes to
+once it is empty: at once when `hatter rm` or `hatter new` takes its last
+session out, otherwise at the next sync. An entry in it is dropped like any
+other once its session stops. Move a workspace out of it as out of any
+group: drag it in cmux and sync, or `hatter new <session> --group <name>`;
+with no --group, `hatter new` takes it to the hat's default or first real
+group, since making or attaching a workspace on purpose places it. A new workspace goes to
 Unassigned only when its hat has no other group, and a cmux Unassigned that
 cmux will not remove is left until what is in it changes.
 
