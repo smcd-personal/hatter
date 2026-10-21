@@ -44,8 +44,9 @@ Termux comes from two places, and hatter works with either:
   shortcuts. The two apps are signed together, and an F-Droid Termux will
   not take commands from a Termux:Widget installed some other way.
 
-The two builds use separate package repositories, so do not mix them. Open
-Termux once and let it finish setting up.
+The two builds are signed differently and install packages from separate
+repositories, so Android will not install one over the other: to switch,
+uninstall the first. Open Termux once and let it finish setting up.
 
 ## 2. The installer
 
@@ -131,9 +132,9 @@ The session keeps running on the server.
 
 ### Shortcuts
 
-Long-press the home screen and add the Termux widget (**Termux:Widget** with
-the F-Droid build, **Termux** with the Play build). It lists one shortcut per
-hat and per workspace, under `hatter/`. A workspace's
+Long-press the home screen and add the Termux widget: **Termux:Widget** with
+the F-Droid build, or the widget the Play build of Termux provides itself. It
+lists one shortcut per hat and per workspace, under `hatter/`. A workspace's
 shortcut is named `<hat> <rest of its name>`, so `dev atlas` is the
 `dev-atlas` workspace, and each hat's workspaces sort right after it.
 
@@ -222,7 +223,8 @@ connection.
 yet. See [step 3](#3-let-the-phone-in).
 
 **A shortcut does nothing.** With the F-Droid build, Termux:Widget and Termux
-have to come from the same source (both F-Droid, or both GitHub). On recent
+have to come from the same source (both F-Droid, or both GitHub). The Play
+build has no separate widget app, so there is nothing to mismatch. On recent
 Android, Termux also needs the "Display over other apps" permission to open a
 session from the home screen. Check the shortcut itself runs from a Termux
 prompt with `bash ~/.shortcuts/hatter/dev`.
