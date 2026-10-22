@@ -2742,6 +2742,7 @@ cmd_new() {
     [[ -n "$host" ]] || die "hat '$hat' has no ssh destination"
 
     ensure_remote_session "$host" "$session" "$d"
+    seen_now "$host" "$session"
     local had_un=0
     group_exists "$(unassigned_key "$hat")" && had_un=1
     remember_session "$group" "$session"
@@ -4803,30 +4804,52 @@ drop_unassigned_now() {
     return 0
 }
 
-# Which sessions sync last saw running on each server, and on which tmux
-# server instance: "<instance>\t<session>" per line, in the state dir, not the
-# config. A recorded session that is not running is evidence of a close only
-# if it was seen on the instance running now. One last seen on an earlier
-# instance was lost to a restart, or is still waiting for the restore.
+# Which sessions have run on each server, and on which tmux server instance:
+# "<instance>\t<session>" per line, in the state dir, not the config. A
+# recorded session that is not running is evidence of a close only if it ran
+# on the instance running now. One that ran only on an earlier instance was
+# lost to a restart, or is still waiting for the restore.
 seen_file() {
     printf '%s/hatter/seen.%s' "${XDG_STATE_HOME:-$HOME/.local/state}" "${1//[^A-Za-z0-9_.@-]/_}"
 }
-# seen_record <host> <instance> <live sessions>
+# seen_record <host> <instance> <sessions>: they ran on <instance>. While the
+# instance is the same, what ran on it before is kept, so a session sync holds
+# back keeps its evidence for a later pass; a new instance starts afresh.
+# Entries for sessions the config no longer records, and that are not running,
+# have nothing left to decide and go.
 seen_record() {
-    local f tmp
-    f=$(seen_file "$1")
+    local host="$1" inst="$2" sessions="$3" f tmp keep
+    [[ -n "$inst" ]] || return 0
+    f=$(seen_file "$host")
     mkdir -p "${f%/*}" 2>/dev/null || return 0
+    keep=$( { cfg '.groups[].sessions // {} | keys_unsorted[]'; printf '%s\n' "$sessions"; } | sort -u)
     tmp="$f.$$"
-    { printf '%s\n' "$3" | awk -v i="$2" 'NF { print i "\t" $0 }' > "$tmp" && mv -f "$tmp" "$f"; } \
+    { { awk -F '\t' -v i="$inst" '$1 == i { print $2 }' "$f" 2>/dev/null || true
+        printf '%s\n' "$sessions"; } \
+        | awk 'NF && !s[$0]++' | grep -xF -- "$keep" \
+        | awk -v i="$inst" '{ print i "\t" $0 }' > "$tmp" && mv -f "$tmp" "$f"; } \
         2>/dev/null || rm -f "$tmp"
     return 0
 }
 # seen_ended <host> <instance> <session>: it ran on this very instance, so its
-# end was a close, not a restart. An unknown instance (an old tmux, a stub)
-# proves nothing either way, and sync falls back to counting.
+# end was a close, not a restart. With nothing to go on (an old tmux, a first
+# pass with no record yet) it proves nothing, and sync falls back to counting.
 seen_ended() {
+    local f
     [[ -z "$2" ]] && return 0
-    grep -qxF -- "$2"$'\t'"$3" "$(seen_file "$1")" 2>/dev/null
+    f=$(seen_file "$1")
+    [[ -e "$f" ]] || return 0
+    grep -qxF -- "$2"$'\t'"$3" "$f" 2>/dev/null
+}
+# seen_now <host> <session>: record a session just made, so that one which
+# ends before the next sync is known to have run here. Best effort.
+seen_now() {
+    local inst
+    inst=$(remote_sh "$1" "tmux display-message -p -t $(sq "=$2") '#{pid}.#{start_time}' 2>/dev/null || true" \
+               2>/dev/null) || return 0
+    [[ "$inst" == . ]] && inst=""
+    ( seen_record "$1" "$inst" "$2" ) || true
+    return 0
 }
 
 cmd_sync() {
@@ -4923,6 +4946,7 @@ sync_once() {
         reached+="$host"$'\n'
         lives[$i]="$live"
         inst=$(awk -F '\t' '$1 == "S" { print $3; exit }' "$tmp/ssh.$i")
+        [[ "$inst" == . ]] && inst=""          # a tmux that knows neither
         insts[$i]="$inst"
         seen=""
         # Session -> its windows, in tmux order.
@@ -5079,7 +5103,7 @@ sync_once() {
                 continue
             }
             if [[ "$place" == "not running" ]] && ! seen_ended "$host" "$inst" "$rs"; then
-                place="not running, and not seen ending on this tmux server: restarted?"
+                place="not running, and never ran on this tmux server: restarted?"
             elif [[ "$place" == "not running" && "$hold" == 0 ]]; then
                 echo "  $hat / $rn / $rs  dropped (not running)"
                 continue
@@ -5090,11 +5114,6 @@ sync_once() {
                           '.[$g].sessions[$s] = $e' <<<"$patch")
         done <<<"$unseen"
 
-    done
-    # What ran where, for the next pass: written only now, so every hat on a
-    # server is judged against the same earlier look.
-    for ((i = 0; i < n; i++)); do
-        [[ -n "${insts[$i]:-}" ]] && seen_record "${hosts[$i]}" "${insts[$i]}" "${lives[$i]}"
     done
     rm -rf "$tmp"
     cmux_snapshot_drop
@@ -5125,6 +5144,12 @@ sync_once() {
             | .groups[$e.key].collapsed = $e.value.collapsed
             | .groups[$e.key].sessions  = $e.value.sessions)
         | '"$PRUNE_UNASSIGNED"' | '"$SYNC_ORDER_JQ"
+    # What ran where, for the next pass: only once this pass's decisions are
+    # written, and under the lock, so a retried or failed pass cannot erase the
+    # evidence it judged by, and an older look never overwrites a newer one.
+    for ((i = 0; i < n; i++)); do
+        [[ -n "${insts[$i]:-}" ]] && seen_record "${hosts[$i]}" "${insts[$i]}" "${lives[$i]}"
+    done
     if [[ "$held" == 1 ]]; then hatter_unlock; fi
 
     # Now that the config holds what this pass found, every running session in
@@ -7652,9 +7677,10 @@ a workspace for good, use `hatter rm`.
 
 A session that is not running is dropped only if sync saw it running on the
 tmux server running now: then it ended, rather than being lost when the server
-restarted. One last seen on an earlier server is kept, "not seen ending on this
+restarted. One that ran only on an earlier server is kept, "never ran on this
 tmux server", until a restore brings it back or `hatter rm` forgets it. With a
-tmux too old to say which server it is, sync falls back to counting.
+tmux too old to say which server it is, or no record yet, sync falls back to
+counting.
 
 A server still coming back from a reboot may run only some of its sessions.
 So when none of a hat's recorded sessions is running, or more than half of

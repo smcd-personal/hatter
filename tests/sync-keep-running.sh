@@ -41,9 +41,17 @@ case "$cmd" in
     *"@@hatter-"*)                        # listing and ending sessions: for real
         exec env -u XDG_STATE_HOME -u XDG_DATA_HOME HOME="$STUB_DIR/rhome" \
             PATH="$STUB_TBIN:$PATH" /bin/sh -c "$cmd" ;;
+    *"display-message -p -t"*)            # seen_now
+        cat "$STUB_DIR/server-id" 2>/dev/null || true ;;
     *"list-sessions -F 'S"*)              # remote_tmux_state
         # $STUB_DIR/server-id, when present, names the tmux server instance.
         id=$(cat "$STUB_DIR/server-id" 2>/dev/null || true)
+        # $STUB_DIR/bump: another hatter writes the config while this pass
+        # reads the server, once, so the pass has to start again.
+        if [[ -e "$STUB_DIR/bump" ]]; then
+            rm -f "$STUB_DIR/bump"; c="$STUB_DIR/home/.config/hatter/config.json"
+            jq '.bumped = true' "$c" > "$c.new" && mv "$c.new" "$c"
+        fi
         while IFS= read -r s; do [[ -n "$s" ]] && printf 'S\t%s\t%s\n' "$s" "$id"; done < "$srv"
         while IFS= read -r s; do [[ -n "$s" ]] && printf 'W\t%s\t@1\tw-%s\t/srv\t\n' "$s" "$s"; done < "$srv" ;;
     *) echo "stub ssh: unexpected: $cmd" >&2; exit 1 ;;
@@ -255,7 +263,7 @@ hatter_in sync || true
 echo 200.2 > "$d/server-id"; grep -vx dev-d "$d/server" > "$d/s" && mv "$d/s" "$d/server"
 hatter_in sync || true
 expect "sync: a session lost to a server restart is kept, though only one is missing" \
-    "$(yes_if all_of has G dev-d -- says "dev-d  kept (not running, and not seen ending on this tmux server" \
+    "$(yes_if all_of has G dev-d -- says "dev-d  kept (not running, and never ran on this tmux server" \
                   -- lacks "none is dropped")"
 # Still missing a pass later, on the same new server: still kept.
 hatter_in sync || true
@@ -270,6 +278,47 @@ echo 300.3 > "$d/server-id"; echo placeholder > "$d/server"
 hatter_in sync || true
 expect "sync: a server back empty but for a stray keeps all seven" \
     "$(yes_if has_all G dev-a dev-b dev-c dev-d dev-l "$Q")"
+
+# A pass that has to start again (another hatter wrote the config meanwhile)
+# still judges by the evidence the first try saw: the record is written only
+# with the config.
+setup retried
+echo 100.1 > "$d/server-id"; printf "$ALL7" > "$d/server"
+hatter_in sync || true
+grep -vx dev-d "$d/server" > "$d/s" && mv "$d/s" "$d/server"; touch "$d/bump"
+hatter_in sync || true
+expect "sync: a pass that starts again still drops the session that ended" \
+    "$(yes_if all_of hasnt G dev-d -- says "reading it again" -- lacks "never ran on this tmux server")"
+
+# Held back by the count, a session keeps its evidence for a later pass.
+setup held
+echo 100.1 > "$d/server-id"; printf "$ALL7" > "$d/server"
+hatter_in sync || true
+printf 'dev-a\ndev-b\n' > "$d/server"           # five of seven end at once
+hatter_in sync || true
+expect "sync: sessions the count holds back are kept" "$(yes_if all_of has_all G dev-c dev-d dev-l -- says "none is dropped this pass")"
+expect "sync: ...and keep their record of having run here" \
+    "$(yes_if grep -qx "$(printf '100.1\tdev-c')" "$d/state/hatter/seen.dev@example.com")"
+# Five more start and are recorded: now the five gone are under half.
+jq '.groups.G.sessions += {"dev-n1":{},"dev-n2":{},"dev-n3":{},"dev-n4":{},"dev-n5":{},"dev-n6":{}}' \
+    "$d/home/.config/hatter/config.json" > "$d/c" && mv "$d/c" "$d/home/.config/hatter/config.json"
+printf 'dev-a\ndev-b\ndev-n1\ndev-n2\ndev-n3\ndev-n4\ndev-n5\ndev-n6\n' > "$d/server"
+hatter_in sync || true
+expect "sync: ...so a later pass drops them" "$(yes_if all_of hasnt G dev-c -- hasnt G dev-d -- hasnt G dev-l)"
+
+# A session made and closed before any sync saw it: new recorded that it ran
+# here, so it is dropped like any other.
+setup made
+sed '/^# -* main$/,$d' "$hatter" > "$work/lib.sh"
+echo 100.1 > "$d/server-id"; printf "$ALL7" > "$d/server"
+hatter_in sync || true
+env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" XDG_STATE_HOME="$d/state" PATH="$work/bin:$PATH" \
+    STUB_DIR="$d" /bin/bash -c "source '$work/lib.sh'; seen_now dev@example.com dev-new" \
+    > "$d/out" 2>&1 || true
+expect "new: a session just made is recorded as having run here" \
+    "$(yes_if grep -qx "$(printf '100.1\tdev-new')" "$d/state/hatter/seen.dev@example.com")"
+expect "...beside what ran there before" \
+    "$(yes_if grep -qx "$(printf '100.1\tdev-c')" "$d/state/hatter/seen.dev@example.com")"
 
 # One of seven going is a close, not a reboot: dropped.
 setup one-gone
