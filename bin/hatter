@@ -337,6 +337,51 @@ hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
 hat_mosh()   { cfg --arg l "$1" '.hats[$l].mosh // false'; }
 hat_names()  { cfg '.hats | keys[]?'; }
 
+# How a hat's panes start their agents, as the tmux options hat-launch reads:
+#   "launch": {"kind": "claude", "args": {"claude": "--permission-mode auto"}}
+# gives @hat_default_kind and @hat_claude_args. A kind is a word; args are
+# split on whitespace with no quote handling, so neither may hold a quote.
+LAUNCH_KINDS="claude codex shell"
+launch_value_ok() { [[ "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *"\\"* ]]; }
+
+# hat_set_launch <hat> <changes json>: merge {kind, args} into the hat's launch
+# settings. An empty value takes that setting out.
+hat_set_launch() {
+    [[ "$2" != '{}' ]] || return 0
+    jq_write --arg l "$1" --argjson c "$2" '
+        .hats[$l].launch = ((.hats[$l].launch // {}) * $c
+            | if .kind == "" then del(.kind) else . end
+            | .args = ((.args // {}) | with_entries(select(.value != "")))
+            | if .args == {} then del(.args) else . end)
+        | if .hats[$l].launch == {} then del(.hats[$l].launch) else . end'
+    info "Hat '$1' launch settings: $(cfg -c --arg l "$1" '.hats[$l].launch // {}')"
+    info "Run 'hatter provision $1' to put them on the server"
+}
+
+# hat_launch_conf <user@host>: the body of that server's launch.tmux.conf.
+# Every hat whose ssh destination is <host> shares its one tmux server, so they
+# must agree on each option they set; one that sets nothing has no say.
+hat_launch_conf() {
+    local lines
+    lines=$(cfg --arg h "$1" '
+        [ .hats[]? | select(.ssh == $h) | .launch // {}
+          | (if .kind then {key: "@hat_default_kind", value: .kind} else empty end),
+            (.args // {} | to_entries[] | {key: "@hat_\(.key)_args", value: .value}) ]
+        | group_by(.key)[]
+        | if (map(.value) | unique | length) > 1
+          then "@@conflict \(.[0].key)"
+          else "\(.[0].key)\t\(.[0].value)" end') || return 1
+    local key val
+    while IFS=$'\t' read -r key val; do
+        [[ -n "$key" ]] || continue
+        if [[ "$key" == "@@conflict "* ]]; then
+            die "hats on $1 share a tmux server but set ${key#@@conflict } differently - make them agree (see: hatter help hat)"
+        fi
+        launch_value_ok "$val" || die "$key for $1 holds a quote or a newline, which tmux.conf cannot carry: '$val'"
+        printf "set -g %s '%s'\n" "$key" "$val"
+    done <<< "$lines"
+}
+
 # Each hat gets a colour, so the same hat looks the same everywhere it appears
 # - the rack, and the cmux group headers under it. Eight names rather than free
 # hex: a name maps to both a terminal colour and the hex cmux wants, and eight
@@ -1440,14 +1485,23 @@ apply_group_style() {
 
 # ------------------------------------------------------------ provisioning
 
+# provision_host <user@host> [launch conf]: the second argument is the body of
+# the server's launch.tmux.conf (see hat_launch_conf); empty clears it.
 provision_host() {
-    local host="$1"
+    local host="$1" launch="${2:-}"
     info "Provisioning tmux persistence on $host"
-    remote_sh_stdin "$host" bash -s <<'REMOTE_EOF'
+    remote_sh_stdin "$host" "bash -s -- $(sq "$launch")" <<'REMOTE_EOF'
 set -euo pipefail
 
 CONF="$HOME/.tmux.conf"
 touch "$CONF"
+
+# The options hat-launch reads, sourced by the managed block below. Written
+# whole every time, so a setting taken out of the config goes from here too.
+LAUNCH_CONF="$HOME/.config/hatter/launch.tmux.conf"
+mkdir -p "$HOME/.config/hatter"
+{ [ -z "${1:-}" ] || printf '%s\n' "$1"; } > "$LAUNCH_CONF.new"
+mv "$LAUNCH_CONF.new" "$LAUNCH_CONF"
 
 if [ ! -d "$HOME/.tmux/plugins/tpm" ]; then
     echo "installing tpm"
@@ -1475,15 +1529,23 @@ fi
 cat >> "$CONF" <<'BLOCK'
 
 # >>> hatter managed >>>
-# Session state survives a reboot of this shell server: continuum autosaves
-# every 15 minutes and restores on tmux server start.
+# Session state survives a reboot of this shell server. hat-restore rebuilds
+# it at boot from hatter's registry, agents resumed; resurrect snapshots are
+# kept as a fallback, restored by hand (prefix + ctrl-r). continuum does not
+# restore on its own: it would race hat-restore on every server start, and
+# what it brings back are plain shells, colliding with the registry rebuild.
 set -g @plugin 'tmux-plugins/tpm'
 set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @plugin 'tmux-plugins/tmux-continuum'
 set -g @resurrect-capture-pane-contents 'on'
 set -g @resurrect-strategy-nvim 'session'
-set -g @continuum-restore 'on'
+set -g @continuum-restore 'off'
 set -g @continuum-save-interval '15'
+
+# The options hat-launch reads (@hat_default_kind, @hat_<kind>_args), from the
+# hat's `launch` settings in hatter's config. Provision rewrites this file, so
+# a fresh server starts agents the same way as one where they were set by hand.
+source-file -q "$HOME/.config/hatter/launch.tmux.conf"
 
 # Logging out must not destroy a tab by accident. Every pane runs its login
 # shell inside a loop, so `exit` and stray ctrl-D just hand back a fresh prompt.
@@ -2468,7 +2530,7 @@ HATUNIT
         esac
     fi
 else
-    echo "no systemd --user here - hook up hat-restore at boot by hand"
+    echo "no systemd --user here - hook up hat-restore at boot by hand; nothing restores tmux after a reboot until then"
 fi
 
 # tmux-continuum saves from a status-line interpolation, and a control-mode
@@ -2659,6 +2721,12 @@ if tmux has-session 2>/dev/null; then
     tmux set -g window-size latest 2>/dev/null || true
     tmux setw -g aggressive-resize on 2>/dev/null || true
     echo "applied to the running tmux server"
+    # A launch option set on this server by hand but not in the config is gone
+    # at the next server start. Say so, rather than unset what someone chose.
+    for o in $(tmux show-options -g 2>/dev/null | awk '$1 ~ /^@hat_/ { print $1 }'); do
+        grep -q "^set -g $o " "$LAUNCH_CONF" \
+            || echo "NOTE: $o is set on the running server but not in hatter's config; a fresh server will not have it (see: hatter help hat)"
+    done
 fi
 
 # Prove it actually works rather than trusting show-options: a shell that exits
@@ -4269,8 +4337,9 @@ cmd_key() {
 # A remote sh fragment that ends tmux session $s and makes sure a reboot does
 # not bring it back. Prints "killed" or "not running", or "@@hatter-err <why>".
 #
-# tmux-continuum restores the last tmux-resurrect snapshot when the server
-# starts, and that snapshot still holds the session. So a fresh one is taken
+# A tmux-resurrect snapshot still holds the session, and it is restored by
+# hand, or when the server starts on a host provisioned before continuum's
+# auto-restore was turned off. So a fresh one is taken
 # once it is gone (hat-save, when provisioned), and then the session is taken
 # out of whatever snapshot `last` points at. The second step is what covers
 # the last session on a server: hat-save keeps the old snapshot when nothing
@@ -4675,10 +4744,11 @@ cmd_hat() {
             cfg '.hats | to_entries[]
                  | "\(.key)\t-> \(.value.ssh)  [\(.value.remote_dir)]"
                    + (if .value.default_group then "  default group: \(.value.default_group)" else "" end)
-                   + (if .value.mosh then "  mosh" else "" end)'
+                   + (if .value.mosh then "  mosh" else "" end)
+                   + (if .value.launch.kind then "  launches \(.value.launch.kind)" else "" end)'
             ;;
         add|set)
-            local name="${1:-}" ssh_dest="" dir="" defgroup="" mosh=""
+            local name="${1:-}" ssh_dest="" dir="" defgroup="" mosh="" launch='{}' k v
             shift || true
             while [[ $# -gt 0 ]]; do
                 case "$1" in
@@ -4687,23 +4757,39 @@ cmd_hat() {
                     --group) defgroup="$2"; shift 2 ;;
                     --mosh) mosh=true; shift ;;
                     --no-mosh) mosh=false; shift ;;
+                    --kind)
+                        [[ $# -ge 2 ]] || die "--kind needs one of: $LAUNCH_KINDS (or '' to clear)"
+                        [[ -z "$2" || " $LAUNCH_KINDS " == *" $2 "* ]] || die "--kind: '$2' is not one of: $LAUNCH_KINDS"
+                        launch=$(jq -c --arg v "$2" '.kind = $v' <<< "$launch"); shift 2 ;;
+                    --args)
+                        [[ $# -ge 2 && "$2" == *=* ]] || die "--args takes <kind>=<arguments>, as in --args claude='--permission-mode auto'"
+                        k="${2%%=*}" v="${2#*=}"
+                        [[ " $LAUNCH_KINDS " == *" $k "* ]] || die "--args: '$k' is not one of: $LAUNCH_KINDS"
+                        launch_value_ok "$v" || die "--args: the arguments may not hold a quote, a backslash or a newline"
+                        launch=$(jq -c --arg k "$k" --arg v "$v" '.args[$k] = $v' <<< "$launch"); shift 2 ;;
                     *) die "unknown flag: $1" ;;
                 esac
             done
-            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh]"
+            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh] [--kind <kind>] [--args <kind>=<args>]"
             # Before anything is written: a default group may not be hatter's own.
             [[ -n "$defgroup" ]] && group_name_reserved "$defgroup" && \
                 die "'$UNASSIGNED' is hatter's own group, kept for workspaces in no group - pick another default group"
-            # Only the transport changing: no need to ask for the rest again.
-            if [[ -n "$mosh" && -z "$ssh_dest$dir$defgroup" ]] && hat_exists "$name"; then
-                jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
-                info "Hat '$name' attaches with $([[ "$mosh" == true ]] && echo mosh || echo ssh)"
+            # Only the transport or the launch settings changing: no need to
+            # ask for the rest again.
+            if [[ ( -n "$mosh" || "$launch" != '{}' ) && -z "$ssh_dest$dir$defgroup" ]] \
+               && hat_exists "$name"; then
+                if [[ -n "$mosh" ]]; then
+                    jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
+                    info "Hat '$name' attaches with $([[ "$mosh" == true ]] && echo mosh || echo ssh)"
+                fi
+                hat_set_launch "$name" "$launch"
                 return 0
             fi
             register_hat "$name" "$ssh_dest" "$dir" "$defgroup"
             if [[ -n "$mosh" ]]; then
                 jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
             fi
+            hat_set_launch "$name" "$launch"
             if [[ -n "$defgroup" ]]; then
                 group_exists "$defgroup" || register_group "$defgroup" "$name"
             fi
@@ -5579,7 +5665,9 @@ cmd_provision() {
     else
         die "unknown hat or group: $token"
     fi
-    provision_host "$host"
+    local launch
+    launch=$(hat_launch_conf "$host") || exit 1
+    provision_host "$host" "$launch"
 }
 
 cmd_list() {
@@ -7910,11 +7998,23 @@ Subcommands:
                                           in when you omit --group. --mosh makes
                                           `hatter attach` use mosh where it is
                                           installed (--no-mosh turns it off).
+                [--kind <kind>] [--args <kind>=<args>]
+                                          How the hat's panes start: --kind is
+                                          the default (claude, codex or shell),
+                                          --args the extra arguments for every
+                                          launch of a kind, new or resumed.
+                                          An empty value clears it. Takes
+                                          effect on the server at the next
+                                          `hatter provision`.
   rename <old> <new>                      Rename a hat and re-prefix its sessions
   rm <hat>                                Forget a hat (server untouched)
 
   hatter hat add cloud --ssh you@shell.example.com
+  hatter hat set cloud --kind claude --args claude='--permission-mode auto'
   hatter hat status
+
+Hats that share an ssh destination share one tmux server, so they must agree
+on --kind and on each kind's --args; provision refuses if they do not.
 USAGE
     ;;
     group) cat <<'USAGE'
@@ -8096,8 +8196,14 @@ hatter provision <hat|user@host>
 
 Set up a shell server so its state survives both a reboot and a stray logout:
 
-  - tpm, tmux-resurrect and tmux-continuum, autosaving every 15 minutes and
-    restoring on tmux server start
+  - tpm, tmux-resurrect and tmux-continuum, autosaving every 15 minutes.
+    continuum does not restore on its own: hat-restore (below) owns that, and
+    the two would race. A snapshot can still be restored by hand (prefix +
+    ctrl-r).
+  - the hat's launch settings (see: hatter help hat), as the tmux options
+    hat-launch reads, in ~/.config/hatter/launch.tmux.conf on the server.
+    An option set on the running server by hand but not in the config is
+    reported, not removed.
   - every pane's login shell wrapped in a loop, so `exit` and ctrl-D hand back
     a fresh prompt instead of closing the tab by accident
   - a `bye` command on the server for closing one deliberately:
