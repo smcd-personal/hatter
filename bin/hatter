@@ -5581,6 +5581,8 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 #   full                    the stream (re)connected; anything may have happened
 #   heal<TAB>workspace<TAB>surface   a tab was dropped into that workspace
 #                           (drop events carry no window id)
+#   closed<TAB>title        a workspace closed; the layout changed too. Its
+#                           title is the tmux session it mirrored.
 #   sync                    the layout changed
 # and "eof" once the stream ends. Heartbeats are asked for and dropped here:
 # they keep a stream whose reader has gone from outliving it for long.
@@ -5589,14 +5591,17 @@ WATCH_JQ='(inputs | fromjson? | objects
              elif .type != "event" then empty
              elif .name == "surface.created" and .payload.origin? == "detach_attach"
                then "heal\t\(.workspace_id // "")\t\(.surface_id // .payload.surface_id? // "")"
+             elif .name == "workspace.closed"
+               then "closed\t\((.payload | objects | .title) // "" | tostring | gsub("[\t\n\r]"; " "))"
              elif ((.name // "") | tostring | test("^(workspace[.](created|closed|reordered)|surface[.](created|closed))$"))
                then "sync"
              else empty end), "eof"'
 
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') watch: $*"; }
 
-# HATTER_WATCH_DRY prints what the watcher would do instead of doing it; the
-# tests drive the event handling with it.
+# HATTER_WATCH_DRY prints what the watcher would do instead of healing or
+# syncing; the tests drive the event handling with it. The close check below
+# only reads and notifies, so it runs either way.
 watch_heal() {
     if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then echo "heal ${1:-all}${2:+ $2}"; return 0; fi
     autosave_heal watch "${1:-}" "${2:-}"
@@ -5616,9 +5621,75 @@ watch_updated() {
 WATCH_SELF=""
 WATCH_SELF_MTIME=""
 
-# Act on what watch_stream collected (its heals, heal_all and sync), and
-# clear what was done. Heal first, so the sync records where the tabs were
-# dropped.
+# A session name as a word the user can paste after `hatter new`.
+watch_word() {
+    case "$1" in
+        *[!A-Za-z0-9_@%+=,./-]*) sq "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# A macOS notification, where there is one to post. Never fails the watcher.
+watch_notify() {
+    command -v osascript >/dev/null 2>&1 || return 0
+    osascript -e 'on run argv' \
+        -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+        -e 'end run' "$1" "$2" >/dev/null 2>&1 </dev/null || true
+    return 0
+}
+
+# watch_closed <titles>: the workspaces cmux closed while their tmux sessions
+# still run. cmux can close a mirrored workspace by itself (a dropped ssh
+# connection under its tmux mirror is one way), and then the session runs on,
+# detached, with nothing to say so but `hatter list`. So each closed title that
+# is a recorded session, still running on its server and shown in no cmux
+# window, is logged and posted as one notification. Nothing re-mirrors it: a
+# close on purpose looks the same on the stream.
+#
+# watch_act calls this only once the config lock is free, so a hatter command
+# that closes a workspace has finished first: repair has re-opened it, rm and
+# rename have changed the record. Unknown is never "still running": a server
+# that does not answer, or a cmux whose windows cannot be read, says nothing.
+watch_closed() {
+    local s hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd=""
+    tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" == array ]] || return 0
+    shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || continue
+        if grep -qxF -- "$s" <<<"$shown"; then continue; fi
+        hat=$(session_hat "$s")
+        [[ -n "$hat" ]] || continue
+        host=$(hat_ssh "$hat" 2>/dev/null) || continue
+        [[ -n "$host" ]] || continue
+        pairs+="$host"$'\t'"$s"$'\n'
+    done < <(printf '%s\n' "$1" | awk '!seen[$0]++')
+    # One look per server, however many of its workspaces closed at once.
+    while IFS=$'\t' read -r host s; do
+        [[ -n "$s" ]] || continue
+        if [[ "$host" != "$prev" ]]; then
+            prev=$host; ok=1
+            live=$(hat_live_sessions "$host" 2>/dev/null) || ok=0
+        fi
+        [[ "$ok" == 1 ]] || continue
+        grep -qxF -- "$s" <<<"$live" || continue
+        cmd="hatter new $(watch_word "$s")"
+        watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
+        said+="${said:+, }$s"; n=$((n + 1))
+    done < <(printf '%s' "$pairs" | sort -t $'\t' -s -k1,1)
+    if [[ "$n" == 1 ]]; then
+        watch_notify "hatter" "'$said' closed in cmux, but its tmux session still runs. Bring it back: $cmd"
+    elif [[ "$n" -gt 1 ]]; then
+        watch_notify "hatter" "$n workspaces closed in cmux while their tmux sessions still run: $said. Bring them back: hatter restore --missing"
+    fi
+    return 0
+}
+
+# Act on what watch_stream collected (its heals, heal_all, closes and sync),
+# and clear what was done. Heal first, so the sync records where the tabs were
+# dropped. The closes are checked under the same wait as the sync, and before
+# it.
 #
 # A hatter command holding the config lock is usually changing cmux, and a
 # sync that reads cmux mid-change can write that half-way layout back after
@@ -5639,6 +5710,8 @@ watch_act() {
         mtime=$(lock_mtime "$LOCK_DIR")
         [[ "$mtime" -gt 0 && $(( $(date +%s) - mtime )) -gt "$LOCK_STALE_SECONDS" ]] || return 0
     fi
+    [[ -z "$closes" ]] || watch_closed "$closes"
+    closes=""
     watch_sync
     sync=0
     return 0
@@ -5647,7 +5720,7 @@ watch_act() {
 # One connection to the stream. Returns 0 when the stream ended, 3 when hatter
 # was updated underneath it.
 watch_stream() {
-    local dir fifo line kind w sf heals="" heal_all=0 sync=0 since=0 now fails=0 last=0 rc=0
+    local dir fifo line kind w sf heals="" heal_all=0 closes="" sync=0 since=0 now fails=0 last=0 rc=0
     dir=$(mktemp -d "${TMPDIR:-/tmp}/hatter-watch.XXXXXX") || return 0
     WATCH_DIR=$dir
     fifo="$dir/events"
@@ -5664,6 +5737,9 @@ watch_stream() {
                 heal$'\t'*)
                     IFS=$'\t' read -r kind w sf <<<"$line"
                     if [[ -n "$w" && -n "$sf" ]]; then heals+="$w"$'\t'"$sf"$'\n'; else heal_all=1; fi
+                    sync=1 ;;
+                closed$'\t'*)
+                    closes+="${line#closed?}"$'\n'
                     sync=1 ;;
                 sync) sync=1 ;;
                 eof) break ;;
@@ -6531,10 +6607,13 @@ edit_short_path() {
     printf '%s' "$v"
 }
 
+# edit_header <where> <title> <caption> [line] [line] [banner]: the banner is
+# a warning that belongs above everything else on the screen.
 edit_header() {
     printf '\033[?25l\033[H\033[2J'
     printf '%s──── hatter rack ──────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
     printf '  %s%s%s\n' "$C_CY" "${1:-all hats}" "$C_R"
+    [[ -n "${6:-}" ]] && printf '  %s%s%s\n' "$C_YL" "$6" "$C_R"
     printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
     printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$2" "$C_R" "$C_DIM" "$3" "$C_R"
     [[ -n "${4:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$4" "$C_R"
@@ -6581,6 +6660,38 @@ edit_nav() {
     return 0
 }
 
+# The recorded sessions that run on their server but that cmux shows nowhere
+# in their hat's window, one per line, for the top screen's banner. A
+# workspace cmux closed by itself leaves one (the watcher says so as it
+# happens; this is for whoever opens the rack later). Works from the rack's
+# session cache and a cmux snapshot the caller holds, so it costs no call of
+# its own. Says nothing without a snapshot, and nothing for a hat whose server
+# was not read: unknown is not "running".
+edit_detached() {
+    local hat win shown s
+    [[ "$CMUX_SNAP" == 1 ]] || return 0
+    while IFS= read -r hat; do
+        [[ -n "$hat" && -s "$(edit_sessions_file "$hat")" ]] || continue
+        win=$(find_hat_window "$hat"); shown=""
+        [[ -z "$win" ]] || shown=$(window_titles "$win")
+        while IFS= read -r s; do
+            [[ -n "$s" && -n "$(edit_session_field "$hat" "$s" 2)" ]] || continue
+            if [[ "$(session_place "$s" "$s" "$shown" "")" == "running, not in cmux" ]]; then
+                printf '%s\n' "$s"
+            fi
+        done < <(cfg --arg l "$hat" '.groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?')
+    done < <(hat_names)
+    return 0
+}
+
+# The banner line for edit_detached's sessions, cut to the screen's width.
+edit_detached_banner() {
+    local list
+    [[ -n "$1" ]] || return 0
+    list=$(printf '%s' "$1" | awk 'NF && !seen[$0]++' | paste -sd ',' - | sed 's/,/, /g')
+    edit_trunc "! running, not in cmux: $list  (S restores them)" "$(( $2 - 4 ))"
+}
+
 # --- level 1: credentials and hats ------------------------------------------
 #
 # The top screen holds two lists at once: the Claude logins on this Mac
@@ -6591,7 +6702,7 @@ edit_top() {
     local SEL=1 nc nh nt i idx hat host state scol sess cred credstate dot dirty=1
     local preselect=1 ch=""
     local cols lastcols="" hdrtail
-    local letter slot email label r5 r7 e5 e7 active holders
+    local letter slot email label r5 r7 e5 e7 active holders detached=""
     while :; do
         # Gathering is what costs: `cswap list --json` alone is ~300ms, and
         # every hat row is several more jq reads on top. It happens only when
@@ -6657,6 +6768,14 @@ edit_top() {
             done < <(hat_names)
             dirty=0
 
+            # One snapshot for the banner and the preselect below, dropped
+            # before any key can change cmux.
+            detached=""
+            if cmux_alive; then
+                cmux_snapshot
+                detached=$(edit_detached)
+            fi
+
             # The rack's question is "which hat am I wearing", so when it can
             # be answered from the launch window, open on that row. Once only:
             # after the first render the highlight belongs to the user.
@@ -6671,6 +6790,7 @@ edit_top() {
                     done
                 fi
             fi
+            cmux_snapshot_drop
         fi
 
         nt=$((nc+nh))
@@ -6681,7 +6801,8 @@ edit_top() {
         # because some hat is wearing it.
         edit_header "" "HATS" \
             "a hat is a login (user@host): one ssh connection," \
-            "one tmux server, one cmux window."
+            "one tmux server, one cmux window." "" \
+            "$(edit_detached_banner "$detached" "$cols")"
 
         i=0
         while [[ $i -lt $nh ]]; do
@@ -7339,7 +7460,8 @@ Snapshots of config.json, kept separately from git.
                      live client, snapshot, then back up if due (what the
                      timer runs)
   watch              Follow cmux events: move a dragged tab the moment it is
-                     dropped, and sync a second after any layout change
+                     dropped, sync a second after any layout change, and say
+                     when a closed workspace's tmux session still runs
                      (what the watcher runs; stays in the foreground)
   now                Snapshot only, no sync
   list               Show the checkpoints and the rolling save
@@ -7354,6 +7476,14 @@ The watcher reacts at once but only to what cmux reports: renames and group
 changes send no event, so the timer still catches those within a minute, and
 anything that happened while the watcher was down. It restarts itself when
 hatter is reinstalled. Log: ~/.config/hatter/autosave/watch.log
+
+When cmux closes the workspace of a recorded session (by itself, as it can
+when the ssh connection under a mirror drops, or because someone closed it)
+and the tmux session still runs on its server, the watcher logs
+"'<session>' closed in cmux while its tmux session still runs" and posts a
+macOS notification naming `hatter new <session>`, which brings it back. It
+re-mirrors nothing itself: a close on purpose looks the same. A server that
+does not answer gets no notice. The rack lists such sessions at the top.
 
 Two layers, on purpose:
 
