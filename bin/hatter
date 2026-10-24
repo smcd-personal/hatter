@@ -65,6 +65,11 @@ die()  { echo "error: $*" >&2; exit 1; }
 # The unit separator, between fields that may be empty or hold any name: tab
 # is whitespace to read, which merges empty fields and trims names.
 US=$'\x1f'
+# tmux 3.4 escapes control characters in -F output, so a $US in a format
+# arrives as the text \037. A format joins its fields with $HT, which every
+# tmux passes through, and the output goes through tmux_fields before parsing.
+HT=$'\t'
+tmux_fields() { tr '\t' '\037'; }
 info() { echo "==> $*"; }
 warn() { echo "  !! $*" >&2; }
 
@@ -2157,8 +2162,9 @@ do_backfill() {
 
     # pane_pid -> session/window/name/cwd
     local panes
-    local us=$'\x1f'
-    panes=$(tmux list-panes -a -F "#{pane_pid}$us#{session_name}$us#{window_index}$us#{window_name}$us#{pane_current_path}" 2>/dev/null) || panes=""
+    # Tab-joined, then turned into \x1f: tmux 3.4 escapes \x1f in -F output.
+    local ht=$'\t'
+    panes=$(tmux list-panes -a -F "#{pane_pid}$ht#{session_name}$ht#{window_index}$ht#{window_name}$ht#{pane_current_path}" 2>/dev/null | tr '\t' '\037') || panes=""
     [ -n "$panes" ] || { say "hat-restore: no tmux panes"; return 0; }
 
     local n=0 miss=0 pid cwd sid owner line ppid hops f
@@ -2934,8 +2940,13 @@ cmd_tab_pin() {
     local action="$1" tab="$3" line wid idx name
     tab_target "$2" "${4:-}"
     line=$(remote_sh "$TAB_HOST" \
-        "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}$US#{window_index}$US#{window_name}' 2>/dev/null" \
-        | AWK_T="$tab" awk -F'\037' 'BEGIN {t = ENVIRON["AWK_T"] ""} ($2 "")==t {print; exit} ($3 "")==t && !n {n=$0} END {if (n) print n}' | head -n 1)
+        "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}$HT#{window_index}$HT#{window_name}' 2>/dev/null" \
+        | tmux_fields | AWK_T="$tab" awk -F'\037' '
+            # Reads to the end: exiting early would break the pipe into tr.
+            BEGIN {t = ENVIRON["AWK_T"] ""}
+            ($2 "")==t && !i {i=$0}
+            ($3 "")==t && !n {n=$0}
+            END {if (i) print i; else if (n) print n}')
     [[ -n "$line" ]] || die "no tab '$tab' in '$TAB_SESSION' - give its index or its name"
     IFS=$'\x1f' read -r wid idx name <<<"$line"
     if [[ "$action" == pin ]]; then
@@ -6504,8 +6515,8 @@ edit_windows() {
     local hat="$1" session="$2" host
     host=$(hat_ssh "$hat")
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-        "$(posix_sh "tmux list-windows -t $(sq "=$session") -F '#{window_index}$US#{window_name}$US#{window_active}$US#{window_panes}$US#{pane_current_command}$US#{pane_current_path}$US#{pane_dead}$US#{@hatter-pinned}' 2>/dev/null")" \
-        2>/dev/null
+        "$(posix_sh "tmux list-windows -t $(sq "=$session") -F '#{window_index}$HT#{window_name}$HT#{window_active}$HT#{window_panes}$HT#{pane_current_command}$HT#{pane_current_path}$HT#{pane_dead}$HT#{@hatter-pinned}' 2>/dev/null")" \
+        2>/dev/null | tmux_fields
 }
 
 # --- chrome -----------------------------------------------------------------
