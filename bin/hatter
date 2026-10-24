@@ -8221,8 +8221,10 @@ Set up a shell server so its state survives both a reboot and a stray logout:
 
   - tpm, tmux-resurrect and tmux-continuum, autosaving every 15 minutes.
     continuum does not restore on its own: hat-restore (below) owns that, and
-    the two would race. A snapshot can still be restored by hand (prefix +
-    ctrl-r).
+    the two would race. hat-restore rebuilds the windows its registry holds,
+    which are the ones that ran an agent; plain shell windows come back from
+    `hatter restore` on the client. A snapshot, splits and scrollback
+    included, can still be restored by hand (prefix + ctrl-r).
   - the hat's launch settings (see: hatter help hat), as the tmux options
     hat-launch reads, in ~/.local/state/hatter/launch.tmux.conf on the
     server. A hat provisioned as user@host that no hat in the config names
