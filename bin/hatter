@@ -342,6 +342,7 @@ hat_names()  { cfg '.hats | keys[]?'; }
 # gives @hat_default_kind and @hat_claude_args. A kind is a word; args are
 # split on whitespace with no quote handling, so neither may hold a quote.
 LAUNCH_KINDS="claude codex shell"
+launch_kind_ok() { local k; for k in $LAUNCH_KINDS; do [[ "$1" == "$k" ]] && return 0; done; return 1; }
 launch_value_ok() { [[ "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *"\\"* ]]; }
 
 # hat_set_launch <hat> <changes json>: merge {kind, args} into the hat's launch
@@ -363,21 +364,34 @@ hat_set_launch() {
 # must agree on each option they set; one that sets nothing has no say.
 hat_launch_conf() {
     local lines
-    lines=$(cfg --arg h "$1" '
-        [ .hats[]? | select(.ssh == $h) | .launch // {}
-          | (if .kind then {key: "@hat_default_kind", value: .kind} else empty end),
-            (.args // {} | to_entries[] | {key: "@hat_\(.key)_args", value: .value}) ]
-        | group_by(.key)[]
-        | if (map(.value) | unique | length) > 1
-          then "@@conflict \(.[0].key)"
-          else "\(.[0].key)\t\(.[0].value)" end') || return 1
+    # Checked here as well as in `hat set`: the config can be edited by hand,
+    # and what this prints becomes tmux.conf lines on the server.
+    lines=$(cfg --arg h "$1" --arg kinds "$LAUNCH_KINDS" '
+        ($kinds | split(" ")) as $ks
+        | [ .hats[]? | select(.ssh == $h) | .launch // {}
+            | if type != "object" then {bad: "launch is not an object"} else
+              (if has("kind") then {key: "@hat_default_kind", kind: "kind", value: .kind} else empty end),
+              (.args // {} | if type != "object" then {bad: "launch.args is not an object"}
+                             else to_entries[] | {key: "@hat_\(.key)_args", kind: .key, value: .value} end)
+              end ]
+        | (.[] | select(.bad) | "@@bad \(.bad)"),
+          (map(select(.bad | not)) | group_by(.key)[]
+           | if (map(.value) | unique | length) > 1 then "@@conflict \(.[0].key)"
+             elif ((.[0].kind == "kind" and (.[0].value | IN($ks[])))
+                   or (.[0].kind != "kind" and (.[0].kind | IN($ks[])))) | not
+             then "@@bad \(.[0].key): kind must be one of \($ks | join(", "))"
+             elif (.[0].value | type) != "string" or (.[0].value | test("[\u0027\\\\\n]"))
+             then "@@bad \(.[0].key) must be a string with no quote, backslash or newline"
+             else "\(.[0].key)\t\(.[0].value)" end)') || die "cannot read the launch settings for $1 from $CONFIG"
     local key val
     while IFS=$'\t' read -r key val; do
         [[ -n "$key" ]] || continue
-        if [[ "$key" == "@@conflict "* ]]; then
-            die "hats on $1 share a tmux server but set ${key#@@conflict } differently - make them agree (see: hatter help hat)"
-        fi
-        launch_value_ok "$val" || die "$key for $1 holds a quote or a newline, which tmux.conf cannot carry: '$val'"
+        case "$key" in
+            "@@conflict "*)
+                die "hats on $1 share a tmux server but set ${key#@@conflict } differently - make them agree (see: hatter help hat)" ;;
+            "@@bad "*)
+                die "launch settings for $1: ${key#@@bad } (see: hatter help hat)" ;;
+        esac
         printf "set -g %s '%s'\n" "$key" "$val"
     done <<< "$lines"
 }
@@ -1498,10 +1512,15 @@ touch "$CONF"
 
 # The options hat-launch reads, sourced by the managed block below. Written
 # whole every time, so a setting taken out of the config goes from here too.
-LAUNCH_CONF="$HOME/.config/hatter/launch.tmux.conf"
-mkdir -p "$HOME/.config/hatter"
-{ [ -z "${1:-}" ] || printf '%s\n' "$1"; } > "$LAUNCH_CONF.new"
-mv "$LAUNCH_CONF.new" "$LAUNCH_CONF"
+# "@@keep" leaves the file as it is: provisioned by user@host, with no hat in
+# the config for that destination to say what it should hold.
+LAUNCH_CONF="$HOME/.local/state/hatter/launch.tmux.conf"   # the path the managed block sources
+mkdir -p "$(dirname "$LAUNCH_CONF")"
+touch "$LAUNCH_CONF"
+if [ "${1:-}" != "@@keep" ]; then
+    { [ -z "${1:-}" ] || printf '%s\n' "$1"; } > "$LAUNCH_CONF.new"
+    mv "$LAUNCH_CONF.new" "$LAUNCH_CONF"
+fi
 
 if [ ! -d "$HOME/.tmux/plugins/tpm" ]; then
     echo "installing tpm"
@@ -1545,7 +1564,7 @@ set -g @continuum-save-interval '15'
 # The options hat-launch reads (@hat_default_kind, @hat_<kind>_args), from the
 # hat's `launch` settings in hatter's config. Provision rewrites this file, so
 # a fresh server starts agents the same way as one where they were set by hand.
-source-file -q "$HOME/.config/hatter/launch.tmux.conf"
+source-file -q "$HOME/.local/state/hatter/launch.tmux.conf"
 
 # Logging out must not destroy a tab by accident. Every pane runs its login
 # shell inside a loop, so `exit` and stray ctrl-D just hand back a fresh prompt.
@@ -2725,7 +2744,7 @@ if tmux has-session 2>/dev/null; then
     # at the next server start. Say so, rather than unset what someone chose.
     for o in $(tmux show-options -g 2>/dev/null | awk '$1 ~ /^@hat_/ { print $1 }'); do
         grep -q "^set -g $o " "$LAUNCH_CONF" \
-            || echo "NOTE: $o is set on the running server but not in hatter's config; a fresh server will not have it (see: hatter help hat)"
+            || echo "NOTE: $o is set on the running server (by hand, or by an earlier provision) but not in hatter's config, so a fresh server will not have it. Record it with \`hatter hat set\`, or clear it: tmux set -gu $o"
     done
 fi
 
@@ -4759,12 +4778,12 @@ cmd_hat() {
                     --no-mosh) mosh=false; shift ;;
                     --kind)
                         [[ $# -ge 2 ]] || die "--kind needs one of: $LAUNCH_KINDS (or '' to clear)"
-                        [[ -z "$2" || " $LAUNCH_KINDS " == *" $2 "* ]] || die "--kind: '$2' is not one of: $LAUNCH_KINDS"
+                        [[ -z "$2" ]] || launch_kind_ok "$2" || die "--kind: '$2' is not one of: $LAUNCH_KINDS"
                         launch=$(jq -c --arg v "$2" '.kind = $v' <<< "$launch"); shift 2 ;;
                     --args)
                         [[ $# -ge 2 && "$2" == *=* ]] || die "--args takes <kind>=<arguments>, as in --args claude='--permission-mode auto'"
                         k="${2%%=*}" v="${2#*=}"
-                        [[ " $LAUNCH_KINDS " == *" $k "* ]] || die "--args: '$k' is not one of: $LAUNCH_KINDS"
+                        launch_kind_ok "$k" || die "--args: '$k' is not one of: $LAUNCH_KINDS"
                         launch_value_ok "$v" || die "--args: the arguments may not hold a quote, a backslash or a newline"
                         launch=$(jq -c --arg k "$k" --arg v "$v" '.args[$k] = $v' <<< "$launch"); shift 2 ;;
                     *) die "unknown flag: $1" ;;
@@ -5665,8 +5684,10 @@ cmd_provision() {
     else
         die "unknown hat or group: $token"
     fi
-    local launch
-    launch=$(hat_launch_conf "$host") || exit 1
+    local launch="@@keep"
+    if [[ -n "$(cfg --arg h "$host" '.hats[]? | select(.ssh == $h) | .ssh' | head -n 1)" ]]; then
+        launch=$(hat_launch_conf "$host") || exit 1
+    fi
     provision_host "$host" "$launch"
 }
 
@@ -7999,10 +8020,12 @@ Subcommands:
                                           `hatter attach` use mosh where it is
                                           installed (--no-mosh turns it off).
                 [--kind <kind>] [--args <kind>=<args>]
-                                          How the hat's panes start: --kind is
-                                          the default (claude, codex or shell),
-                                          --args the extra arguments for every
-                                          launch of a kind, new or resumed.
+                                          How hat-launch starts agents on the
+                                          hat's server: --args gives the extra
+                                          arguments for every launch of a kind
+                                          (claude, codex or shell), including
+                                          each agent restored at boot. --kind
+                                          is what a bare `hat-launch` starts.
                                           An empty value clears it. Takes
                                           effect on the server at the next
                                           `hatter provision`.
@@ -8201,7 +8224,9 @@ Set up a shell server so its state survives both a reboot and a stray logout:
     the two would race. A snapshot can still be restored by hand (prefix +
     ctrl-r).
   - the hat's launch settings (see: hatter help hat), as the tmux options
-    hat-launch reads, in ~/.config/hatter/launch.tmux.conf on the server.
+    hat-launch reads, in ~/.local/state/hatter/launch.tmux.conf on the
+    server. A hat provisioned as user@host that no hat in the config names
+    keeps the file it has.
     An option set on the running server by hand but not in the config is
     reported, not removed.
   - every pane's login shell wrapped in a loop, so `exit` and ctrl-D hand back
