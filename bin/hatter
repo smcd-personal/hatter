@@ -2941,7 +2941,12 @@ cmd_tab_pin() {
     tab_target "$2" "${4:-}"
     line=$(remote_sh "$TAB_HOST" \
         "tmux list-windows -t $(sq "=$TAB_SESSION") -F '#{window_id}$HT#{window_index}$HT#{window_name}' 2>/dev/null" \
-        | tmux_fields | AWK_T="$tab" awk -F'\037' 'BEGIN {t = ENVIRON["AWK_T"] ""} ($2 "")==t {print; exit} ($3 "")==t && !n {n=$0} END {if (n) print n}' | head -n 1)
+        | tmux_fields | AWK_T="$tab" awk -F'\037' '
+            # Reads to the end: exiting early would break the pipe into tr.
+            BEGIN {t = ENVIRON["AWK_T"] ""}
+            ($2 "")==t && !i {i=$0}
+            ($3 "")==t && !n {n=$0}
+            END {if (i) print i; else if (n) print n}')
     [[ -n "$line" ]] || die "no tab '$tab' in '$TAB_SESSION' - give its index or its name"
     IFS=$'\x1f' read -r wid idx name <<<"$line"
     if [[ "$action" == pin ]]; then
