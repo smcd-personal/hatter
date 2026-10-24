@@ -2185,6 +2185,7 @@ EOT
         if [ "$dry" = 1 ]; then
             printf '  would record: %s:%s (%s) -> %s\n' "$s" "$w" "${nm:-unnamed}" "$sid"
         else
+            keep_closed "$f" "$sid"
             jq -n --arg s "$s" --arg w "$w" --arg n "$nm" --arg c "$cwd" \
                   --arg i "$sid" \
                   --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -2229,8 +2230,11 @@ do_prune() {
             printf '  would forget: %s:%s  (%s)\n' "$s" "$w" \
                 "$(jq -r '.name // ""' "$f" 2>/dev/null)"
         else
-            keep_closed "$f" ""
-            rm -f "$f"
+            # Moved aside first: a hook writing a new session into this slot
+            # meanwhile keeps its entry, which a copy-then-delete would remove.
+            mv -f "$f" "$PANES/.prune.$$" 2>/dev/null || continue
+            keep_closed "$PANES/.prune.$$" ""
+            rm -f "$PANES/.prune.$$"
         fi
         gone=$((gone+1))
     done
@@ -2241,7 +2245,7 @@ do_prune() {
     # hatter's own state directory whatever PANES turned out to be.
     if [ "$dry" != 1 ] && [ -d "$PANES/closed" ]; then
         case "$PANES" in
-            */hatter/panes) find "$PANES/closed" -maxdepth 1 -name '*.json' -mtime +"$HISTORY_DAYS" -exec rm -f {} + 2>/dev/null ;;
+            */hatter/panes) find "$PANES/closed" -maxdepth 1 -name '*.json' -mtime +"$((HISTORY_DAYS - 1))" -exec rm -f {} + 2>/dev/null ;;
         esac
     fi
     return 0

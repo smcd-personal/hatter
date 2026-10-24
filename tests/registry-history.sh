@@ -39,7 +39,8 @@ printf '%s\n' "\$*" >> "$work/calls"
 case "\$1" in
     list-windows) printf 'dev@0\ndev@1\n' ;;
     display-message) printf 'dev\t1\tnotes\n' ;;
-    has-session|list-panes) exit 1 ;;
+    list-panes) [ "\$2" = -a ] && printf '4242\037dev\0371\037notes\037/srv/x\n' ;;
+    has-session) exit 1 ;;
 esac
 exit 0
 STUB
@@ -102,15 +103,37 @@ hook SessionStart first
 [ ! -e "$panes/closed/first.json" ] || fail "a resumed session is still listed as closed"
 [ -f "$panes/closed/second.json" ] || fail "resuming 'first' over 'second' did not keep 'second'"
 
-# --- hat-launch: a shell taking over the window keeps the agent before it ----
-# The login shell stub answers the environment probe and then exits 99, which
-# ends hat-launch's loop.
+# The login shell stub runs what it is given with -lc, and otherwise exits 99,
+# which ends hat-launch's loop.
 cat > "$work/bin/fakesh" <<'STUB'
 #!/bin/sh
 [ "$1" = -lc ] && exec sh -c "$2"
 exit 99
 STUB
 chmod +x "$work/bin/fakesh"
+
+# --- backfill: writing a found agent over an entry keeps the one it replaces --
+# claude reports one agent, whose pid is the pane of dev:1.
+cat > "$work/bin/claude" <<'STUB'
+#!/bin/sh
+printf '[{"pid": 4242, "cwd": "/srv/x", "sessionId": "found"}]\n'
+STUB
+chmod +x "$work/bin/claude"
+backfill() { (unset XDG_STATE_HOME; HOME="$hd" PATH="$work/bin:$PATH" SHELL="$work/bin/fakesh" "$work/hat-restore" --backfill) >/dev/null; }
+rm -rf "$panes/closed"
+mkdir -p "$panes/closed"
+entry dev 1 claude before-bf
+echo '{}' > "$panes/closed/found.json"
+backfill
+[ "$(jq -r .session_id "$(slot dev 1)")" = found ] || fail "backfill did not record the agent: $(cat "$(slot dev 1)")"
+[ -f "$panes/closed/before-bf.json" ] || fail "backfill wrote over 'before-bf' without keeping it: $(ls "$panes/closed")"
+[ ! -e "$panes/closed/found.json" ] || fail "backfill left the live agent listed as closed"
+
+# Backfilling the same agent again has nothing to file away.
+backfill
+[ ! -e "$panes/closed/found.json" ] || fail "backfill filed the window's own session as closed"
+
+# --- hat-launch: a shell taking over the window keeps the agent before it ----
 rm -rf "$panes/closed"
 entry dev 1 claude agent-z
 (unset XDG_STATE_HOME; cd "$work"; HOME="$hd" PATH="$work/bin:$PATH" SHELL="$work/bin/fakesh" \
