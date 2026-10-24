@@ -18,6 +18,7 @@ mkdir -p "$work/bin" "$work/remote" "$work/cfg/hatter" "$panes/closed" "$claude/
 cat > "$work/remote/tmux" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$work/calls"
+printf '%s\n' "\$@" > "$work/args"
 case "\$1" in
     list-windows) printf 'dev-main\t0\t@1\n' ;;
     has-session) [ "\$3" = "=dev-main" ] ;;
@@ -96,6 +97,25 @@ run "find_resume dev u@dev.example.com dev-docs '' /srv/docs with-history" >/dev
 grep -q '^new-session -d -P -F .* -s dev-docs -n claude .*hat-launch.* --resume claude .*with-history' "$work/calls" \
     || fail "find_resume (stopped) did not start the session: $(cat "$work/calls")"
 grep -q '^new-window' "$work/calls" && fail "find_resume (stopped) also tried new-window"
+
+# A tab name with quotes and a directory with a space reach tmux as one
+# argument each, and the command tmux runs names the session id as one word.
+mkdir -p "$work/my dir"
+run "find_resume dev u@dev.example.com dev-main \"it's a \\\"tab\\\"\" '$work/my dir' with-history" >/dev/null \
+    || fail "find_resume (quoted name) failed"
+argv=()
+while IFS= read -r a; do argv+=("$a"); done < "$work/args"
+want_after() {  # want_after <flag> <value>: the argument after <flag> is <value>
+    local i
+    for ((i = 0; i < ${#argv[@]} - 1; i++)); do
+        [ "${argv[$i]}" = "$1" ] && { [ "${argv[$((i + 1))]}" = "$2" ] && return 0; break; }
+    done
+    fail "tmux $1 was not '$2': $(printf '[%s] ' "${argv[@]}")"
+}
+want_after -n "it's a \"tab\""
+want_after -c "$(cd "$work/my dir" && pwd)"
+[ "${argv[${#argv[@]} - 1]}" = "\"\$HOME/.local/bin/hat-launch\" --resume claude 'with-history'" ] \
+    || fail "the command tmux runs is wrong: [${argv[${#argv[@]} - 1]}]"
 
 # A hat with no hat-launch is told to provision, and nothing is opened.
 rm -f "$work/calls" "$hd/.local/bin/hat-launch"
