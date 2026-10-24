@@ -22,7 +22,7 @@ printf '%s\n' "\$@" > "$work/args"
 case "\$1" in
     list-windows) printf 'dev-main\t0\t@1\n' ;;
     has-session) [ "\$3" = "=dev-main" ] ;;
-    new-window|new-session) printf '4\037@44\n' ;;
+    new-window|new-session) printf '4\t@44\n' ;;
     *) exit 0 ;;
 esac
 EOF

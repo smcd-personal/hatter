@@ -3911,13 +3911,14 @@ find_resume() {
     # $HOME is left for the server's shell to expand.
     launch="\"\$HOME/.local/bin/hat-launch\" --resume claude $(sq "$sid")"
     if remote_session_exists "$dest" "$session"; then
-        create="tmux new-window -d -P -F '#{window_index}$US#{window_id}' -t $(sq "=$session:")"
+        create="tmux new-window -d -P -F '#{window_index}$HT#{window_id}' -t $(sq "=$session:")"
     else
-        create="tmux new-session -d -P -F '#{window_index}$US#{window_id}' -s $(sq "$session")"
+        create="tmux new-session -d -P -F '#{window_index}$HT#{window_id}' -s $(sq "$session")"
     fi
     out=$(remote_sh "$dest" "[ -x \"\$HOME/.local/bin/hat-launch\" ] || { echo @@no-launch; exit 0; }
         cd $(sq_dir "$cwd") 2>/dev/null || cd
         $create -n $(sq "${name:-claude}") -c \"\$PWD\" $(sq "$launch")") || return 1
+    out=$(printf '%s' "$out" | tmux_fields)
     if [[ "$out" == @@no-launch ]]; then
         warn "hat '$hat' has no hat-launch - run: hatter provision $hat"
         return 1
