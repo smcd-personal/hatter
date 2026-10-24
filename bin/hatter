@@ -1865,6 +1865,26 @@ if [ -n "${TMUX:-}" ]; then
 fi
 
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+# keep_closed <entry> <new session id>: before an entry is deleted or written
+# over, keep the conversation it names. History is filed by session id under
+# closed/, so a conversation resumed later in another tab replaces its own
+# record, and a session that is live again ("<new session id>") leaves it.
+# hat-launch, hat-record and hat-restore each carry this same copy.
+keep_closed() {
+    local f="$1" new="${2:-}" old d="$PANES/closed"
+    if [ -f "$f" ]; then
+        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
+        if [ -n "$old" ] && [ "$old" != "$new" ]; then
+            mkdir -p "$d" 2>/dev/null || true
+            jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {closed: $t}' "$f" > "$d/.tmp.$$" 2>/dev/null \
+              && mv "$d/.tmp.$$" "$d/$(printf '%s' "$old" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
+            rm -f "$d/.tmp.$$" 2>/dev/null
+        fi
+    fi
+    [ -z "$new" ] || rm -f "$d/$(printf '%s' "$new" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
+    return 0
+}
+
 # How Claude Code names a project dir after a path: /a/.b -> -a--b
 mangle() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '-'; }
 
@@ -1880,6 +1900,7 @@ record() {
     s=${meta%%	*}; rest=${meta#*	}; w=${rest%%	*}; n=${rest#*	}
     [ -n "$s" ] || return 0
     f="$PANES/$(slug "$s")@$w.json"
+    keep_closed "$f" "${2:-}"
     jq -n --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$PWD" \
           --arg k "$1" --arg i "${2:-}" --arg p "${3:-}" \
           --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -2001,6 +2022,27 @@ s=${meta%%	*}; rest=${meta#*	}; w=${rest%%	*}; n=${rest#*	}
 slug=$(printf '%s' "$s" | tr -c 'A-Za-z0-9_.@-' '_')
 f="$PANES/$slug@$w.json"
 
+# keep_closed <entry> <new session id>: before an entry is deleted or written
+# over, keep the conversation it names. History is filed by session id under
+# closed/, so a conversation resumed later in another tab replaces its own
+# record, and a session that is live again ("<new session id>") leaves it.
+# hat-launch, hat-record and hat-restore each carry this same copy.
+keep_closed() {
+    local f="$1" new="${2:-}" old d="$PANES/closed"
+    if [ -f "$f" ]; then
+        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
+        if [ -n "$old" ] && [ "$old" != "$new" ]; then
+            mkdir -p "$d" 2>/dev/null || true
+            jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {closed: $t}' "$f" > "$d/.tmp.$$" 2>/dev/null \
+              && mv "$d/.tmp.$$" "$d/$(printf '%s' "$old" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
+            rm -f "$d/.tmp.$$" 2>/dev/null
+        fi
+    fi
+    [ -z "$new" ] || rm -f "$d/$(printf '%s' "$new" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
+    return 0
+}
+keep_closed "$f" "$sid"
+
 # SessionEnd keeps the entry and marks it ended: a tab whose agent exited before
 # the power went out should come back as the shell it was, not as a resumed
 # conversation nobody asked for.
@@ -2035,6 +2077,10 @@ cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 #   hat-restore --prune      forget entries whose tmux window is gone
 #   hat-restore --no-prune   with --backfill, keep the orphans
 #
+# An agent's entry is not lost when its tab goes: prune, and any launch or hook
+# that writes over it, first files it under $PANES/closed by session id. Those
+# are history for `hatter find`, never restored, and go after HISTORY_DAYS.
+#
 # --backfill exists because the hook only fires when a session starts. On a box
 # that was already running agents when hatter arrived, the registry would stay
 # empty until every one of them happened to restart - and the first reboot would
@@ -2059,6 +2105,8 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
 PANES="$STATE/panes"
 KEEP="$STATE/sessions"
 LAUNCH="$HOME/.local/bin/hat-launch"
+# Days a closed tab's entry is kept in $PANES/closed (see keep_closed).
+HISTORY_DAYS=90
 
 dry=0 quiet=0 agents=1 backfill=0 prune=0 no_prune=0
 for a in "$@"; do
@@ -2074,6 +2122,26 @@ done
 say() { [ "$quiet" = 1 ] || printf '%s\n' "$*"; }
 
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+
+# keep_closed <entry> <new session id>: before an entry is deleted or written
+# over, keep the conversation it names. History is filed by session id under
+# closed/, so a conversation resumed later in another tab replaces its own
+# record, and a session that is live again ("<new session id>") leaves it.
+# hat-launch, hat-record and hat-restore each carry this same copy.
+keep_closed() {
+    local f="$1" new="${2:-}" old d="$PANES/closed"
+    if [ -f "$f" ]; then
+        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
+        if [ -n "$old" ] && [ "$old" != "$new" ]; then
+            mkdir -p "$d" 2>/dev/null || true
+            jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {closed: $t}' "$f" > "$d/.tmp.$$" 2>/dev/null \
+              && mv "$d/.tmp.$$" "$d/$(printf '%s' "$old" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
+            rm -f "$d/.tmp.$$" 2>/dev/null
+        fi
+    fi
+    [ -z "$new" ] || rm -f "$d/$(printf '%s' "$new" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
+    return 0
+}
 
 do_backfill() {
     command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; return 0; }
@@ -2117,6 +2185,7 @@ EOT
         if [ "$dry" = 1 ]; then
             printf '  would record: %s:%s (%s) -> %s\n' "$s" "$w" "${nm:-unnamed}" "$sid"
         else
+            keep_closed "$f" "$sid"
             jq -n --arg s "$s" --arg w "$w" --arg n "$nm" --arg c "$cwd" \
                   --arg i "$sid" \
                   --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -2161,11 +2230,24 @@ do_prune() {
             printf '  would forget: %s:%s  (%s)\n' "$s" "$w" \
                 "$(jq -r '.name // ""' "$f" 2>/dev/null)"
         else
-            rm -f "$f"
+            # Moved aside first: a hook writing a new session into this slot
+            # meanwhile keeps its entry, which a copy-then-delete would remove.
+            mv -f "$f" "$PANES/.prune.$$" 2>/dev/null || continue
+            keep_closed "$PANES/.prune.$$" ""
+            rm -f "$PANES/.prune.$$"
         fi
         gone=$((gone+1))
     done
     say "hat-restore: pruned $gone entry(ies) whose window is gone"
+
+    # History is for finding old conversations, not for restoring them, so it
+    # has an age limit rather than a size one. The case keeps the delete inside
+    # hatter's own state directory whatever PANES turned out to be.
+    if [ "$dry" != 1 ] && [ -d "$PANES/closed" ]; then
+        case "$PANES" in
+            */hatter/panes) find "$PANES/closed" -maxdepth 1 -name '*.json' -mtime +"$((HISTORY_DAYS - 1))" -exec rm -f {} + 2>/dev/null ;;
+        esac
+    fi
     return 0
 }
 
@@ -7782,6 +7864,11 @@ the Mac being involved at all:
                  is filed under). --backfill prunes afterwards unless given
                  --no-prune. Pruning refuses to run when tmux has no windows,
                  since at boot the registry is the only truth there is.
+                 An agent's entry is never simply lost: when prune drops it, or
+                 a new launch in the same window writes over it, it moves to
+                 panes/closed/<session id>.json. That history is what
+                 `hatter find` uses to say where an old conversation ran; it is
+                 never restored, and is kept for 90 days.
   - a systemd user unit for the above, and a timer that snapshots tmux-resurrect
     every 15 minutes - continuum's own autosave never fires, because it hangs
     off a status line that a control-mode client like cmux never draws.
