@@ -3587,7 +3587,7 @@ pick_one() {
         ask_line "${prompt%: }" || return 1
         a="$EDIT_REPLY"
         [[ -n "$a" ]] || return 1
-        if [[ "$a" =~ ^[0-9]+$ ]] && [[ "$a" -ge 1 && "$a" -le ${#opts[@]} ]]; then
+        if [[ "$a" =~ ^[1-9][0-9]*$ ]] && [[ "$a" -ge 1 && "$a" -le ${#opts[@]} ]]; then
             printf '%s' "${opts[$((a-1))]}"
             return 0
         fi
@@ -3676,6 +3676,8 @@ $(printf '%s\n' "$list" | sed 's/^/    /')"
 # Prints one line per match, fields separated by \037 (a tab would let read
 # collapse the empty fields of a closed session):
 #   score state mtime session window window_id session_id cwd window_name title snippet
+# A closed session's session, window and window_name are where it last ran,
+# from the registry's history (empty when it has none); window_id is empty.
 # score is 2 when every term is in the title, prompt or window name, 1 when
 # some are only in the conversation, 0 when only in a closed session's older
 # history. A line "@@hatter-err <why>" means the hat could not be searched,
@@ -3837,8 +3839,16 @@ done
 while IFS= read -r t; do
     sid=$(basename "$t" .jsonl)
     case "$live_ids" in *" $sid "*) continue ;; esac
-    cwd=$(grep -m 1 -F '"cwd":' "$t" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null)
-    emit closed "" "" "" "$sid" "$cwd" "" "$t"
+    # Where it last ran, if the registry kept its tab when the tab closed.
+    hs="" hw="" hn="" cwd=""
+    h="$PANES/closed/$(printf '%s' "$sid" | tr -c 'A-Za-z0-9_.@-' '_').json"
+    if [ -f "$h" ]; then
+        IFS=$'\037' read -r hs hw hn cwd <<EOH
+$(jq -j '[.session // "", (.window // "" | tostring), .name // "", .cwd // ""] | join("\u001f")' "$h" 2>/dev/null)
+EOH
+    fi
+    [ -n "$cwd" ] || cwd=$(grep -m 1 -F '"cwd":' "$t" 2>/dev/null | jq -r '.cwd // empty' 2>/dev/null)
+    emit closed "$hs" "$hw" "" "$sid" "$cwd" "$hn" "$t"
 done <<EOF
 $list
 EOF
@@ -3869,6 +3879,117 @@ find_focus() {
     cmux_change select-workspace --workspace "$wref" --window "$win" >/dev/null 2>&1 || return 1
     [[ -z "$surface" ]] || \
         cmux_change focus-panel --panel "$surface" --workspace "$wref" --window "$win" >/dev/null 2>&1 || true
+    return 0
+}
+
+# find_default_workspace <hat> <last session> <cwd> <workspaces>: where a
+# closed session should go back to. The workspace it last ran in, when that is
+# still one of the hat's; otherwise the first workspace with a recorded tab in
+# its directory; otherwise nothing.
+find_default_workspace() {
+    local hat="$1" last="$2" cwd="$3" list="$4" ws
+    if [[ -n "$last" ]] && grep -qxF -- "$last" <<<"$list"; then
+        printf '%s' "$last"; return 0
+    fi
+    [[ -n "$cwd" ]] || return 0
+    while IFS= read -r ws; do
+        [[ -n "$ws" ]] && grep -qxF -- "$ws" <<<"$list" && { printf '%s' "$ws"; return 0; }
+    done < <(cfg --arg l "$hat" --arg c "$cwd" '
+        .groups[] | select(.hat == $l) | .sessions | to_entries[]
+        | select([.value.windows[]?.cwd] | index($c)) | .key')
+    return 0
+}
+
+# find_resume <hat> <dest> <session> <tab name> <cwd> <session id>: open a tab in
+# <session> that resumes the conversation through hat-launch, starting the
+# session if it is not running. hat-launch records the pane, so the session is
+# live to `find` and comes back at boot, and it starts claude with the hat's
+# @hat_claude_args like any other pane. Prints the new tmux window's
+# "<index>\037<id>".
+find_resume() {
+    local hat="$1" dest="$2" session="$3" name="$4" cwd="$5" sid="$6" launch create out
+    # $HOME is left for the server's shell to expand.
+    launch="\"\$HOME/.local/bin/hat-launch\" --resume claude $(sq "$sid")"
+    if remote_session_exists "$dest" "$session"; then
+        create="tmux new-window -d -P -F '#{window_index}$HT#{window_id}' -t $(sq "=$session:")"
+    else
+        create="tmux new-session -d -P -F '#{window_index}$HT#{window_id}' -s $(sq "$session")"
+    fi
+    out=$(remote_sh "$dest" "[ -x \"\$HOME/.local/bin/hat-launch\" ] || { echo @@no-launch; exit 0; }
+        cd $(sq_dir "$cwd") 2>/dev/null || cd
+        $create -n $(sq "${name:-claude}") -c \"\$PWD\" $(sq "$launch")") || return 1
+    out=$(printf '%s' "$out" | tmux_fields)
+    if [[ "$out" == @@no-launch ]]; then
+        warn "hat '$hat' has no hat-launch - run: hatter provision $hat"
+        return 1
+    fi
+    [[ "$out" == *$'\037'* ]] || return 1
+    printf '%s' "$out"
+}
+
+# Picking a closed session from `find`: ask which workspace to resume it in,
+# with the one it came from offered first, then open it there and go to it.
+find_resume_pick() {
+    local hat="$1" dest="$2" sid="$3" cwd="$4" last="$5" name="$6"
+    local list def session a i=1 out window wid
+    local -a choices=()
+    list=$(hat_workspaces "$hat")
+    def=$(find_default_workspace "$hat" "$last" "$cwd" "$list")
+    echo
+    echo "  Resume it in which workspace on '$hat'?"
+    if [[ -n "$list" ]]; then
+        while IFS= read -r a; do choices+=("$a"); done <<<"$list"
+    fi
+    choices+=("+ new workspace")
+    for a in "${choices[@]}"; do
+        printf '  %2d) %s%s\n' "$i" "$a" "$( [[ "$a" == "$def" ]] && printf '   %s<- where it last ran%s' "$C_DIM" "$C_R")" >&2
+        i=$((i + 1))
+    done
+    while true; do
+        if [[ -n "$def" ]]; then
+            ask_line "workspace (Enter for $def), Esc to cancel" || return 0
+        else
+            ask_line "workspace (1-${#choices[@]}), Esc to cancel" || return 0
+        fi
+        a="$EDIT_REPLY"
+        if [[ -z "$a" ]]; then
+            [[ -n "$def" ]] || return 0
+            session="$def"; break
+        fi
+        if [[ "$a" =~ ^[1-9][0-9]*$ && "$a" -ge 1 && "$a" -le ${#choices[@]} ]]; then
+            session="${choices[$((a - 1))]}"; break
+        fi
+        echo "  pick a number from 1 to ${#choices[@]}" >&2
+    done
+    if [[ "$session" == "+ new workspace" ]]; then
+        ask_line "name (becomes $hat-<name>), Esc to cancel" || return 0
+        [[ -n "$EDIT_REPLY" ]] || return 0
+        session=$(hat_session_name "$hat" "$(tmux_session_name "$EDIT_REPLY")")
+    fi
+
+    out=$(find_resume "$hat" "$dest" "$session" "$name" "$cwd" "$sid") \
+        || die "could not open a tab in '$session' on $dest"
+    IFS=$'\037' read -r window wid <<<"$out"
+    info "Resuming it in '$session', tab $window"
+
+    if ! have_cmux; then
+        attach_session "$hat" "$session" "$window"
+    fi
+    # A workspace cmux does not show yet is mirrored, and recorded, by new.
+    local win
+    win=$(find_hat_window "$hat")
+    if [[ -z "$win" || -z "$(workspace_ref_by_title "$session" "$win")" ]]; then
+        "$0" new "$session" --hat "$hat" </dev/tty || warn "could not bring '$session' into cmux: hatter new $session --focus"
+    fi
+    # The new tab takes a moment to show up in the mirror: wait for cmux to map
+    # its window before going to it, or only the workspace would be selected.
+    for i in 1 2 3 4 5 6 7 8; do
+        cmux_pane_map "$dest" "$session" \
+            | jq -e --arg w "$wid" '[.panes[]? | select(.window_id == $w)] | length > 0' >/dev/null 2>&1 && break
+        sleep 0.5
+    done
+    find_focus "$hat" "$dest" "$session" "$wid" && return 0
+    warn "cmux does not show '$session' yet - open it with: hatter new $session --focus"
     return 0
 }
 
@@ -3976,7 +4097,7 @@ cmd_find() {
         if [[ "$state" == live ]]; then
             where="$session:$window${name:+ ($name)}"
         else
-            where="${C_DIM}closed${C_R}  $(edit_short_path "$cwd" 2>/dev/null || printf '%s' "$cwd")"
+            where="${C_DIM}closed${C_R}${session:+  last in $session${name:+ ($name)}}  $(edit_short_path "$cwd" 2>/dev/null || printf '%s' "$cwd")"
         fi
         printf '  %2d) %s%s%s  %s  %s%s ago%s\n' "$k" "$C_B" "$owner" "$C_R" "$where" "$C_DIM" "$(find_age "$mtime")" "$C_R"
         printf '      %s\n' "$(edit_trunc "${title:-(untitled)}" 100)"
@@ -3992,16 +4113,14 @@ cmd_find() {
         ask_line "open which (1-$n), Esc to skip" || return 0
         pick="$EDIT_REPLY"
         [[ -n "$pick" ]] || return 0
-        [[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le "$n" ]] && break
+        [[ "$pick" =~ ^[1-9][0-9]*$ && "$pick" -ge 1 && "$pick" -le "$n" ]] && break
         echo "  pick a number from 1 to $n" >&2
     done
     IFS=$'\037' read -r owner di score state mtime session window wid sid cwd name title snip <<<"${rows[$((pick - 1))]}"
     dest="${dests[$di]}"
 
     if [[ "$state" != live ]]; then
-        echo
-        echo "  Closed. To resume it on $owner ($dest):"
-        echo "    cd $(sq "$cwd") && claude --resume $sid"
+        find_resume_pick "$owner" "$dest" "$sid" "$cwd" "$session" "$name"
         return 0
     fi
     if have_cmux; then
@@ -7680,8 +7799,11 @@ conversation (what you and Claude wrote, not tool output). Sessions whose title,
 prompt or tab name has every term come first.
 
   --all        Also search closed sessions changed in the last 7 days, matching
-               anywhere in the transcript. Picking one prints the command that
-               resumes it. Subagent transcripts are skipped.
+               anywhere in the transcript. Subagent transcripts are skipped.
+               Picking one resumes it in a new tab: choose the workspace, with
+               the one it last ran in (or one with a tab in its directory)
+               offered as the default. The tab runs through hat-launch, so the
+               session is recorded and starts with the hat's claude arguments.
   --days N     With --all, look back N days instead (implies --all)
   --hat <hat>  Search only this hat
   --limit N    List the best N (default 20; 0 lists every match)
