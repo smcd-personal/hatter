@@ -72,7 +72,14 @@ case "$*" in
       # Blank, with a notice on stderr: the screen is still blank.
       noisy) printf '   \n\n'; echo 'Warning: a newer cmux is available' >&2 ;;
     esac ;;
-  close-surface*) echo "close $*" >> "$log" ;;
+  # STUB_PINNED: cmux refuses to close the tab until it is unpinned.
+  # STUB_STUCK: it refuses even then.
+  tab-action*) echo "tab-action $*" >> "$log"; [[ "$*" == *unpin* ]] && touch "$STUB_DIR/unpinned" ;;
+  close-surface*)
+    if [[ "${STUB_STUCK:-}" || ( "${STUB_PINNED:-}" && ! -f "$STUB_DIR/unpinned" ) ]]; then
+      echo "refused $*" >> "$log"; echo 'Error: internal_error: Failed to close surface' >&2; exit 1
+    fi
+    echo "close $*" >> "$log" ;;
   close-workspace*) echo "close-workspace $*" >> "$log" ;;
 esac
 exit 0
@@ -93,6 +100,7 @@ case "$cmd" in
       printf 'S\tdev-a\nS\tdev-b\nW\tdev-a\t@1\tone\t/\t\nW\tdev-a\t%s\ttwo\t/\t\nW\tdev-b\t@3\tthree\t/\t\n' "$wid"
     fi ;;
   *move-window*) echo "move $cmd" >> "$STUB_DIR/log"; touch "$STUB_DIR/moved" ;;
+  *set-option*) echo "set $cmd" >> "$STUB_DIR/log" ;;
 esac
 exit 0
 STUB
@@ -109,7 +117,7 @@ run() {
     echo '{"version":3,"hats":{"dev":{"ssh":"dev@example.com","remote_dir":"$HOME"}},
            "groups":{"G":{"hat":"dev","sessions":{"dev-a":{},"dev-b":{}}}}}' \
         > "$d/home/.config/hatter/config.json"
-    rm -f "$d/log" "$d/looked" "$d/pass2"; touch "$d/log"
+    rm -f "$d/log" "$d/looked" "$d/pass2" "$d/unpinned"; touch "$d/log"
     env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
         STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" ${HATTER_CMD:-_drag-heal} >"$d/out" 2>&1 || true
     cat "$d/log"
@@ -124,6 +132,23 @@ expect "a blank dragged tab: its window is moved" \
     "$(grep -q "^move .*move-window .*'=dev-a:@2' .*'=dev-b:'" <<<"$log" && echo y)"
 expect "a blank dragged tab: the blank copy is closed" \
     "$(grep -q '^close .*--surface s-new ' <<<"$log" && echo y)"
+
+expect "an unpinned blank tab: no unpin, and no pin set on its window" \
+    "$(! grep -qE '^(tab-action|set)' <<<"$log" && echo y)"
+
+# A pinned tab (#111): cmux will not close it until it is unpinned.
+log=$(run pinned blank STUB_PINNED=1)
+expect "a pinned blank tab: unpinned, then closed" \
+    "$(grep -q '^refused .*--surface s-new ' <<<"$log" \
+        && grep -A1000 '^tab-action' <<<"$log" | grep -q '^close .*--surface s-new ' \
+        && grep -q '^tab-action .*--action unpin --tab s-new ' <<<"$log" && echo y)"
+expect "a pinned blank tab: its pin passes to the moved window as hatter's own" \
+    "$(grep -q "^set .*set-option -w -t '@2' @hatter-pinned 1" <<<"$log" \
+        && grep -q "was pinned in cmux; hatter pins it in 'dev-b'" "$work/run-pinned/out" && echo y)"
+log=$(run stuck blank STUB_STUCK=1)
+expect "a blank tab cmux will not close at all: the warning gives cmux's error, and no pin is set" \
+    "$(grep -q "could not close its blank copy: Error: internal_error: Failed to close surface" "$work/run-stuck/out" \
+        && ! grep -q '^set' <<<"$log" && echo y)"
 
 log=$(run unavailable unavailable)
 expect "a dragged tab cmux has no terminal for (surface_unavailable): its window is moved" \

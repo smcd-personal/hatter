@@ -3721,8 +3721,7 @@ heal_move() {
         if jq -e --arg w "$wid" --arg o "$orphan" '
                 any(.panes[]?; .window_id == $w) and all(.panes[]?; .surface_id != $o)' \
                 <<<"$map" >/dev/null 2>&1; then
-            cmux_change close-surface --surface "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
-                || warn "moved tab '$label' into '$to', but could not close its blank copy"
+            heal_close_blank "$host" "$win" "$orphan" "$ws" "$to" "$wid" "$name" "$label"
             info "Moved tab '$label' into '$to': it was dragged there in cmux, but tmux had kept it in '$from'"
             HEAL_MOVED+="$to"$'\n'
             return 0
@@ -3731,6 +3730,29 @@ heal_move() {
     done
     warn "moved tab '$label' into '$to', but cmux has not shown it there yet"
     HEAL_MOVED+="$to"$'\n'
+    return 0
+}
+
+# heal_close_blank <host> <cmux-window> <orphan> <workspace> <to> <window-id> <name> <label>
+# Close a dragged tab's blank copy. cmux will not close a pinned tab, so a
+# refused close is retried once unpinned. The pin was on the tab, which is
+# going: it passes to the moved window as hatter's own pin, since cmux cannot
+# pin a mirrored tab. A close still refused says what cmux said.
+heal_close_blank() {
+    local host="$1" win="$2" orphan="$3" ws="$4" to="$5" wid="$6" name="$7" label="$8" err
+    err=$(cmux_change close-surface --surface "$orphan" --workspace "$ws" --window "$win" </dev/null 2>&1 >/dev/null) \
+        && return 0
+    if cmux_change tab-action --action unpin --tab "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
+        && cmux_change close-surface --surface "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1; then
+        # Pins are matched by name, so an unnamed window cannot hold one.
+        [[ -n "$name" ]] || return 0
+        remote_sh "$host" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1" >/dev/null 2>&1 \
+            && info "Tab '$label' was pinned in cmux; hatter pins it in '$to' instead" \
+            || warn "tab '$label' was pinned in cmux, but hatter could not pin it in '$to'"
+        return 0
+    fi
+    err=$(printf '%s\n' "$err" | grep -m 1 '[^[:space:]]' | tr -d '[:cntrl:]' || true)
+    warn "moved tab '$label' into '$to', but could not close its blank copy${err:+: ${err:0:120}}"
     return 0
 }
 
@@ -8158,7 +8180,10 @@ The usual way: cmux moves the tab but never tells tmux, so the window stays
 in its old session. The dropped tab has nothing behind it, and the old
 workspace no longer shows the window. repair moves the tmux window into the
 session the tab was dropped on and closes the blank tab, and cmux shows the
-window there as a new tab, at the end. Nothing is re-mirrored. The autosave
+window there as a new tab, at the end. Nothing is re-mirrored. cmux will not
+close a pinned tab, so a pinned blank tab is unpinned first, and the moved
+window gets hatter's own pin instead (see: hatter help tab), since cmux cannot
+pin a mirrored tab. The autosave
 watcher does the same the moment a tab is dropped (see: hatter help autosave),
 so a dragged tab is usually fixed before you ask. A tab is only moved when its window is certain: the blank tab's
 title names exactly one window that cmux no longer shows anywhere, and the
