@@ -1579,9 +1579,22 @@ source-file -q "$HOME/.local/state/hatter/launch.tmux.conf"
 #
 # This replaced `remain-on-exit on` + a `pane-died` respawn hook, which raced
 # with tmux's own pane teardown and only fired about two times in three.
-set -g default-command 'while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
+#
+# The loop is hat-launch's (see ~/.local/bin/hat-launch), which also records
+# the window in the registry hat-restore rebuilds from, shells included; a
+# window that never recorded itself did not come back after a reboot. Without
+# hat-launch the bare loop still runs, so a pane can never fail to start.
+set -g default-command 'h="$HOME/.local/bin/hat-launch"; [ -x "$h" ] && exec "$h"; while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
 set -g remain-on-exit off
 set-hook -gu pane-died
+
+# The registry follows its windows (see ~/.local/bin/hat-registry): whenever a
+# window closes, moves or is renumbered, or a session is renamed, it re-reads
+# where every window is. Index 42 of each hook, so one of your own at [0] stays.
+set-hook -g 'window-unlinked[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
+set-hook -g 'window-linked[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
+set-hook -g 'session-renamed[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
+set-hook -g 'after-move-window[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
 
 # One session, several screens - a desktop and a phone, say. A window takes the
 # size of whichever client used it last, rather than shrinking to the smallest
@@ -1867,7 +1880,361 @@ chmod +x "$HOME/.local/bin/hat-creds"
 # brings panes back as bare shells - and `claude --continue` cannot tell
 # concurrent conversations apart when a dozen panes share one directory.
 
-cat > "$HOME/.local/bin/hat-launch" <<'HATLAUNCH'
+cat > "$HOME/.local/bin/hat-registry" <<'HATREGISTRY'
+#!/usr/bin/env bash
+# hat-registry - the pane registry: what each tmux window was running, for
+# hat-restore to rebuild after a reboot. The one writer of $PANES.
+#
+#   hat-registry put <pane> <kind> <session-id> <state> <cwd> [pid] [source]
+#   hat-registry adopt <entry file> <window id>   file an entry under the
+#                                   window hat-restore just built for it
+#   hat-registry refresh            follow this server's windows (tmux hooks)
+#   hat-registry prune [--dry-run]  refresh, settle entries from before this
+#                                   server started, record any window that
+#                                   has no entry as a shell, age out history
+#
+# An entry is filed under its window's tmux id and the server's (pid and start
+# time), and follows the window when windows close, move or renumber. Keyed by
+# window index, as it once was, an entry stayed at its index and was handed to
+# whichever window moved into it. The session, index and name are kept as
+# hints for a rebuild, and refreshed from tmux. A Claude session id is in at
+# most one entry: a later record for it, from any window, replaces the older.
+#
+# An agent's entry is not lost when its tab goes: before one is deleted or
+# written over by another conversation, it is filed under $PANES/closed by
+# session id. That is history for `hatter find`, never restored, and goes
+# after HISTORY_DAYS.
+#
+# Never fails, and only prune writes to stdout: hat-record runs this from a
+# Claude Code hook, and tmux from its own hooks.
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+PANES="$STATE/panes"
+RESTORING="$STATE/restoring"
+HISTORY_DAYS=90
+US=$'\x1f'
+# tmux 3.4 escapes control characters in -F output, so formats join their
+# fields with a tab, turned into $US before anything reads them. And a client
+# with no UTF-8 locale, which is what tmux's own hooks and a server started at
+# boot have, gets even a tab back as "_": -u tells tmux the client is UTF-8.
+HT=$'\t'
+tmux() { command tmux -u "$@"; }
+command -v tmux >/dev/null 2>&1 || exit 0
+command -v jq   >/dev/null 2>&1 || exit 0
+mkdir -p "$PANES" 2>/dev/null || exit 0
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+
+# One writer at a time: each command reads the registry, works out a plan and
+# carries it out, and another writing in between would be overwritten by it.
+# A lock left by a writer that died is taken over; one still held after 10
+# seconds by a live writer is not waited for (nothing is done).
+lock() {
+    local i=0 owner
+    while ! mkdir "$PANES/.lock" 2>/dev/null; do
+        i=$((i+1))
+        if [ "$i" -ge 100 ]; then
+            owner=$(cat "$PANES/.lock/pid" 2>/dev/null) || owner=""
+            if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then return 1; fi
+            rm -f "$PANES/.lock/pid"; rmdir "$PANES/.lock" 2>/dev/null; i=0
+            continue
+        fi
+        sleep 0.1
+    done
+    echo $$ > "$PANES/.lock/pid"
+    trap 'rm -f "$PANES/.lock/pid"; rmdir "$PANES/.lock" 2>/dev/null' EXIT
+}
+
+# hat-restore is rebuilding: entries from before this server started may
+# still be waiting for their windows, so nothing may take them for gone.
+restoring() {
+    local p
+    p=$(cat "$RESTORING" 2>/dev/null) || return 1
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+
+# Every entry, as one array, each with the file it came from in ._file. A file
+# that is not a JSON object (cut short, say) is left out rather than taking
+# the whole registry with it; with none readable at all this fails.
+entries() {
+    set -- "$PANES"/*.json
+    [ -e "$1" ] || { echo '[]'; return 0; }
+    jq -c -n '[inputs | objects | . + {_file: input_filename}]' "$@" 2>/dev/null && return 0
+    local f
+    for f in "$@"; do
+        jq -c --arg f "$f" 'objects | . + {_file: $f}' "$f" 2>/dev/null
+    done | jq -c -s '.'
+}
+
+# Every window on this server, with its first pane.
+live() {
+    local raw
+    raw=$(tmux list-panes -a -F "#{window_id}$HT#{session_name}$HT#{window_index}$HT#{window_name}$HT#{pid}.#{start_time}$HT#{pane_id}$HT#{pane_current_path}$HT#{pane_index}" 2>/dev/null | tr '\t' '\037') || raw=""
+    [ -n "$raw" ] || { echo '[]'; return 0; }
+    printf '%s\n' "$raw" | jq -c -Rn '[inputs | split("\u001f") | select(length >= 8)
+                 | {id: .[0], session: .[1], window: (.[2] | tonumber), name: .[3],
+                    server: .[4], pane: .[5], cwd: .[6], pane_index: (.[7] | tonumber)}]
+                | group_by(.id) | map(min_by(.pane_index) | del(.pane_index))' 2>/dev/null || echo '[]'
+}
+
+# keep_closed <entry file> <new session id>: before an entry is deleted or
+# written over, file the conversation it names under closed/, unless it is
+# the one taking its place; and a session live again is history no longer.
+keep_closed() {
+    local f="$1" new="${2:-}" old
+    if [ -f "$f" ]; then
+        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
+        if [ -n "$old" ] && [ "$old" != "$new" ]; then
+            mkdir -p "$PANES/closed" 2>/dev/null || true
+            jq --arg t "$(now)" '. + {closed: $t}' "$f" > "$PANES/closed/.tmp.$$" 2>/dev/null \
+              && mv "$PANES/closed/.tmp.$$" "$PANES/closed/$(slug "$old").json" 2>/dev/null
+            rm -f "$PANES/closed/.tmp.$$" 2>/dev/null
+        fi
+    fi
+    [ -z "$new" ] || rm -f "$PANES/closed/$(slug "$new").json" 2>/dev/null
+    return 0
+}
+
+write() {  # write <file> <json>
+    [ -n "$2" ] || return 1
+    printf '%s\n' "$2" > "$1.tmp.$$" 2>/dev/null && mv "$1.tmp.$$" "$1" 2>/dev/null
+    rm -f "$1.tmp.$$" 2>/dev/null
+}
+
+# Carry out a plan, one step a line, fields joined by $US:
+#   put   <file> <entry>             write a whole entry
+#   merge <from> <to> <fields>       the entry in <from> as it is now, with
+#                                    <fields> set, written to <to>
+#   rm    <file> <keep 1|0> [label]  forget it, keeping its conversation as
+#                                    history when <keep> is 1
+# Writes go first, and a file just written is never removed. Every path is
+# checked to be a registry file before anything is done with it.
+apply() {
+    local op a b c written="" plan
+    plan=$(cat)
+    while IFS="$US" read -r op a b c; do
+        case "$a" in "$PANES"/*.json) ;; *) continue ;; esac
+        case "$op" in
+            put)   keep_closed "$a" "$(printf '%s' "$b" | jq -r '.session_id // ""' 2>/dev/null)"
+                   write "$a" "$b" && written="$written$US$a$US" ;;
+            merge) case "$b" in "$PANES"/*.json) ;; *) continue ;; esac
+                   [ -f "$a" ] || continue
+                   write "$b" "$(jq -c --argjson m "$c" '. + $m' "$a" 2>/dev/null)" || continue
+                   written="$written$US$b$US"
+                   [ "$a" = "$b" ] || rm -f "$a" ;;
+        esac
+    done <<EOF
+$plan
+EOF
+    while IFS="$US" read -r op a b c; do
+        [ "$op" = rm ] || continue
+        case "$a" in "$PANES"/*.json) ;; *) continue ;; esac
+        case "$written" in *"$US$a$US"*) continue ;; esac
+        # Moved aside first, so a hook writing to this file meanwhile keeps
+        # its entry, which a copy-then-delete would remove.
+        mv -f "$a" "$PANES/.rm.$$" 2>/dev/null || continue
+        [ "$b" = 1 ] && keep_closed "$PANES/.rm.$$" ""
+        rm -f "$PANES/.rm.$$"
+    done <<EOF
+$plan
+EOF
+    return 0
+}
+
+# The jq every plan shares: the file an entry for a window lives in.
+JQ_DEFS='def slug: gsub("[^A-Za-z0-9_.@-]"; "_");
+def keyfile($dir): "\($dir)/\(.server | slug)-\(.id | slug).json";
+def clean: del(._file);'
+
+cmd_put() {
+    local pane="${1:-}" kind="${2:-shell}" sid="${3:-}" state="${4:-live}" cwd="${5:-$PWD}" pid="${6:-}" src="${7:-}"
+    [ -n "$pane" ] || return 0
+    local meta s w n wid srv mates rest=0 all
+    meta=$(tmux display-message -p -t "$pane" \
+        "#{session_name}$HT#{window_index}$HT#{window_name}$HT#{window_id}$HT#{pid}.#{start_time}" 2>/dev/null | tr '\t' '\037') || return 0
+    IFS="$US" read -r s w n wid srv <<EOF
+$meta
+EOF
+    [ -n "$s" ] && [ -n "$wid" ] && [ -n "$srv" ] || return 0
+    case "$w" in ''|*[!0-9]*) return 0 ;; esac
+    mates=$(tmux list-panes -t "$wid" -F '#{pane_id}' 2>/dev/null | tr '\n' ' ') || mates=""
+    restoring && rest=1
+    lock || return 0
+    all=$(entries) || return 0
+    printf '%s' "$all" | jq -r --arg dir "$PANES" --arg s "$s" --arg w "$w" --arg n "$n" --arg wid "$wid" \
+            --arg srv "$srv" --arg pane "$pane" --arg c "$cwd" --arg k "$kind" --arg i "$sid" \
+            --arg st "$state" --arg p "$pid" --arg src "$src" --arg t "$(now)" \
+            --arg mates " $mates" --arg rest "$rest" "$JQ_DEFS"'
+        ({server: $srv, id: $wid} | keyfile($dir)) as $f
+        | (map(select(._file == $f)) | first) as $mine
+        # A shell starting in a split of a window whose agent still runs in
+        # another of its panes is not what the window is: leave its entry be.
+        | if $k == "shell" and $i == "" and $mine != null and ($mine.session_id // "") != ""
+             and ($mine.pane // "") != $pane and ($mates | contains(" \($mine.pane // "-") "))
+          then empty
+          else
+            ({session: $s, window: ($w | tonumber), name: $n, cwd: $c, kind: $k,
+              session_id: $i, state: $st, recorded: $t, window_id: $wid, server: $srv, pane: $pane}
+             + (if $p != "" then {pid: $p} else {} end)
+             + (if $src != "" then {source: $src} else {} end)) as $new
+            | "put\u001f\($f)\u001f\($new | tojson)",
+              (.[] | select(._file != $f)
+               # Another entry holding this session id: this record has it
+               # now. One on this server keeps its window, as a shell.
+               | if $i != "" and .session_id == $i then
+                   (if .server == $srv
+                    then "merge\u001f\(._file)\u001f\(._file)\u001f\({kind: "shell", session_id: "", state: "live"} | tojson)"
+                    else "rm\u001f\(._file)\u001f0" end)
+                 # This window filed by its index under an older server: what
+                 # it held before. Not while hat-restore is rebuilding, when
+                 # it may be an entry still waiting for its own window.
+                 elif $rest == "0" and .server != $srv and .session == $s and .window == ($w | tonumber)
+                 then "rm\u001f\(._file)\u001f1"
+                 else empty end)
+          end' 2>/dev/null | apply
+}
+
+cmd_adopt() {
+    local f="${1:-}" wid="${2:-}" meta srv w pane to
+    case "$f" in "$PANES"/*.json) ;; *) return 0 ;; esac
+    [ -n "$wid" ] || return 0
+    meta=$(tmux display-message -p -t "$wid" "#{pid}.#{start_time}$HT#{window_index}$HT#{pane_id}" 2>/dev/null | tr '\t' '\037') || return 0
+    IFS="$US" read -r srv w pane <<EOF
+$meta
+EOF
+    [ -n "$srv" ] || return 0
+    lock || return 0
+    to="$PANES/$(slug "$srv")-$(slug "$wid").json"
+    # The window's own pane may have recorded itself already: that is newer.
+    if [ -e "$to" ] && [ "$to" != "$f" ]; then
+        printf 'rm%s%s%s0\n' "$US" "$f" "$US" | apply
+        return 0
+    fi
+    printf 'merge%s%s%s%s%s%s\n' "$US" "$f" "$US" "$to" "$US" \
+        "$(jq -cn --arg wid "$wid" --arg srv "$srv" --arg w "$w" --arg p "$pane" \
+             '{window_id: $wid, server: $srv, window: ($w | tonumber), pane: $p}')" | apply
+}
+
+# This server's entries follow their windows: a window that is gone takes its
+# entry with it, and one that moved, or whose session was renamed, carries its
+# new place. Entries from before this server started are left to `prune` and
+# to hat-restore, which may still be rebuilding them.
+cmd_refresh() {
+    local l all
+    l=$(live)
+    [ "$l" != "[]" ] || return 0
+    lock || return 0
+    all=$(entries) || return 0
+    printf '%s' "$all" | jq -r --argjson live "$l" "$JQ_DEFS"'
+        ($live[0].server) as $srv
+        | ($live | map({key: .id, value: .}) | from_entries) as $by
+        | .[] | select(.server == $srv)
+        | $by[.window_id // ""] as $w
+        | if $w == null then "rm\u001f\(._file)\u001f1"
+          elif .session == $w.session and .window == $w.window and .name == $w.name then empty
+          else "merge\u001f\(._file)\u001f\(._file)\u001f\({session: $w.session, window: $w.window, name: $w.name} | tojson)"
+          end' 2>/dev/null | apply
+}
+
+# refresh, and more: an entry from before this server started is matched to a
+# window by its session and index, the only guess there is, and refiled under
+# that window or forgotten; two entries for one window keep the one recorded
+# on it, else the latest; a session id held twice keeps its latest record; and
+# a window with no entry is recorded as the shell it is.
+#
+# At boot the registry is the only truth there is, and tmux is empty because
+# of whatever is being recovered from; so with no windows, or while
+# hat-restore is still rebuilding, nothing is touched.
+cmd_prune() {
+    local dry=0 l all plan op a b c
+    [ "${1:-}" = --dry-run ] && dry=1
+    l=$(live)
+    if [ "$l" = "[]" ]; then
+        echo "hat-registry: tmux has no windows - refusing to prune"
+        return 0
+    fi
+    if restoring; then
+        echo "hat-registry: hat-restore is rebuilding - not pruning until it is done"
+        return 0
+    fi
+    lock || { echo "hat-registry: another writer holds the registry - not pruning"; return 0; }
+    all=$(entries) || { echo "hat-registry: could not read the registry - nothing changed"; return 0; }
+    plan=$(printf '%s' "$all" | jq -r --argjson live "$l" --arg dir "$PANES" --arg t "$(now)" "$JQ_DEFS"'
+        ($live[0].server) as $srv
+        | ($live | map({key: .id, value: .}) | from_entries) as $by
+        | ($live | map({key: "\(.session)\u001f\(.window)", value: .}) | from_entries) as $at
+        | map(. as $e
+              | (if .server == $srv then $by[.window_id // ""] else $at["\(.session)\u001f\(.window)"] end) as $w
+              | {e: $e, w: $w, mine: (.server == $srv), at: (.recorded // ""),
+                 to: (if $w then ($w | keyfile($dir)) else null end)})
+        | (map(select(.w == null) | {e, why: "its window is gone"})) as $gone
+        | (map(select(.w != null)) | group_by(.to)) as $per
+        | ($per | map(sort_by(.mine, .at) | last)) as $one
+        | ($per | map(sort_by(.mine, .at) | .[:-1][] | {e, why: "another entry has its window"})) as $twice
+        | ($one | map(select((.e.session_id // "") != "")) | group_by(.e.session_id)
+                | map(sort_by(.at, .mine) | .[:-1][])) as $dupes
+        | ($dupes | map(.e._file)) as $dupf
+        | ($one | map(select(.e._file as $x | $dupf | index([$x]) | not))) as $kept
+        | ($kept | map(.w.id)) as $held
+        | ($kept | map(.e.session_id // "" | select(. != ""))) as $ids
+        | [ (($gone + $twice) | .[]
+             | (.e.session_id // "") as $sid
+             | (if $sid != "" and ($ids | index([$sid]) | not) then 1 else 0 end) as $keep
+             | "rm\u001f\(.e._file)\u001f\($keep)\u001f\(.why): \(.e.session // ""):\(.e.window // "") (\(.e.name // ""))"),
+            ($dupes[] | "rm\u001f\(.e._file)\u001f0\u001fa later record has its session id: \(.e.session // ""):\(.e.window // "")"),
+            ($kept[] | . as $k
+             | {session: $k.w.session, window: $k.w.window, name: $k.w.name,
+                window_id: $k.w.id, server: $k.w.server} as $m
+             | select($k.to != $k.e._file or ($k.e | clean) != (($k.e | clean) + $m))
+             | "merge\u001f\($k.e._file)\u001f\($k.to)\u001f\($m | tojson)"),
+            ($live[] | select(.id as $x | $held | index([$x]) | not)
+             | {session, window, name, cwd, kind: "shell", session_id: "", state: "live",
+                recorded: $t, window_id: .id, server, pane, source: "prune"} as $n
+             | "put\u001f\({server, id} | keyfile($dir))\u001f\($n | tojson)") ]
+        | .[]' 2>/dev/null) || { echo "hat-registry: could not work out a plan - nothing changed"; return 0; }
+    local gone=0 added=0
+    while IFS="$US" read -r op a b c; do
+        case "$op" in
+            rm)  gone=$((gone+1))
+                 [ "$dry" = 1 ] && printf '  would forget: %s\n' "$c" ;;
+            put) added=$((added+1))
+                 [ "$dry" = 1 ] && printf '  would record as a shell: %s\n' \
+                     "$(printf '%s' "$b" | jq -r '"\(.session):\(.window) (\(.name))"' 2>/dev/null)" ;;
+        esac
+    done <<EOF
+$plan
+EOF
+    if [ "$dry" != 1 ]; then
+        printf '%s\n' "$plan" | apply
+        # History is for finding old conversations, not for restoring them,
+        # so it has an age limit rather than a size one. The case keeps the
+        # delete inside hatter's own state directory whatever PANES is.
+        if [ -d "$PANES/closed" ]; then
+            case "$PANES" in
+                */hatter/panes) find "$PANES/closed" -maxdepth 1 -name '*.json' -mtime +"$((HISTORY_DAYS - 1))" -exec rm -f {} + 2>/dev/null ;;
+            esac
+        fi
+    fi
+    echo "hat-registry: forgot $gone entry(ies), recorded $added window(s) as shells"
+}
+
+case "${1:-}" in
+    put)     shift; cmd_put "$@" ;;
+    adopt)   shift; cmd_adopt "$@" ;;
+    refresh) cmd_refresh ;;
+    prune)   shift; cmd_prune "$@" ;;
+    *)       echo "usage: hat-registry put|adopt|refresh|prune" >&2 ;;
+esac
+exit 0
+HATREGISTRY
+chmod +x "$HOME/.local/bin/hat-registry"
+
+# Written beside it and moved into place: every pane runs hat-launch for as long
+# as it is open, and bash reads a script as it goes, so one rewritten in place
+# would have running copies resume at their old offset in the new text.
+cat > "$HOME/.local/bin/hat-launch.new" <<'HATLAUNCH'
 #!/usr/bin/env bash
 # hat-launch - the command every pane runs.
 #
@@ -1892,9 +2259,6 @@ cat > "$HOME/.local/bin/hat-launch" <<'HATLAUNCH'
 #     bare `exit` returns the last command's status)
 set -uo pipefail
 
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
-PANES="$STATE/panes"
-mkdir -p "$PANES" 2>/dev/null || true
 
 kind="" sid=""
 while [ $# -gt 0 ]; do
@@ -1922,12 +2286,18 @@ fi
 # SHELL=/bin/bash, and a zsh user's profile is not one bash reads. A profile
 # that blocks gets 10 seconds, and anything it prints is skipped by reading
 # only what follows the marker.
-login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
-[ -x "${login_shell:-}" ] || login_shell="${SHELL:-/bin/bash}"
-# Read via a file, not a pipe: a profile that leaves a background child
-# holding the pipe open would keep the read loop waiting past the timeout.
-to=""; command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
-envf=$(mktemp 2>/dev/null) || envf=""
+#
+# A plain shell is a login shell itself and needs none of this; it is what
+# most panes run, so it does not wait on a profile twice.
+envf=""
+if [ "$kind" != shell ]; then
+    login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+    [ -x "${login_shell:-}" ] || login_shell="${SHELL:-/bin/bash}"
+    # Read via a file, not a pipe: a profile that leaves a background child
+    # holding the pipe open would keep the read loop waiting past the timeout.
+    to=""; command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
+    envf=$(mktemp 2>/dev/null) || envf=""
+fi
 if [ -n "$envf" ]; then
     $to "$login_shell" -lc 'printf "HATENV\0"; env -0' </dev/null >"$envf" 2>/dev/null
     seen=0
@@ -1950,50 +2320,15 @@ if [ -n "${TMUX:-}" ]; then
     read -r -a extra <<< "$(tmux show-options -gv "@hat_${kind}_args" 2>/dev/null)" || extra=()
 fi
 
-slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
-# keep_closed <entry> <new session id>: before an entry is deleted or written
-# over, keep the conversation it names. History is filed by session id under
-# closed/, so a conversation resumed later in another tab replaces its own
-# record, and a session that is live again ("<new session id>") leaves it.
-# hat-launch, hat-record and hat-restore each carry this same copy.
-keep_closed() {
-    local f="$1" new="${2:-}" old d="$PANES/closed"
-    if [ -f "$f" ]; then
-        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
-        if [ -n "$old" ] && [ "$old" != "$new" ]; then
-            mkdir -p "$d" 2>/dev/null || true
-            jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {closed: $t}' "$f" > "$d/.tmp.$$" 2>/dev/null \
-              && mv "$d/.tmp.$$" "$d/$(printf '%s' "$old" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
-            rm -f "$d/.tmp.$$" 2>/dev/null
-        fi
-    fi
-    [ -z "$new" ] || rm -f "$d/$(printf '%s' "$new" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
-    return 0
-}
-
 # How Claude Code names a project dir after a path: /a/.b -> -a--b
 mangle() { printf '%s' "$1" | tr -c 'A-Za-z0-9' '-'; }
 
-# Never write stdout from here: nothing downstream expects it, and the hook
-# sibling of this script shares the rule for a harder reason.
+# record <kind> <session id> <pid>: this pane's window, in the registry (see
+# hat-registry). Never write stdout from here: nothing downstream expects it,
+# and the hook sibling of this script shares the rule for a harder reason.
 record() {
-    [ -n "${TMUX:-}" ] || return 0
-    command -v tmux >/dev/null 2>&1 || return 0
-    command -v jq   >/dev/null 2>&1 || return 0
-    local meta s w n rest f
-    meta=$(tmux display-message -p -t "${TMUX_PANE:-}" \
-            '#{session_name}	#{window_index}	#{window_name}' 2>/dev/null) || return 0
-    s=${meta%%	*}; rest=${meta#*	}; w=${rest%%	*}; n=${rest#*	}
-    [ -n "$s" ] || return 0
-    f="$PANES/$(slug "$s")@$w.json"
-    keep_closed "$f" "${2:-}"
-    jq -n --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$PWD" \
-          --arg k "$1" --arg i "${2:-}" --arg p "${3:-}" \
-          --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '{session:$s, window:($w|tonumber), name:$n, cwd:$c,
-        kind:$k, session_id:$i, pid:$p, recorded:$t}' > "$f.tmp" 2>/dev/null \
-      && mv "$f.tmp" "$f" 2>/dev/null
-    rm -f "$f.tmp" 2>/dev/null
+    [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ] || return 0
+    "$HOME/.local/bin/hat-registry" put "$TMUX_PANE" "$1" "${2:-}" live "$PWD" "${3:-}" >/dev/null 2>&1
     return 0
 }
 
@@ -2064,7 +2399,8 @@ while :; do
     sleep 0.3
 done
 HATLAUNCH
-chmod +x "$HOME/.local/bin/hat-launch"
+chmod +x "$HOME/.local/bin/hat-launch.new"
+mv -f "$HOME/.local/bin/hat-launch.new" "$HOME/.local/bin/hat-launch"
 
 cat > "$HOME/.local/bin/hat-record" <<'HATRECORD'
 #!/usr/bin/env bash
@@ -2083,10 +2419,6 @@ set -uo pipefail
 
 payload=$(cat 2>/dev/null) || payload=""
 
-STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
-PANES="$STATE/panes"
-mkdir -p "$PANES" 2>/dev/null || true
-
 # No tmux is a silent no-op: claude runs outside tmux on some servers, and a
 # hook that assumed $TMUX_PANE would break every session on that box.
 [ -n "${TMUX:-}" ] || exit 0
@@ -2100,48 +2432,13 @@ ev=$(printf '%s' "$payload"  | jq -r '.hook_event_name // ""' 2>/dev/null) || ev
 [ -n "$sid" ] || exit 0
 [ -n "$cwd" ] || cwd="$PWD"
 
-meta=$(tmux display-message -p -t "$TMUX_PANE" \
-        '#{session_name}	#{window_index}	#{window_name}' 2>/dev/null) || exit 0
-s=${meta%%	*}; rest=${meta#*	}; w=${rest%%	*}; n=${rest#*	}
-[ -n "$s" ] || exit 0
-
-slug=$(printf '%s' "$s" | tr -c 'A-Za-z0-9_.@-' '_')
-f="$PANES/$slug@$w.json"
-
-# keep_closed <entry> <new session id>: before an entry is deleted or written
-# over, keep the conversation it names. History is filed by session id under
-# closed/, so a conversation resumed later in another tab replaces its own
-# record, and a session that is live again ("<new session id>") leaves it.
-# hat-launch, hat-record and hat-restore each carry this same copy.
-keep_closed() {
-    local f="$1" new="${2:-}" old d="$PANES/closed"
-    if [ -f "$f" ]; then
-        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
-        if [ -n "$old" ] && [ "$old" != "$new" ]; then
-            mkdir -p "$d" 2>/dev/null || true
-            jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {closed: $t}' "$f" > "$d/.tmp.$$" 2>/dev/null \
-              && mv "$d/.tmp.$$" "$d/$(printf '%s' "$old" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
-            rm -f "$d/.tmp.$$" 2>/dev/null
-        fi
-    fi
-    [ -z "$new" ] || rm -f "$d/$(printf '%s' "$new" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
-    return 0
-}
-keep_closed "$f" "$sid"
-
 # SessionEnd keeps the entry and marks it ended: a tab whose agent exited before
 # the power went out should come back as the shell it was, not as a resumed
 # conversation nobody asked for.
 state=live
 [ "$ev" = SessionEnd ] && state=ended
 
-jq -n --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$cwd" \
-      --arg i "$sid" --arg st "$state" \
-      --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{session:$s, window:($w|tonumber), name:$n, cwd:$c,
-    kind:"claude", session_id:$i, state:$st, recorded:$t}' > "$f.tmp" 2>/dev/null \
-  && mv "$f.tmp" "$f" 2>/dev/null
-rm -f "$f.tmp" 2>/dev/null
+"$HOME/.local/bin/hat-registry" put "$TMUX_PANE" claude "$sid" "$state" "$cwd" >/dev/null 2>&1
 exit 0
 HATRECORD
 chmod +x "$HOME/.local/bin/hat-record"
@@ -2163,9 +2460,9 @@ cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 #   hat-restore --prune      forget entries whose tmux window is gone
 #   hat-restore --no-prune   with --backfill, keep the orphans
 #
-# An agent's entry is not lost when its tab goes: prune, and any launch or hook
-# that writes over it, first files it under $PANES/closed by session id. Those
-# are history for `hatter find`, never restored, and go after HISTORY_DAYS.
+# An agent's entry is not lost when its tab goes: hat-registry files it under
+# $PANES/closed by session id first. That is history for `hatter find`, never
+# restored here.
 #
 # --backfill exists because the hook only fires when a session starts. On a box
 # that was already running agents when hatter arrived, the registry would stay
@@ -2174,11 +2471,10 @@ cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 # session id but not its pane, so each pid is walked up its parent chain until
 # it lands on a tmux pane. That is the same join bin/unfleet does.
 #
-# A backfill overwrites the entries it matches but knows nothing about the ones
-# it does not, so closed tabs - and any tab dragged to another workspace, which
-# changes the very key an entry is filed under - accumulate as orphans that a
-# reboot would faithfully resurrect. --prune drops them, and --backfill runs it
-# afterwards by default.
+# Entries follow their windows as tmux reports them (see hat-registry), but an
+# entry from before this server started, or from an older registry keyed by
+# window index, is only a guess until something settles it. --prune does (see
+# `hat-registry prune`), and --backfill runs it afterwards by default.
 #
 # The registry knows every tab this box has run, not which ones the client still
 # wants. `hatter sync` writes that down in $STATE/sessions, and a rebuild skips
@@ -2191,8 +2487,11 @@ STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
 PANES="$STATE/panes"
 KEEP="$STATE/sessions"
 LAUNCH="$HOME/.local/bin/hat-launch"
-# Days a closed tab's entry is kept in $PANES/closed (see keep_closed).
-HISTORY_DAYS=90
+REG="$HOME/.local/bin/hat-registry"
+# Formats join fields with a tab: tmux 3.4 escapes \x1f in -F output, and
+# with no UTF-8 locale (a server started at boot has none) even a tab comes
+# back as "_" unless the client says it is UTF-8 (-u).
+tmux() { command tmux -u "$@"; }
 
 dry=0 quiet=0 agents=1 backfill=0 prune=0 no_prune=0
 for a in "$@"; do
@@ -2208,26 +2507,6 @@ done
 say() { [ "$quiet" = 1 ] || printf '%s\n' "$*"; }
 
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
-
-# keep_closed <entry> <new session id>: before an entry is deleted or written
-# over, keep the conversation it names. History is filed by session id under
-# closed/, so a conversation resumed later in another tab replaces its own
-# record, and a session that is live again ("<new session id>") leaves it.
-# hat-launch, hat-record and hat-restore each carry this same copy.
-keep_closed() {
-    local f="$1" new="${2:-}" old d="$PANES/closed"
-    if [ -f "$f" ]; then
-        old=$(jq -r '.session_id // ""' "$f" 2>/dev/null) || old=""
-        if [ -n "$old" ] && [ "$old" != "$new" ]; then
-            mkdir -p "$d" 2>/dev/null || true
-            jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '. + {closed: $t}' "$f" > "$d/.tmp.$$" 2>/dev/null \
-              && mv "$d/.tmp.$$" "$d/$(printf '%s' "$old" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
-            rm -f "$d/.tmp.$$" 2>/dev/null
-        fi
-    fi
-    [ -z "$new" ] || rm -f "$d/$(printf '%s' "$new" | tr -c 'A-Za-z0-9_.@-' '_').json" 2>/dev/null
-    return 0
-}
 
 do_backfill() {
     command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; return 0; }
@@ -2245,7 +2524,7 @@ do_backfill() {
     local panes
     # Tab-joined, then turned into \x1f: tmux 3.4 escapes \x1f in -F output.
     local ht=$'\t'
-    panes=$(tmux list-panes -a -F "#{pane_pid}$ht#{session_name}$ht#{window_index}$ht#{window_name}$ht#{pane_current_path}" 2>/dev/null | tr '\t' '\037') || panes=""
+    panes=$(tmux list-panes -a -F "#{pane_pid}$ht#{session_name}$ht#{window_index}$ht#{window_name}$ht#{pane_current_path}$ht#{pane_id}" 2>/dev/null | tr '\t' '\037') || panes=""
     [ -n "$panes" ] || { say "hat-restore: no tmux panes"; return 0; }
 
     local n=0 miss=0 pid cwd sid owner line ppid hops f
@@ -2263,23 +2542,15 @@ do_backfill() {
         done
         [ -n "$owner" ] || { miss=$((miss+1)); continue; }
 
-        local _pp s w nm pcwd
-        IFS=$'\x1f' read -r _pp s w nm pcwd <<EOT
+        local _pp s w nm pcwd pane
+        IFS=$'\x1f' read -r _pp s w nm pcwd pane <<EOT
 $owner
 EOT
         [ -n "$cwd" ] || cwd="$pcwd"
-        f="$PANES/$(slug "$s")@$w.json"
         if [ "$dry" = 1 ]; then
             printf '  would record: %s:%s (%s) -> %s\n' "$s" "$w" "${nm:-unnamed}" "$sid"
         else
-            keep_closed "$f" "$sid"
-            jq -n --arg s "$s" --arg w "$w" --arg n "$nm" --arg c "$cwd" \
-                  --arg i "$sid" \
-                  --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              '{session:$s, window:($w|tonumber), name:$n, cwd:$c,
-                kind:"claude", session_id:$i, state:"live", recorded:$t,
-                source:"backfill"}' > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
-            rm -f "$f.tmp" 2>/dev/null
+            "$REG" put "$pane" claude "$sid" live "$cwd" "$pid" backfill >/dev/null 2>&1
         fi
         n=$((n+1))
     done <<EOT
@@ -2291,51 +2562,7 @@ EOT
 }
 
 do_prune() {
-    command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; return 0; }
-    command -v jq   >/dev/null 2>&1 || { say "hat-restore: no jq"; return 0; }
-    [ -d "$PANES" ] || return 0
-
-    local live
-    live=$(tmux list-windows -a -F '#{session_name}@#{window_index}' 2>/dev/null) || live=""
-
-    # The one rule that matters: at boot the registry IS the truth, and tmux is
-    # empty precisely because the thing we are recovering from happened. Pruning
-    # against an empty window list would erase everything there is to restore.
-    if [ -z "$live" ]; then
-        say "hat-restore: tmux has no windows - refusing to prune"
-        return 0
-    fi
-
-    local f s w gone=0
-    for f in "$PANES"/*.json; do
-        [ -e "$f" ] || continue
-        s=$(jq -r '.session // ""' "$f" 2>/dev/null) || continue
-        w=$(jq -r '.window // ""'  "$f" 2>/dev/null) || continue
-        [ -n "$s" ] || continue
-        printf '%s\n' "$live" | grep -qxF "$s@$w" && continue
-        if [ "$dry" = 1 ]; then
-            printf '  would forget: %s:%s  (%s)\n' "$s" "$w" \
-                "$(jq -r '.name // ""' "$f" 2>/dev/null)"
-        else
-            # Moved aside first: a hook writing a new session into this slot
-            # meanwhile keeps its entry, which a copy-then-delete would remove.
-            mv -f "$f" "$PANES/.prune.$$" 2>/dev/null || continue
-            keep_closed "$PANES/.prune.$$" ""
-            rm -f "$PANES/.prune.$$"
-        fi
-        gone=$((gone+1))
-    done
-    say "hat-restore: pruned $gone entry(ies) whose window is gone"
-
-    # History is for finding old conversations, not for restoring them, so it
-    # has an age limit rather than a size one. The case keeps the delete inside
-    # hatter's own state directory whatever PANES turned out to be.
-    if [ "$dry" != 1 ] && [ -d "$PANES/closed" ]; then
-        case "$PANES" in
-            */hatter/panes) find "$PANES/closed" -maxdepth 1 -name '*.json' -mtime +"$((HISTORY_DAYS - 1))" -exec rm -f {} + 2>/dev/null ;;
-        esac
-    fi
-    return 0
+    if [ "$dry" = 1 ]; then "$REG" prune --dry-run; else "$REG" prune; fi
 }
 
 if [ "$backfill" = 1 ]; then
@@ -2353,15 +2580,38 @@ command -v tmux >/dev/null 2>&1 || { say "hat-restore: no tmux"; exit 0; }
 command -v jq   >/dev/null 2>&1 || { say "hat-restore: no jq"; exit 0; }
 [ -d "$PANES" ] || { say "hat-restore: nothing recorded in $PANES"; exit 0; }
 
-# One line per pane, ordered so that window 0 of each session comes first - the
-# session has to be created by its own first window.
-entries=$(cat "$PANES"/*.json 2>/dev/null \
-    | jq -rs 'map(select(.session != null))
-              | sort_by(.session, .window)
-              | .[] | [.session, (.window|tostring), .name, .cwd,
-                       (.kind // "shell"), (.session_id // ""), (.state // "live")]
-              | map(. // "" | tostring) | join("\u001f")' 2>/dev/null) || entries=""
+# One line per window, ordered so that the lowest window of each session comes
+# first - the session has to be created by its own first window. A session id
+# held by more than one entry, which an older registry allowed, resumes only in
+# the latest; the others come back as shells.
+entries=$(jq -n '[inputs | objects | . + {_file: input_filename}]' "$PANES"/*.json 2>/dev/null \
+    | jq -r 'map(select(.session != null))
+             | (map(select((.session_id // "") != "")) | group_by(.session_id)
+                | map(sort_by(.recorded // "") | .[:-1][] | ._file)) as $dup
+             | map(._file as $f | if ($dup | index([$f])) then .kind = "shell" | .session_id = "" else . end)
+             | sort_by(.session, .window)
+             | .[] | [.session, (.window|tostring), .name, .cwd,
+                      (.kind // "shell"), (.session_id // ""), (.state // "live"),
+                      (.window_id // ""), (.server // ""), ._file]
+             | map(. // "" | tostring) | join("\u001f")' 2>/dev/null) || entries=""
 [ -n "$entries" ] || { say "hat-restore: no usable entries"; exit 0; }
+
+# The server as it stands: an entry recorded on it whose window is still there
+# is already standing, wherever that window has moved.
+ht=$'\t'
+cur=$(tmux list-windows -a -F "#{pid}.#{start_time}$ht#{window_id}" 2>/dev/null) || cur=""
+server=$(printf '%s\n' "$cur" | head -n 1 | cut -f 1)
+
+# While this rebuilds, entries from before the server started are waiting for
+# their windows: hat-registry neither prunes them nor takes their index.
+if [ "$dry" = 0 ]; then
+    echo $$ > "$STATE/restoring" 2>/dev/null || true
+    trap 'rm -f "$STATE/restoring"' EXIT
+fi
+
+# rekey <entry file> <window id>: file the entry under the window just made
+# for it, so it follows that window from now on.
+rekey() { [ -n "$2" ] && "$REG" adopt "$1" "$2" >/dev/null 2>&1; return 0; }
 
 run() {
     if [ "$dry" = 1 ]; then printf '  would: %s\n' "$*"; else "$@"; fi
@@ -2376,9 +2626,14 @@ have_session() {
     tmux has-session -t "=$1" 2>/dev/null
 }
 
-made=0 skipped=0 unwanted=0
-while IFS=$'\x1f' read -r s w n cwd kind sid state; do
+made=0 skipped=0 unwanted=0 built=""
+while IFS=$'\x1f' read -r s w n cwd kind sid state wid srv file; do
     [ -n "$s" ] || continue
+    if [ -n "$server" ] && [ "$srv" = "$server" ] \
+       && printf '%s\n' "$cur" | grep -qxF -- "$server$ht$wid"; then
+        skipped=$((skipped+1))
+        continue
+    fi
     if [ -f "$KEEP" ] && ! grep -qxF -- "$s" "$KEEP"; then
         [ "$dry" = 1 ] && printf '  would leave closed: %s:%s  (not in the client config)\n' "$s" "$w"
         unwanted=$((unwanted+1))
@@ -2396,7 +2651,13 @@ while IFS=$'\x1f' read -r s w n cwd kind sid state; do
 
     if ! have_session "$s"; then
         say "  session $s  (window $w: ${n:-unnamed})"
-        run tmux new-session -d -s "$s" -n "${n:-shell}" -c "$cwd" "$cmd"
+        if [ "$dry" = 1 ]; then
+            run tmux new-session -d -s "$s" -n "${n:-shell}" -c "$cwd" "$cmd"
+        else
+            nw=$(tmux new-session -d -s "$s" -n "${n:-shell}" -c "$cwd" -P -F '#{window_id}' "$cmd")
+            built="$built $nw"
+            rekey "$file" "$nw"
+        fi
         seen="$seen $s"
         made=$((made+1))
         continue
@@ -2404,12 +2665,27 @@ while IFS=$'\x1f' read -r s w n cwd kind sid state; do
 
     # The session exists. Only add a window that is not already there, so a
     # rerun - or a run after someone rebuilt half of it by hand - is harmless.
-    if [ "$dry" = 0 ] && tmux list-windows -t "=$s" -F '#{window_index}' 2>/dev/null | grep -qx "$w"; then
-        skipped=$((skipped+1))
-        continue
+    # An index this run has itself just filled is another entry's stale hint
+    # meeting this one: both are windows to rebuild, so this one goes after.
+    target="=$s:$w"
+    if [ "$dry" = 0 ]; then
+        occupant=$(tmux list-windows -t "=$s" -F "#{window_index}$ht#{window_id}" 2>/dev/null \
+                   | awk -F '\t' -v w="$w" '$1 == w { print $2 }' | head -n 1)
+        if [ -n "$occupant" ]; then
+            case " $built " in
+                *" $occupant "*) target="=$s:" ;;
+                *) skipped=$((skipped+1)); continue ;;
+            esac
+        fi
     fi
     say "  window $s:$w  (${n:-unnamed})"
-    run tmux new-window -d -t "=$s:$w" -n "${n:-shell}" -c "$cwd" "$cmd"
+    if [ "$dry" = 1 ]; then
+        run tmux new-window -d -t "$target" -n "${n:-shell}" -c "$cwd" "$cmd"
+    else
+        nw=$(tmux new-window -d -t "$target" -n "${n:-shell}" -c "$cwd" -P -F '#{window_id}' "$cmd")
+        built="$built $nw"
+        rekey "$file" "$nw"
+    fi
     made=$((made+1))
 done <<< "$entries"
 
@@ -2577,6 +2853,10 @@ save="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
 [ -x "$save" ] || { echo "hat-save: no tmux-resurrect"; exit 0; }
 command -v tmux >/dev/null 2>&1 || { echo "hat-save: no tmux"; exit 0; }
 
+# The registry follows its windows on tmux's hooks; `move-window -r` and the
+# like fire none, so it is brought up to date here too.
+"$HOME/.local/bin/hat-registry" refresh >/dev/null 2>&1 || true
+
 sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || sessions=""
 if [ -z "$sessions" ]; then
     echo "hat-save: no tmux sessions - keeping the last snapshot"
@@ -2734,7 +3014,7 @@ done
 # server can hold a pane-died hook that reads as set but never fires, so clear
 # it before setting it rather than assuming the value is live.
 if tmux has-session 2>/dev/null; then
-    tmux set -g default-command 'while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
+    tmux set -g default-command 'h="$HOME/.local/bin/hat-launch"; [ -x "$h" ] && exec "$h"; while true; do "$SHELL" -l; [ $? -eq 99 ] && break; sleep 0.3; done'
     tmux set -g remain-on-exit off
     tmux set-hook -gu pane-died 2>/dev/null || true
     tmux set -g window-size latest 2>/dev/null || true
@@ -2751,7 +3031,9 @@ fi
 # Prove it actually works rather than trusting show-options: a shell that exits
 # must come back with a usable prompt, in a throwaway session.
 tmux kill-session -t '=hatter-selftest' 2>/dev/null || true
-tmux new-session -d -s hatter-selftest -x 80 -y 24
+# hat-launch is asked for a shell: a hat whose panes default to an agent would
+# otherwise have these keys typed into its prompt.
+tmux new-session -d -s hatter-selftest -x 80 -y 24 "$HOME/.local/bin/hat-launch --kind shell"
 sleep 1
 tmux send-keys -t '=hatter-selftest:0' 'exit' Enter
 sleep 2
@@ -2770,7 +3052,7 @@ tmux kill-session -t '=hatter-selftest' 2>/dev/null || true
 
 # ...and that the deliberate exits really do close it.
 tmux kill-session -t '=hatter-selftest2' 2>/dev/null || true
-tmux new-session -d -s hatter-selftest2 -x 80 -y 24
+tmux new-session -d -s hatter-selftest2 -x 80 -y 24 "$HOME/.local/bin/hat-launch --kind shell"
 sleep 1
 tmux send-keys -t '=hatter-selftest2:0' 'exit 99' Enter
 sleep 2
@@ -2797,6 +3079,11 @@ if "$HOME/.local/bin/hat-restore" --dry-run >/dev/null 2>&1; then
     echo "selftest ok: 'hat-restore' runs"
 else
     echo "SELFTEST FAILED: 'hat-restore' did not run" >&2
+fi
+if "$HOME/.local/bin/hat-registry" refresh >/dev/null 2>&1; then
+    echo "selftest ok: 'hat-registry' runs"
+else
+    echo "SELFTEST FAILED: 'hat-registry' must never exit non-zero" >&2
 fi
 if printf '{}' | "$HOME/.local/bin/hat-record" >/dev/null 2>&1; then
     echo "selftest ok: 'hat-record' is a silent no-op outside tmux"
@@ -3895,17 +4182,31 @@ transcript() {
 
 # Running sessions: registry entries whose tmux window is still there.
 live_ids=""
-windows=$(tmux list-windows -a -F '#{session_name}	#{window_index}	#{window_id}' 2>/dev/null) || windows=""
+windows=$(tmux list-windows -a -F '#{session_name}	#{window_index}	#{window_id}	#{pid}.#{start_time}' 2>/dev/null) || windows=""
 if [ -n "$windows" ] && [ -d "$PANES" ]; then
     for p in "$PANES"/*.json; do
         [ -f "$p" ] || continue
         # \037-joined, not @tsv, which would escape a backslash in a name.
-        IFS=$'\037' read -r kind s w sid cwd name <<EOF
-$(jq -j '[.kind // "", .session // "", (.window // "" | tostring), .session_id // "", .cwd // "", .name // ""] | join("\u001f")' "$p" 2>/dev/null)
+        IFS=$'\037' read -r kind s w sid cwd name ewid esrv <<EOF
+$(jq -j '[.kind // "", .session // "", (.window // "" | tostring), .session_id // "", .cwd // "", .name // "", .window_id // "", .server // ""] | join("\u001f")' "$p" 2>/dev/null)
 EOF
         [ "${kind:-}" = claude ] && [ -n "${sid:-}" ] || continue
-        wid=$(printf '%s\n' "$windows" | HF_S="$s" HF_W="$w" awk -F '\t' '$1 == ENVIRON["HF_S"] && $2 == ENVIRON["HF_W"] { print $3; exit }')
-        [ -n "$wid" ] || continue
+        # Recorded on this server: its window by id, where it is now. From
+        # before (an older registry, or a server since restarted): by session
+        # and index, the only guess there is.
+        line=$(printf '%s\n' "$windows" | HF_I="${ewid:-}" HF_V="${esrv:-}" \
+            awk -F '\t' 'ENVIRON["HF_I"] != "" && $3 == ENVIRON["HF_I"] && $4 == ENVIRON["HF_V"] { print; exit }')
+        # An entry of this server whose window is gone is a closed tab, never
+        # whichever window now sits at its index.
+        cursrv=$(printf '%s\n' "$windows" | head -n 1 | cut -f 4)
+        if [ -z "$line" ] && { [ -z "${esrv:-}" ] || [ "$esrv" != "$cursrv" ]; }; then
+            line=$(printf '%s\n' "$windows" | HF_S="$s" HF_W="$w" \
+                awk -F '\t' '$1 == ENVIRON["HF_S"] && $2 == ENVIRON["HF_W"] { print; exit }')
+        fi
+        [ -n "$line" ] || continue
+        IFS=$'\t' read -r s w wid _ <<EOF
+$line
+EOF
         t=$(transcript "$sid") || continue
         live_ids="$live_ids $sid "
         emit live "$s" "$w" "$wid" "$sid" "$cwd" "$name" "$t"
@@ -8221,10 +8522,10 @@ Set up a shell server so its state survives both a reboot and a stray logout:
 
   - tpm, tmux-resurrect and tmux-continuum, autosaving every 15 minutes.
     continuum does not restore on its own: hat-restore (below) owns that, and
-    the two would race. hat-restore rebuilds the windows its registry holds,
-    which are the ones that ran an agent; plain shell windows come back from
-    `hatter restore` on the client. A snapshot, splits and scrollback
-    included, can still be restored by hand (prefix + ctrl-r).
+    the two would race. hat-restore rebuilds every window its registry holds,
+    agents and shells alike (every pane records itself through hat-launch).
+    A snapshot, splits and scrollback included, can still be restored by hand
+    (prefix + ctrl-r).
   - the hat's launch settings (see: hatter help hat), as the tmux options
     hat-launch reads, in ~/.local/state/hatter/launch.tmux.conf on the
     server. A hat provisioned as user@host that no hat in the config names
@@ -8243,7 +8544,8 @@ Set up a shell server so its state survives both a reboot and a stray logout:
 It also installs boot recovery, which rebuilds the server's own tmux without
 the Mac being involved at all:
 
-  - hat-launch   what a pane runs. It mints the agent's session id BEFORE
+  - hat-launch   what every pane runs, and so what records each window, shells
+                 included. For an agent it mints the session id BEFORE
                  starting it, so which conversation a tab held is something the
                  tab wrote down rather than something anyone has to infer.
   - hat-record   a SessionStart/SessionEnd hook, appended as its own entry so
@@ -8254,10 +8556,9 @@ the Mac being involved at all:
                  --dry-run prints the plan; --no-agents rebuilds plain shells;
                  --backfill records the agents running right now, which
                  provision does for you so an already-busy box is covered
-                 before its first reboot rather than after it; --prune forgets
-                 entries whose tmux window is gone (closed tabs, and tabs
-                 dragged to another workspace, which changes the key an entry
-                 is filed under). --backfill prunes afterwards unless given
+                 before its first reboot rather than after it; --prune settles
+                 the registry against the windows there are (see
+                 hat-registry). --backfill prunes afterwards unless given
                  --no-prune. Pruning refuses to run when tmux has no windows,
                  since at boot the registry is the only truth there is.
                  An agent's entry is never simply lost: when prune drops it, or
@@ -8265,6 +8566,12 @@ the Mac being involved at all:
                  panes/closed/<session id>.json. That history is what
                  `hatter find` uses to say where an old conversation ran; it is
                  never restored, and is kept for 90 days.
+  - hat-registry the registry itself: one entry per tmux window, filed under
+                 the window's id, so it follows the window through closes,
+                 moves and renumbering, and a Claude session id in one entry
+                 only. tmux hooks keep it current; `hat-registry prune`
+                 settles entries from before the server started and records
+                 any window without one as a shell.
   - a systemd user unit for the above, and a timer that snapshots tmux-resurrect
     every 15 minutes - continuum's own autosave never fires, because it hangs
     off a status line that a control-mode client like cmux never draws.
