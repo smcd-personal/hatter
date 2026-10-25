@@ -72,11 +72,13 @@ case "$*" in
       # Blank, with a notice on stderr: the screen is still blank.
       noisy) printf '   \n\n'; echo 'Warning: a newer cmux is available' >&2 ;;
     esac ;;
-  # STUB_PINNED: cmux refuses to close the tab until it is unpinned.
-  # STUB_STUCK: it refuses even then.
+  # Why cmux may refuse to close the dropped tab: STUB_PINNED, until it is
+  # unpinned; STUB_BUSY, it takes the tab for a live one, unless forced;
+  # STUB_STUCK, always.
   tab-action*) echo "tab-action $*" >> "$log"; [[ "$*" == *unpin* ]] && touch "$STUB_DIR/unpinned" ;;
   close-surface*)
-    if [[ "${STUB_STUCK:-}" || ( "${STUB_PINNED:-}" && ! -f "$STUB_DIR/unpinned" ) ]]; then
+    if [[ "${STUB_STUCK:-}" || ( "${STUB_PINNED:-}" && ! -f "$STUB_DIR/unpinned" ) \
+          || ( "${STUB_BUSY:-}" && "$*" != *--force* ) ]]; then
       echo "refused $*" >> "$log"; echo 'Error: internal_error: Failed to close surface' >&2; exit 1
     fi
     echo "close $*" >> "$log" ;;
@@ -133,22 +135,25 @@ expect "a blank dragged tab: its window is moved" \
 expect "a blank dragged tab: the blank copy is closed" \
     "$(grep -q '^close .*--surface s-new ' <<<"$log" && echo y)"
 
-expect "an unpinned blank tab: no unpin, and no pin set on its window" \
-    "$(! grep -qE '^(tab-action|set)' <<<"$log" && echo y)"
+expect "a blank tab cmux closes: no unpin, no force" \
+    "$(! grep -q '^tab-action' <<<"$log" && ! grep -q -- '--force' <<<"$log" && echo y)"
 
-# A pinned tab (#111): cmux will not close it until it is unpinned.
+# cmux refusing the close (#111). Every close of a blank tab is checked
+# against the map first, so forcing one kills nothing.
 log=$(run pinned blank STUB_PINNED=1)
-expect "a pinned blank tab: unpinned, then closed" \
+expect "a pinned blank tab: refused, unpinned, then closed" \
     "$(grep -q '^refused .*--surface s-new ' <<<"$log" \
-        && grep -A1000 '^tab-action' <<<"$log" | grep -q '^close .*--surface s-new ' \
-        && grep -q '^tab-action .*--action unpin --tab s-new ' <<<"$log" && echo y)"
-expect "a pinned blank tab: its pin passes to the moved window as hatter's own" \
-    "$(grep -q "^set .*set-option -w -t '@2' @hatter-pinned 1" <<<"$log" \
-        && grep -q "was pinned in cmux; hatter pins it in 'dev-b'" "$work/run-pinned/out" && echo y)"
+        && grep -q '^tab-action .*--action unpin --tab s-new ' <<<"$log" \
+        && grep -A1000 '^tab-action' <<<"$log" | grep -q '^close .*--surface s-new ' && echo y)"
+log=$(run busy blank STUB_BUSY=1)
+expect "a blank tab cmux takes for a live one: closed by force" \
+    "$(grep -q '^refused .*--surface s-new ' <<<"$log" \
+        && grep -q '^close .*--force .*--surface s-new ' <<<"$log" && echo y)"
+expect "a refused close leaves no warning once it succeeds" \
+    "$(! grep -q 'could not close' "$work/run-busy/out" && echo y)"
 log=$(run stuck blank STUB_STUCK=1)
-expect "a blank tab cmux will not close at all: the warning gives cmux's error, and no pin is set" \
-    "$(grep -q "could not close its blank copy: Error: internal_error: Failed to close surface" "$work/run-stuck/out" \
-        && ! grep -q '^set' <<<"$log" && echo y)"
+expect "a blank tab cmux will not close at all: the warning gives cmux's error" \
+    "$(grep -q "could not close its blank copy: Error: internal_error: Failed to close surface" "$work/run-stuck/out" && echo y)"
 
 log=$(run unavailable unavailable)
 expect "a dragged tab cmux has no terminal for (surface_unavailable): its window is moved" \
