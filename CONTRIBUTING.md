@@ -79,6 +79,13 @@ You need `ssh`, `jq` and a server running `tmux`. The cmux commands need
   puts it back however the run ends. Only reads call `cmux` directly.
   `tests/focus-restore.sh` fails on a bare change. If you add an EXIT
   trap, call `hatter_on_exit` from it.
+- **tmux output that hatter parses is read as `tmux -u`, with fields joined
+  by a tab.** tmux 3.4 escapes `\x1f` in `-F` output. A client with no UTF-8
+  locale (an ssh command, a tmux hook, a server started at boot) gets every
+  tab and non-ASCII character back as `_`. Remote commands get the `-u`
+  wrapper from `posix_sh`. A script provisioned onto the server that parses
+  `-F` output defines it itself, guarded so a missing tmux still reads as
+  missing. `tests/tmux-separator.sh` checks both.
 - **No secrets, ever.** Credentials go through the OS keychain and an ssh
   pipe; nothing is written to disk. Keep it that way.
 - **Examples use `example.com`.** No real hostnames or usernames in code,

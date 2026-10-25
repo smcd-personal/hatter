@@ -29,6 +29,9 @@ dest=""
 for a in "$@"; do case "$a" in *@*.example.com) dest="$a" ;; esac; done
 # hatter sends every command as `sh -c '<script>'`; take the script out.
 [[ "$cmd" == "sh -c "* ]] && { eval "set -- $cmd"; cmd="$3"; }
+# posix_sh puts the tmux -u wrapper first (#109); the script follows it.
+pre='command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }; '
+cmd="${cmd#"$pre"}"
 srv="$STUB_DIR/server.${dest%%@*}"
 touch "$srv"
 case "$cmd" in

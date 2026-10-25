@@ -18,6 +18,8 @@ mkdir -p "$work/bin" "$work/remote" "$work/cfg/hatter" "$panes" "$claude/project
 # Two tmux windows are open: dev-a:1 and dev-a:2. dev-a:3 has closed.
 cat > "$work/remote/tmux" <<'EOF'
 #!/usr/bin/env bash
+# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+if [ "$1" = -u ]; then shift; fi
 [ "$1" = list-windows ] || { echo "stub tmux: unexpected: $*" >&2; exit 1; }
 printf 'dev-a\t1\t@11\ndev-a\t2\t@12\n'
 EOF

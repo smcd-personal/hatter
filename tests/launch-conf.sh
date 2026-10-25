@@ -108,7 +108,8 @@ cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
 cmd="\${*: -1}"
 eval "set -- \$cmd"     # sh -c '<script>'
-eval "set -- \$3"       # bash -s -- '<launch conf>'
+# bash -s -- '<launch conf>', after the tmux -u wrapper posix_sh puts first
+eval "set -- bash -s -- \${3#*bash -s -- }"
 cat > /dev/null
 HOME="$work/rhome" bash "$work/step.sh" "\$4"
 EOF

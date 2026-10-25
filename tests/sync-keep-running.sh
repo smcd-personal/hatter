@@ -62,6 +62,8 @@ STUB
 # tmux on the server. STUB_TMUX_ERR makes its socket unusable.
 cat > "$work/tbin/tmux" <<'STUB'
 #!/usr/bin/env bash
+# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+if [ "$1" = -u ]; then shift; fi
 srv="$STUB_DIR/server"
 if [[ -n "${STUB_TMUX_ERR:-}" ]]; then
     echo "error connecting to /tmp/tmux-1000/default (Permission denied)" >&2; exit 1

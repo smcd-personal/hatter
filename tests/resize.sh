@@ -52,6 +52,8 @@ fi
 # windows.txt lines: <session> <window id> <WxH>
 cat > "$work/bin/tmux" <<EOF
 #!/usr/bin/env bash
+# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+if [ "\$1" = -u ]; then shift; fi
 w="$work/windows.txt"
 case "\$1" in
     list-windows)

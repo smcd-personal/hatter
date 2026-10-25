@@ -17,6 +17,8 @@ mkdir -p "$work/bin" "$work/remote" "$work/cfg/hatter" "$panes/closed" "$claude/
 # The server: tmux runs dev-main; every tmux call is logged.
 cat > "$work/remote/tmux" <<EOF
 #!/usr/bin/env bash
+# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+if [ "\$1" = -u ]; then shift; fi
 printf '%s\n' "\$*" >> "$work/calls"
 printf '%s\n' "\$@" > "$work/args"
 case "\$1" in
