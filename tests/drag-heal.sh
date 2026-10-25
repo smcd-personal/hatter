@@ -26,15 +26,29 @@ case "$*" in
       a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]},{"surfaces":[{"id":"s-old","title":"two","type":"terminal"}]}]'
     else a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]}]'; fi
     b_drop=',{"surfaces":[{"id":"s-new","title":"two","type":"terminal"}]}'
-    [[ "${STUB_NODRAG:-}" ]] && b_drop=""
+    [[ "${STUB_NODRAG:-}" || "${STUB_LOCAL:-}" ]] && b_drop=""
+    # STUB_LOCAL: the tab was dropped into a local workspace (#93), titled
+    # STUB_LOCAL_TITLE; "twin" puts a second tab of the same title there.
+    local_ws=""
+    if [[ "${STUB_LOCAL:-}" ]]; then
+      twin=""; [[ "$STUB_LOCAL" == twin ]] && twin=',{"surfaces":[{"id":"s-twin","title":"two","type":"terminal"}]}'
+      local_ws=',{"id":"ws-l","title":"'"${STUB_LOCAL_TITLE:-scratch}"'","panes":[{"surfaces":[{"id":"s-new","title":"two","type":"terminal"}]}'"$twin"']}'
+    fi
     echo '{"windows":[{"id":"W1","workspaces":[
       {"id":"ws-a","title":"dev-a","panes":'"$a_panes"'},
-      {"id":"ws-b","title":"dev-b","panes":[{"surfaces":[{"id":"s-3","title":"three","type":"terminal"}]}'"$b_drop"']}]}]}' ;;
+      {"id":"ws-b","title":"dev-b","panes":[{"surfaces":[{"id":"s-3","title":"three","type":"terminal"}]}'"$b_drop"']}'"$local_ws"']}]}' ;;
+  *"workspace list"*)
+    # dev-a goes when its workspace is closed, and comes back new once mirrored.
+    a='{"id":"ws-a","title":"dev-a"},'
+    [[ -f "$STUB_DIR/closed" ]] && a=""
+    [[ -f "$STUB_DIR/remirrored" ]] && a='{"id":"ws-a2","title":"dev-a"},'
+    echo '{"workspaces":['"$a"'{"id":"ws-b","title":"dev-b"},{"id":"ws-l","title":"scratch"}]}' ;;
   *"workspace-group list"*) echo '{"groups":[]}' ;;
   *"remote.tmux.pane_surfaces"*)
     # The window id of "two": @5 once STUB_SECOND=newid has swapped it.
     wid=@2; [[ "${STUB_SECOND:-}" == newid && -f "$STUB_DIR/pass2" ]] && wid=@5
     case "$*" in
+      *'"dev-c"'*) echo '{"mirrored":false}' ;;
       *'"dev-a"'*) if [[ -f "$STUB_DIR/moved" ]]; then
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"}]}'
                    elif [[ "${STUB_LAST:-}" ]]; then
@@ -82,7 +96,8 @@ case "$*" in
       echo "refused $*" >> "$log"; echo 'Error: internal_error: Failed to close surface' >&2; exit 1
     fi
     echo "close $*" >> "$log" ;;
-  close-workspace*) echo "close-workspace $*" >> "$log" ;;
+  close-workspace*) echo "close-workspace $*" >> "$log"; touch "$STUB_DIR/closed" ;;
+  ssh-tmux*) echo "ssh-tmux $*" >> "$log"; touch "$STUB_DIR/remirrored" ;;
 esac
 exit 0
 STUB
@@ -100,7 +115,9 @@ case "$cmd" in
       printf 'S\tdev-a\nS\tdev-b\nW\tdev-a\t%s\ttwo\t/\t\nW\tdev-b\t@3\tthree\t/\t\n' "$wid"
     else
       printf 'S\tdev-a\nS\tdev-b\nW\tdev-a\t@1\tone\t/\t\nW\tdev-a\t%s\ttwo\t/\t\nW\tdev-b\t@3\tthree\t/\t\n' "$wid"
-    fi ;;
+    fi
+    [[ "${STUB_DEVC:-}" ]] && printf 'S\tdev-c\nW\tdev-c\t@9\tnine\t/\t\n'
+    true ;;
   *move-window*) echo "move $cmd" >> "$STUB_DIR/log"; touch "$STUB_DIR/moved" ;;
   *set-option*) echo "set $cmd" >> "$STUB_DIR/log" ;;
 esac
@@ -119,7 +136,7 @@ run() {
     echo '{"version":3,"hats":{"dev":{"ssh":"dev@example.com","remote_dir":"$HOME"}},
            "groups":{"G":{"hat":"dev","sessions":{"dev-a":{},"dev-b":{}}}}}' \
         > "$d/home/.config/hatter/config.json"
-    rm -f "$d/log" "$d/looked" "$d/pass2" "$d/unpinned"; touch "$d/log"
+    rm -f "$d/log" "$d/looked" "$d/pass2" "$d/unpinned" "$d/closed" "$d/remirrored"; touch "$d/log"
     env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
         STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" ${HATTER_CMD:-_drag-heal} >"$d/out" 2>&1 || true
     cat "$d/log"
@@ -237,6 +254,38 @@ log=$(HATTER_CMD="_drag-heal dev report ws-b s-3" run event-other blank)
 expect "a drop event for another tab moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
 log=$(HATTER_CMD="_drag-heal dev report ws-gone s-new" run event-nows blank)
 expect "a drop event for a workspace in no window moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
+
+# A tab dropped into a local workspace (#93): no session to move its window
+# into, so the blank tab goes and the session it came from is mirrored again.
+log=$(run local unavailable STUB_LOCAL=1)
+expect "a tab dropped into a local workspace: the blank tab is closed" \
+    "$(grep -q '^close .*--surface s-new .*--workspace ws-l ' <<<"$log" && echo y)"
+expect "a tab dropped into a local workspace: its window is not moved" \
+    "$(! grep -q '^move' <<<"$log" && echo y)"
+expect "a tab dropped into a local workspace: the session it came from is mirrored again" \
+    "$(grep -A1000 '^close .*--surface s-new' <<<"$log" | grep -q '^close-workspace .*--workspace ws-a' \
+        && grep -q '^ssh-tmux .*dev@example.com' <<<"$log" && echo y)"
+expect "a tab dropped into a local workspace: the log says what was done" \
+    "$(grep -q "dropped into 'scratch', which is not a tmux session; showing it in 'dev-a' again" "$work/run-local/out" && echo y)"
+log=$(HATTER_CMD="_drag-heal dev report ws-l s-new" run local-event unavailable STUB_LOCAL=1)
+expect "a drop event for a tab dropped into a local workspace heals it" \
+    "$(grep -q '^close .*--surface s-new ' <<<"$log" && grep -q '^ssh-tmux' <<<"$log" && echo y)"
+
+log=$(run local-text text STUB_LOCAL=1)
+expect "a local tab of the same title that shows text is left alone" \
+    "$(! grep -qE '^(close|close-workspace|ssh-tmux|move)' <<<"$log" && echo y)"
+expect "a local tab left alone: the warning says how to fix it by hand" \
+    "$(grep -q "dropped into 'scratch' was left alone: cmux shows a terminal behind it" "$work/run-local-text/out" \
+        && grep -qF "hatter repair 'dev-a'" "$work/run-local-text/out" && echo y)"
+log=$(run local-blank blank STUB_LOCAL=1)
+expect "a local tab with an empty screen (a terminal, maybe a quiet shell) is left alone" \
+    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
+log=$(run local-twin unavailable STUB_LOCAL=twin)
+expect "two local tabs of the window's title: neither is taken" \
+    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
+log=$(run local-session unavailable STUB_LOCAL=1 STUB_LOCAL_TITLE=dev-c STUB_DEVC=1)
+expect "a workspace titled after a running session is not taken for a local one" \
+    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"
