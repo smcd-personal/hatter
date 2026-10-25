@@ -8178,11 +8178,11 @@ workspace no longer shows the window. repair moves the tmux window into the
 session the tab was dropped on and closes the blank tab, and cmux shows the
 window there as a new tab, at the end. Nothing is re-mirrored. When cmux
 refuses to close the blank tab (it may be pinned, or taken for a busy one),
-it is unpinned and closed by force; nothing runs behind it. A pin the tab had
-in cmux is not carried over, since cmux does not say whether a tab is pinned:
-pin the new tab with hatter tab pin. The autosave
-watcher does the same the moment a tab is dropped (see: hatter help autosave),
-so a dragged tab is usually fixed before you ask. A tab is only moved when its window is certain: the blank tab's
+it is unpinned and closed by force; nothing runs behind it. The new tab is
+never pinned in cmux, and cmux does not say whether the old one was, so
+re-pin it with hatter tab pin. The autosave watcher does the same the moment
+a tab is dropped (see: hatter help autosave), so a dragged tab is usually
+fixed before you ask. A tab is only moved when its window is certain: the blank tab's
 title names exactly one window that cmux no longer shows anywhere, and the
 tab really is blank, or has no terminal behind it at all. A local shell
 sitting in a mirrored workspace is never taken for one. A session's last tab
