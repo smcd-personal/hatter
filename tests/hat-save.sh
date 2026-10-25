@@ -22,6 +22,8 @@ grep -q '^# hat-save' "$work/hat-save" || fail "could not extract hat-save from 
 mkdir -p "$work/bin"
 cat > "$work/bin/tmux" <<'EOF'
 #!/usr/bin/env bash
+# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+if [ "$1" = -u ]; then shift; fi
 case "$1" in
     list-sessions)
         [ -n "${STUB_SESSIONS+x}" ] || { echo "no server running on /tmp/stub" >&2; exit 1; }

@@ -15,6 +15,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 mkdir -p "$work/bin" "$work/remote" "$work/cfg/hatter"
 cat > "$work/remote/tmux" <<EOF
 #!/usr/bin/env bash
+# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+if [ "\$1" = -u ]; then shift; fi
 r="$work/running.txt"
 case "\$1" in
     has-session) grep -qxF -- "\${3#=}" "\$r" ;;

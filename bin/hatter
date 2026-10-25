@@ -615,7 +615,12 @@ remember_session() {
 # to pass on, and sh runs the script. (csh and tcsh cannot hold a newline in a
 # quoted word, so a multi-line script still needs a login shell other than
 # those.)
-posix_sh() { printf 'sh -c %s' "$(sq "$*")"; }
+# Every remote command runs with tmux as `tmux -u`: a client with no UTF-8
+# locale, which is what an ssh command session can have, gets tmux's output
+# with every tab and non-ASCII character turned into "_", so the fields of a
+# format, and names like "✳ notes", would not read back (#109).
+TMUX_U='command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }'
+posix_sh() { printf 'sh -c %s' "$(sq "$TMUX_U; $*")"; }
 
 remote_sh() {
     # -n so ssh cannot swallow the stdin of a calling loop.
@@ -1920,7 +1925,7 @@ US=$'\x1f'
 # with no UTF-8 locale, which is what tmux's own hooks and a server started at
 # boot have, gets even a tab back as "_": -u tells tmux the client is UTF-8.
 HT=$'\t'
-tmux() { command tmux -u "$@"; }
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 command -v tmux >/dev/null 2>&1 || exit 0
 command -v jq   >/dev/null 2>&1 || exit 0
 mkdir -p "$PANES" 2>/dev/null || exit 0
@@ -2492,7 +2497,7 @@ REG="$HOME/.local/bin/hat-registry"
 # Formats join fields with a tab: tmux 3.4 escapes \x1f in -F output, and
 # with no UTF-8 locale (a server started at boot has none) even a tab comes
 # back as "_" unless the client says it is UTF-8 (-u).
-tmux() { command tmux -u "$@"; }
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 
 dry=0 quiet=0 agents=1 backfill=0 prune=0 no_prune=0
 for a in "$@"; do
@@ -2712,6 +2717,9 @@ cat > "$HOME/.local/bin/hat-resize" <<'HATRESIZE'
 # tmux then holds each window at that size (window-size manual), even when the
 # client resizes. To let one follow the client again:
 #   tmux set-window-option -u -t <window> window-size
+# No UTF-8 locale here at boot: without -u, tmux turns every non-ASCII
+# character in a name into "_" (#109).
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 set -u
 
 session="" size=""
@@ -2848,6 +2856,9 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/
 # It also records the window size the client really uses, which .tmux.conf
 # reads at server start: a restore makes its windows with no client attached,
 # and without it they come back at tmux's 80x24.
+# No UTF-8 locale here at boot: without -u, tmux turns every non-ASCII
+# character in a name into "_" (#109).
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 set -u
 
 save="$HOME/.tmux/plugins/tmux-resurrect/scripts/save.sh"
