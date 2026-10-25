@@ -1589,12 +1589,13 @@ set -g remain-on-exit off
 set-hook -gu pane-died
 
 # The registry follows its windows (see ~/.local/bin/hat-registry): whenever a
-# window closes, moves or is renumbered, or a session is renamed, it re-reads
-# where every window is. Index 42 of each hook, so one of your own at [0] stays.
+# window closes or moves, or a session is renamed, it re-reads where every
+# window is. Index 42 of each hook, so one of your own at [0] stays. Only hooks
+# every supported tmux has: `move-window -r` fires none of them, and is caught
+# by hat-save every 15 minutes and by `hatter sync` instead.
 set-hook -g 'window-unlinked[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
 set-hook -g 'window-linked[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
 set-hook -g 'session-renamed[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
-set-hook -g 'after-move-window[42]' "run-shell -b '$HOME/.local/bin/hat-registry refresh'"
 
 # One session, several screens - a desktop and a phone, say. A window takes the
 # size of whichever client used it last, rather than shrinking to the smallest

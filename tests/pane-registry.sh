@@ -38,6 +38,13 @@ PANES="$HOME/.local/state/hatter/panes"
 { extract BLOCK | grep -E "^set -g default-command|^set-hook -g '[a-z-]+\[42\]'"
   echo "set -g renumber-windows on"; } > "$work/tmux.conf"
 [ "$(grep -c '\[42\]' "$work/tmux.conf")" -ge 3 ] || { echo "FAIL no registry hooks in the managed block"; exit 1; }
+# Every hook the block sets must exist in every tmux hatter supports: one tmux
+# does not know makes each config load report an error (#113). These are the
+# event hooks tmux 3.2 has; after-<command> hooks vary by version, and are out.
+known=" alert-activity alert-bell alert-silence client-attached client-detached client-resized client-session-changed pane-died pane-exited pane-focus-in pane-focus-out pane-mode-changed pane-set-clipboard session-closed session-created session-renamed session-window-changed window-layout-changed window-linked window-renamed window-unlinked "
+for h in $(extract BLOCK | sed -n "s/^set-hook -g[a-z]* '\{0,1\}\([a-z-]*\).*/\1/p"); do
+    case "$known" in *" $h "*) ;; *) echo "FAIL the managed block sets hook '$h', which not every tmux has"; exit 1 ;; esac
+done
 
 # entry <session id>: "session:index" of every entry holding it.
 entry() { jq -r --arg i "$1" 'select(.session_id == $i) | "\(.session):\(.window)"' "$PANES"/*.json 2>/dev/null | sort | tr '\n' ' '; }
