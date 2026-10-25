@@ -3476,19 +3476,20 @@ DRAG_PLAN_JQ='
       | select($t != null and $maps[$t] == null and ($sessions | index([$t]) | not))
       | .id as $ws
       | .surfaces[]? | select(.type == "terminal")
+      | select(.id as $x | [$maps[][].surface_id] | index([$x]) | not)
       | {surface: .id, ws: $ws, wstitle: $t, title: (.title // "")}] as $locals
   | def named($t; $not):
       [$hidden[] | select(.session != $not
                           and (if .name == "" then "tmux window" else .name end) == $t)];
-    def twins($t): [($orphans + $locals)[] | select(.title == $t)] | length;
+    def twins($t; $among): [$among[] | select(.title == $t)] | length;
     ($orphans[] as $o
      | named($o.title; $o.session) as $named
-     | (if ($named | length) == 1 and twins($o.title) == 1 then $named[0] else null end) as $h
+     | (if ($named | length) == 1 and twins($o.title; $orphans) == 1 then $named[0] else null end) as $h
      | if $h == null then ["orphan", $o.surface, $o.ws, $o.session, $o.title]
        else ["move", $o.surface, $o.ws, $o.session, $h.session, $h.window, $h.name] end),
     ($locals[] as $o
      | named($o.title; null) as $named
-     | select(($named | length) == 1 and twins($o.title) == 1)
+     | select(($named | length) == 1 and twins($o.title; $orphans + $locals) == 1)
      | $named[0] as $h
      | ["local", $o.surface, $o.ws, $o.wstitle, $h.session, $h.window, $h.name])
   | map(. // "" | tostring) | join("\u001f")'
@@ -3638,7 +3639,8 @@ heal_hat_drags() {
             </dev/null 2>"$errf") || rc=$?
         [[ "$rc" == 0 ]] || screen=$(cat "$errf" 2>/dev/null; printf '%s' "$screen")
         if [[ "$kind" == local ]]; then
-            heal_local_drop "$hat" "$host" "$win" "$orphan" "$ws" "$to" "$from" "$name" "$rc" "$screen" "$report"
+            heal_local_drop "$hat" "$host" "$win" "$orphan" "$ws" "$to" "$from" "$name" "$rc" "$screen" "$report" \
+                "$(drag_unmapped_tabs "$from" "$tree" "$host")"
             continue
         fi
         why=$(drag_not_blank "$rc" "$screen")
@@ -3796,12 +3798,19 @@ heal_close_blank() {
 # here, because the close may be forced, and a quiet local shell would die.
 heal_local_drop() {
     local hat="$1" host="$2" win="$3" orphan="$4" ws="$5" wstitle="$6" from="$7" name="$8"
-    local rc="$9" screen="${10}" report="${11}" label line
+    local rc="$9" screen="${10}" report="${11}" extra="${12:-}" label line
     label="${name:-tmux window}"
     if [[ "$rc" == 0 ]] || ! grep -q 'surface_unavailable' <<<"$screen"; then
         line=$(printf '%s\n' "$screen" | grep -m 1 '[^[:space:]]' | tr -d '[:cntrl:]' || true)
         drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" \
             "cmux shows a terminal behind it${line:+ (\"${line:0:80}\")}"
+        return 0
+    fi
+    # Re-mirroring closes the source workspace, and any tab in it that is not
+    # one of its tmux windows (a local shell) would go with it.
+    if [[ -n "$extra" ]]; then
+        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" \
+            "re-mirroring '$from' would close $extra tab(s) in it that are not tmux windows"
         return 0
     fi
     if ! heal_close_blank "$win" "$orphan" "$ws"; then
@@ -3810,12 +3819,31 @@ heal_local_drop() {
         return 0
     fi
     info "Closed the blank tab '$label' dropped into '$wstitle', which is not a tmux session; showing it in '$from' again"
-    if [[ -n "$hat" ]] && ( remirror_session "$hat" "$host" "$from" ); then
+    if [[ -n "$hat" ]] && ( remirror_session "$hat" "$host" "$from" "$win" ) </dev/null; then
         HEAL_MOVED+="$from"$'\n'
     else
         warn "the tab '$label' is still in '$from' on $host, but cmux does not show it there. Run:
-    hatter repair $(sq "$from")"
+    hatter repair $(sq "$from")
+  or, if '$from' is no longer in cmux at all:
+    hatter restore $(sq "${hat:-<hat>}")"
     fi
+    return 0
+}
+
+# drag_unmapped_tabs <session> <tree> <host>
+# How many terminal tabs the session's workspace shows that are not its tmux
+# windows (local shells), or nothing when there are none. A count cmux cannot
+# give is unknown, and unknown counts as some.
+drag_unmapped_tabs() {
+    local session="$1" tree="$2" host="$3" map n
+    map=$(cmux_pane_map "$host" "$session" </dev/null 2>/dev/null) || { echo "an unknown number of"; return 0; }
+    [[ -n "$map" ]] || map='{}'
+    n=$(jq -rn --argjson t "$tree" --argjson m "$map" --arg s "$session" '
+        [($m.panes // [])[].surface_id] as $mapped
+        | [$t.windows[]?.workspaces[]? | select(.title == $s) | .panes[]?.surfaces[]?
+           | select(.type == "terminal") | select(.id as $x | $mapped | index([$x]) | not)] | length' 2>/dev/null) \
+        || { echo "an unknown number of"; return 0; }
+    [[ "$n" == 0 ]] || echo "$n"
     return 0
 }
 
@@ -3869,14 +3897,15 @@ cmd_resize() {
     remote_sh "$host" "$cmd"
 }
 
-# remirror_session <hat> <host> <session>
+# remirror_session <hat> <host> <session> [cmux-window]
 # Detach a session's workspace from cmux and mirror it again, back in its group
 # and place, so cmux rebuilds its view from tmux: every window gets a tab. Dies
-# when it cannot, saying how to get the session back.
+# when it cannot, saying how to get the session back. With a window, only that
+# one is looked in: another hat's window can hold a session of the same name.
 remirror_session() {
     local hat="$1" host="$2" session="$3" win="" ws="" w
     # Where it is now: its window, its group, and its neighbour in that group.
-    for w in $(window_ids); do
+    for w in ${4:-$(window_ids)}; do
         ws=$(workspace_ref_by_title "$session" "$w")
         if [[ -n "$ws" ]]; then win="$w"; break; fi
     done

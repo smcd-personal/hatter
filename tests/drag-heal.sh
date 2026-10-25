@@ -24,6 +24,8 @@ case "$*" in
     if [[ "${STUB_LAST:-}" ]]; then a_panes='[]'
     elif [[ "${STUB_NODRAG:-}" ]]; then
       a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]},{"surfaces":[{"id":"s-old","title":"two","type":"terminal"}]}]'
+    elif [[ "${STUB_SRC_EXTRA:-}" ]]; then
+      a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]},{"surfaces":[{"id":"s-sh","title":"Terminal","type":"terminal"}]}]'
     else a_panes='[{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]}]'; fi
     b_drop=',{"surfaces":[{"id":"s-new","title":"two","type":"terminal"}]}'
     [[ "${STUB_NODRAG:-}" || "${STUB_LOCAL:-}" ]] && b_drop=""
@@ -53,6 +55,8 @@ case "$*" in
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"}]}'
                    elif [[ "${STUB_LAST:-}" ]]; then
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-old","window_id":"'$wid'"}]}'
+                   elif [[ "${STUB_SRC_EXTRA:-}" ]]; then
+                     echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"},{"surface_id":"s-old","window_id":"'$wid'"},{"surface_id":"s-seven","window_id":"@7"}]}'
                    else
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"},{"surface_id":"s-old","window_id":"'$wid'"}]}'
                    fi ;;
@@ -96,7 +100,9 @@ case "$*" in
       echo "refused $*" >> "$log"; echo 'Error: internal_error: Failed to close surface' >&2; exit 1
     fi
     echo "close $*" >> "$log" ;;
-  close-workspace*) echo "close-workspace $*" >> "$log"; touch "$STUB_DIR/closed" ;;
+  close-workspace*)
+    [[ "${STUB_NOCLOSEWS:-}" ]] && { echo "refused-workspace $*" >> "$log"; exit 1; }
+    echo "close-workspace $*" >> "$log"; touch "$STUB_DIR/closed" ;;
   ssh-tmux*) echo "ssh-tmux $*" >> "$log"; touch "$STUB_DIR/remirrored" ;;
 esac
 exit 0
@@ -117,6 +123,7 @@ case "$cmd" in
       printf 'S\tdev-a\nS\tdev-b\nW\tdev-a\t@1\tone\t/\t\nW\tdev-a\t%s\ttwo\t/\t\nW\tdev-b\t@3\tthree\t/\t\n' "$wid"
     fi
     [[ "${STUB_DEVC:-}" ]] && printf 'S\tdev-c\nW\tdev-c\t@9\tnine\t/\t\n'
+    [[ "${STUB_SRC_EXTRA:-}" ]] && printf 'W\tdev-a\t@7\tseven\t/\t\n'
     true ;;
   *move-window*) echo "move $cmd" >> "$STUB_DIR/log"; touch "$STUB_DIR/moved" ;;
   *set-option*) echo "set $cmd" >> "$STUB_DIR/log" ;;
@@ -279,7 +286,17 @@ expect "a local tab left alone: the warning says how to fix it by hand" \
         && grep -qF "hatter repair 'dev-a'" "$work/run-local-text/out" && echo y)"
 log=$(run local-blank blank STUB_LOCAL=1)
 expect "a local tab with an empty screen (a terminal, maybe a quiet shell) is left alone" \
-    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
+    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" \
+        && grep -q "dropped into 'scratch' was left alone: cmux shows a terminal behind it" "$work/run-local-blank/out" && echo y)"
+log=$(run local-extra unavailable STUB_LOCAL=1 STUB_SRC_EXTRA=1)
+expect "a source workspace holding a local shell: nothing is closed, so the shell lives" \
+    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" \
+        && grep -q "re-mirroring 'dev-a' would close 1 tab(s) in it that are not tmux windows" "$work/run-local-extra/out" && echo y)"
+log=$(run local-noremirror unavailable STUB_LOCAL=1 STUB_NOCLOSEWS=1)
+expect "a re-mirror cmux refuses: the blank tab is closed, nothing is mirrored, and the log says how to finish" \
+    "$(grep -q '^close .*--surface s-new ' <<<"$log" && ! grep -q '^ssh-tmux' <<<"$log" \
+        && grep -q "is still in 'dev-a' on dev@example.com, but cmux does not show it there" "$work/run-local-noremirror/out" \
+        && grep -qF "hatter restore 'dev'" "$work/run-local-noremirror/out" && echo y)"
 log=$(run local-twin unavailable STUB_LOCAL=twin)
 expect "two local tabs of the window's title: neither is taken" \
     "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
