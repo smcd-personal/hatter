@@ -52,13 +52,18 @@ nfiles() { set -- "$PANES"/*.json; [ -e "$1" ] && echo $# || echo 0; }
 # settle <cmd...>: wait (up to 5s) for the hooks to make <cmd> true.
 settle() { local i; for i in $(seq 1 50); do eval "$1" && return 0; sleep 0.1; done; return 1; }
 pane() { tmux list-panes -t "=$1" -F '#{pane_id}' | head -n 1; }
+# quiet: wait until no registry writer is still running - tmux runs hooks in
+# the background, and a busy machine can leave one writing into the next case.
+quiet() { settle '! pgrep -f "$HOME/.local/bin/hat-registry" >/dev/null' || true; }
 start() {  # start <session> <windows>: a fresh server, one session
     tmux kill-server 2>/dev/null || true
+    quiet
     rm -f "$PANES"/*.json
     tmux -f "$work/tmux.conf" new-session -d -s "$1" -x 100 -y 30
     local i; for ((i = 1; i < $2; i++)); do tmux new-window -d -t "=$1:"; done
     # Every pane runs hat-launch, which records its window as a shell.
     settle "[ \"\$(nfiles)\" -eq $2 ]" || true
+    quiet
 }
 
 # --- each pane records itself ---------------------------------------------------
@@ -116,6 +121,7 @@ expect "a moved window's entry follows it" "$(yes_if [ "$(entry moved)" = "t:7 "
 
 # --- an older registry, keyed by index ------------------------------------------
 start s 2
+quiet
 rm -f "$PANES"/*.json
 old() { jq -n --arg s "$1" --argjson w "$2" --arg i "$3" --arg t "$4" \
         '{session: $s, window: $w, name: "n", cwd: "/", kind: "claude", session_id: $i, state: "live", recorded: $t}' \
