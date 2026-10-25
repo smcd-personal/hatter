@@ -39,10 +39,16 @@ missing=$(awk -v w="$wrap" '
 [[ -z "$missing" ]] || fail "scripts run on the server parse tmux -F output without the tmux -u wrapper: $missing"
 
 # --- a missing tmux still reads as missing through the wrapper ---------------
+# The command is built as usual, then run where PATH holds only what the
+# script needs, and no tmux: a CI runner has tmux in /usr/bin.
 sed '/^# -* main$/,$d' "$root/bin/hatter" > "$work/lib-early.sh"
-lerr=$(PATH=/usr/bin:/bin /bin/bash -c "source '$work/lib-early.sh' 2>/dev/null
-    command -v tmux >/dev/null 2>&1 && { echo 'tmux on the base PATH'; exit; }
-    eval \"\$(posix_sh \"\$REMOTE_LIST_SH\"'; printf %s \"\$lerr\"')\"")
+mkdir -p "$work/notmux"
+for c in sh head; do ln -s "$(command -v "$c")" "$work/notmux/$c"; done
+lerr=$(bash -c "source '$work/lib-early.sh' 2>/dev/null
+    cmd=\$(posix_sh \"\$REMOTE_LIST_SH\"'; printf %s \"\$lerr\"')
+    PATH='$work/notmux'
+    command -v tmux >/dev/null 2>&1 && { echo 'tmux on the test PATH'; exit; }
+    eval \"\$cmd\"")
 [[ "$lerr" == "tmux is not installed" ]] || fail "with no tmux, the session list says '$lerr', want 'tmux is not installed'"
 
 # --- stubs: ssh runs the remote command here, against a stub tmux ------------
