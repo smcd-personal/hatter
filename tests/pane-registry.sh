@@ -38,6 +38,13 @@ PANES="$HOME/.local/state/hatter/panes"
 { extract BLOCK | grep -E "^set -g default-command|^set-hook -g '[a-z-]+\[42\]'"
   echo "set -g renumber-windows on"; } > "$work/tmux.conf"
 [ "$(grep -c '\[42\]' "$work/tmux.conf")" -ge 3 ] || { echo "FAIL no registry hooks in the managed block"; exit 1; }
+# Every hook the block sets must exist in every tmux hatter supports: one tmux
+# does not know makes each config load report an error (#113). These are the
+# event hooks tmux 3.2 has; after-<command> hooks vary by version, and are out.
+known=" alert-activity alert-bell alert-silence client-attached client-detached client-resized client-session-changed pane-died pane-exited pane-focus-in pane-focus-out pane-mode-changed pane-set-clipboard session-closed session-created session-renamed session-window-changed window-layout-changed window-linked window-renamed window-unlinked "
+for h in $(extract BLOCK | sed -n "s/^set-hook -g[a-z]* '\{0,1\}\([a-z-]*\).*/\1/p"); do
+    case "$known" in *" $h "*) ;; *) echo "FAIL the managed block sets hook '$h', which not every tmux has"; exit 1 ;; esac
+done
 
 # entry <session id>: "session:index" of every entry holding it.
 entry() { jq -r --arg i "$1" 'select(.session_id == $i) | "\(.session):\(.window)"' "$PANES"/*.json 2>/dev/null | sort | tr '\n' ' '; }
@@ -45,13 +52,18 @@ nfiles() { set -- "$PANES"/*.json; [ -e "$1" ] && echo $# || echo 0; }
 # settle <cmd...>: wait (up to 5s) for the hooks to make <cmd> true.
 settle() { local i; for i in $(seq 1 50); do eval "$1" && return 0; sleep 0.1; done; return 1; }
 pane() { tmux list-panes -t "=$1" -F '#{pane_id}' | head -n 1; }
+# quiet: wait until no registry writer is still running - tmux runs hooks in
+# the background, and a busy machine can leave one writing into the next case.
+quiet() { settle '! pgrep -f "$HOME/.local/bin/hat-registry" >/dev/null' || true; }
 start() {  # start <session> <windows>: a fresh server, one session
     tmux kill-server 2>/dev/null || true
+    quiet
     rm -f "$PANES"/*.json
     tmux -f "$work/tmux.conf" new-session -d -s "$1" -x 100 -y 30
     local i; for ((i = 1; i < $2; i++)); do tmux new-window -d -t "=$1:"; done
     # Every pane runs hat-launch, which records its window as a shell.
     settle "[ \"\$(nfiles)\" -eq $2 ]" || true
+    quiet
 }
 
 # --- each pane records itself ---------------------------------------------------
@@ -109,6 +121,7 @@ expect "a moved window's entry follows it" "$(yes_if [ "$(entry moved)" = "t:7 "
 
 # --- an older registry, keyed by index ------------------------------------------
 start s 2
+quiet
 rm -f "$PANES"/*.json
 old() { jq -n --arg s "$1" --argjson w "$2" --arg i "$3" --arg t "$4" \
         '{session: $s, window: $w, name: "n", cwd: "/", kind: "claude", session_id: $i, state: "live", recorded: $t}' \
