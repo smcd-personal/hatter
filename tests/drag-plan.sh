@@ -190,5 +190,48 @@ check "a map entry with no window id is skipped" \
            "dev-b": [{"surface_id": "s-3", "window_id": "@3"}]},
   "windows": [{"session": "dev-a", "id": "@2", "name": "two"}, {"session": "dev-b", "id": "@3", "name": "three"}]}'
 
+# A tab dropped into a local workspace (#93): "scratch" is no tmux session.
+# local <facts-tail>: the facts for that drop, with the given extra surfaces in
+# scratch and extra fields. dev-a's @2 is hidden, as in every drag.
+local_facts() {
+    local scratch="$1" extra="${2:-}"
+    printf '%s' '{
+  "workspaces": [
+    {"id": "ws-a", "title": "dev-a", "surfaces": [{"id": "s-1", "title": "one", "type": "terminal"}]},
+    {"id": "ws-l", "title": "scratch", "surfaces": ['"$scratch"']}],
+  "surfaces": ["s-1", "s-new", "s-twin"],
+  "maps": {"dev-a": [{"surface_id": "s-1", "window_id": "@1"}, {"surface_id": "s-old", "window_id": "@2"}]},
+  "sessions": ["dev-a"'"$extra"'],
+  "windows": [{"session": "dev-a", "id": "@1", "name": "one"}, {"session": "dev-a", "id": "@2", "name": "two"}]}'
+}
+drop='{"id": "s-new", "title": "two", "type": "terminal"}'
+check "a tab dropped into a local workspace is planned as a local drop" \
+"local${T}s-new${T}ws-l${T}scratch${T}dev-a${T}@2${T}two" "$(local_facts "$drop")"
+check "two local tabs of the window's title: neither is taken" "" \
+    "$(local_facts "$drop"', {"id": "s-twin", "title": "two", "type": "terminal"}')"
+check "a workspace titled after a running session is not taken for a local one" "" \
+    "$(local_facts "$drop" ', "scratch"')"
+check "a local tab whose title names no hidden window plans nothing" "" \
+    "$(local_facts '{"id": "s-new", "title": "zsh", "type": "terminal"}')"
+# A tab some session maps is that session's, wherever cmux shows it.
+check "a tab in a local workspace that a session maps is not taken" "" \
+    "$(local_facts "$drop" | jq -c '.maps["dev-a"] += [{"surface_id": "s-new", "window_id": "@9"}]')"
+
+# A local shell titled like a dragged window does not stop a drag between
+# mirrored workspaces from healing: twins are counted among orphans only.
+check "a same-titled local tab leaves a mirrored drag to heal" \
+"move${T}s-new${T}ws-b${T}dev-b${T}dev-a${T}@2${T}two" '{
+  "workspaces": [
+    {"id": "ws-a", "title": "dev-a", "surfaces": [{"id": "s-1", "title": "one", "type": "terminal"}]},
+    {"id": "ws-b", "title": "dev-b", "surfaces": [{"id": "s-3", "title": "three", "type": "terminal"},
+                                                  {"id": "s-new", "title": "two", "type": "terminal"}]},
+    {"id": "ws-l", "title": "scratch", "surfaces": [{"id": "s-loc", "title": "two", "type": "terminal"}]}],
+  "surfaces": ["s-1", "s-3", "s-new", "s-loc"],
+  "maps": {"dev-a": [{"surface_id": "s-1", "window_id": "@1"}, {"surface_id": "s-old", "window_id": "@2"}],
+           "dev-b": [{"surface_id": "s-3", "window_id": "@3"}]},
+  "sessions": ["dev-a", "dev-b"],
+  "windows": [{"session": "dev-a", "id": "@1", "name": "one"}, {"session": "dev-a", "id": "@2", "name": "two"},
+              {"session": "dev-b", "id": "@3", "name": "three"}]}'
+
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"
