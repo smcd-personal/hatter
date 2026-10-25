@@ -4093,6 +4093,8 @@ read -r -d '' FIND_SH <<'HATFIND' || true
 #!/usr/bin/env bash
 # hat-find [--all] [--days N] <term>...
 set -uo pipefail
+# Run as `bash -s`, so posix_sh's tmux -u wrapper does not reach it (#109).
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 trap 'echo @@hatter-ok' EXIT
 
 all=0 days=7

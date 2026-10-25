@@ -27,13 +27,16 @@ wrap='command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }'
 grep -qF "TMUX_U='$wrap'" "$root/bin/hatter" || fail "posix_sh's tmux -u wrapper is gone or unguarded"
 grep -q 'posix_sh() { .*\$TMUX_U; ' "$root/bin/hatter" || fail "posix_sh does not put the tmux -u wrapper first"
 missing=$(awk -v w="$wrap" '
-    /^cat > "\$HOME\/\.local\/bin\/hat-[a-z]*(\.new)?" <<.[A-Z]+.$/ || /^    cat > "\$HOME\/\.local\/bin\/hat-[a-z]*" <<.[A-Z]+.$/ {
+    # A provisioned script, or one kept in a variable to run as `bash -s`.
+    /^ *cat > "\$HOME\/\.local\/bin\/hat-[a-z]*(\.new)?" <<.[A-Z]+.$/ || /^read -r -d .. [A-Z_]+ <<.[A-Z]+./ {
         match($0, /<<.[A-Z]+/); end = substr($0, RSTART + 3, RLENGTH - 3)
-        match($0, /hat-[a-z]+/); name = substr($0, RSTART, RLENGTH); inb = 1; has = 0; uses = 0; next }
+        if (match($0, /hat-[a-z]+/)) name = substr($0, RSTART, RLENGTH)
+        else { match($0, /[A-Z_]+ <</); name = substr($0, RSTART, RLENGTH - 3) }
+        inb = 1; has = 0; uses = 0; next }
     inb && $0 == end { if (uses && !has) print name; inb = 0; next }
     inb && index($0, w) { has = 1 }
     inb && /tmux [a-z-]+ .*-F / { uses = 1 }' "$root/bin/hatter")
-[[ -z "$missing" ]] || fail "provisioned scripts parse tmux -F output without the tmux -u wrapper: $missing"
+[[ -z "$missing" ]] || fail "scripts run on the server parse tmux -F output without the tmux -u wrapper: $missing"
 
 # --- a missing tmux still reads as missing through the wrapper ---------------
 sed '/^# -* main$/,$d' "$root/bin/hatter" > "$work/lib-early.sh"
