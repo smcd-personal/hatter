@@ -51,7 +51,7 @@ case "$*" in
     wid=@2; [[ "${STUB_SECOND:-}" == newid && -f "$STUB_DIR/pass2" ]] && wid=@5
     case "$*" in
       *'"dev-c"'*) echo '{"mirrored":false}' ;;
-      *'"dev-a"'*) if [[ -f "$STUB_DIR/hopped" ]]; then
+      *'"dev-a"'*) if [[ -f "$STUB_DIR/hopped" && -z "${STUB_NOSHOW:-}" ]]; then
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"},{"surface_id":"s-back","window_id":"@2"}]}'
                    elif [[ -f "$STUB_DIR/moved" ]]; then
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"}]}'
@@ -301,6 +301,16 @@ expect "a hop that leaves the window in the temporary session: the blank tab sta
 log=$(run local-nohop unavailable STUB_LOCAL=1 STUB_HOP=none)
 expect "a hop that moved nothing: the blank tab stays for the next pass" \
     "$(! grep -q '^close' <<<"$log" && grep -q "could not hop window @2 of 'dev-a'" "$work/run-local-nohop/out" && echo y)"
+# A hop cmux does not draw is tried once per dropped tab, then only logged:
+# each one moves the window, and another would fare no better.
+log=$(run local-noshow unavailable STUB_LOCAL=1 STUB_NOSHOW=1)
+expect "a hop cmux does not draw: the blank tab stays, and the log says so" \
+    "$(grep -q '^hop' <<<"$log" && ! grep -q '^close' <<<"$log" \
+        && grep -q "cmux has not shown it in 'dev-a' yet" "$work/run-local-noshow/out" && echo y)"
+log=$(KEEP=1 run local-noshow unavailable STUB_LOCAL=1 STUB_NOSHOW=1)
+expect "...and the next pass does not hop it again, but says why" \
+    "$(! grep -q '^hop' <<<"$log" \
+        && grep -q "was left alone: a hop did not make cmux show it in 'dev-a'" "$work/run-local-noshow/out" && echo y)"
 log=$(run local-last unavailable STUB_LOCAL=1 STUB_LAST=1)
 expect "a session's last window is not hopped: moving it out would end the session" \
     "$(! grep -qE '^(hop|close)' <<<"$log" \
