@@ -6427,7 +6427,7 @@ watch_notify() {
 # that does not answer, or a cmux whose windows cannot be read, says nothing.
 WATCH_REATTACH_GAP=1800
 watch_closed() {
-    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd=""
+    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd="" back="" lives=""
     tree=$(cmux_json tree --all 2>/dev/null) || return 0
     [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" == array ]] || return 0
     shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
@@ -6440,7 +6440,12 @@ watch_closed() {
         host=$(hat_ssh "$hat" 2>/dev/null) || continue
         [[ -n "$host" ]] || continue
         pairs+="$host"$'\t'"$s"$'\t'"${kind:-user}"$'\t'"$hat"$'\n'
-    done < <(printf '%s\n' "$1" | awk -F '\t' '!seen[$1]++')
+    done < <(printf '%s\n' "$1" | awk -F '\t' '
+        # One line per title, in first-seen order; a person closing it wins.
+        $1 == "" { next }
+        !($1 in k) { o[++n] = $1; k[$1] = $2 }
+        $2 == "user" { k[$1] = "user" }
+        END { for (i = 1; i <= n; i++) print o[i] "\t" k[o[i]] }')
     # One look per server, however many of its workspaces closed at once.
     while IFS=$'\t' read -r host s kind hat; do
         [[ -n "$s" ]] || continue
@@ -6450,13 +6455,24 @@ watch_closed() {
         fi
         [[ "$ok" == 1 ]] || continue
         grep -qxF -- "$s" <<<"$live" || continue
-        if [[ "$kind" == lost ]] && ! watch_reattached_lately "$s" && watch_reattach "$hat" "$s"; then
+        if [[ "$kind" == lost ]] && ! watch_reattached_lately "$s"; then
+            back+="$hat"$'\t'"$s"$'\n'
+            lives+="$live"$'\n'
             continue
         fi
         cmd="hatter new $(watch_word "$s")"
         watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
         said+="${said:+, }$s"; n=$((n + 1))
     done < <(printf '%s' "$pairs" | sort -t $'\t' -s -k1,1)
+    # Those that did not come back are reported like any other.
+    if [[ -n "$back" ]]; then
+        while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
+            cmd="hatter new $(watch_word "$s")"
+            watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
+            said+="${said:+, }$s"; n=$((n + 1))
+        done < <(watch_reattach "$back" "$tree" "$lives")
+    fi
     if [[ "$n" == 1 ]]; then
         watch_notify "hatter" "'$said' closed in cmux, but its tmux session still runs. Bring it back: $cmd"
     elif [[ "$n" -gt 1 ]]; then
@@ -6475,29 +6491,70 @@ watch_reattached_lately() {
         "$AUTOSAVE_DIR/reattached" 2>/dev/null
 }
 
-# watch_reattach <hat> <session>: mirror a running session that cmux tore down
-# back into its hat's window and the group the config has it in, as
-# `hatter new` does, and put focus back where it was. Says what it did either
-# way; fails when the session is not back, so the caller reports it instead.
+# watch_reattach <hat TAB session lines> <cmux tree before> <live sessions of their hosts>
+# Mirror running sessions cmux tore down back into their hats' windows and
+# the groups the config has them in, as `hatter new` does, under the config
+# lock so the timer's sync cannot read cmux half-way. Mirroring a host brings
+# back every session of it that no workspace shows, including ones a person
+# closed: each of those that was not shown before is detached again (a close,
+# which for a mirror leaves the session running). Focus goes back where it was.
+# Prints the sessions that are not back, for the caller to report.
 watch_reattach() {
-    local hat="$1" s="$2" group rc=0 f
-    group=$(session_group "$s" "$hat" 2>/dev/null) || group=""
+    local list="$1" before="$2" lives="$3" hat s group rc f err out="" after id title want=""
     f="$AUTOSAVE_DIR/reattached"
     mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
-    { tail -n 199 "$f" 2>/dev/null; printf '%s\t%s\n' "$(date +%s)" "$s"; } > "$f.tmp" 2>/dev/null \
-        && mv "$f.tmp" "$f" 2>/dev/null || true
-    if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then
-        echo "reattach $s${group:+ into $group}"
-        return "${HATTER_WATCH_REATTACH_RC:-0}"
-    fi
-    ( cmd_new "$s" --hat "$hat" ${group:+--group "$group"} ) >/dev/null 2>&1 </dev/null || rc=$?
-    focus_restore
-    if [[ "$rc" == 0 ]] && [[ -n "$(workspace_ref_by_title "$s")" ]]; then
-        watch_log "'$s' was closed by cmux, not by anyone, while its tmux session still runs; reattached it. To keep it closed, close it again"
+    if [[ -z "${HATTER_WATCH_DRY:-}" ]] && ! hatter_lock 20; then
+        watch_log "another hatter command is running; not reattaching now"
+        printf '%s' "$list" | cut -f 2
         return 0
     fi
-    watch_log "'$s' was closed by cmux while its tmux session still runs, and reattaching it failed"
-    return 1
+    while IFS=$'\t' read -r hat s; do
+        [[ -n "$s" ]] || continue
+        # The gap is what keeps a close by hand from being undone twice. With
+        # no record of this reattach there is no gap, so no reattach either.
+        if ! { { tail -n 199 "$f" 2>/dev/null; printf '%s\t%s\n' "$(date +%s)" "$s"; } > "$f.tmp" \
+                && mv "$f.tmp" "$f"; } 2>/dev/null; then
+            watch_log "cannot record reattaching '$s' in $AUTOSAVE_DIR; not reattaching it"
+            out+="$s"$'\n'; continue
+        fi
+        group=$(session_group "$s" "$hat" 2>/dev/null) || group=""
+        want+="$s"$'\n'
+        if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then
+            echo "reattach $s${group:+ into $group}" >&2
+            [[ "${HATTER_WATCH_REATTACH_RC:-0}" == 0 ]] || out+="$s"$'\n'
+            continue
+        fi
+        rc=0
+        err=$( ( cmd_new "$s" --hat "$hat" ${group:+--group "$group"} ) 2>&1 >/dev/null </dev/null ) || rc=$?
+        if [[ "$rc" == 0 ]]; then
+            watch_log "'$s' was closed by cmux, not by anyone, while its tmux session still runs; reattached it. To keep it closed, close it again"
+        else
+            err=$(printf '%s\n' "$err" | grep -m 1 '^error:' | cut -c 1-160 || true)
+            watch_log "'$s' was closed by cmux while its tmux session still runs, and reattaching it failed${err:+: ${err#error: }}"
+            out+="$s"$'\n'
+        fi
+    done <<<"$list"
+    if [[ -z "${HATTER_WATCH_DRY:-}" ]]; then
+        # What the mirror brought back besides: live sessions of these hosts
+        # that no workspace showed before, and that nobody asked back.
+        after=$(cmux_json tree --all 2>/dev/null || true)
+        [[ -n "$after" ]] || after='{}'
+        [[ -n "$before" ]] || before='{}'
+        while IFS=$'\t' read -r id title; do
+            [[ -n "$id" ]] || continue
+            grep -qxF -- "$title" <<<"$want" && continue
+            grep -qxF -- "$title" <<<"$lives" || continue
+            cmux_change close-workspace --force --workspace "$id" >/dev/null 2>&1 \
+                && watch_log "detached '$title' again: reattaching its host brought it back too"
+        done < <(jq -r --argjson b "$before" '
+            [$b.windows[]?.workspaces[]?.id] as $had
+            | .windows[]?.workspaces[]? | select(.id as $x | $had | index([$x]) | not)
+            | [.id, (.title // "")] | @tsv' <<<"$after" 2>/dev/null || true)
+        hatter_unlock
+        focus_restore
+    fi
+    printf '%s' "$out"
+    return 0
 }
 
 # Act on what watch_stream collected (its heals, heal_all, closes and sync),

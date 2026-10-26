@@ -295,6 +295,19 @@ expect "a session reattached lately is reported, not reattached again" \
 expect "  and each reattach is recorded" \
     "$(grep -q $'\tdev-web$' "$d/config/hatter/autosave/reattached" && echo y)" "$(cat "$d/config/hatter/autosave/reattached" 2>/dev/null)"
 
+# The same workspace closed twice in one batch, once by cmux and once by a
+# person: the person's close wins.
+d="$work/mixed"
+out=$(watch mixed <<<"$ack
+SLEEP 2
+$(lost dev-api)
+$(close dev-api)
+$(lost dev-web)
+SLEEP 2")
+expect "a title closed both ways in one batch is a person's close" \
+    "$(logged "$out" dev-api dev-api && grep -qx 'reattach dev-web into Work' <<<"$out" \
+       && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
+
 d="$work/reattach-fails"
 out=$(watch reattach-fails HATTER_WATCH_REATTACH_RC=1 <<<"$ack
 SLEEP 2
@@ -303,6 +316,64 @@ SLEEP 2")
 expect "a reattach that fails is reported as before" \
     "$(grep -qx 'reattach dev-api into Work' <<<"$out" && logged "$out" dev-api dev-api \
        && grep -q "'dev-api' closed in cmux" "$d/notes" && echo y)" "$out"
+
+# --- the reattach itself, outside the dry run ------------------------------------
+# hatter's functions, sourced without main, with hatter new, cmux and the lock
+# stubbed: what it runs, what it detaches again, and what it says.
+sed '/^# -* main$/,$d' "$work/self/hatter" > "$work/lib-reattach.sh"
+reattach() {
+    local d="$work/$1"; shift
+    mkdir -p "$d/config/hatter"; : > "$d/calls"
+    cp "$work/running/config/hatter/config.json" "$d/config/hatter/"
+    env HOME="$d" XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_DIR="$d" "$@" bash -c "
+        source '$work/lib-reattach.sh'
+        hatter_lock() { echo lock >> '$d/calls'; [[ -z \"\${STUB_LOCKED:-}\" ]] || return 1; HATTER_LOCK_HELD=1; }
+        hatter_unlock() { echo unlock >> '$d/calls'; HATTER_LOCK_HELD=0; }
+        focus_restore() { echo focus >> '$d/calls'; }
+        cmd_new() { echo \"new \$* held=\$HATTER_LOCK_HELD\" >> '$d/calls'
+                    [[ -z \"\${STUB_NEW_FAILS:-}\" ]] || { echo 'error: no cmux workspace appeared for dev-api' >&2; return 1; } }
+        cmux_json() { [[ \"\$1\" == tree ]] && cat '$d/after'; }
+        cmux_change() { echo \"cmux \$*\" >> '$d/calls'; }
+        watch_log() { echo \"log: \$*\"; }
+        watch_reattach \"\$(printf 'dev\\tdev-api\\n')\" '$(tree_of dev-web)' \"\$(printf 'dev-api\\ndev-web\\ndev-stray\\n')\"
+    " 2>&1 || true
+}
+# Before: only dev-web shown. After the mirror: dev-api back (asked for), and
+# dev-stray too (a person had closed it), and dev-web as it was.
+mkdir -p "$work/re-ok"
+jq -nc '{windows: [{id: "W1", workspaces: [{id: "WS-dev-web", title: "dev-web"},
+                                           {id: "WS-new-api", title: "dev-api"},
+                                           {id: "WS-new-stray", title: "dev-stray"}]}]}' > "$work/re-ok/after"
+out=$(reattach re-ok)
+d="$work/re-ok"
+expect "the reattach runs hatter new for the session, into its group, under the lock" \
+    "$(grep -qx 'new dev-api --hat dev --group Work held=1' "$d/calls" \
+       && [[ "$(head -1 "$d/calls")" == lock ]] && grep -qx unlock "$d/calls" && echo y)" "$(cat "$d/calls")"
+expect "  a session the mirror brought back besides is detached again; the one asked for and one shown before are not" \
+    "$(grep -qx 'cmux close-workspace --force --workspace WS-new-stray' "$d/calls" \
+       && ! grep -q 'WS-new-api\|WS-dev-web' "$d/calls" \
+       && grep -q "detached 'dev-stray' again" <<<"$out" && echo y)" "$(cat "$d/calls")
+$out"
+expect "  focus goes back, and nothing is left to report" \
+    "$(grep -qx focus "$d/calls" && ! grep -qx dev-api <<<"$out" && grep -q "reattached it" <<<"$out" && echo y)" "$out"
+
+mkdir -p "$work/re-fail"; tree_of dev-web > "$work/re-fail/after"
+out=$(reattach re-fail STUB_NEW_FAILS=1)
+expect "a reattach that fails says why, and names the session to report" \
+    "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api" <<<"$out" && grep -qx dev-api <<<"$out" && echo y)" "$out"
+
+mkdir -p "$work/re-locked"; tree_of dev-web > "$work/re-locked/after"
+out=$(reattach re-locked STUB_LOCKED=1)
+expect "with another hatter command running, nothing is reattached and the session is reported" \
+    "$(! grep -q '^new' "$work/re-locked/calls" && grep -qx dev-api <<<"$out" && echo y)" "$out"
+
+mkdir -p "$work/re-norecord/config/hatter/autosave"; chmod 555 "$work/re-norecord/config/hatter/autosave"
+tree_of dev-web > "$work/re-norecord/after"
+out=$(reattach re-norecord)
+chmod 755 "$work/re-norecord/config/hatter/autosave"
+expect "a reattach that cannot be recorded is not made: without the record there is no gap" \
+    "$(! grep -q '^new' "$work/re-norecord/calls" && grep -qx dev-api <<<"$out" \
+       && grep -q "cannot record reattaching 'dev-api'" <<<"$out" && echo y)" "$out"
 
 # --- the rack's banner ---------------------------------------------------------
 # hatter's functions, sourced without main, against the same config. The rack
