@@ -319,61 +319,89 @@ expect "a reattach that fails is reported as before" \
 
 # --- the reattach itself, outside the dry run ------------------------------------
 # hatter's functions, sourced without main, with hatter new, cmux and the lock
-# stubbed: what it runs, what it detaches again, and what it says.
+# stubbed. $d/names is what it hands back to report (stdout), $d/log what it
+# logs (stderr), $d/calls what it ran. cmux shows $d/before until hatter new
+# runs, then $d/after; $d/mirrors lists the titles cmux says are mirrors.
 sed '/^# -* main$/,$d' "$work/self/hatter" > "$work/lib-reattach.sh"
 reattach() {
     local d="$work/$1"; shift
     mkdir -p "$d/config/hatter"; : > "$d/calls"
     cp "$work/running/config/hatter/config.json" "$d/config/hatter/"
-    env HOME="$d" XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_DIR="$d" "$@" bash -c "
-        source '$work/lib-reattach.sh'
-        hatter_lock() { echo lock >> '$d/calls'; [[ -z \"\${STUB_LOCKED:-}\" ]] || return 1; HATTER_LOCK_HELD=1; }
-        hatter_unlock() { echo unlock >> '$d/calls'; HATTER_LOCK_HELD=0; }
-        focus_restore() { echo focus >> '$d/calls'; }
-        cmd_new() { echo \"new \$* held=\$HATTER_LOCK_HELD\" >> '$d/calls'
-                    [[ -z \"\${STUB_NEW_FAILS:-}\" ]] || { echo 'error: no cmux workspace appeared for dev-api' >&2; return 1; } }
-        cmux_json() { [[ \"\$1\" == tree ]] && cat '$d/after'; }
-        cmux_change() { echo \"cmux \$*\" >> '$d/calls'; }
-        watch_log() { echo \"log: \$*\"; }
-        watch_reattach \"\$(printf 'dev\\tdev-api\\n')\" '$(tree_of dev-web)' \"\$(printf 'dev-api\\ndev-web\\ndev-stray\\n')\"
-    " 2>&1 || true
+    [[ -f "$d/before" ]] || tree_of dev-web > "$d/before"
+    [[ -f "$d/after" ]] || cp "$d/before" "$d/after"
+    [[ -f "$d/mirrors" ]] || : > "$d/mirrors"
+    env HOME="$d" XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_DIR="$d" "$@" bash -c '
+        source "$1"; d="$2"
+        hatter_lock() { echo lock >> "$d/calls"; [[ -z "${STUB_LOCKED:-}" ]] || return 1; HATTER_LOCK_HELD=1; }
+        hatter_unlock() { echo unlock >> "$d/calls"; HATTER_LOCK_HELD=0; }
+        focus_restore() { echo focus >> "$d/calls"; }
+        cmd_new() { echo "new $* held=$HATTER_LOCK_HELD" >> "$d/calls"; touch "$d/newed"
+                    [[ -z "${STUB_NEW_FAILS:-}" ]] || { echo "error: no cmux workspace appeared for $1" >&2; return 1; } }
+        cmux_json() { [[ "$1" == tree ]] || return 1; if [[ -f "$d/newed" ]]; then cat "$d/after"; else cat "$d/before"; fi; }
+        cmux_pane_map() { if grep -qxF -- "$2" "$d/mirrors"; then echo "{\"mirrored\":true}"; else echo "{\"mirrored\":false}"; fi; }
+        cmux_change() { echo "cmux $*" >> "$d/calls"; }
+        watch_log() { echo "log: $*"; }
+        watch_reattach "$(printf "dev\tdev-api\n")" \
+            "$(printf "dev@one.example.com\t%s\n" dev-api dev-web dev-stray dev-local)"
+    ' _ "$work/lib-reattach.sh" "$d" > "$d/names" 2> "$d/log" || true
+    rm -f "$d/newed"
 }
-# Before: only dev-web shown. After the mirror: dev-api back (asked for), and
-# dev-stray too (a person had closed it), and dev-web as it was.
+names() { tr '\n' ' ' < "$work/$1/names" | sed 's/ $//'; }
+
+# Before: only dev-web shown. After the mirror: dev-api back (asked for),
+# dev-stray too (a person had closed it), and a local workspace that happens
+# to be named like a live session (dev-local), which is no mirror.
 mkdir -p "$work/re-ok"
 jq -nc '{windows: [{id: "W1", workspaces: [{id: "WS-dev-web", title: "dev-web"},
                                            {id: "WS-new-api", title: "dev-api"},
-                                           {id: "WS-new-stray", title: "dev-stray"}]}]}' > "$work/re-ok/after"
-out=$(reattach re-ok)
+                                           {id: "WS-new-stray", title: "dev-stray"},
+                                           {id: "WS-new-local", title: "dev-local"}]}]}' > "$work/re-ok/after"
+printf '%s\n' dev-api dev-web dev-stray > "$work/re-ok/mirrors"
+reattach re-ok
 d="$work/re-ok"
 expect "the reattach runs hatter new for the session, into its group, under the lock" \
     "$(grep -qx 'new dev-api --hat dev --group Work held=1' "$d/calls" \
        && [[ "$(head -1 "$d/calls")" == lock ]] && grep -qx unlock "$d/calls" && echo y)" "$(cat "$d/calls")"
-expect "  a session the mirror brought back besides is detached again; the one asked for and one shown before are not" \
+expect "  a mirror it brought back besides is detached again" \
     "$(grep -qx 'cmux close-workspace --force --workspace WS-new-stray' "$d/calls" \
-       && ! grep -q 'WS-new-api\|WS-dev-web' "$d/calls" \
-       && grep -q "detached 'dev-stray' again" <<<"$out" && echo y)" "$(cat "$d/calls")
-$out"
-expect "  focus goes back, and nothing is left to report" \
-    "$(grep -qx focus "$d/calls" && ! grep -qx dev-api <<<"$out" && grep -q "reattached it" <<<"$out" && echo y)" "$out"
+       && grep -q "detached 'dev-stray' again" "$d/log" && echo y)" "$(cat "$d/calls")"
+expect "  not the one asked for, one shown before, or a local workspace of a session's name" \
+    "$(! grep -q 'WS-new-api\|WS-dev-web\|WS-new-local' "$d/calls" && echo y)" "$(cat "$d/calls")"
+expect "  focus goes back; nothing is handed back to report, and its log stays out of that" \
+    "$(grep -qx focus "$d/calls" && [[ ! -s "$d/names" ]] && grep -q "reattached it" "$d/log" && echo y)" \
+    "names: $(cat "$d/names")
+log: $(cat "$d/log")"
 
-mkdir -p "$work/re-fail"; tree_of dev-web > "$work/re-fail/after"
-out=$(reattach re-fail STUB_NEW_FAILS=1)
-expect "a reattach that fails says why, and names the session to report" \
-    "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api" <<<"$out" && grep -qx dev-api <<<"$out" && echo y)" "$out"
+# A workspace a person opens while the reattach waits for the lock is in
+# what cmux shows once the lock is held, so it is no stray.
+mkdir -p "$work/re-opened"
+jq -nc '{windows: [{id: "W1", workspaces: [{id: "WS-dev-web", title: "dev-web"}, {id: "WS-opened", title: "dev-stray"}]}]}' > "$work/re-opened/before"
+jq -nc '{windows: [{id: "W1", workspaces: [{id: "WS-dev-web", title: "dev-web"}, {id: "WS-opened", title: "dev-stray"},
+                                           {id: "WS-new-api", title: "dev-api"}]}]}' > "$work/re-opened/after"
+printf '%s\n' dev-api dev-web dev-stray > "$work/re-opened/mirrors"
+reattach re-opened
+expect "a workspace already open when the lock was taken is not detached" \
+    "$(! grep -q 'close-workspace' "$work/re-opened/calls" && echo y)" "$(cat "$work/re-opened/calls")"
 
-mkdir -p "$work/re-locked"; tree_of dev-web > "$work/re-locked/after"
-out=$(reattach re-locked STUB_LOCKED=1)
-expect "with another hatter command running, nothing is reattached and the session is reported" \
-    "$(! grep -q '^new' "$work/re-locked/calls" && grep -qx dev-api <<<"$out" && echo y)" "$out"
+reattach re-fail STUB_NEW_FAILS=1
+expect "a reattach that fails says why, and hands back just the session to report" \
+    "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api" "$work/re-fail/log" \
+       && [[ "$(names re-fail)" == dev-api ]] && echo y)" "names: $(cat "$work/re-fail/names")
+log: $(cat "$work/re-fail/log")"
+
+reattach re-locked STUB_LOCKED=1
+expect "with another hatter command running, nothing is reattached and the session is handed back" \
+    "$(! grep -q '^new' "$work/re-locked/calls" && [[ "$(names re-locked)" == dev-api ]] && echo y)" \
+    "names: $(cat "$work/re-locked/names")"
 
 mkdir -p "$work/re-norecord/config/hatter/autosave"; chmod 555 "$work/re-norecord/config/hatter/autosave"
-tree_of dev-web > "$work/re-norecord/after"
-out=$(reattach re-norecord)
+reattach re-norecord
 chmod 755 "$work/re-norecord/config/hatter/autosave"
 expect "a reattach that cannot be recorded is not made: without the record there is no gap" \
-    "$(! grep -q '^new' "$work/re-norecord/calls" && grep -qx dev-api <<<"$out" \
-       && grep -q "cannot record reattaching 'dev-api'" <<<"$out" && echo y)" "$out"
+    "$(! grep -q '^new' "$work/re-norecord/calls" && [[ "$(names re-norecord)" == dev-api ]] \
+       && grep -q "cannot record reattaching 'dev-api'" "$work/re-norecord/log" && echo y)" \
+    "names: $(cat "$work/re-norecord/names")
+log: $(cat "$work/re-norecord/log")"
 
 # --- the rack's banner ---------------------------------------------------------
 # hatter's functions, sourced without main, against the same config. The rack

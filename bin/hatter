@@ -6457,7 +6457,7 @@ watch_closed() {
         grep -qxF -- "$s" <<<"$live" || continue
         if [[ "$kind" == lost ]] && ! watch_reattached_lately "$s"; then
             back+="$hat"$'\t'"$s"$'\n'
-            lives+="$live"$'\n'
+            lives+=$(printf '%s\n' "$live" | AWK_H="$host" awk '{ print ENVIRON["AWK_H"] "\t" $0 }')$'\n'
             continue
         fi
         cmd="hatter new $(watch_word "$s")"
@@ -6471,7 +6471,7 @@ watch_closed() {
             cmd="hatter new $(watch_word "$s")"
             watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
             said+="${said:+, }$s"; n=$((n + 1))
-        done < <(watch_reattach "$back" "$tree" "$lives")
+        done < <(watch_reattach "$back" "$lives")
     fi
     if [[ "$n" == 1 ]]; then
         watch_notify "hatter" "'$said' closed in cmux, but its tmux session still runs. Bring it back: $cmd"
@@ -6491,22 +6491,30 @@ watch_reattached_lately() {
         "$AUTOSAVE_DIR/reattached" 2>/dev/null
 }
 
-# watch_reattach <hat TAB session lines> <cmux tree before> <live sessions of their hosts>
+# watch_reattach <hat TAB session lines> <host TAB live-session lines>
 # Mirror running sessions cmux tore down back into their hats' windows and
 # the groups the config has them in, as `hatter new` does, under the config
 # lock so the timer's sync cannot read cmux half-way. Mirroring a host brings
 # back every session of it that no workspace shows, including ones a person
-# closed: each of those that was not shown before is detached again (a close,
-# which for a mirror leaves the session running). Focus goes back where it was.
-# Prints the sessions that are not back, for the caller to report.
+# closed: each such mirror that was not there when the lock was taken, and was
+# not asked back, is detached again (a close, which for a mirror leaves the
+# session running). Focus goes back where it was.
+# Prints the sessions that are not back, one per line, for the caller to
+# report; what it logs goes to stderr, which the watch log takes as well.
 watch_reattach() {
-    local list="$1" before="$2" lives="$3" hat s group rc f err out="" after id title want=""
+    local list="$1" lives="$2" hat s group rc f err out="" before after id title want="" h
     f="$AUTOSAVE_DIR/reattached"
     mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
-    if [[ -z "${HATTER_WATCH_DRY:-}" ]] && ! hatter_lock 20; then
-        watch_log "another hatter command is running; not reattaching now"
-        printf '%s' "$list" | cut -f 2
-        return 0
+    if [[ -z "${HATTER_WATCH_DRY:-}" ]]; then
+        if ! hatter_lock 20; then
+            watch_log "another hatter command is running; not reattaching now" >&2
+            printf '%s' "$list" | cut -f 2
+            return 0
+        fi
+        # What cmux shows now, with the lock held: nothing a person opens
+        # from here on can be taken for something the mirror brought back.
+        before=$(cmux_json tree --all 2>/dev/null || true)
+        [[ -n "$before" ]] || before='{}'
     fi
     while IFS=$'\t' read -r hat s; do
         [[ -n "$s" ]] || continue
@@ -6514,7 +6522,7 @@ watch_reattach() {
         # no record of this reattach there is no gap, so no reattach either.
         if ! { { tail -n 199 "$f" 2>/dev/null; printf '%s\t%s\n' "$(date +%s)" "$s"; } > "$f.tmp" \
                 && mv "$f.tmp" "$f"; } 2>/dev/null; then
-            watch_log "cannot record reattaching '$s' in $AUTOSAVE_DIR; not reattaching it"
+            watch_log "cannot record reattaching '$s' in $AUTOSAVE_DIR; not reattaching it" >&2
             out+="$s"$'\n'; continue
         fi
         group=$(session_group "$s" "$hat" 2>/dev/null) || group=""
@@ -6527,25 +6535,29 @@ watch_reattach() {
         rc=0
         err=$( ( cmd_new "$s" --hat "$hat" ${group:+--group "$group"} ) 2>&1 >/dev/null </dev/null ) || rc=$?
         if [[ "$rc" == 0 ]]; then
-            watch_log "'$s' was closed by cmux, not by anyone, while its tmux session still runs; reattached it. To keep it closed, close it again"
+            watch_log "'$s' was closed by cmux, not by anyone, while its tmux session still runs; reattached it. To keep it closed, close it again" >&2
         else
             err=$(printf '%s\n' "$err" | grep -m 1 '^error:' | cut -c 1-160 || true)
-            watch_log "'$s' was closed by cmux while its tmux session still runs, and reattaching it failed${err:+: ${err#error: }}"
+            watch_log "'$s' was closed by cmux while its tmux session still runs, and reattaching it failed${err:+: ${err#error: }}" >&2
             out+="$s"$'\n'
         fi
     done <<<"$list"
     if [[ -z "${HATTER_WATCH_DRY:-}" ]]; then
-        # What the mirror brought back besides: live sessions of these hosts
-        # that no workspace showed before, and that nobody asked back.
+        # What the mirror brought back besides: new workspaces that cmux says
+        # mirror a live session of these hosts, and that nobody asked back. A
+        # local workspace of the same name is not one.
         after=$(cmux_json tree --all 2>/dev/null || true)
         [[ -n "$after" ]] || after='{}'
-        [[ -n "$before" ]] || before='{}'
         while IFS=$'\t' read -r id title; do
             [[ -n "$id" ]] || continue
             grep -qxF -- "$title" <<<"$want" && continue
-            grep -qxF -- "$title" <<<"$lives" || continue
-            cmux_change close-workspace --force --workspace "$id" >/dev/null 2>&1 \
-                && watch_log "detached '$title' again: reattaching its host brought it back too"
+            while IFS= read -r h; do
+                [[ -n "$h" ]] || continue
+                cmux_pane_map "$h" "$title" </dev/null 2>/dev/null | jq -e '.mirrored == true' >/dev/null 2>&1 || continue
+                cmux_change close-workspace --force --workspace "$id" >/dev/null 2>&1 \
+                    && watch_log "detached '$title' again: reattaching its host brought it back too" >&2
+                break
+            done < <(AWK_T="$title" awk -F '\t' '($2 "") == (ENVIRON["AWK_T"] "") { print $1 }' <<<"$lives" | awk '!seen[$0]++')
         done < <(jq -r --argjson b "$before" '
             [$b.windows[]?.workspaces[]?.id] as $had
             | .windows[]?.workspaces[]? | select(.id as $x | $had | index([$x]) | not)
