@@ -701,6 +701,7 @@ session_place() {
 # this hat's server records, and that belong to this hat. Several hats can share
 # one server; a session goes to the hat its name is prefixed with, and one with
 # no such prefix goes to the first of them by name, so each is shown once.
+# The drag healer's own short-lived hop sessions (heal_hop_window) are no one's.
 hat_unrecorded() {
     cfg --arg l "$1" --arg live "$2" '
         .hats[$l].ssh as $h
@@ -708,6 +709,7 @@ hat_unrecorded() {
         | ([.groups[] | select(.hat as $x | $hats | index($x)) | .sessions | keys_unsorted[]?]) as $rec
         | $live | split("\n")[]
         | select(. != "" and (. as $s | $rec | index($s) | not))
+        | select(startswith("hatter-hop-") | not)
         | select((split("-")[0]) as $p
                  | if ($hats | index($p)) then $p == $l else $hats[0] == $l end)'
 }
@@ -3590,14 +3592,14 @@ heal_dragged_tabs() {
     done
     wait
     for ((i = 0; i < ${#hats[@]}; i++)); do
-        heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" "$onlysf" "${hats[$i]}" || true
+        heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" "$onlysf" || true
     done
     rm -rf "$tmp"
     return 0
 }
 
 heal_hat_drags() {
-    local host="$1" win="$2" tree="$3" state="$4" report="$5" onlysf="${6:-}" hat="${7:-}" first second
+    local host="$1" win="$2" tree="$3" state="$4" report="$5" onlysf="${6:-}" first second
     [[ -n "$state" ]] || return 0
     drag_suspect "$win" "$tree" "$state" || return 0
 
@@ -3639,8 +3641,8 @@ heal_hat_drags() {
             </dev/null 2>"$errf") || rc=$?
         [[ "$rc" == 0 ]] || screen=$(cat "$errf" 2>/dev/null; printf '%s' "$screen")
         if [[ "$kind" == local ]]; then
-            heal_local_drop "$hat" "$host" "$win" "$orphan" "$ws" "$to" "$from" "$name" "$rc" "$screen" "$report" \
-                "$(drag_unmapped_tabs "$from" "$tree" "$host")"
+            heal_local_drop "$host" "$win" "$orphan" "$ws" "$to" "$from" "$wid" "$name" "$rc" "$screen" "$report" \
+                "$(AWK_S="$from" awk -F '\t' '$1 == "W" && ($2 "") == (ENVIRON["AWK_S"] "")' <<<"$state" | wc -l | tr -d ' ')"
             continue
         fi
         why=$(drag_not_blank "$rc" "$screen")
@@ -3787,71 +3789,110 @@ heal_close_blank() {
     return 1
 }
 
-# heal_local_drop <hat> <host> <cmux-window> <orphan> <workspace> <workspace-title>
-#                 <from-session> <name> <read-screen status> <read-screen output> <report>
+# heal_local_drop <host> <cmux-window> <orphan> <workspace> <workspace-title>
+#                 <from-session> <window-id> <name> <read-screen status>
+#                 <read-screen output> <report> <windows in from-session>
 # A tab dropped into a workspace that is not a tmux session (a local one) has no
 # session to move its window into. Its window is still in <from-session>, and
-# that workspace no longer shows it. So the blank tab goes, and <from-session>
-# is mirrored again, which gives every one of its windows a tab.
+# that workspace no longer shows it. cmux draws a window as a new tab when it
+# enters a mirrored session, so the window hops out to a session of its own and
+# straight back (heal_hop_window), and only then does the blank tab go: a hop
+# that fails leaves the drop as it was, for the next pass to find.
 #
 # Only a tab cmux has no terminal for counts: an empty screen is not enough
 # here, because the close may be forced, and a quiet local shell would die.
 heal_local_drop() {
-    local hat="$1" host="$2" win="$3" orphan="$4" ws="$5" wstitle="$6" from="$7" name="$8"
-    local rc="$9" screen="${10}" report="${11}" extra="${12:-}" label line
+    local host="$1" win="$2" orphan="$3" ws="$4" wstitle="$5" from="$6" wid="$7" name="$8"
+    local rc="$9" screen="${10}" report="${11}" nwin="${12:-0}" label line i map before=""
     label="${name:-tmux window}"
     if [[ "$rc" == 0 ]] || ! grep -q 'surface_unavailable' <<<"$screen"; then
         line=$(printf '%s\n' "$screen" | grep -m 1 '[^[:space:]]' | tr -d '[:cntrl:]' || true)
-        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" \
+        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" "$wid" \
             "cmux shows a terminal behind it${line:+ (\"${line:0:80}\")}"
         return 0
     fi
-    # Re-mirroring closes the source workspace, and any tab in it that is not
-    # one of its tmux windows (a local shell) would go with it.
-    if [[ -n "$extra" ]]; then
-        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" \
-            "re-mirroring '$from' would close $extra tab(s) in it that are not tmux windows"
+    # Moving a session's last window out ends the session.
+    if [[ "$nwin" -le 1 ]]; then
+        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" "$wid" \
+            "it is the last tab of '$from'"
         return 0
     fi
-    if ! heal_close_blank "$win" "$orphan" "$ws"; then
-        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" \
-            "cmux would not close it${HEAL_CLOSE_ERR:+: $HEAL_CLOSE_ERR}"
+    # One hop per dropped tab: a hop cmux did not draw would not draw the next
+    # time either, and each one moves the window.
+    local tried="$AUTOSAVE_DIR/drag-hopped"
+    if grep -qxF "$orphan" "$tried" 2>/dev/null; then
+        drag_local_refuse "$report" "$orphan" "$label" "$wstitle" "$from" "$wid" \
+            "a hop did not make cmux show it in '$from'"
         return 0
     fi
-    info "Closed the blank tab '$label' dropped into '$wstitle', which is not a tmux session; showing it in '$from' again"
-    if [[ -n "$hat" ]] && ( remirror_session "$hat" "$host" "$from" "$win" ) </dev/null; then
-        HEAL_MOVED+="$from"$'\n'
-    else
-        warn "the tab '$label' is still in '$from' on $host, but cmux does not show it there. Run:
-    hatter repair $(sq "$from")
-  or, if '$from' is no longer in cmux at all:
-    hatter restore $(sq "${hat:-<hat>}")"
-    fi
+    before=$(cmux_pane_map "$host" "$from" </dev/null 2>/dev/null \
+        | jq -r --arg w "$wid" '[.panes[]? | select(.window_id == $w) | .surface_id] | first // empty' 2>/dev/null || true)
+    heal_hop_window "$host" "$from" "$wid" || return 0
+    # Close the blank tab once cmux shows the window under a tab of its own.
+    for ((i = 0; i < 20; i++)); do
+        map=$(cmux_pane_map "$host" "$from" </dev/null 2>/dev/null || true)
+        [[ -n "$map" ]] || map='{}'
+        if jq -e --arg w "$wid" --arg b "$before" --arg o "$orphan" '
+                any(.panes[]?; .window_id == $w and .surface_id != $b and .surface_id != $o)' \
+                <<<"$map" >/dev/null 2>&1; then
+            heal_close_blank "$win" "$orphan" "$ws" \
+                || warn "'$label' shows in '$from' again, but the blank tab in '$wstitle' would not close${HEAL_CLOSE_ERR:+: $HEAL_CLOSE_ERR}"
+            info "Showed tab '$label' in '$from' again: it was dropped into '$wstitle', which is not a tmux session"
+            HEAL_MOVED+="$from"$'\n'
+            return 0
+        fi
+        sleep 0.25
+    done
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+    { tail -n 99 "$tried" 2>/dev/null; echo "$orphan"; } > "$tried.tmp" 2>/dev/null \
+        && mv "$tried.tmp" "$tried" 2>/dev/null || true
+    warn "hopped '$label' through a session of its own, but cmux has not shown it in '$from' yet; the blank tab in '$wstitle' is left"
     return 0
 }
 
-# drag_unmapped_tabs <session> <tree> <host>
-# How many terminal tabs the session's workspace shows that are not its tmux
-# windows (local shells), or nothing when there are none. A count cmux cannot
-# give is unknown, and unknown counts as some.
-drag_unmapped_tabs() {
-    local session="$1" tree="$2" host="$3" map n
-    map=$(cmux_pane_map "$host" "$session" </dev/null 2>/dev/null) || { echo "an unknown number of"; return 0; }
-    [[ -n "$map" ]] || map='{}'
-    n=$(jq -rn --argjson t "$tree" --argjson m "$map" --arg s "$session" '
-        [($m.panes // [])[].surface_id] as $mapped
-        | [$t.windows[]?.workspaces[]? | select(.title == $s) | .panes[]?.surfaces[]?
-           | select(.type == "terminal") | select(.id as $x | $mapped | index([$x]) | not)] | length' 2>/dev/null) \
-        || { echo "an unknown number of"; return 0; }
-    [[ "$n" == 0 ]] || echo "$n"
-    return 0
+# heal_hop_window <host> <session> <window-id>
+# Move a window out of its session to a new one of its own and straight back,
+# so a mirroring cmux sees it arrive and draws it as a new tab. It goes back to
+# the index it had, and is the session's current window again if it was. The
+# hop session is killed only once the window is out of it again: killing it
+# with the window inside would end the window. Fails, having said why, when the
+# window did not make the round trip.
+heal_hop_window() {
+    local host="$1" session="$2" wid="$3" out hop
+    hop="hatter-hop-${wid#@}-$$"
+    out=$(remote_sh "$host" "h=$(sq "$hop") f=$(sq "$session") w=$(sq "$wid")"'
+        # Where it was, so it comes back to the same place, active if it was.
+        at=$(tmux display-message -p -t "=$f:$w" "#{window_index} #{window_active}" 2>/dev/null) \
+            || { echo "@@hop-none"; exit 0; }
+        idx=${at% *} act=${at#* }
+        tmux new-session -d -s "$h" -c "$HOME" || { echo "@@hop-none"; exit 0; }
+        if tmux move-window -d -s "=$f:$w" -t "=$h:"; then
+            sleep 1
+            # Its index may have been taken meanwhile: then it goes last.
+            tmux move-window -d -s "=$h:$w" -t "=$f:$idx" 2>/dev/null \
+                || tmux move-window -d -s "=$h:$w" -t "=$f:" \
+                || { echo "@@hop-stuck"; exit 0; }
+            [ "$act" != 1 ] || tmux select-window -t "=$f:$w" 2>/dev/null || true
+            r=@@hop-ok
+        else r=@@hop-none; fi
+        tmux list-windows -t "=$h" -F "#{window_id}" 2>/dev/null | grep -qxF "$w" || tmux kill-session -t "=$h"
+        echo "$r"' </dev/null 2>/dev/null || true)
+    case "$out" in
+        *@@hop-ok*) return 0 ;;
+        *@@hop-stuck*)
+            warn "window $wid of '$session' is now in the temporary session '$hop' on $host. Put it back with:
+    ssh $host \"tmux move-window -s '=$hop:$wid' -t '=$session:' && tmux kill-session -t '=$hop'\""
+            return 1 ;;
+        *)  warn "could not hop window $wid of '$session' on $host; nothing was moved"
+            return 1 ;;
+    esac
 }
 
-# drag_local_refuse <report> <orphan> <label> <workspace-title> <from-session> <reason>
+# drag_local_refuse <report> <orphan> <label> <workspace-title> <from-session> <window-id> <reason>
 # Says why a tab dropped into a local workspace was left alone, as drag_refuse
 # does: always with "report", once per tab with "once".
 drag_local_refuse() {
-    local report="$1" orphan="$2" label="$3" wstitle="$4" from="$5" reason="$6" seen
+    local report="$1" orphan="$2" label="$3" wstitle="$4" from="$5" wid="$6" reason="$7" seen
     case "$report" in
         report) ;;
         once)
@@ -3863,7 +3904,7 @@ drag_local_refuse() {
         *) return 0 ;;
     esac
     warn "the tab '$label' dropped into '$wstitle' was left alone: $reason.
-  If it was dragged there from '$from', close it, then run:
+  If it was dragged there from '$from', close it, and show the window there again with:
     hatter repair $(sq "$from")"
     return 0
 }
@@ -3930,8 +3971,11 @@ remirror_session() {
     fi
 
     info "Detaching '$session' from cmux (its tmux session keeps running)"
-    cmux_change close-workspace --workspace "$ws" >/dev/null 2>&1 \
-        || die "cmux would not close the workspace - nothing was changed"
+    # cmux asks before closing a workspace with anything running in it. For a
+    # mirrored one a close only detaches: the tmux session runs on.
+    local err
+    err=$(cmux_change close-workspace --force --workspace "$ws" --window "$win" 2>&1 >/dev/null) \
+        || die "cmux would not close the workspace - nothing was changed${err:+: $(printf '%s\n' "$err" | grep -m 1 '[^[:space:]]')}"
     # Wait until it is really gone, or the wait below could take the old one
     # for the re-mirrored one.
     local i
@@ -8321,10 +8365,12 @@ the window would show nowhere. The timer logs it once.
 
 A tab dropped into a workspace that is not a tmux session (a local one) has
 no session to move its window into. Its window is still in the session it
-came from, which no longer shows it. So the blank tab is closed and that
-session is mirrored again, back in its group and place, which gives the
-window a tab there. Only a tab cmux has no terminal for is taken: a local
-shell, even a quiet one, is left alone, with a note on how to do it by hand.
+came from, which no longer shows it. cmux draws a window as a new tab when it
+enters a mirrored session, so the window hops out to a temporary session and
+straight back, and then the blank tab is closed. Nothing is closed or
+mirrored again. Only a tab cmux has no terminal for is taken: a local shell,
+even a quiet one, is left alone, with a note on how to do it by hand. A
+session's last window is left alone too, since moving it out would end it.
 
 The other way: the window did move, but cmux has stopped painting it, and
 nothing on the tmux side helps. For that, repair checks the session has

@@ -150,7 +150,8 @@ ONE_TREE='{"windows": [{"id": "W1", "workspaces": [
 # dev-x is loose in cmux and recorded nowhere; dev-y runs but is not mirrored.
 setup loose "$ONE_HAT" "$ONE_TREE"
 groups W1 '{"groups": [{"id": "g-G", "name": "G", "member_workspace_ids": ["ws-a"]}]}'
-printf 'dev-a\ndev-x\ndev-y\n' > "$d/server.dev"
+# hatter-hop-*: the drag healer's short-lived hop session (#118), mid-hop.
+printf 'dev-a\ndev-x\ndev-y\nhatter-hop-7-4242\n' > "$d/server.dev"
 hatter_in sync || true
 U='.groups["Unassigned@dev"]'
 expect "a loose running session is recorded in Unassigned" \
@@ -159,6 +160,8 @@ expect "...with its tabs" \
     "$(yes_if [ "$(cfg_of "$U.sessions[\"dev-x\"].windows[0].name")" = w-dev-x ])"
 expect "a running session cmux does not show is recorded in Unassigned" \
     "$(yes_if [ "$(cfg_of "$U.sessions | has(\"dev-y\")")" = true ])"
+expect "the drag healer's hop session is no one's, and is not recorded" \
+    "$(yes_if [ "$(cfg_of '[.groups[].sessions | keys[]] | map(select(startswith("hatter-hop-"))) | length')" = 0 ])"
 expect "Unassigned is the hat's, managed, and named Unassigned" \
     "$(yes_if [ "$(cfg_of "[$U.hat, $U.managed, $U.name] | join(\" \")")" = "dev true Unassigned" ])"
 expect "the loose workspace is put into a cmux group named Unassigned" \
