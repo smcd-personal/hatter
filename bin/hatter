@@ -6311,21 +6311,58 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 #   full                    the stream (re)connected; anything may have happened
 #   heal<TAB>workspace<TAB>surface   a tab was dropped into that workspace
 #                           (drop events carry no window id)
-#   closed<TAB>title        a workspace closed; the layout changed too. Its
-#                           title is the tmux session it mirrored.
+#   closed<TAB>title<TAB>user|lost   a workspace closed; the layout changed too.
+#                           Its title is the tmux session it mirrored.
 #   sync                    the layout changed
 # and "eof" once the stream ends. Heartbeats are asked for and dropped here:
 # they keep a stream whose reader has gone from outliving it for long.
-WATCH_JQ='(inputs | fromjson? | objects
-           | if .type == "ack" then "full"
-             elif .type != "event" then empty
-             elif .name == "surface.created" and .payload.origin? == "detach_attach"
-               then "heal\t\(.workspace_id // "")\t\(.surface_id // .payload.surface_id? // "")"
-             elif .name == "workspace.closed"
-               then "closed\t\((.payload | objects | .title) // "" | tostring | gsub("[\t\n\r]"; " "))"
-             elif ((.name // "") | tostring | test("^(workspace[.](created|closed|reordered)|surface[.](created|closed))$"))
-               then "sync"
-             else empty end), "eof"'
+#
+# A close is "user" or "lost" (#117). The event is the same either way: its
+# tabs close with origin "workspace_teardown", then the workspace. What differs
+# is what came before. A person closes the workspace they are on, so it was
+# selected, or lost the selection to the next one in the same instant. cmux
+# tearing a mirror down when its connection drops closes one nobody was on.
+# So the jq keeps which workspaces are selected, from workspace.selected and
+# its previous_workspace_id, starting from $seed (each window's selection when
+# the stream opened). A close by a script, or from the sidebar of a workspace
+# not selected, reads as "lost" too: watch_closed brings such a workspace back
+# only once in a while, so closing it again keeps it closed.
+WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try fromdateiso8601 catch null));
+  (foreach (inputs | fromjson? | objects) as $e
+    ({sel: ([$seed[] | {(.): true}] | add // {}), at: {}, out: null};
+     .out = null
+     | if $e.type == "ack" then .out = "full"
+       elif $e.type != "event" then .
+       elif $e.name == "workspace.selected" then
+         ($e.payload.workspace_id? // $e.workspace_id // null) as $w
+         | ($e.payload.previous_workspace_id? // null) as $p
+         | ($e | at) as $t
+         | (if $p != null then .sel[$p] = false | .at[$p] = $t else . end)
+         | (if $w != null then .sel[$w] = true | .at[$w] = $t else . end)
+       elif $e.name == "surface.created" and $e.payload.origin? == "detach_attach"
+         then .out = "heal\t\($e.workspace_id // "")\t\($e.surface_id // $e.payload.surface_id? // "")"
+       elif $e.name == "workspace.closed" then
+         ($e.workspace_id // $e.payload.workspace_id? // "") as $w
+         | ($e | at) as $t
+         | (if .sel[$w] == true or (.at[$w] != null and $t != null and ($t - .at[$w]) <= 3)
+            then "user" else "lost" end) as $k
+         | .sel[$w] = false
+         | .out = "closed\t\(($e.payload | objects | .title) // "" | tostring | gsub("[\t\n\r]"; " "))\t\($k)"
+       elif (($e.name // "") | tostring | test("^(workspace[.](created|closed|reordered)|surface[.](created|closed))$"))
+         then .out = "sync"
+       else . end;
+     .out | select(. != null))), "eof"'
+
+# Each window's selected workspace, as a JSON array, for WATCH_JQ's $seed.
+# Unreadable is none: every close is then taken for cmux's own until a
+# selection is seen, and the reattach gap bounds what that can do.
+watch_seed() {
+    local seed
+    seed=$(cmux_json list-windows 2>/dev/null \
+        | jq -c '[.[]? | .selected_workspace_id // empty]' 2>/dev/null) || seed=""
+    [[ "$seed" == "["* ]] || seed='[]'
+    printf '%s' "$seed"
+}
 
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') watch: $*"; }
 
@@ -6368,24 +6405,33 @@ watch_notify() {
     return 0
 }
 
-# watch_closed <titles>: the workspaces cmux closed while their tmux sessions
-# still run. cmux can close a mirrored workspace by itself (a dropped ssh
-# connection under its tmux mirror is one way), and then the session runs on,
-# detached, with nothing to say so but `hatter list`. So each closed title that
-# is a recorded session, still running on its server and shown in no cmux
-# window, is logged and posted as one notification. Nothing re-mirrors it: a
-# close on purpose looks the same on the stream.
+# watch_closed <title TAB user|lost lines>: the workspaces cmux closed while
+# their tmux sessions still run. cmux can close a mirrored workspace by itself:
+# when the ssh connection under its tmux mirror drops (after the Mac sleeps,
+# tmux can drop a control client that fell too far behind), cmux takes the
+# session for ended and tears the workspace down (#117). The session runs on,
+# detached. So each closed title that is a recorded session, still running on
+# its server and shown in no cmux window, is either brought back or reported:
+#
+#   - a "lost" close (see WATCH_JQ) is reattached, as `hatter new` would, into
+#     the group the config has it in. Only once per session in WATCH_REATTACH_GAP
+#     seconds: a lost close can also be someone closing it from a script, or
+#     from the sidebar without selecting it, and then closing it again keeps
+#     it closed.
+#   - a "user" close, or a lost one inside that gap, is logged and posted as
+#     one notification, saying how to bring it back.
 #
 # watch_act calls this only once the config lock is free, so a hatter command
 # that closes a workspace has finished first: repair has re-opened it, rm and
 # rename have changed the record. Unknown is never "still running": a server
 # that does not answer, or a cmux whose windows cannot be read, says nothing.
+WATCH_REATTACH_GAP=1800
 watch_closed() {
-    local s hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd=""
+    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd=""
     tree=$(cmux_json tree --all 2>/dev/null) || return 0
     [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" == array ]] || return 0
     shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
-    while IFS= read -r s; do
+    while IFS=$'\t' read -r s kind; do
         [[ -n "$s" ]] || continue
         [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || continue
         if grep -qxF -- "$s" <<<"$shown"; then continue; fi
@@ -6393,10 +6439,10 @@ watch_closed() {
         [[ -n "$hat" ]] || continue
         host=$(hat_ssh "$hat" 2>/dev/null) || continue
         [[ -n "$host" ]] || continue
-        pairs+="$host"$'\t'"$s"$'\n'
-    done < <(printf '%s\n' "$1" | awk '!seen[$0]++')
+        pairs+="$host"$'\t'"$s"$'\t'"${kind:-user}"$'\t'"$hat"$'\n'
+    done < <(printf '%s\n' "$1" | awk -F '\t' '!seen[$1]++')
     # One look per server, however many of its workspaces closed at once.
-    while IFS=$'\t' read -r host s; do
+    while IFS=$'\t' read -r host s kind hat; do
         [[ -n "$s" ]] || continue
         if [[ "$host" != "$prev" ]]; then
             prev=$host; ok=1
@@ -6404,6 +6450,9 @@ watch_closed() {
         fi
         [[ "$ok" == 1 ]] || continue
         grep -qxF -- "$s" <<<"$live" || continue
+        if [[ "$kind" == lost ]] && ! watch_reattached_lately "$s" && watch_reattach "$hat" "$s"; then
+            continue
+        fi
         cmd="hatter new $(watch_word "$s")"
         watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
         said+="${said:+, }$s"; n=$((n + 1))
@@ -6414,6 +6463,41 @@ watch_closed() {
         watch_notify "hatter" "$n workspaces closed in cmux while their tmux sessions still run: $said. Bring them back: hatter restore --missing"
     fi
     return 0
+}
+
+# watch_reattached_lately <session>: the watcher brought it back less than
+# WATCH_REATTACH_GAP seconds ago. The record is "<epoch> TAB <session>" lines.
+watch_reattached_lately() {
+    local now
+    now=$(date +%s)
+    AWK_S="$1" AWK_T=$((now - WATCH_REATTACH_GAP)) awk -F '\t' '
+        ($2 "") == (ENVIRON["AWK_S"] "") && $1 + 0 > ENVIRON["AWK_T"] + 0 { f = 1 } END { exit !f }' \
+        "$AUTOSAVE_DIR/reattached" 2>/dev/null
+}
+
+# watch_reattach <hat> <session>: mirror a running session that cmux tore down
+# back into its hat's window and the group the config has it in, as
+# `hatter new` does, and put focus back where it was. Says what it did either
+# way; fails when the session is not back, so the caller reports it instead.
+watch_reattach() {
+    local hat="$1" s="$2" group rc=0 f
+    group=$(session_group "$s" "$hat" 2>/dev/null) || group=""
+    f="$AUTOSAVE_DIR/reattached"
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+    { tail -n 199 "$f" 2>/dev/null; printf '%s\t%s\n' "$(date +%s)" "$s"; } > "$f.tmp" 2>/dev/null \
+        && mv "$f.tmp" "$f" 2>/dev/null || true
+    if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then
+        echo "reattach $s${group:+ into $group}"
+        return "${HATTER_WATCH_REATTACH_RC:-0}"
+    fi
+    ( cmd_new "$s" --hat "$hat" ${group:+--group "$group"} ) >/dev/null 2>&1 </dev/null || rc=$?
+    focus_restore
+    if [[ "$rc" == 0 ]] && [[ -n "$(workspace_ref_by_title "$s")" ]]; then
+        watch_log "'$s' was closed by cmux, not by anyone, while its tmux session still runs; reattached it. To keep it closed, close it again"
+        return 0
+    fi
+    watch_log "'$s' was closed by cmux while its tmux session still runs, and reattaching it failed"
+    return 1
 }
 
 # Act on what watch_stream collected (its heals, heal_all, closes and sync),
@@ -6457,7 +6541,7 @@ watch_stream() {
     mkfifo "$fifo" || { watch_cleanup; return 0; }
     cmux events --category workspace --category surface \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
-        | jq -nR --unbuffered -r "$WATCH_JQ" > "$fifo" &
+        | jq -nR --unbuffered -r --argjson seed "$(watch_seed)" "$WATCH_JQ" > "$fifo" &
     exec 3<"$fifo"
     while :; do
         if IFS= read -r -t "$WATCH_QUIET" line <&3; then
@@ -8207,13 +8291,19 @@ changes send no event, so the timer still catches those within a minute, and
 anything that happened while the watcher was down. It restarts itself when
 hatter is reinstalled. Log: ~/.config/hatter/autosave/watch.log
 
-When cmux closes the workspace of a recorded session (by itself, as it can
-when the ssh connection under a mirror drops, or because someone closed it)
-and the tmux session still runs on its server, the watcher logs
-"'<session>' closed in cmux while its tmux session still runs" and posts a
-macOS notification naming `hatter new <session>`, which brings it back. It
-re-mirrors nothing itself: a close on purpose looks the same. A server that
-does not answer gets no notice. The rack lists such sessions at the top.
+When cmux closes the workspace of a recorded session and the tmux session
+still runs on its server, the watcher looks at who closed it. cmux closes a
+mirror by itself when the ssh connection under it drops, as can happen after
+the Mac sleeps. A workspace nobody was on, closed that way, is reattached
+into its group, as `hatter new <session>` would, and the log says so. A
+workspace someone closed (the one selected in its window) is left closed:
+the watcher logs "'<session>' closed in cmux while its tmux session still
+runs" and posts a macOS notification naming `hatter new <session>`, which
+brings it back. A close from a script, or from the sidebar of a workspace
+that is not selected, looks like cmux's own. So a session is reattached at
+most once in 30 minutes: closing it again keeps it closed, with the notice.
+A server that does not answer gets nothing. The rack lists such sessions at
+the top.
 
 Two layers, on purpose:
 
