@@ -51,7 +51,9 @@ case "$*" in
     wid=@2; [[ "${STUB_SECOND:-}" == newid && -f "$STUB_DIR/pass2" ]] && wid=@5
     case "$*" in
       *'"dev-c"'*) echo '{"mirrored":false}' ;;
-      *'"dev-a"'*) if [[ -f "$STUB_DIR/moved" ]]; then
+      *'"dev-a"'*) if [[ -f "$STUB_DIR/hopped" ]]; then
+                     echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"},{"surface_id":"s-back","window_id":"@2"}]}'
+                   elif [[ -f "$STUB_DIR/moved" ]]; then
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-1","window_id":"@1"}]}'
                    elif [[ "${STUB_LAST:-}" ]]; then
                      echo '{"mirrored":true,"panes":[{"surface_id":"s-old","window_id":"'$wid'"}]}'
@@ -125,6 +127,16 @@ case "$cmd" in
     [[ "${STUB_DEVC:-}" ]] && printf 'S\tdev-c\nW\tdev-c\t@9\tnine\t/\t\n'
     [[ "${STUB_SRC_EXTRA:-}" ]] && printf 'W\tdev-a\t@7\tseven\t/\t\n'
     true ;;
+  # repair's look at the server: lines of content in the session.
+  *capture-pane*) echo 3 ;;
+  # The local-drop healer's round trip (#118). STUB_HOP: stuck, or none.
+  *hatter-hop-*)
+    echo "hop $cmd" | tr '\n' ' ' >> "$STUB_DIR/log"; echo >> "$STUB_DIR/log"
+    case "${STUB_HOP:-}" in
+      stuck) echo @@hop-stuck ;;
+      none)  echo @@hop-none ;;
+      *)     touch "$STUB_DIR/hopped"; echo @@hop-ok ;;
+    esac ;;
   *move-window*) echo "move $cmd" >> "$STUB_DIR/log"; touch "$STUB_DIR/moved" ;;
   *set-option*) echo "set $cmd" >> "$STUB_DIR/log" ;;
 esac
@@ -143,7 +155,7 @@ run() {
     echo '{"version":3,"hats":{"dev":{"ssh":"dev@example.com","remote_dir":"$HOME"}},
            "groups":{"G":{"hat":"dev","sessions":{"dev-a":{},"dev-b":{}}}}}' \
         > "$d/home/.config/hatter/config.json"
-    rm -f "$d/log" "$d/looked" "$d/pass2" "$d/unpinned" "$d/closed" "$d/remirrored"; touch "$d/log"
+    rm -f "$d/log" "$d/looked" "$d/pass2" "$d/unpinned" "$d/closed" "$d/remirrored" "$d/hopped"; touch "$d/log"
     env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
         STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" ${HATTER_CMD:-_drag-heal} >"$d/out" 2>&1 || true
     cat "$d/log"
@@ -263,46 +275,56 @@ log=$(HATTER_CMD="_drag-heal dev report ws-gone s-new" run event-nows blank)
 expect "a drop event for a workspace in no window moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
 
 # A tab dropped into a local workspace (#93): no session to move its window
-# into, so the blank tab goes and the session it came from is mirrored again.
+# into, so the window hops out to a session of its own and back, which cmux
+# draws as a new tab, and then the blank tab goes (#118).
 log=$(run local unavailable STUB_LOCAL=1)
-expect "a tab dropped into a local workspace: the blank tab is closed" \
-    "$(grep -q '^close .*--surface s-new .*--workspace ws-l ' <<<"$log" && echo y)"
-expect "a tab dropped into a local workspace: its window is not moved" \
-    "$(! grep -q '^move' <<<"$log" && echo y)"
-expect "a tab dropped into a local workspace: the session it came from is mirrored again" \
-    "$(grep -A1000 '^close .*--surface s-new' <<<"$log" | grep -q '^close-workspace .*--workspace ws-a' \
-        && grep -q '^ssh-tmux .*dev@example.com' <<<"$log" && echo y)"
+expect "a tab dropped into a local workspace: its window hops out of its session and back" \
+    "$(grep -q "^hop .*f='dev-a' w='@2'" <<<"$log" && ! grep -q '^move' <<<"$log" && echo y)"
+expect "a tab dropped into a local workspace: the blank tab is closed after the hop" \
+    "$(grep -A1000 '^hop' <<<"$log" | grep -q '^close .*--surface s-new .*--workspace ws-l ' && echo y)"
+expect "a tab dropped into a local workspace: no workspace is closed or mirrored again" \
+    "$(! grep -qE '^(close-workspace|ssh-tmux)' <<<"$log" && echo y)"
 expect "a tab dropped into a local workspace: the log says what was done" \
-    "$(grep -q "dropped into 'scratch', which is not a tmux session; showing it in 'dev-a' again" "$work/run-local/out" && echo y)"
+    "$(grep -q "Showed tab 'two' in 'dev-a' again: it was dropped into 'scratch', which is not a tmux session" "$work/run-local/out" && echo y)"
 log=$(HATTER_CMD="_drag-heal dev report ws-l s-new" run local-event unavailable STUB_LOCAL=1)
 expect "a drop event for a tab dropped into a local workspace heals it" \
-    "$(grep -q '^close .*--surface s-new ' <<<"$log" && grep -q '^ssh-tmux' <<<"$log" && echo y)"
+    "$(grep -q '^hop' <<<"$log" && grep -q '^close .*--surface s-new ' <<<"$log" && echo y)"
+log=$(run local-extra unavailable STUB_LOCAL=1 STUB_SRC_EXTRA=1)
+expect "a source workspace holding a local shell: healed, and the shell is not touched" \
+    "$(grep -q '^hop' <<<"$log" && grep -q '^close .*--surface s-new ' <<<"$log" \
+        && ! grep -q 's-sh' <<<"$log" && echo y)"
+
+log=$(run local-stuck unavailable STUB_LOCAL=1 STUB_HOP=stuck)
+expect "a hop that leaves the window in the temporary session: the blank tab stays, and the log says how to put it back" \
+    "$(! grep -q '^close' <<<"$log" \
+        && grep -qF "tmux move-window -s '=hatter-hop-2-" "$work/run-local-stuck/out" && echo y)"
+log=$(run local-nohop unavailable STUB_LOCAL=1 STUB_HOP=none)
+expect "a hop that moved nothing: the blank tab stays for the next pass" \
+    "$(! grep -q '^close' <<<"$log" && grep -q "could not hop window @2 of 'dev-a'" "$work/run-local-nohop/out" && echo y)"
+log=$(run local-last unavailable STUB_LOCAL=1 STUB_LAST=1)
+expect "a session's last window is not hopped: moving it out would end the session" \
+    "$(! grep -qE '^(hop|close)' <<<"$log" \
+        && grep -q "dropped into 'scratch' was left alone: it is the last tab of 'dev-a'" "$work/run-local-last/out" && echo y)"
 
 log=$(run local-text text STUB_LOCAL=1)
 expect "a local tab of the same title that shows text is left alone" \
-    "$(! grep -qE '^(close|close-workspace|ssh-tmux|move)' <<<"$log" && echo y)"
+    "$(! grep -qE '^(close|hop|move)' <<<"$log" && echo y)"
 expect "a local tab left alone: the warning says how to fix it by hand" \
     "$(grep -q "dropped into 'scratch' was left alone: cmux shows a terminal behind it" "$work/run-local-text/out" \
         && grep -qF "hatter repair 'dev-a'" "$work/run-local-text/out" && echo y)"
 log=$(run local-blank blank STUB_LOCAL=1)
 expect "a local tab with an empty screen (a terminal, maybe a quiet shell) is left alone" \
-    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" \
+    "$(! grep -qE '^(close|hop)' <<<"$log" \
         && grep -q "dropped into 'scratch' was left alone: cmux shows a terminal behind it" "$work/run-local-blank/out" && echo y)"
-log=$(run local-extra unavailable STUB_LOCAL=1 STUB_SRC_EXTRA=1)
-expect "a source workspace holding a local shell: nothing is closed, so the shell lives" \
-    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" \
-        && grep -q "re-mirroring 'dev-a' would close 1 tab(s) in it that are not tmux windows" "$work/run-local-extra/out" && echo y)"
-log=$(run local-noremirror unavailable STUB_LOCAL=1 STUB_NOCLOSEWS=1)
-expect "a re-mirror cmux refuses: the blank tab is closed, nothing is mirrored, and the log says how to finish" \
-    "$(grep -q '^close .*--surface s-new ' <<<"$log" && ! grep -q '^ssh-tmux' <<<"$log" \
-        && grep -q "is still in 'dev-a' on dev@example.com, but cmux does not show it there" "$work/run-local-noremirror/out" \
-        && grep -qF "hatter restore 'dev'" "$work/run-local-noremirror/out" && echo y)"
 log=$(run local-twin unavailable STUB_LOCAL=twin)
 expect "two local tabs of the window's title: neither is taken" \
-    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
-log=$(run local-session unavailable STUB_LOCAL=1 STUB_LOCAL_TITLE=dev-c STUB_DEVC=1)
-expect "a workspace titled after a running session is not taken for a local one" \
-    "$(! grep -qE '^(close|close-workspace|ssh-tmux)' <<<"$log" && echo y)"
+    "$(! grep -qE '^(close|hop)' <<<"$log" && echo y)"
+
+# repair's re-mirror closes the workspace by force: cmux 0.65 asks first when
+# anything runs in it, and a mirrored one only detaches (#118).
+log=$(HATTER_CMD="repair dev-b" run repair-force blank STUB_NODRAG=1)
+expect "repair closes the workspace it re-mirrors with --force" \
+    "$(grep -q '^close-workspace .*--force' <<<"$log" && echo y)"
 
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"
