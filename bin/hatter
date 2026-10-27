@@ -4709,7 +4709,7 @@ cmd_find() {
     attach_session "$owner" "$session" "$window"
 }
 
-# Termux:Widget lists the scripts under ~/.shortcuts as home-screen buttons.
+# The Termux widget lists the scripts under ~/.shortcuts as home-screen buttons.
 # One per hat, which opens the workspace picker, and one per recorded
 # workspace. A workspace is named "<hat> <rest of its name>": a space sorts
 # before anything else, so each hat's workspaces come straight after it.
@@ -8291,7 +8291,7 @@ Commands:
   restore [hat|group]    Rebuild the layout from the config
   provision <hat>        Set up tmux persistence and boot recovery on a server
   backup [message]       sync, then commit and push the config to git
-  shortcuts              Write Termux:Widget home-screen shortcuts (Android)
+  shortcuts              Write Termux home-screen widget shortcuts (Android)
 
 Run `hatter` with no arguments to open the rack, or without cmux, to attach.
 Run `hatter <command>` or `hatter help <command>` for a command's options.
@@ -8612,9 +8612,10 @@ USAGE
     shortcuts) cat <<'USAGE'
 hatter shortcuts [--dir <path>]
 
-Write home-screen shortcuts for the Termux:Widget app on Android: one per hat,
+Write shortcuts for the Termux home-screen widget on Android: one per hat,
 which opens that hat's workspace picker, and one per workspace the config
-records, which attaches straight to it. A workspace's shortcut is named
+records, which attaches straight to it. docs/install-android.md says which
+widget each Termux build has. A workspace's shortcut is named
 "<hat> <rest of its name>", so each hat's workspaces sort right after it.
 
 The shortcuts go in ~/.shortcuts/hatter (or --dir). Run this again after
