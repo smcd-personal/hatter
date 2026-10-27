@@ -12,7 +12,7 @@
 #   5. every hat           probed over ssh, with the fix for one that refuses
 #                          this phone's key
 #   6. the extra-keys row  Esc, Ctrl, Alt, Tab, arrows and the tmux prefix
-#   7. widget shortcuts    one per hat and per workspace, for Termux:Widget
+#   7. widget shortcuts    one per hat and per workspace, for the Termux widget
 #
 # In Termux:
 #
@@ -50,7 +50,7 @@ Options:
   --mosh                 also install mosh; then `hatter hat add <hat> --mosh`
   --prefix <letter>      your tmux prefix, for the extra-keys row (default b)
   --no-extra-keys        leave termux.properties alone
-  --no-shortcuts         do not write Termux:Widget shortcuts
+  --no-shortcuts         do not write Termux widget shortcuts
   --non-interactive      never ask; a new key gets no passphrase
 USAGE
 }
@@ -372,12 +372,13 @@ fi
 
 # --------------------------------------------------------------- 7. shortcuts
 
-step "Termux:Widget shortcuts"
+step "Termux widget shortcuts"
 if [[ "$SHORTCUTS" == 0 ]]; then
     note "skipped (--no-shortcuts)"
 else
     "$HATTER" shortcuts | sed 's/^==> /  ok  /'
-    note "add the Termux:Widget widget to your home screen to use them"
+    note "add the Termux widget to your home screen to use them"
+    note "which widget your Termux build has: https://github.com/smcd-personal/hatter/blob/main/docs/install-android.md#shortcuts"
 fi
 
 # ---------------------------------------------------------------- summary
