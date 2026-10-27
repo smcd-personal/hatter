@@ -8614,8 +8614,10 @@ hatter shortcuts [--dir <path>]
 
 Write shortcuts for the Termux home-screen widget on Android: one per hat,
 which opens that hat's workspace picker, and one per workspace the config
-records, which attaches straight to it. docs/install-android.md says which
-widget each Termux build has. A workspace's shortcut is named
+records, which attaches straight to it. Which widget each Termux build has:
+https://github.com/smcd-personal/hatter/blob/main/docs/install-android.md#shortcuts
+
+A workspace's shortcut is named
 "<hat> <rest of its name>", so each hat's workspaces sort right after it.
 
 The shortcuts go in ~/.shortcuts/hatter (or --dir). Run this again after
