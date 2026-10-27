@@ -86,6 +86,11 @@ You need `ssh`, `jq` and a server running `tmux`. The cmux commands need
   wrapper from `posix_sh`. A script provisioned onto the server that parses
   `-F` output defines it itself, guarded so a missing tmux still reads as
   missing. `tests/tmux-separator.sh` checks both.
+- **Output read from a login shell starts at a marker.** A profile or rc file
+  may print as it starts (a color escape, a greeting) with no newline, so
+  print a marker such as `HATCFG<...>` first and read only what follows it.
+  Guard the read with `|| true` or a fallback: a failing rc file must not
+  abort a script under `set -e`. `tests/login-shell-noise.sh` checks it.
 - **No secrets, ever.** Credentials go through the OS keychain and an ssh
   pipe; nothing is written to disk. Keep it that way.
 - **Examples use `example.com`.** No real hostnames or usernames in code,
