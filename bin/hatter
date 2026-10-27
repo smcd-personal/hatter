@@ -2526,7 +2526,8 @@ do_backfill() {
     [ -x "$claude_bin" ] || { say "hat-restore: no claude binary"; return 0; }
     # Asked outside a login shell, `claude agents --json` answers [] rather than
     # failing, so the query goes through one. A backfill that silently found
-    # nothing would look exactly like a box with no agents on it.
+    # nothing would look exactly like a box with no agents on it. Anything the
+    # profile prints would break the JSON, so only what follows HATJSON is read.
 
     # pane_pid -> session/window/name/cwd
     local panes
@@ -2562,7 +2563,7 @@ EOT
         fi
         n=$((n+1))
     done <<EOT
-$("${SHELL:-/bin/bash}" -lc "$(printf '%q' "$claude_bin") agents --json" 2>/dev/null | jq -r '.[]? | select((.sessionId // "") != "") | [(.pid|tostring), (.cwd // ""), .sessionId] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null)
+$("${SHELL:-/bin/bash}" -lc "printf '\\nHATJSON\\n'; $(printf '%q' "$claude_bin") agents --json" 2>/dev/null | sed '1,/^HATJSON$/d' | jq -r '.[]? | select((.sessionId // "") != "") | [(.pid|tostring), (.cwd // ""), .sessionId] | map(. // "" | tostring) | join("\u001f")' 2>/dev/null)
 EOT
 
     say "hat-restore: backfilled $n agent(s); $miss not traceable to a tmux pane"
@@ -3079,8 +3080,14 @@ fi
 
 # `bye` has to resolve to the script in an interactive login shell, which is
 # what panes run. Being on PATH is not enough: a builtin, alias or function of
-# the same name wins, and `command -v` reports those too.
-bye_resolves=$("${SHELL:-/bin/sh}" -lic 'command -v bye' 2>/dev/null </dev/null | tail -n 1)
+# the same name wins, and `command -v` reports those too. An rc file may print
+# to the terminal as it starts (a color escape, a greeting), so only what
+# follows the marker is read.
+bye_resolves=$("${SHELL:-/bin/sh}" -lic 'printf "HATBYE<%s>" "$(command -v bye)"' 2>/dev/null </dev/null) || true
+case "$bye_resolves" in
+    *"HATBYE<"*) bye_resolves=${bye_resolves##*HATBYE<}; bye_resolves=${bye_resolves%%>*} ;;
+    *) bye_resolves="" ;;
+esac
 if [ "$bye_resolves" = "$HOME/.local/bin/bye" ]; then
     echo "selftest ok: 'bye' resolves to ~/.local/bin/bye in a login shell"
 else
