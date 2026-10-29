@@ -999,9 +999,11 @@ focus_save() {
 # Only the outermost hatter restores, and only in its own shell, never in a
 # subshell: `( cmd_sync )` sets the EXIT trap inside the subshell, and $$ there
 # is still the parent's. BASH_SUBSHELL, unlike BASHPID, is in bash 3.2.
+# `focus_restore now` is for a run about to ask a question, wherever it is: the
+# answer can only be typed where focus is. A change after it records afresh.
 focus_restore() {
     local f="$HATTER_FOCUS_FILE" saved="" win="" ws="" pane="" surface="" now
-    [[ "$BASH_SUBSHELL" == 0 && "$HATTER_FOCUS_OWNER" == "$$" ]] || return 0
+    [[ "${1:-}" == now ]] || [[ "$BASH_SUBSHELL" == 0 && "$HATTER_FOCUS_OWNER" == "$$" ]] || return 0
     [[ -n "$f" && -f "$f" && -O "$f" && ! -L "$f" ]] || return 0
     IFS= read -r saved < "$f" || true
     rm -f "$f"
@@ -6079,17 +6081,107 @@ hat_missing() {
     done < <(groups_of_hat "$hat")
 }
 
+# group_members <groups json> <group id>: its workspace ids, in sidebar order.
+group_members() {
+    jq -r --arg g "$2" 'first(.groups[]? | select(.id == $g)) | .member_workspace_ids[]?' <<<"$1" 2>/dev/null || true
+}
+
+# order_drifted <recorded> <current>: two lists of workspace ids, one per
+# line. True when the ids on both stand in a different order on each. An id on
+# one list only does not count: the current list also holds workspaces no
+# session of the group records, and those are not restore's to move.
+order_drifted() {
+    local r c
+    r=$(both_lists "$1" "$2"); c=$(both_lists "$2" "$1")
+    [[ "$r" != "$c" ]]
+}
+# both_lists <list> <other>: the lines of <list> that <other> holds too, in
+# <list>'s order.
+both_lists() {
+    AWK_O="$2" awk 'BEGIN { n = split(ENVIRON["AWK_O"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") in_o[a[i]] = 1 }
+                    $0 != "" && ($0 in in_o)' <<<"$1"
+}
+
+# Groups a restore found in another order than the config records, one per
+# line: "<window>\x1f<hat> / <group>\x1f<workspace ids, recorded order>".
+RESTORE_DRIFT=""
+RESTORE_ORDER=ask          # ask, stored or current: --order
+
+# Settle the groups in RESTORE_DRIFT, once, after every hat: put the stored
+# order back, or keep the one cmux shows and offer to sync it into the config.
+# With no terminal to ask at, the current order stays.
+restore_settle_order() {
+    [[ -n "$RESTORE_DRIFT" ]] || return 0
+    local line win name ids choice="$RESTORE_ORDER" prev id
+    echo "These groups are in a different order from the one the config records:"
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        name="${line#*"$US"}"; name="${name%%"$US"*}"
+        echo "  $name"
+    done <<<"$RESTORE_DRIFT"
+
+    local tty=0
+    [[ -t 0 && -t 1 ]] && tty=1
+    if [[ "$choice" == ask ]]; then
+        if [[ "$tty" == 1 ]]; then
+            focus_restore now
+            printf '[k]eep the current order, or put back the [s]tored one? [K/s] '
+            IFS= read -r choice || choice=""
+            case "$choice" in s|S|stored) choice=stored ;; *) choice=current ;; esac
+        else
+            choice=current
+            echo "Kept the current order (no terminal to ask at). 'hatter restore --order stored'"
+            echo "puts the stored one back; 'hatter sync' records the current one."
+        fi
+    fi
+
+    if [[ "$choice" == stored ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            win="${line%%"$US"*}"; ids="${line##*"$US"}"
+            name="${line#*"$US"}"; name="${name%%"$US"*}"
+            prev=""
+            for id in ${ids//,/ }; do
+                if [[ -n "$prev" ]]; then
+                    cmux_change reorder-workspace --workspace "$id" --after "$prev" --window "$win" >/dev/null 2>&1 \
+                        || warn "could not put $id in its recorded place in $name"
+                fi
+                prev="$id"
+            done
+            echo "  $name: stored order put back"
+        done <<<"$RESTORE_DRIFT"
+    elif [[ "$tty" == 1 ]]; then
+        local a
+        printf 'Kept the current order. Sync it into the config now, so a restore keeps it? [y/N] '
+        IFS= read -r a || a=""
+        case "$a" in
+            y|Y|yes|YES|Yes) cmd_sync ;;
+            *) echo "Not synced: the config still records the old order ('hatter sync' records it)." ;;
+        esac
+    fi
+    RESTORE_DRIFT=""
+    return 0
+}
+
 cmd_restore() {
     require_cmux restore
     local hats only_missing=0
 
-    local args=() a
+    local args=() a want_order=""
     for a in "$@"; do
+        if [[ "$want_order" == 1 ]]; then RESTORE_ORDER="$a"; want_order=""; continue; fi
         case "$a" in
             --missing|--only-missing) only_missing=1 ;;
+            --order) want_order=1 ;;
+            --order=*) RESTORE_ORDER="${a#--order=}" ;;
             *) args+=("$a") ;;
         esac
     done
+    [[ -z "$want_order" ]] || die "--order needs stored, current or ask"
+    case "$RESTORE_ORDER" in
+        ask|stored|current) ;;
+        *) die "--order takes stored, current or ask, not '$RESTORE_ORDER'" ;;
+    esac
     set -- ${args[@]+"${args[@]}"}
 
     if [[ $# -gt 0 ]]; then
@@ -6168,10 +6260,13 @@ cmd_restore() {
         win=$(ensure_hat_window "$hat")
         mirror_hat "$hat" "$win"
 
-        # 3. put the workspaces back in their groups, in their recorded order,
-        # restyle. cmux mirrors sessions in tmux's order, so each one is moved
-        # to follow the one recorded before it.
-        local gref wref prev
+        # 3. put the workspaces back in their groups (#129). One already in its
+        # group is left exactly as it is: re-adding or moving it would undo
+        # whatever the user did there since the last sync. One that is not
+        # goes in after the workspace recorded before it. If the ones already
+        # there stand in another order than the recorded one, nothing is
+        # moved yet: restore_settle_order asks once, after every hat.
+        local gref wref prev made glist wsl members want display
         while IFS= read -r group; do
             [[ -z "$group" ]] && continue
             # An empty Unassigned is not created; settling below removes it.
@@ -6179,8 +6274,13 @@ cmd_restore() {
                && [[ "$(cfg --arg g "$group" '.groups[$g].sessions | length')" == 0 ]]; then
                 continue
             fi
+            display=$(group_display "$group")
+            made=0
+            [[ -n "$(group_ref_in_window "$win" "$display")" ]] || made=1
             gref=$(ensure_cmux_group "$group" "$win")
-            prev=""
+            prev="" want=""
+            glist=$(window_groups_json "$win" 2>/dev/null) || glist='{}'
+            members=$(group_members "$glist" "$gref")
             while IFS= read -r session; do
                 [[ -z "$session" ]] && continue
                 wref=$(wait_for_workspace "$session" "$win" 20)
@@ -6188,18 +6288,43 @@ cmd_restore() {
                     warn "no workspace appeared for '$session'"
                     continue
                 fi
-                if ! cmux_group_add "$gref" "$wref"; then
-                    warn "could not put '$session' into group '$(group_display "$group")'"
+                want+="${want:+,}$wref"
+                if grep -qxF "$wref" <<<"$members"; then
+                    prev="$wref"
+                    echo "  ok  $hat / $display / $session (in place)"
                     continue
                 fi
+                if ! cmux_group_add "$gref" "$wref"; then
+                    warn "could not put '$session' into group '$display'"
+                    continue
+                fi
+                # The first recorded one goes ahead of whatever is there.
                 if [[ -n "$prev" ]]; then
                     cmux_change reorder-workspace --workspace "$wref" --after "$prev" --window "$win" >/dev/null 2>&1 \
                         || warn "could not put '$session' in its recorded place"
+                elif [[ -n "$members" ]]; then
+                    cmux_change reorder-workspace --workspace "$wref" --before "$(head -n 1 <<<"$members")" \
+                        --window "$win" >/dev/null 2>&1 \
+                        || warn "could not put '$session' in its recorded place"
                 fi
                 prev="$wref"
-                echo "  ok  $hat / $(group_display "$group") / $session -> $wref"
+                members+=$'\n'"$wref"
+                echo "  ok  $hat / $display / $session -> $wref"
             done < <(cfg --arg g "$group" '.groups[$g].sessions | keys_unsorted[]?')
-            apply_group_style "$group" "$gref"
+
+            # Out of order? Compared once everything missing is in, so only
+            # the order of the workspaces that were already there can differ.
+            glist=$(window_groups_json "$win" 2>/dev/null) || glist='{}'
+            wsl=$(group_members "$glist" "$gref")
+            if order_drifted "$(tr ',' '\n' <<<"$want")" "$wsl"; then
+                RESTORE_DRIFT+="$win$US$hat / $display$US$want"$'\n'
+            fi
+
+            # --missing restyles only what it made: an existing group's colour,
+            # pin and collapse are the user's, as they left them.
+            if [[ "$only_missing" == 0 || "$made" == 1 ]]; then
+                apply_group_style "$group" "$gref"
+            fi
         done < <(groups_of_hat "$hat")
 
         # 4. the mirror brings every session on the server, recorded or not:
@@ -6210,6 +6335,7 @@ cmd_restore() {
         discard_stray_workspace "$win"
     done <<<"$hats"
 
+    restore_settle_order
     info "Restore complete"
 }
 
@@ -8975,10 +9101,17 @@ USAGE
 hatter restore [hat|group ...]
 
 Rebuild from the config after a Mac or shell-server reboot: recreate missing
-tmux sessions and their tabs, find or open each hat's window, re-mirror, put the
-workspaces back in their groups in their saved order, and re-apply styling.
-Idempotent. Groups it creates follow the saved order; a group already in the
-window keeps its place.
+tmux sessions and their tabs, find or open each hat's window, re-mirror, put
+missing workspaces back in their groups, and re-apply styling. Idempotent.
+Groups it creates follow the saved order; a group already in the window keeps
+its place.
+
+A workspace already in its group is left as it is: not re-added, not moved.
+One that was missing goes in after the workspace saved before it. When the
+workspaces already in a group stand in a different order from the saved one,
+restore asks once, at the end, whether to keep the current order or put back
+the saved one. Keeping it offers a sync, so the config records the order you
+kept. With no terminal to ask at, the current order is kept.
 
 With no arguments, every hat. Hats with nothing recorded, or whose server is
 unreachable, are skipped rather than failing the run.
@@ -8988,10 +9121,15 @@ Options:
                  session not running on the server, one running but not
                  mirrored, or a hat with no window. A hat that is already whole
                  is left alone entirely - no window, no re-mirror, no restyle.
+                 Only the groups it has to create are styled.
+  --order stored|current|ask
+                 What to do with a group found out of its saved order: put the
+                 saved order back, keep the current one, or ask (the default).
 
   hatter restore
   hatter restore dev
   hatter restore --missing
+  hatter restore --order stored
 USAGE
     ;;
     backup) cat <<'USAGE'
