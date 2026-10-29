@@ -6266,7 +6266,7 @@ cmd_restore() {
         # goes in after the workspace recorded before it. If the ones already
         # there stand in another order than the recorded one, nothing is
         # moved yet: restore_settle_order asks once, after every hat.
-        local gref wref prev made glist wsl members want display
+        local gref wref prev made glist wsl members want display ahead a here
         while IFS= read -r group; do
             [[ -z "$group" ]] && continue
             # An empty Unassigned is not created; settling below removes it.
@@ -6278,7 +6278,7 @@ cmd_restore() {
             made=0
             [[ -n "$(group_ref_in_window "$win" "$display")" ]] || made=1
             gref=$(ensure_cmux_group "$group" "$win")
-            prev="" want=""
+            prev="" want="" ahead="" here=0
             glist=$(window_groups_json "$win" 2>/dev/null) || glist='{}'
             members=$(group_members "$glist" "$gref")
             while IFS= read -r session; do
@@ -6288,8 +6288,16 @@ cmd_restore() {
                     warn "no workspace appeared for '$session'"
                     continue
                 fi
-                want+="${want:+,}$wref"
                 if grep -qxF "$wref" <<<"$members"; then
+                    # The ones added before the first that was already here go
+                    # ahead of it. Never ahead of the group's first member as
+                    # such: that may be its anchor.
+                    for a in $ahead; do
+                        cmux_change reorder-workspace --workspace "$a" --before "$wref" --window "$win" >/dev/null 2>&1 \
+                            || warn "could not put $a in its recorded place"
+                    done
+                    ahead="" here=1
+                    want+="${want:+,}$wref"
                     prev="$wref"
                     echo "  ok  $hat / $display / $session (in place)"
                     continue
@@ -6298,15 +6306,15 @@ cmd_restore() {
                     warn "could not put '$session' into group '$display'"
                     continue
                 fi
-                # The first recorded one goes ahead of whatever is there.
-                if [[ -n "$prev" ]]; then
+                # Until one already here comes up, an add lands at the end in
+                # recorded order, and is moved ahead of that one when it does.
+                if [[ "$here" == 1 ]]; then
                     cmux_change reorder-workspace --workspace "$wref" --after "$prev" --window "$win" >/dev/null 2>&1 \
                         || warn "could not put '$session' in its recorded place"
-                elif [[ -n "$members" ]]; then
-                    cmux_change reorder-workspace --workspace "$wref" --before "$(head -n 1 <<<"$members")" \
-                        --window "$win" >/dev/null 2>&1 \
-                        || warn "could not put '$session' in its recorded place"
+                else
+                    ahead+="${ahead:+ }$wref"
                 fi
+                want+="${want:+,}$wref"
                 prev="$wref"
                 members+=$'\n'"$wref"
                 echo "  ok  $hat / $display / $session -> $wref"

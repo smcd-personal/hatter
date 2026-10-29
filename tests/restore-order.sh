@@ -16,6 +16,15 @@ expect() {
     if [[ "$2" == y ]]; then echo "ok   $1"; else echo "FAIL $1"; fails=$((fails + 1)); fi
 }
 yes_if() { if "$@"; then echo y; else echo n; fi; }
+all_of() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        if [ "$1" = -- ]; then "${args[@]}" || return 1; args=()
+        else args+=("$1"); fi
+        shift
+    done
+    [ ${#args[@]} -eq 0 ] || "${args[@]}"
+}
 
 mkdir -p "$work/bin"
 
@@ -35,6 +44,8 @@ case "$1 ${2:-}" in
     "workspace-group list") cat "$f" ;;
     "workspace-group add")
         echo "$*" >> "$log"
+        # STUB_ADD_FAIL=<workspace>: cmux refuses to add that one.
+        [[ "$(arg --workspace "$@")" == "${STUB_ADD_FAIL:-}" ]] && exit 1
         g=$(arg --group "$@"); ws=$(arg --workspace "$@")
         edit --arg g "$g" --arg ws "$ws" '
             .groups |= map(.member_workspace_ids -= [$ws]
@@ -119,11 +130,20 @@ expect "...and nothing else is moved" \
     "$(yes_if bash -c '[ "$(grep -c reorder-workspace "$1")" = 1 ]' _ "$d/log")"
 show missing
 
-# The first saved one, when missing, goes ahead of what is there.
-setup missing-first '["ws-b", "ws-c"]' '["ws-a"]'
+# The first saved ones, when missing, go ahead of the first already there,
+# not ahead of the group's first member (it may be the group's anchor).
+setup missing-first '["ws-anchor", "ws-c"]' '["ws-a", "ws-b"]'
 restore --missing dev || true
-expect "a missing first workspace goes to the front" "$(yes_if [ "$(order)" = ws-a,ws-b,ws-c ])"
+expect "missing first workspaces go ahead of the first one in place, in order" \
+    "$(yes_if [ "$(order)" = ws-anchor,ws-a,ws-b,ws-c ])"
 show missing-first
+
+# A workspace cmux will not add is left out of the order restore puts back.
+setup add-fails '["ws-c", "ws-a"]' '["ws-b"]'
+STUB_ADD_FAIL=ws-b restore --order stored dev || true
+expect "a failed add is not chained into the stored order" \
+    "$(yes_if all_of [ "$(order)" = ws-a,ws-c ] -- bash -c '! grep -q "reorder-workspace --workspace ws-b\|--after ws-b" "$1"' _ "$d/log")"
+show add-fails
 
 # --- out of order ---------------------------------------------------------------
 setup drift-ask '["ws-c", "ws-a", "ws-b"]'
