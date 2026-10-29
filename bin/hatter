@@ -2340,6 +2340,50 @@ record() {
     return 0
 }
 
+# as_job <command...>: run the agent so that ctrl+z suspends it. This script is
+# no interactive shell, so without job control the agent shares its process
+# group, which the kernel counts as orphaned (the script's parent, tmux, is in
+# another session). The SIGTSTP an agent sends itself on ctrl+z is then
+# dropped, and Claude Code sits with its screen torn down waiting for a SIGCONT
+# that never comes. With `set -m` the agent is a job of its own and really
+# stops; the pane then gets a login shell, and leaving it (`exit`, ctrl+d, or
+# `fg` in bash) resumes the agent. The agent's own exit status is returned.
+#
+# Two bash rules shape it. A job that stops inside a loop breaks the loop, so
+# each further ctrl+z is caught by recursion rather than a `while`. And fg must
+# keep its output: with it redirected, Claude Code exits as soon as it resumes.
+# fg prints the job's command line (`"$@"`) before the agent redraws.
+#
+# bash 3.2 never returns from waiting on a job that stopped, so there the agent
+# runs as it always did.
+as_job() {
+    [ "${BASH_VERSINFO[0]}" -ge 4 ] || { "$@"; return; }
+    local rc
+    set -m
+    "$@"; rc=$?
+    resume_job
+    set +m
+    return "$rc"
+}
+
+# resume_job: while the agent is stopped, give the pane a shell, then resume
+# the agent; sets as_job's rc to its status.
+resume_job() {
+    [ -n "$(jobs -sp)" ] || return 0
+    printf '\nhat-launch: %s is suspended. exit, ctrl+d or fg goes back to it.\n' "$kind" >&2
+    # Claude Code says "Run fg". In a bash login shell with no jobs of its own,
+    # an exported fg leaves that shell, which resumes the agent. Only the shell
+    # this script started has it as parent: a bash run inside it keeps the
+    # real fg.
+    env HAT_LAUNCH_PID=$$ 'BASH_FUNC_fg%%=() { if [ "$PPID" = "${HAT_LAUNCH_PID:-}" ] && [ -z "$(jobs -p)" ]; then exit 0; fi; builtin fg "$@"; }' \
+        "${SHELL:-/bin/bash}" -l
+    # `exit 99` closes the pane here as everywhere; the stopped agent is then
+    # hung up with it.
+    [ $? -ne 99 ] || exit 99
+    fg; rc=$?
+    resume_job
+}
+
 run_agent() {
     local bin="$HOME/.local/bin/$kind"
     command -v "$kind" >/dev/null 2>&1 && bin="$(command -v "$kind")"
@@ -2374,7 +2418,7 @@ run_agent() {
                 fi
                 record claude "$sid" "$$"
                 start=$(date +%s)
-                "$bin" ${extra[@]+"${extra[@]}"} --resume "$sid"; rc=$?
+                as_job "$bin" ${extra[@]+"${extra[@]}"} --resume "$sid"; rc=$?
                 # A resume that dies at once ("No conversation found") never
                 # ran: keep the id rather than record the shell over it.
                 if [ "$rc" != 0 ] && [ $(( $(date +%s) - start )) -lt 15 ]; then
@@ -2387,11 +2431,11 @@ run_agent() {
                 # this pane held.
                 sid=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
                 record claude "$sid" "$$"
-                "$bin" ${extra[@]+"${extra[@]}"} --session-id "$sid"
+                as_job "$bin" ${extra[@]+"${extra[@]}"} --session-id "$sid"
             fi ;;
         *)
             record "$kind" "${sid:-}" "$$"
-            "$bin" ${extra[@]+"${extra[@]}"} ;;
+            as_job "$bin" ${extra[@]+"${extra[@]}"} ;;
     esac
 }
 
@@ -8989,6 +9033,9 @@ Set up a shell server so its state survives both a reboot and a stray logout:
     reported, not removed.
   - every pane's login shell wrapped in a loop, so `exit` and ctrl-D hand back
     a fresh prompt instead of closing the tab by accident
+  - agents started as jobs, so ctrl-Z in an agent pane suspends the agent and
+    gives a shell; `exit`, ctrl-D or (in bash) `fg` goes back to the agent.
+    Needs bash 4 or later on the server; with bash 3.2 ctrl-Z does nothing
   - a `bye` command on the server for closing one deliberately:
       bye            close this pane / tab
       bye window     close the whole tmux window
