@@ -82,6 +82,9 @@ fi
 touch "$work/nostop"
 start /bin/sh --kind codex
 expect "no suspend: the agent runs to the end" "$(settle 'logged resumed' && echo y || echo n)"
+# Wait for the pane's shell to take a command: by then any notice is out.
+tmux send-keys -t "=t1:" "echo shell-ready >> $LOG" Enter
+expect "no suspend: the pane's shell takes over" "$(settle 'logged shell-ready' && echo y || echo n)"
 expect "no suspend: no suspend notice" "$(screen | grep -q 'is suspended' && echo n || echo y)"
 expect "no suspend: the pane survives the agent" "$(tmux has-session -t =t1 2>/dev/null && echo y || echo n)"
 rm -f "$work/nostop"
@@ -90,6 +93,7 @@ rm -f "$work/nostop"
 start /bin/sh --kind codex
 expect "suspend: the notice is shown" "$(settle 'screen | grep -q "codex is suspended"' && echo y || echo n)"
 expect "suspend: the agent is stopped, not resumed" "$(logged resumed && echo n || echo y)"
+expect "suspend: the agent's process is stopped" "$(ps -eo stat,args | grep -q '^T.*/codex$' && echo y || echo n)"
 tmux send-keys -t "=t1:" "echo in-shell >> $LOG" Enter
 expect "suspend: the shell takes commands" "$(settle 'logged in-shell' && echo y || echo n)"
 tmux send-keys -t "=t1:" exit Enter
@@ -113,6 +117,13 @@ expect "suspend twice: the agent is stopped again" "$(logged resumed-again && ec
 tmux send-keys -t "=t1:" exit Enter
 expect "suspend twice: exit resumes it again" "$(settle 'logged resumed-again' && echo y || echo n)"
 rm -f "$work/twice"
+
+# `exit 99` in the suspended shell closes the pane, as it does anywhere.
+start /bin/sh --kind codex
+settle 'screen | grep -q "codex is suspended"' || true
+tmux send-keys -t "=t1:" "exit 99" Enter
+expect "suspend: exit 99 closes the pane" "$(settle '! tmux has-session -t =t1 2>/dev/null' && echo y || echo n)"
+expect "suspend: exit 99 does not resume the agent" "$(logged resumed && echo n || echo y)"
 
 # The agent's exit status survives the suspend: a resume that dies at once
 # still keeps its registry entry.

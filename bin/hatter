@@ -2377,6 +2377,9 @@ resume_job() {
     # real fg.
     env HAT_LAUNCH_PID=$$ 'BASH_FUNC_fg%%=() { if [ "$PPID" = "${HAT_LAUNCH_PID:-}" ] && [ -z "$(jobs -p)" ]; then exit 0; fi; builtin fg "$@"; }' \
         "${SHELL:-/bin/bash}" -l
+    # `exit 99` closes the pane here as everywhere; the stopped agent is then
+    # hung up with it.
+    [ $? -ne 99 ] || exit 99
     fg; rc=$?
     resume_job
 }
