@@ -6187,6 +6187,89 @@ cmd_provision() {
         launch=$(hat_launch_conf "$host") || exit 1
     fi
     provision_host "$host" "$launch"
+    check_max_sessions "$host"
+}
+
+# cmux mirrors every tmux session on a server over one ssh connection, one
+# channel per session, and sshd caps the channels a connection may carry at
+# MaxSessions (10 unless set). The mirrors past the cap are refused ("no more
+# sessions" in the server's log) and come back one by one on cmux's retry
+# backoff, on every reconnect (#121). Setting it needs root, so provision only
+# says so.
+#
+# remote_maxsessions_sh prints a script that prints the server's MaxSessions, or "unknown". sshd -T
+# is the real answer but usually needs root; failing that, the config files
+# are read the way sshd reads them: the first value wins, an Include is read
+# where it stands, and a Match block ends what applies to every connection.
+# A file that cannot be read before a value turns up makes it unknown, and is
+# named: "unknown <file>". An
+# explicit SSHD_CONFIG reads only the files (the tests use it).
+remote_maxsessions_sh() {
+    cat <<'MAXSESSIONS'
+PATH="$PATH:/usr/sbin:/sbin"
+cfgfile=${SSHD_CONFIG:-/etc/ssh/sshd_config}
+cfgdir=$(dirname "$cfgfile")
+ms_scan() {
+    for f in $1; do
+        [ -e "$f" ] || continue
+        [ -r "$f" ] || { echo "unknown $f"; return; }
+        # sshd's own reading: "key value", "key=value" and "key = value",
+        # words split on spaces or tabs, a value in double quotes, and a last
+        # line with no newline.
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(printf '%s\n' "$line" | sed 's/^[[:space:]]*\([A-Za-z]*\)[[:space:]]*=[[:space:]]*/\1 /')
+            set -f; set -- $line; set +f
+            line=""
+            [ $# -gt 0 ] || continue
+            k=$(printf '%s' "$1" | tr 'A-Z' 'a-z'); shift
+            case "$k" in
+                '#'*) ;;
+                match) return ;;
+                maxsessions) v=${1:-}; v=${v#\"}; echo "${v%\"}"; return ;;
+                include)
+                    for p in "$@"; do
+                        case "$p" in /*) ;; *) p="$cfgdir/$p" ;; esac
+                        r=$(ms_scan "$p")
+                        [ -n "$r" ] && { echo "$r"; return; }
+                    done ;;
+            esac
+        done < "$f"
+    done
+}
+v=""
+if [ -z "${SSHD_CONFIG:-}" ]; then
+    v=$(sshd -T </dev/null 2>/dev/null | awk '$1 == "maxsessions" { print $2; exit }') || v=""
+fi
+if [ -z "$v" ]; then
+    if [ -r "$cfgfile" ]; then v=$(ms_scan "$cfgfile"); v=${v:-10}; else v="unknown $cfgfile"; fi
+fi
+echo "$v"
+MAXSESSIONS
+}
+
+# max_sessions_advice <host> <limit> <sessions>: what provision says about
+# it, or nothing when the sessions fit. <limit> is what the remote script
+# printed: a number, or "unknown <file>".
+max_sessions_advice() {
+    local host="$1" limit="$2" n="$3" fix
+    fix="As root, put 'MaxSessions 64' in /etc/ssh/sshd_config.d/10-hatter.conf (early, since sshd keeps the first value it reads) and reload sshd."
+    if [[ "$limit" =~ ^[0-9]+$ ]]; then
+        [[ "$n" -gt "$limit" ]] || return 0
+        warn "$host has $n tmux sessions, but its sshd lets one connection carry $limit (MaxSessions). cmux mirrors them all over one connection, so the rest come back slowly on every reconnect. $fix"
+    elif [[ "$n" -gt 10 ]]; then
+        local file="${limit#unknown}"; file="${file# }"
+        warn "$host has $n tmux sessions, and its sshd MaxSessions could not be read${file:+ ($file needs root)}. If it is still the default of 10, the mirrors past it come back slowly on every reconnect. Check with: sudo sshd -T | grep maxsessions. $fix"
+    fi
+}
+
+check_max_sessions() {
+    local host="$1" limit live recorded n
+    limit=$(remote_sh "$host" "$(remote_maxsessions_sh)" 2>/dev/null | tail -n 1) || limit=""
+    [[ -n "$limit" ]] || limit=unknown
+    live=$(hat_live_sessions "$host" 2>/dev/null | grep -c .) || live=0
+    recorded=$(host_recorded_sessions "$host" 2>/dev/null | sort -u | grep -c .) || recorded=0
+    n=$(( live > recorded ? live : recorded ))
+    max_sessions_advice "$host" "$limit" "$n"
 }
 
 cmd_list() {
@@ -8950,6 +9033,14 @@ the Mac being involved at all:
 
 Boot recovery needs lingering (`sudo loginctl enable-linger <user>`); provision
 says so if it is off.
+
+cmux mirrors every tmux session on a server over one ssh connection, and sshd
+lets a connection carry only MaxSessions of them (10 unless set). Provision
+warns when the server has more sessions than that, or more than 10 and the
+limit cannot be read without root, since the mirrors past it come back slowly
+on every reconnect. Raising it needs root: put `MaxSessions 64` in
+/etc/ssh/sshd_config.d/10-hatter.conf (sshd keeps the first value it reads, so
+the name sorts early) and reload sshd.
 
 Rewrites its managed block in ~/.tmux.conf on every run, then self-tests that a
 shell which exits comes back usable. Takes no options.

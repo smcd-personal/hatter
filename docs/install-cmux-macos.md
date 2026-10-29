@@ -78,6 +78,9 @@ installs the `bye` command, and self-tests the result:
 hatter provision dev
 ```
 
+A server with more than 10 workspaces needs sshd's `MaxSessions` raised;
+provision says so when it does (see `hatter help provision`).
+
 Then make your first workspace. A workspace is a tmux session named
 `<hat>-<subproject>`, shown as one entry in the cmux sidebar:
 

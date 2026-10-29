@@ -107,6 +107,8 @@ printf '%s\n' "$step" > "$work/step.sh"
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
 cmd="\${*: -1}"
+# Only the provision script; anything else provision asks (#121) gets no answer.
+case "\$cmd" in *"bash -s -- "*) ;; *) exit 255 ;; esac
 eval "set -- \$cmd"     # sh -c '<script>'
 # bash -s -- '<launch conf>', after the tmux -u wrapper posix_sh puts first
 eval "set -- bash -s -- \${3#*bash -s -- }"
