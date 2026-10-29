@@ -6213,17 +6213,21 @@ ms_scan() {
     for f in $1; do
         [ -e "$f" ] || continue
         [ -r "$f" ] || { echo "unknown $f"; return; }
-        while read -r k a; do
-            k=$(printf '%s' "$k" | tr 'A-Z' 'a-z')
+        # sshd's own reading: "key value", "key=value" and "key = value",
+        # words split on spaces or tabs, a value in double quotes, and a last
+        # line with no newline.
+        while IFS= read -r line || [ -n "$line" ]; do
+            line=$(printf '%s\n' "$line" | sed 's/^[[:space:]]*\([A-Za-z]*\)[[:space:]]*=[[:space:]]*/\1 /')
+            set -f; set -- $line; set +f
+            line=""
+            [ $# -gt 0 ] || continue
+            k=$(printf '%s' "$1" | tr 'A-Z' 'a-z'); shift
             case "$k" in
-                maxsessions=*) a=${k#*=}; k=maxsessions ;;
-            esac
-            case "$k" in
-                ''|'#'*) ;;
+                '#'*) ;;
                 match) return ;;
-                maxsessions) echo "${a%% *}"; return ;;
+                maxsessions) v=${1:-}; v=${v#\"}; echo "${v%\"}"; return ;;
                 include)
-                    for p in $a; do
+                    for p in "$@"; do
                         case "$p" in /*) ;; *) p="$cfgdir/$p" ;; esac
                         r=$(ms_scan "$p")
                         [ -n "$r" ] && { echo "$r"; return; }

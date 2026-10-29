@@ -52,6 +52,17 @@ got=$(scan "Port 22
 Match User someone
     MaxSessions 99")
 expect "a value inside a Match block does not count" "$([[ "$got" == 10 ]] && echo y || echo n)"
+got=$(scan "MaxSessions = 21")
+expect "key = value is read" "$([[ "$got" == 21 ]] && echo y || echo n)"
+got=$(scan "MaxSessions= 22")
+expect "key= value is read" "$([[ "$got" == 22 ]] && echo y || echo n)"
+got=$(scan 'MaxSessions "23"')
+expect "a quoted value is read" "$([[ "$got" == 23 ]] && echo y || echo n)"
+got=$(scan "$(printf 'MaxSessions\t24\t# a comment')")
+expect "tabs separate words" "$([[ "$got" == 24 ]] && echo y || echo n)"
+d="$work/etc.nonl"; mkdir -p "$d"; printf 'Port 22\nMaxSessions 25' > "$d/sshd_config"
+got=$(SSHD_CONFIG="$d/sshd_config" sh "$work/ms.sh")
+expect "a last line with no newline is read" "$([[ "$got" == 25 ]] && echo y || echo n)"
 got=$(scan "# MaxSessions 99")
 expect "a commented-out value does not count" "$([[ "$got" == 10 ]] && echo y || echo n)"
 if [[ "$(id -u)" != 0 ]]; then
