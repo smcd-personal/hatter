@@ -70,7 +70,12 @@ printf '%s\n' "\${STUB_PANES:-}" | while IFS= read -r id; do
         || echo "\$id" >> "$work/capture-failed"
 done
 tar cf "\$dir/pane_contents.tar" -C "\$dir/save" ./pane_contents
-[ -z "\$(ls -A "\$pc")" ] || rm "\$pc"/* || true
+# STUB_KEEP_LINKS leaves symlinks for hat-save to meet.
+for x in "\$pc"/*; do
+    [ -e "\$x" ] || [ -L "\$x" ] || continue
+    [ -n "\${STUB_KEEP_LINKS:-}" ] && [ -L "\$x" ] && continue
+    rm "\$x" || true
+done
 [ -z "\${STUB_ERR:-}" ] || echo "\$STUB_ERR" >&2
 EOF
 chmod +x "$save_dir/save.sh"
@@ -202,12 +207,15 @@ STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES="$panes" run >/dev/nul
 STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES='plain:0.0' run >/dev/null 2>&1
 [ "$(archived)" = "pane-plain:0.0 " ] || fail "slash: a closed session archived again: $(archived)"
 
-# A symlink named like a folder is not followed out of pane_contents.
+# A symlink named like a folder is not followed out of pane_contents, and a
+# folder not named pane-* is not resurrect's and stays.
 reset
-mkdir -p "$pc" "$work/outside"; echo keep > "$work/outside/f"
+mkdir -p "$pc/other" "$work/outside"; echo keep > "$work/outside/f"; echo keep > "$pc/other/f"
 ln -s "$work/outside" "$pc/pane-link"
-STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES='plain:0.0' run >/dev/null 2>&1
+STUB_SESSIONS="main" STUB_CONTENT=$'pane\tx\n' STUB_PANES='plain:0.0' STUB_KEEP_LINKS=1 run >/dev/null 2>&1
+[ -L "$pc/pane-link" ] || fail "slash: the symlink was not there for hat-save to meet"
 [ "$(cat "$work/outside/f" 2>/dev/null)" = keep ] || fail "slash: deleted through a symlink"
+[ "$(cat "$pc/other/f" 2>/dev/null)" = keep ] || fail "slash: deleted a folder not named pane-*"
 rm -f "$pc/pane-link"
 
 # Sessions without / need nothing: no folders appear.
