@@ -2969,9 +2969,15 @@ esac
 prev=$(readlink "$dir/last" 2>/dev/null) || prev=""
 # That same rm says "Is a directory" for each of those folders on every save
 # (#131). Only that message is dropped; anything else save.sh says is passed on.
+# Through a file, not a pipe: a post-save hook that leaves something running
+# would hold a pipe open, and this would wait on it.
+errf=$(mktemp "${TMPDIR:-/tmp}/hat-save.XXXXXX") || errf=/dev/null
 rc=0
-{ err=$("$save" quiet 2>&1 1>&3 3>&-); } 3>&1 || rc=$?
-[ -z "$err" ] || printf '%s\n' "$err" | grep -vi '^rm: .*/pane_contents/.*: is a directory$' >&2 || true
+"$save" quiet 2>"$errf" || rc=$?
+if [ "$errf" != /dev/null ]; then
+    grep -vi '^rm: .*/pane_contents/.*: is a directory$' "$errf" >&2 || true
+    rm -f -- "$errf"
+fi
 [ "$rc" = 0 ] || exit "$rc"
 # The snapshot is archived, so the folders go now, as resurrect's own files
 # did. Left in place, a session that has gone would have its scrollback
