@@ -2967,7 +2967,19 @@ case "$dir" in
 esac
 
 prev=$(readlink "$dir/last" 2>/dev/null) || prev=""
-"$save" quiet || exit $?
+# That same rm says "Is a directory" for each of those folders on every save
+# (#131). Only that message is dropped; anything else save.sh says is passed on.
+rc=0
+{ err=$("$save" quiet 2>&1 1>&3 3>&-); } 3>&1 || rc=$?
+[ -z "$err" ] || printf '%s\n' "$err" | grep -vi '^rm: .*/pane_contents/.*: is a directory$' >&2 || true
+[ "$rc" = 0 ] || exit "$rc"
+# The snapshot is archived, so the folders go now, as resurrect's own files
+# did. Left in place, a session that has gone would have its scrollback
+# archived again on every save. -type d never follows a symlink out.
+case "$dir" in
+    /*) [ ! -d "$dir/save/pane_contents" ] \
+        || find "$dir/save/pane_contents" -mindepth 1 -maxdepth 1 -type d -name 'pane-*' -exec rm -rf -- {} + ;;
+esac
 now=$(readlink "$dir/last" 2>/dev/null) || now=""
 case "$now" in
     "")  exit 0 ;;
