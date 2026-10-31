@@ -2759,13 +2759,15 @@ cat > "$HOME/.local/bin/hat-resize" <<'HATRESIZE'
 #
 # A window no client has sized stays at tmux's 80x24, and a control-mode client
 # such as cmux does not size every window it shows. The size comes from the
-# record hat-save keeps. Each window is resized by its id: resize-window with no
-# target acts on the session's current window, which under a control-mode
-# client is not the window you are in.
+# record hat-save keeps. With no record yet (hat-save has not run since the
+# server was set up, or its timer stalled: #133), it is read off the windows
+# the client has sized, the way hat-save reads it. Each window is resized by
+# its id: resize-window with no target acts on the session's current window,
+# which under a control-mode client is not the window you are in.
 #
-# tmux then holds each window at that size (window-size manual), even when the
-# client resizes. To let one follow the client again:
-#   tmux set-window-option -u -t <window> window-size
+# resize-window leaves a window at window-size manual, held at that size even
+# when the client resizes. The option is unset straight after, so the window
+# keeps its new size until a client looks at it, then follows that client.
 # No UTF-8 locale here at boot: without -u, tmux turns every non-ASCII
 # character in a name into "_" (#109).
 command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
@@ -2782,7 +2784,12 @@ done
 
 if [ -z "$size" ]; then
     size=$(cat "${XDG_STATE_HOME:-$HOME/.local/state}/hatter/window-size" 2>/dev/null) || size=""
-    [ -n "$size" ] || { echo "hat-resize: no window size recorded yet - pass --size WxH" >&2; exit 1; }
+fi
+if [ -z "$size" ]; then
+    def=$(tmux show-option -gv default-size 2>/dev/null) || def=""
+    size=$(tmux list-windows -a -F '#{window_width}x#{window_height}' 2>/dev/null \
+        | grep -vxF -e 80x24 -e "${def:-80x24}" | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')
+    [ -n "$size" ] || { echo "hat-resize: no window size recorded, and no window shows one yet - pass --size WxH" >&2; exit 1; }
 fi
 case "$size" in
     [1-9]*x[1-9]*) ;;
@@ -2801,7 +2808,9 @@ fi
 
 n=0
 for id in $(printf '%s\n' "$windows" | awk '$2 == "80x24" {print $1}'); do
-    tmux resize-window -t "$id" -x "$w" -y "$h" && n=$((n + 1))
+    tmux resize-window -t "$id" -x "$w" -y "$h" || continue
+    tmux set-window-option -u -t "$id" window-size 2>/dev/null || true
+    n=$((n + 1))
 done
 echo "hat-resize: $n window(s) resized to $size"
 HATRESIZE
@@ -3013,6 +3022,7 @@ Description=hatter: snapshot tmux every 15 minutes
 
 [Timer]
 OnBootSec=5min
+OnStartupSec=5min
 OnUnitActiveSec=15min
 Persistent=true
 
@@ -3020,7 +3030,14 @@ Persistent=true
 WantedBy=timers.target
 SAVETIMER
     systemctl --user daemon-reload
+    # OnStartupSec counts from the user manager's own start. Without it, a
+    # manager that started well after boot was seen to never fire the timer:
+    # OnBootSec was long past, and OnUnitActiveSec waits on a run that never
+    # came (#133). Persistent covers OnCalendar
+    # only. The restart re-arms a timer that is already running.
     if systemctl --user enable --now hatter-resurrect-save.timer >/dev/null 2>&1; then
+        systemctl --user restart hatter-resurrect-save.timer >/dev/null 2>&1 \
+            || echo "WARNING: could not restart the resurrect save timer" >&2
         echo "resurrect save timer enabled (every 15 min)"
     else
         echo "WARNING: could not enable the resurrect save timer" >&2
@@ -6181,6 +6198,24 @@ restore_settle_order() {
     return 0
 }
 
+# restore_resize <hat> <host>
+# Run hat-resize on a hat after restoring it. It touches only windows at
+# exactly 80x24, so on a hat with none it does nothing and says nothing. A
+# server provisioned before hat-resize existed is left alone.
+restore_resize() {
+    local hat="$1" host="$2" out
+    out=$(remote_sh "$host" 'h="$HOME/.local/bin/hat-resize"; [ -x "$h" ] || exit 0; "$h" 2>&1') || {
+        out=${out#hat-resize: }
+        warn "$hat: tabs not resized: ${out:-could not reach $host}
+  Once cmux shows a tab at its full size, run: hatter resize $hat"
+        return 0
+    }
+    case "$out" in
+        *" 0 window(s) "*|"") ;;
+        *) echo "  $hat: ${out#hat-resize: }" ;;
+    esac
+}
+
 cmd_restore() {
     require_cmux restore
     local hats only_missing=0
@@ -6359,6 +6394,11 @@ cmd_restore() {
         live=$(hat_live_sessions "$host") || live=""
         settle_ungrouped "$hat" "$win" "$live"
         discard_stray_workspace "$win"
+
+        # 5. windows a restore made with no client attached come up at 80x24
+        # unless the server knew the size cmux uses. Mirroring alone does not
+        # fix them: cmux sizes only the tab it shows (#133).
+        restore_resize "$hat" "$host"
     done <<<"$hats"
 
     restore_settle_order
@@ -8772,10 +8812,9 @@ records the size cmux uses, and the tmux server starts from it. resize is for
 windows that are already wrong. The size is that record unless --size says
 otherwise.
 
-tmux then holds each resized window at that size, even when cmux resizes. To
-let one follow cmux again, in that tab:
-
-  tmux set-window-option -u -t "$TMUX_PANE" window-size
+With no record yet, the size is the one cmux already shows in the tabs it has
+drawn. Each resized window keeps that size until cmux shows it, then follows
+cmux as usual. hatter restore runs this on every hat it restores.
 
 An agent already running picks up the new size at once, but what it printed
 before stays wrapped at 80 columns until it restarts.
