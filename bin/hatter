@@ -35,6 +35,9 @@ export CMUX_QUIET=1
 HATTER_LAUNCH_WORKSPACE="${CMUX_WORKSPACE_ID:-}"
 unset CMUX_WORKSPACE_ID CMUX_SURFACE_ID CMUX_TAB_ID
 
+# This file, for the server scripts it carries (see cmd_tab_rename_here).
+HATTER_SELF="${BASH_SOURCE[0]}"
+
 # Where cmux focus was before this run first changed cmux, so the run can put it
 # back (see focus_save). One record per outermost hatter: a hatter started by
 # another one, while that one is still running, finds these set and shares its
@@ -775,6 +778,21 @@ sync_windows_merge() {
         | ([$live[].name] + [$live[].was // [] | .[]]) as $known
         | [$rec[] | select(.pinned and (.name as $n | $known | index($n) | not))]
           + ($live | map(del(.was)))'
+}
+
+# clear_renamed_from <lines of host\x1fwindow id>: drop WAS_OPT from those
+# windows, once a sync has written their new names into the config. Kept, an
+# old name would outlive its use: a later tab given that name, pinned and
+# closed, would be taken for the renamed one, and never reopened.
+clear_renamed_from() {
+    local h cmd
+    while IFS= read -r h; do
+        [[ -z "$h" ]] && continue
+        cmd=$(AWK_H="$h" awk -F'\037' '$1 == ENVIRON["AWK_H"] && $2 != "" {print $2}' <<<"$1" \
+              | while IFS= read -r w; do printf "tmux set-option -wu -t %s %s 2>/dev/null; " "$(sq "$w")" "$WAS_OPT"; done)
+        [[ -n "$cmd" ]] && { remote_sh "$h" "${cmd}true" >/dev/null 2>&1 || true; }
+    done < <(cut -d $'\x1f' -f 1 <<<"$1" | sort -u)
+    return 0
 }
 
 # A pinned tab is one hatter keeps: restore creates it first, and brings it
@@ -1757,8 +1775,12 @@ if tmux list-windows -t "$wid" -F "#{window_id}	#{window_name}" 2>/dev/null \
     exit 1
 fi
 
-# The names this window has had, as a JSON list, for the client's sync. Not
-# the new one: a tab renamed back has not been renamed away from it.
+tmux rename-window -t "$wid" -- "$new" || exit 1
+
+# The names this window has had, as a JSON list, for the client's sync, which
+# clears it once the config has the new name. Not the new one: a tab renamed
+# back has not been renamed away from it. Needs jq, as hat-registry does;
+# without it the tab is still renamed.
 was=$(tmux show-options -wqv -t "$wid" @hatter-was 2>/dev/null) || was=""
 if command -v jq >/dev/null 2>&1; then
     was=$(printf '%s' "${was:-[]}" | jq -c --arg o "$old" --arg n "$new" '
@@ -1766,7 +1788,6 @@ if command -v jq >/dev/null 2>&1; then
         || was=$(jq -nc --arg o "$old" '[$o]')
     tmux set-option -w -t "$wid" @hatter-was "$was"
 fi
-tmux rename-window -t "$wid" -- "$new" || exit 1
 h="$HOME/.local/bin/hat-registry"
 [ -x "$h" ] && "$h" refresh >/dev/null 2>&1
 echo "tab '$old' is now '$new'"
@@ -3500,8 +3521,14 @@ cmd_tab() {
     set -- ${args[@]+"${args[@]}"}
     case "${1:-}" in
         pin|unpin) [[ $# -eq 3 ]] && { cmd_tab_pin "$1" "$2" "$3" "$want"; return; } ;;
-        rename|mv) [[ $# -eq 4 ]] || die "usage: hatter tab rename <session> <tab> <new-name> [--hat <hat>]"
-                   cmd_tab_rename "$2" "$3" "$4" "$want"; return ;;
+        rename|mv)
+            if [[ $# -eq 3 && ( "$2" == here || "$2" == this ) ]]; then
+                [[ -z "$want" ]] || die "--hat does not go with '$2': the tab is the one hatter is running in"
+                cmd_tab_rename_here "$3"; return
+            fi
+            [[ $# -eq 4 ]] || die "usage: hatter tab rename <session> <tab> <new-name> [--hat <hat>]
+       hatter tab rename here <new-name>"
+            cmd_tab_rename "$2" "$3" "$4" "$want"; return ;;
     esac
     # Add a tab back to a workspace: in the mirror a tab IS a tmux window, so
     # creating one on the server makes it appear - no re-mirror needed.
@@ -3588,8 +3615,8 @@ cmd_tab_rename() {
     was=$(jq -c --arg o "$old" --arg n "$new" \
               '(if type == "array" then . else [] end) - [$o, $n] + [$o]' <<<"${TAB_WAS:-[]}" 2>/dev/null) \
         || was=$(jq -nc --arg o "$old" '[$o]')
-    remote_sh "$TAB_HOST" "tmux set-option -w -t $(sq "$TAB_WID") $WAS_OPT $(sq "$was") 2>/dev/null
-        tmux rename-window -t $(sq "$TAB_WID") -- $(sq "$new") || exit 1
+    remote_sh "$TAB_HOST" "tmux rename-window -t $(sq "$TAB_WID") -- $(sq "$new") || exit 1
+        tmux set-option -w -t $(sq "$TAB_WID") $WAS_OPT $(sq "$was") 2>/dev/null
         h=\"\$HOME/.local/bin/hat-registry\"; [ -x \"\$h\" ] && \"\$h\" refresh >/dev/null 2>&1; true" \
         || die "could not rename tab $TAB_IDX in '$TAB_SESSION' on $TAB_HOST"
 
@@ -3603,6 +3630,19 @@ cmd_tab_rename() {
             else . end'
     fi
     info "Renamed tab ${old:+'$old' }($TAB_IDX) in '$TAB_SESSION' to '$new'"
+}
+
+# hatter tab rename here|this <new-name>: the tab hatter is running in. Only a
+# tmux window is a tab hatter records, so this needs tmux, and it runs the very
+# script provision installs as `tabname` - taken from this file, so a server
+# not yet provisioned with it does the same thing.
+cmd_tab_rename_here() {
+    [[ -n "${TMUX:-}" && -n "${TMUX_PANE:-}" ]] || die "not running inside a tmux tab, so there is no tab here to rename.
+  Name the tab instead:  hatter tab rename <session> <tab> <new-name>"
+    local script
+    script=$(sed -n "/<<'TABNAME'\$/,/^TABNAME\$/p" "$HATTER_SELF" 2>/dev/null | sed '1d;$d')
+    [[ "$script" == *'# tabname - '* ]] || die "cannot find the tabname script in $HATTER_SELF"
+    sh -c "$script" tabname -- "$1"
 }
 
 # tab_target <session> [hat]: resolve a workspace name the way `hatter tab`
@@ -5944,7 +5984,7 @@ sync_once() {
     # Iterate hats, not windows. A group belongs to exactly one hat and so lives
     # in exactly one window; scanning every window would let a same-named group
     # in some other window overwrite the real one.
-    local hats=() wins=() hosts=() hat i n reached=""
+    local hats=() wins=() hosts=() hat i n reached="" renamed=""
     while IFS= read -r hat; do
         [[ -z "$hat" ]] && continue
         hats+=("$hat")
@@ -6072,6 +6112,7 @@ sync_once() {
                 grep -qxF "$title" <<<"$live" || continue
 
                 windows=$(jq -c --arg s "$title" '.[$s] // []' <<<"$wjson")
+                renamed+=$(jq -r --arg h "$host" '.[] | select(.was) | "\($h)\u001f\(.id)"' <<<"$windows")$'\n'
                 order=$(cmux_tab_order "$w" "$wref" "$host" "$title" \
                             "$tmp/map.${wref//[^A-Za-z0-9_-]/_}" | jq -R . | jq -sc .)
                 recorded=$(cfg --arg g "$gkey" --arg s "$title" '.groups[$g].sessions[$s].windows // []')
@@ -6193,6 +6234,9 @@ sync_once() {
         [[ -n "${insts[$i]:-}" ]] && seen_record "${hosts[$i]}" "${insts[$i]}" "${lives[$i]}"
     done
     if [[ "$held" == 1 ]]; then hatter_unlock; fi
+
+    # The config now holds the new names, so the old ones have done their job.
+    clear_renamed_from "$renamed"
 
     # Now that the config holds what this pass found, every running session in
     # no group goes into its hat's Unassigned, and an empty Unassigned goes.
@@ -8937,6 +8981,10 @@ so does the record the server rebuilds from after a reboot. The rack's `r` on
 a tab does the same.
 
   hatter tab rename dev-atlas 0 notes
+
+`here` (or `this`) is the tab hatter is running in, when that is a tmux tab:
+
+  hatter tab rename here notes
 
 On the server, in the tab itself, `tabname <new-name>` does it without the
 client (`tabname` alone prints the name). The config catches up at the next

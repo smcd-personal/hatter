@@ -68,9 +68,31 @@ if command -v tmux >/dev/null 2>&1; then
     [[ "$(names)" == "first -x " ]] || fail "after --: windows are '$(names)'"
     out=$(tn -- 2>&1) && fail "tabname -- (no name) succeeded"
     echo "ok: tabname"
+
+    # hatter tab rename here: the same script, run by hatter in its own tab,
+    # with no config at all (a server where hatter is installed but not set up).
+    hh() {
+        HOME="$work/home" XDG_CONFIG_HOME="$work/nocfg" TMUX="$sock,1,0" TMUX_PANE="$pane" \
+            bash "$root/bin/hatter" tab rename "$@" 2>&1
+    }
+    out=$(hh here "from hatter") || fail "tab rename here: $out"
+    [[ "$(names)" == "first from hatter " ]] || fail "rename here: windows are '$(names)'"
+    [[ "$(was | jq -r 'last')" == "-x" ]] || fail "rename here: @hatter-was is '$(was)'"
+    out=$(hh this second) || fail "tab rename this: $out"
+    [[ "$(names)" == "first second " ]] || fail "rename this: windows are '$(names)'"
+    out=$(hh here first) && fail "rename here took a duplicate name"
+    grep -q "already has a tab called 'first'" <<<"$out" || fail "rename here duplicate: $out"
+    out=$(hh here x --hat dev) && fail "rename here took --hat"
+    grep -q 'does not go with' <<<"$out" || fail "rename here --hat: $out"
+    echo "ok: hatter tab rename here"
 else
     echo "skip: tabname against tmux (no tmux)"
 fi
+
+# Outside tmux there is no tab here, and nothing is guessed.
+out=$(env -u TMUX -u TMUX_PANE XDG_CONFIG_HOME="$work/nocfg" bash "$root/bin/hatter" tab rename here x 2>&1) \
+    && fail "tab rename here outside tmux succeeded"
+grep -q 'not running inside a tmux tab' <<<"$out" || fail "rename here outside tmux: $out"
 
 # --- hatter tab rename, against a stub server ---------------------------------
 # ssh runs the remote command here, against a stub tmux whose windows are
@@ -161,6 +183,16 @@ got=$(run "sync_windows_merge '[]' '$rec' <<<'[{\"id\":\"@1\",\"name\":\"zsh\"},
 got=$(run "sync_windows_merge '[]' '$rec' <<<'[{\"id\":\"@1\",\"name\":\"zsh\"}]'")
 [[ "$got" == '[{"name":"notes","pinned":true},{"name":"zsh"}]' ]] \
     || fail "sync, closed pinned tab: $got"
+# Once the config has the new name, sync clears the old ones from the server,
+# and only from the windows that had them.
+setup
+out=$(run "clear_renamed_from \$'u@dev.example.com\x1f@2\nu@dev.example.com\x1f@5\n'") || fail "clear_renamed_from: $out"
+grep -qF 'set-option -wu -t @2 @hatter-was' "$work/log" || fail "@2 not cleared: $(cat "$work/log")"
+grep -qF 'set-option -wu -t @5 @hatter-was' "$work/log" || fail "@5 not cleared: $(cat "$work/log")"
+[[ "$(grep -c set-option "$work/log")" == 2 ]] || fail "cleared more than asked: $(cat "$work/log")"
+setup
+run "clear_renamed_from ''" >/dev/null || fail "clear_renamed_from with nothing failed"
+[[ ! -s "$work/log" ]] || fail "clear_renamed_from with nothing reached the server: $(cat "$work/log")"
 echo "ok: sync after a rename"
 
 # --- restore: a renamed pinned tab is found, not reopened ---------------------
