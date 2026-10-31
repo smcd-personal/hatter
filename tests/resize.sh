@@ -44,6 +44,26 @@ if command -v tmux >/dev/null 2>&1; then
     first_size; [ "$got" = "80x24 " ] || fail "conf: nothing recorded, windows came up $got"
     echo garbage > "$work/state/hatter/window-size"
     first_size; [ "$got" = "80x24 " ] || fail "conf: a bad record changed the size: $got"
+    # hat-resize against a real server (#133): no record, so the size comes
+    # from a window a client sized; the stuck window is resized and then let
+    # go (window-size unset), not held at window-size manual.
+    rm -f "$work/state/hatter/window-size"
+    mkdir -p "$work/tmuxdir"
+    rt() { TMUX_TMPDIR="$work/tmuxdir" tmux -f /dev/null "$@"; }
+    socks="$socks"  # the TMUX_TMPDIR server is killed below, by its own socket
+    rt new-session -d -s big -x 150 -y 40
+    rt set -g window-size latest
+    rt new-window -d -t '=big:'
+    rt resize-window -t "$(rt list-windows -t '=big' -F '#{window_id}' | head -n 1)" -x 150 -y 40
+    rt set-window-option -u -t "$(rt list-windows -t '=big' -F '#{window_id}' | head -n 1)" window-size
+    rt new-session -d -s small -x 80 -y 24
+    stuck=$(rt list-windows -t '=small' -F '#{window_id}')
+    out=$(TMUX_TMPDIR="$work/tmuxdir" HOME="$work/hd" XDG_STATE_HOME="$work/state" "$work/hd/.local/bin/hat-resize" small)
+    got=$(rt list-windows -t '=small' -F '#{window_width}x#{window_height}')
+    pin=$(rt show-window-options -t "$stuck" window-size)
+    rt kill-server 2>/dev/null || true
+    [ "$got" = 150x40 ] || fail "real tmux: no record, stuck window came out $got ($out)"
+    [ -z "$pin" ] || fail "real tmux: resized window left pinned: $pin"
 else
     echo "skip: no tmux here for the .tmux.conf check"
 fi
@@ -52,14 +72,21 @@ fi
 # windows.txt lines: <session> <window id> <WxH>
 cat > "$work/bin/tmux" <<EOF
 #!/usr/bin/env bash
-# hatter runs tmux as `tmux -u` (#109); the stub takes it as given.
+# hatter runs tmux as 'tmux -u' (#109); the stub takes it as given.
 if [ "\$1" = -u ]; then shift; fi
 w="$work/windows.txt"
 case "\$1" in
     list-windows)
-        if [ "\$2" = -a ]; then awk '{print \$2, \$3}' "\$w"
-        else s="\${3#=}"; grep -q "^\$s " "\$w" || exit 1; awk -v s="\$s" '\$1 == s {print \$2, \$3}' "\$w"; fi ;;
+        if [ "\$2" = -a ]; then rows=\$(cat "\$w")
+        else s="\${3#=}"; rows=\$(grep "^\$s " "\$w") || exit 1; fi
+        # With #{window_id} in the format: "<id> <WxH>"; without: "<WxH>".
+        case "\$*" in
+            *window_id*) printf '%s\n' "\$rows" | cut -d' ' -f2,3 ;;
+            *)           printf '%s\n' "\$rows" | cut -d' ' -f3 ;;
+        esac ;;
     resize-window) echo "\$*" >> "$work/resized" ;;
+    set-window-option) echo "\$*" >> "$work/unpinned" ;;
+    show-option) cat "$work/defsize" 2>/dev/null || echo 80x24 ;;
     *) echo "stub tmux: unexpected: \$*" >&2; exit 1 ;;
 esac
 EOF
@@ -80,13 +107,30 @@ dev-web @3 80x24
 dev-web @4 80x24
 EOF
 resized() { [ -e "$work/resized" ] && cat "$work/resized" | tr '\n' ';'; true; }
-hr() { rm -f "$work/resized"; HOME="$work/hd" XDG_STATE_HOME="$work/state" PATH="$work/bin:$PATH" \
+unpinned() { [ -e "$work/unpinned" ] && cat "$work/unpinned" | tr '\n' ';'; true; }
+hr() { rm -f "$work/resized" "$work/unpinned"; HOME="$work/hd" XDG_STATE_HOME="$work/state" PATH="$work/bin:$PATH" \
        "$work/hd/.local/bin/hat-resize" "$@"; }
 
 # --- hat-resize ------------------------------------------------------------
+# No record, and no window a client has sized: nothing to go on (#133).
 rm -f "$work/state/hatter/window-size"
-if hr >/dev/null 2>&1; then fail "hat-resize: ran with no record and no --size"; fi
+cp "$work/windows.txt" "$work/windows.all"
+grep -v ' 180x57$' "$work/windows.all" > "$work/windows.txt"
+if hr >/dev/null 2>&1; then fail "hat-resize: ran with no record and no sized window"; fi
 [ -z "$(resized)" ] || fail "hat-resize: resized with no size known"
+
+# No record, but a client has sized a window: that size, every stuck window.
+cp "$work/windows.all" "$work/windows.txt"
+out=$(hr)
+[ "$(resized)" = "resize-window -t @1 -x 180 -y 57;resize-window -t @3 -x 180 -y 57;resize-window -t @4 -x 180 -y 57;" ] \
+    || fail "hat-resize: no record, live size: $(resized)"
+[ "$(unpinned)" = "set-window-option -u -t @1 window-size;set-window-option -u -t @3 window-size;set-window-option -u -t @4 window-size;" ] \
+    || fail "hat-resize: resized windows not let go: $(unpinned)"
+
+# A window at the server's default-size is not a size a client chose.
+echo 180x57 > "$work/defsize"
+if hr >/dev/null 2>&1; then fail "hat-resize: took default-size as the client's size"; fi
+rm -f "$work/defsize"
 
 echo 180x57 > "$work/state/hatter/window-size"
 out=$(hr)
@@ -129,9 +173,38 @@ hatter_fn 'cmd_resize dev-web --size 200x60' >/dev/null
 
 if hatter_fn 'cmd_resize nowhere' >/dev/null 2>&1; then fail "hatter resize: accepted an unknown target"; fi
 
+# --- restore runs it on every hat (#133) ------------------------------------
+out=$(hatter_fn 'restore_resize dev me@dev.example.com' 2>&1)
+[ "$out" = "  dev: 3 window(s) resized to 180x57" ] || fail "restore: stuck windows: said '$out'"
+[ "$(cat "$work/hosts")" = me@dev.example.com ] || fail "restore: went to $(cat "$work/hosts")"
+
+# Nothing stuck: nothing touched, nothing said.
+sed 's/ 80x24$/ 180x57/' "$work/windows.all" > "$work/windows.txt"
+out=$(hatter_fn 'restore_resize dev me@dev.example.com' 2>&1)
+[ -z "$out" ] || fail "restore: nothing stuck, still said '$out'"
+[ -z "$(resized)" ] || fail "restore: nothing stuck, still resized $(resized)"
+
+# Stuck, but no size known: restore goes on, and says what to run later.
+grep -v ' 180x57$' "$work/windows.all" > "$work/windows.txt"
+mv "$work/state/hatter/window-size" "$work/window-size.off"
+out=$(hatter_fn 'restore_resize dev me@dev.example.com' 2>&1) || fail "restore: no size failed the restore"
+case "$out" in *"hatter resize dev"*) ;; *) fail "restore: no size: said '$out'" ;; esac
+mv "$work/window-size.off" "$work/state/hatter/window-size"
+cp "$work/windows.all" "$work/windows.txt"
+
 # Not provisioned yet: says so rather than failing with a bare 'not found'.
 mv "$work/hd/.local/bin/hat-resize" "$work/hat-resize.off"
 out=$(hatter_fn 'cmd_resize ops' 2>&1) && fail "hatter resize: succeeded with no hat-resize on the server"
 case "$out" in *"hatter provision"*) ;; *) fail "hatter resize unprovisioned: said '$out'" ;; esac
+# ...while restore, on a server provisioned before hat-resize, stays quiet.
+out=$(hatter_fn 'restore_resize dev me@dev.example.com' 2>&1) || fail "restore: unprovisioned failed"
+[ -z "$out" ] || fail "restore: unprovisioned said '$out'"
+
+# --- the save timer fires when the user manager starts late (#133) -----------
+# OnBootSec alone is long past for a manager started after boot, and
+# OnUnitActiveSec waits on a first run; OnStartupSec counts from the manager.
+timer=$(extract SAVETIMER)
+grep -qx 'OnStartupSec=5min' <<<"$timer" || fail "save timer: no OnStartupSec"
+grep -qx 'OnUnitActiveSec=15min' <<<"$timer" || fail "save timer: no OnUnitActiveSec"
 
 echo "PASS resize"

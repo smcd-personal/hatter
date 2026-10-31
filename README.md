@@ -53,7 +53,8 @@ session still running on its server, and `hatter rm` ends one for good
 - **Persistence on both ends.** Each hat's server rebuilds its windows after a
   reboot, each agent resuming its own conversation, with tmux-resurrect
   snapshots as a fallback; the config covers the client side. Restored tabs start at the size cmux last used rather than tmux's
-  80x24; `hatter resize` fixes tabs that are already stuck there.
+  80x24, and `hatter restore` resizes any still stuck there
+  (`hatter help resize`).
 - **Logging out cannot destroy a tab.** Every pane runs its login shell in a
   loop, so a stray ctrl-D hands back a fresh prompt. Two deliberate ways out:
   `bye`, or `exit 99`.
