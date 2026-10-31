@@ -2,6 +2,9 @@
 # Window size after a restore (#67): the .tmux.conf line that starts a server
 # at the recorded size, hat-resize, and `hatter resize` driving it over ssh.
 set -euo pipefail
+# Run from inside tmux, $TMUX would point every tmux call below - and
+# hat-resize's own - at the live server, whatever TMUX_TMPDIR says.
+unset TMUX
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")
@@ -11,6 +14,7 @@ socks=""
 cleanup() {
     local k
     for k in $socks; do tmux -L "$k" kill-server 2>/dev/null || true; done
+    if [ -d "$work/tmuxdir" ]; then TMUX_TMPDIR="$work/tmuxdir" tmux kill-server 2>/dev/null || true; fi
     rm -rf "$work"
 }
 trap cleanup EXIT
@@ -50,7 +54,6 @@ if command -v tmux >/dev/null 2>&1; then
     rm -f "$work/state/hatter/window-size"
     mkdir -p "$work/tmuxdir"
     rt() { TMUX_TMPDIR="$work/tmuxdir" tmux -f /dev/null "$@"; }
-    socks="$socks"  # the TMUX_TMPDIR server is killed below, by its own socket
     rt new-session -d -s big -x 150 -y 40
     rt set -g window-size latest
     rt new-window -d -t '=big:'

@@ -3035,8 +3035,9 @@ SAVETIMER
     # OnBootSec was long past, and OnUnitActiveSec waits on a run that never
     # came (#133). Persistent covers OnCalendar
     # only. The restart re-arms a timer that is already running.
-    if systemctl --user enable --now hatter-resurrect-save.timer >/dev/null 2>&1 \
-       && systemctl --user restart hatter-resurrect-save.timer >/dev/null 2>&1; then
+    if systemctl --user enable --now hatter-resurrect-save.timer >/dev/null 2>&1; then
+        systemctl --user restart hatter-resurrect-save.timer >/dev/null 2>&1 \
+            || echo "WARNING: could not restart the resurrect save timer" >&2
         echo "resurrect save timer enabled (every 15 min)"
     else
         echo "WARNING: could not enable the resurrect save timer" >&2
@@ -6204,7 +6205,8 @@ restore_settle_order() {
 restore_resize() {
     local hat="$1" host="$2" out
     out=$(remote_sh "$host" 'h="$HOME/.local/bin/hat-resize"; [ -x "$h" ] || exit 0; "$h" 2>&1') || {
-        warn "$hat: tabs not resized: ${out#hat-resize: }
+        out=${out#hat-resize: }
+        warn "$hat: tabs not resized: ${out:-could not reach $host}
   Once cmux shows a tab at its full size, run: hatter resize $hat"
         return 0
     }
