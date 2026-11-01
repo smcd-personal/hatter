@@ -2620,6 +2620,101 @@ exit 0
 HATRECORD
 chmod +x "$HOME/.local/bin/hat-record"
 
+cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
+#!/usr/bin/env bash
+# hat-attn - Claude Code / Codex hook: flag a tab whose agent is waiting for
+# its human.
+#
+# The agent runs here, in tmux; the client only sees what the pane prints. So
+# the flag is an OSC 9 notification written into the pane's own terminal. A
+# client that mirrors tmux (cmux) shows it on exactly that tab - a ring on the
+# tab, an unread badge on its workspace - and looking at the tab marks it read.
+# Clients that do not draw OSC 9 ignore it. The window also carries the option
+# @hatter-waiting while it waits, for hatter itself to read.
+#
+#   needs approval   Claude Notification permission_prompt, Codex PermissionRequest
+#   has a question   Claude Notification elicitation_dialog, PreToolUse AskUserQuestion
+#   waiting for you  Stop (the turn ended)
+#   (cleared)        UserPromptSubmit
+#
+# Same two rules as hat-record:
+#   - never write stdout: it is the hook JSON channel
+#   - never exit non-zero: a failing hook breaks the session
+set -uo pipefail
+
+payload=$(cat 2>/dev/null) || payload=""
+
+[ -n "${TMUX:-}" ] || exit 0
+[ -n "${TMUX_PANE:-}" ] || exit 0
+command -v tmux >/dev/null 2>&1 || exit 0
+command -v jq   >/dev/null 2>&1 || exit 0
+
+# Split on \037, not a tab: tab is IFS whitespace, so `read` would fold an
+# empty middle field away and shift the tool name into the wrong variable.
+IFS=$'\037' read -r ev ntype tool <<EOF || true
+$(printf '%s' "$payload" | jq -r '[.hook_event_name, .notification_type, .tool_name]
+    | map(. // "" | tostring | gsub("[\u001f\t\r\n]"; " ")) | join("\u001f")' 2>/dev/null)
+EOF
+
+kind=""
+case "${ev:-}" in
+    Notification)
+        case "${ntype:-}" in
+            permission_prompt)  kind=approval ;;
+            elicitation_dialog) kind=question ;;
+            # idle_prompt repeats a Stop a minute later; auth_success is noise.
+            *) exit 0 ;;
+        esac ;;
+    PermissionRequest) kind=approval ;;
+    PreToolUse) [ "${tool:-}" = AskUserQuestion ] && kind=question || exit 0 ;;
+    Stop) kind=done ;;
+    UserPromptSubmit)
+        tmux set-option -wu -t "$TMUX_PANE" @hatter-waiting 2>/dev/null
+        exit 0 ;;
+    *) exit 0 ;;
+esac
+
+# An agent run BY an agent - `claude -p` or `codex exec` in a tool call -
+# shares the pane and fires the same hooks; its turns are not the human's
+# business. Walk up from the hook: a second agent above the first means this
+# one is nested. Any doubt (no ps, odd process names) counts as not nested.
+agents=0 pid=$PPID n=0
+while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$n" -lt 40 ]; do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
+    case "${comm##*/}" in claude|codex|codex-*) agents=$((agents + 1)) ;; esac
+    [ "$agents" -lt 2 ] || exit 0
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
+    n=$((n + 1))
+done
+
+tmux set-option -w -t "$TMUX_PANE" @hatter-waiting "$kind" 2>/dev/null
+
+# A snoozed tab waits quietly; waking it is what brings it to the human.
+[ -z "$(tmux show-options -wqv -t "$TMUX_PANE" @hatter-snooze-until 2>/dev/null)" ] || exit 0
+
+case "$kind" in
+    approval) what="Needs approval" ;;
+    question) what="Has a question" ;;
+    *)        what="Waiting for you" ;;
+esac
+tab=$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null) || tab=""
+# The text starts with a letter on purpose: OSC 9 text that starts "4;" is a
+# progress-bar command to some terminals. Control bytes would end it early.
+body=$(printf '%s%s' "$what" "${tab:+ in $tab}" | tr -d '\000-\037\177' | cut -c1-120)
+
+tty=$(tmux display-message -p -t "$TMUX_PANE" '#{pane_tty}' 2>/dev/null) || exit 0
+[ -n "$tty" ] && [ -w "$tty" ] || exit 0
+# A pane whose client has stopped reading can block a write; never hang the
+# agent on it.
+if command -v timeout >/dev/null 2>&1; then
+    timeout 2 sh -c 'printf "\033]9;%s\007" "$1" > "$2"' sh "$body" "$tty" 2>/dev/null
+else
+    printf '\033]9;%s\007' "$body" > "$tty" 2>/dev/null
+fi
+exit 0
+HATATTN
+chmod +x "$HOME/.local/bin/hat-attn"
+
 cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 #!/usr/bin/env bash
 # hat-restore - rebuild tmux from the durable registry, with the agents resumed.
@@ -2957,12 +3052,18 @@ esac
 claude_settings="$claude_cfg/settings.json"
 if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
     [ -e "$claude_settings.hatter.bak" ] || cp "$claude_settings" "$claude_settings.hatter.bak"
-    if jq --arg c "$HOME/.local/bin/hat-record" '
-            def add(ev):
+    # hat-attn (the waiting-for-input flag) rides along: Notification, Stop and
+    # UserPromptSubmit, and PreToolUse for AskUserQuestion only - a hook on
+    # every tool call would cost a process per call for nothing.
+    if jq --arg c "$HOME/.local/bin/hat-record" --arg a "$HOME/.local/bin/hat-attn" '
+            def add(ev; cmd; extra):
               .hooks[ev] = ((.hooks[ev] // [])
-                + (if [(.hooks[ev] // [])[]?.hooks[]?.command] | any(. == $c)
-                   then [] else [{hooks:[{type:"command",command:$c}]}] end));
-            add("SessionStart") | add("SessionEnd")
+                + (if [(.hooks[ev] // [])[]?.hooks[]?.command] | any(. == cmd)
+                   then [] else [{hooks:[{type:"command",command:cmd}]} + extra] end));
+            add("SessionStart"; $c; {}) | add("SessionEnd"; $c; {})
+            | add("Notification"; $a; {}) | add("Stop"; $a; {})
+            | add("UserPromptSubmit"; $a; {})
+            | add("PreToolUse"; $a; {matcher:"AskUserQuestion"})
        ' "$claude_settings" > "$claude_settings.hatter.new"; then
         # Written through, not moved over: a symlinked settings.json stays one.
         if ! cat "$claude_settings.hatter.new" > "$claude_settings"; then
@@ -2971,7 +3072,7 @@ if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
             echo "WARNING: could not write $claude_settings - restored from settings.json.hatter.bak" >&2
         else
             rm -f "$claude_settings.hatter.new"
-            echo "hat-record wired into SessionStart/SessionEnd in $claude_settings (backup: settings.json.hatter.bak)"
+            echo "hat-record and hat-attn wired into $claude_settings (backup: settings.json.hatter.bak)"
         fi
     else
         rm -f "$claude_settings.hatter.new"
@@ -2979,6 +3080,39 @@ if [ -f "$claude_settings" ] && command -v jq >/dev/null 2>&1; then
     fi
 else
     echo "no $claude_settings (or no jq) - skipping the session hook"
+fi
+
+# Codex gets hat-attn too, through its user-level hooks.json, which loads
+# whatever project is open. Only where the login shell finds codex, and in
+# CODEX_HOME when the login profile moves it.
+codex_home=$("${SHELL:-/bin/bash}" -lc 'command -v codex >/dev/null 2>&1 && printf "HATCDX<%s>" "${CODEX_HOME:-$HOME/.codex}"' </dev/null 2>/dev/null) || codex_home=""
+case "$codex_home" in
+    *"HATCDX<"*) codex_home=${codex_home##*HATCDX<}; codex_home=${codex_home%%>*} ;;
+    *) codex_home="" ;;
+esac
+if [ -n "$codex_home" ] && command -v jq >/dev/null 2>&1; then
+    codex_hooks="$codex_home/hooks.json"
+    mkdir -p "$codex_home"
+    if [ -f "$codex_hooks" ]; then
+        [ -e "$codex_hooks.hatter.bak" ] || cp "$codex_hooks" "$codex_hooks.hatter.bak"
+        src="$codex_hooks"
+    else
+        src=/dev/null
+    fi
+    if jq -n --arg a "$HOME/.local/bin/hat-attn" --slurpfile cur "$src" '
+            ($cur[0] // {}) as $c
+            | def add(ev):
+                .hooks[ev] = ((.hooks[ev] // [])
+                  + (if [(.hooks[ev] // [])[]?.hooks[]?.command] | any(. == $a)
+                     then [] else [{hooks:[{type:"command",command:$a}]}] end));
+            $c | add("PermissionRequest") | add("Stop") | add("UserPromptSubmit")
+       ' > "$codex_hooks.hatter.new" 2>/dev/null \
+       && cat "$codex_hooks.hatter.new" > "$codex_hooks"; then
+        echo "hat-attn wired into $codex_hooks"
+    else
+        echo "WARNING: could not update $codex_hooks - left unchanged" >&2
+    fi
+    rm -f "$codex_hooks.hatter.new"
 fi
 
 # A systemd user unit only fires at boot with lingering on, which is also what
@@ -9465,6 +9599,14 @@ the Mac being involved at all:
   - hat-record   a SessionStart/SessionEnd hook, appended as its own entry so
                  existing hooks are untouched. This is what catches a session
                  started by hand, which is most of them.
+  - hat-attn     a Claude Code and Codex hook that flags a tab whose agent is
+                 waiting for you: a permission prompt, a question, or a turn
+                 that ended. It writes an OSC 9 notification into the pane, so
+                 cmux rings that tab and badges its workspace until you look,
+                 and sets the tmux window option @hatter-waiting until the next
+                 prompt. Quiet for an agent started by another agent, and for a
+                 snoozed tab. Goes in Codex's hooks.json where codex is
+                 installed.
   - hat-restore  replays the registry at boot: sessions, windows, names, working
                  directories, and `claude --resume <id>` in each pane.
                  --dry-run prints the plan; --no-agents rebuilds plain shells;
