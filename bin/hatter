@@ -2855,12 +2855,19 @@ cat > "$HOME/.local/bin/hat-snooze" <<'HATSNOOZE'
 #   hat-snooze snooze [-t <tab>] <when>   hide a tab (default: the one this runs in)
 #   hat-snooze unsnooze <which>           bring one back now
 #   hat-snooze tick                       bring back every tab that is due (the timer)
-#   hat-snooze list                       the snoozed tabs, one a line, \037 between:
+#   hat-snooze list [--text]              the snoozed tabs; --text for people. Else
+#                                         one a line, \037 between:
 #                                         window id, name, origin session,
 #                                         origin index, wake time (epoch), mode
 #   hat-snooze when <when>                the wake time <when> means, in epoch seconds
+#   hat-snooze tz [zone]                  the human's timezone: print it, or set it
 #
-# <when> is a duration (30m, 4h, 2d, 1w, 1h30m) or @<epoch seconds>.
+# <when> is a duration (30m, 4h, 2d, 1w, 1h30m), @<epoch seconds>, or a time
+# in the human's timezone: tomorrow, tomorrow 2pm, fri, fri 9am, 14:00, 9:30pm,
+# noon, 2026-11-03, 2026-11-03 14:00. A day with no time means 09:00; a time
+# with no day means the next time it comes round. The timezone is the one
+# `hatter tz` set on the client and provision copied here ($STATE/tz), or
+# HAT_TZ; with neither, an absolute time is refused rather than guessed.
 # <which> is a window id (@12), <origin session>:<tab name>, or a tab name.
 #
 # A snoozed tab is its tmux window moved into the session hatter-snooze, which
@@ -2891,12 +2898,26 @@ command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 command -v tmux >/dev/null 2>&1 || die "no tmux here"
 command -v jq   >/dev/null 2>&1 || die "no jq here"
 
-now() { date +%s; }
+now() { printf '%s\n' "${HAT_NOW:-$(date +%s)}"; }
+TZFILE="$STATE/tz"
+human_tz() {
+    local z="${HAT_TZ:-}"
+    [ -n "$z" ] || z=$(cat "$TZFILE" 2>/dev/null) || z=""
+    printf '%s' "$z"
+}
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
-stamp() { date -d "@$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -r "$1" '+%a %d %b %H:%M %Z'; }
+# stamp <epoch>: in the human's timezone, named, when it is known.
+stamp() {
+    local z t
+    z=$(human_tz)
+    t=$( { [ -z "$z" ] || export TZ="$z"; }
+         date -d "@$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -r "$1" '+%a %d %b %H:%M %Z')
+    printf '%s%s' "$t" "${z:+ ($z)}"
+}
 
-# when <spec>: the epoch second it names, or fail.
-when() {
+# when_rel <spec>: a duration or @epoch as an epoch second; fails quietly on
+# anything else, and with 2 on a duration past MAX.
+when_rel() {
     local rest n u total=0
     case "$1" in
         @*) n=${1#@}
@@ -2921,8 +2942,114 @@ when() {
             *) return 1 ;;
         esac
     done
-    [ "$total" -gt 0 ] && [ "$total" -le "$MAX" ] || return 1
+    [ "$total" -gt 0 ] || return 1
+    [ "$total" -le "$MAX" ] || return 2
     printf '%s\n' "$(( $(now) + total ))"
+}
+
+# when_abs <spec> <zone>: a day and time on the human's clock. Python, for
+# its timezone database: a day that loses or repeats an hour to daylight
+# saving is worked out, not guessed, and said when it matters.
+when_abs() {
+    command -v python3 >/dev/null 2>&1 || { echo "hat-snooze: no python3 here for an absolute time" >&2; return 1; }
+    python3 - "$1" "$2" "$(now)" "$MAX" <<'PYWHEN'
+import datetime as dt, re, sys
+spec, zone, now_s, max_s = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+def die(msg):
+    sys.stderr.write("hat-snooze: %s\n" % msg); sys.exit(1)
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(zone)
+except Exception:
+    die("unknown timezone '%s': set it again with `hatter tz` on your client" % zone)
+HINT = ("cannot read '%s' as a time. Try 30m, 4h, 2d, tomorrow, tomorrow 2pm, "
+        "fri 9am, 14:00 or 2026-11-03 14:00" % spec)
+now = dt.datetime.fromtimestamp(now_s, tz)
+s = " ".join(spec.lower().replace(",", " ").split())
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+def weekday(w):
+    for i, d in enumerate(DAYS):
+        if len(w) >= 3 and d.startswith(w.rstrip(".")):
+            return i
+    return None
+def clock(t):
+    if t == "noon": return (12, 0)
+    if t == "midnight": return (0, 0)
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))? ?(am|pm)", t)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if not 1 <= h <= 12 or mi > 59: return None
+        return (h % 12 + (12 if m.group(3) == "pm" else 0), mi)
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23 or mi > 59: return None
+        return (h, mi)
+    return None
+
+# kind: what the day was given as, which decides what a time gone by means.
+kind, day, rest = "time", None, s
+m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:[ t](.+))?", s)
+if m:
+    try: day = dt.date.fromisoformat(m.group(1))
+    except ValueError: die("there is no date %s" % m.group(1))
+    kind, rest = "date", m.group(2) or ""
+else:
+    words, nxt = s.split(" "), False
+    if words[0] == "next" and len(words) > 1 and weekday(words[1]) is not None:
+        words, nxt = words[1:], True
+    head, tail = words[0], " ".join(words[1:])
+    wd = weekday(head)
+    if head in ("today", "tomorrow"):
+        kind, rest = head, tail
+        day = now.date() + dt.timedelta(days=1 if head == "tomorrow" else 0)
+    elif wd is not None:
+        kind, rest = "weekday", tail
+        # "next mon" said on a Monday is a week away; "mon" may be today.
+        ahead = (wd - now.weekday()) % 7
+        day = now.date() + dt.timedelta(days=7 if nxt and ahead == 0 else ahead)
+    else:
+        day = now.date()
+if kind == "time" and rest == "": die(HINT)
+if kind == "today" and rest == "": die("today needs a time, like today 5pm")
+hm = clock(rest) if rest else (9, 0)
+if hm is None: die(HINT)
+def at(d):
+    wall = dt.datetime(d.year, d.month, d.day, hm[0], hm[1])
+    when = wall.replace(tzinfo=tz)
+    real = when.astimezone(dt.timezone.utc).astimezone(tz)
+    return wall, when, real
+wall, when, real = at(day)
+if when.timestamp() <= now_s:
+    # A weekday or a bare time already gone by means the next one; a day
+    # named outright that has gone by is a mistake to say, not to fix.
+    if kind == "weekday":  wall, when, real = at(day + dt.timedelta(days=7))
+    elif kind == "time":   wall, when, real = at(day + dt.timedelta(days=1))
+    else: die("%s is in the past" % s)
+if real.replace(tzinfo=None) != wall:
+    sys.stderr.write("hat-snooze: %s does not happen on %s in %s (the clocks go forward); "
+                     "taking %s\n" % (wall.strftime("%H:%M"), wall.date(), zone, real.strftime("%H:%M")))
+elif when.replace(fold=1).utcoffset() != when.utcoffset():
+    sys.stderr.write("hat-snooze: %s happens twice on %s in %s (the clocks go back); "
+                     "taking the first\n" % (wall.strftime("%H:%M"), wall.date(), zone))
+t = int(when.timestamp())
+if t - now_s > max_s: die("%s is more than 400 days away" % s)
+print(t)
+PYWHEN
+}
+
+# when <spec>: the epoch second it names, or say why not and fail.
+when() {
+    local t rc=0 z
+    t=$(when_rel "$1") || rc=$?
+    if [ "$rc" = 0 ]; then printf '%s\n' "$t"; return 0; fi
+    if [ "$rc" = 2 ]; then echo "hat-snooze: '$1' is more than 400 days" >&2; return 1; fi
+    z=$(human_tz)
+    if [ -z "$z" ]; then
+        echo "hat-snooze: cannot read '$1' as a duration (30m, 4h, 2d, 1w), and an absolute time needs the human's timezone, which is not set here: run \`hatter tz\` on the client" >&2
+        return 1
+    fi
+    when_abs "$1" "$z"
 }
 
 # One snooze change at a time: the timer and a person can both be at it. A
@@ -3016,9 +3143,10 @@ do_snooze() {
             *) break ;;
         esac
     done
-    spec="${1:-}"
+    # "fri 9am" may come as one word or two.
+    spec="$*"
     [ -n "$spec" ] || die "usage: hat-snooze snooze [-t <tab>] <when>"
-    until=$(when "$spec") || die "cannot read '$spec' as a time: give a duration like 30m, 4h, 2d or 1w (up to 400d)"
+    until=$(when "$spec") || exit 1
     if [ -z "$target" ]; then
         [ -n "${TMUX_PANE:-}" ] || die "not running in tmux: say which tab with -t"
         target="$TMUX_PANE"
@@ -3136,7 +3264,36 @@ rows() {
     done
 }
 
-do_list() { rows; return 0; }
+do_list() {
+    local wid name from idx until mode
+    if [ "${1:-}" != --text ]; then rows; return 0; fi
+    rows | while IFS="$US" read -r wid name from idx until mode; do
+        case "$until" in
+            ''|*[!0-9]*) printf '%s  %s  (no record of where it came from)\n' "$wid" "$name" ;;
+            *) printf '%s:%s  wakes %s\n' "$from" "$name" "$(stamp "$until")" ;;
+        esac
+    done
+    [ -n "$(rows)" ] || echo "Nothing is snoozed on this server."
+    return 0
+}
+
+# tz [zone]: print the human's timezone, or set it (the client does, through
+# `hatter tz` and provision). A zone this server's timezone database does not
+# know is refused.
+do_tz() {
+    local z="${1:-}"
+    if [ -z "$z" ]; then
+        z=$(human_tz)
+        [ -n "$z" ] || die "no timezone set here: run \`hatter tz\` on the client"
+        printf '%s\n' "$z"; return 0
+    fi
+    case "$z" in *[!A-Za-z0-9_+/-]*|/*|*..*) die "not a timezone name: $z" ;; esac
+    python3 -c 'import sys, zoneinfo; zoneinfo.ZoneInfo(sys.argv[1])' "$z" 2>/dev/null \
+        || die "this server does not know the timezone '$z'"
+    mkdir -p "$STATE" && printf '%s\n' "$z" > "$TZFILE.new" && mv "$TZFILE.new" "$TZFILE" \
+        || die "could not write $TZFILE"
+    printf 'hat-snooze: timezone %s\n' "$z"
+}
 
 do_unsnooze() {
     local which="${1:-}" hits n wid
@@ -3185,9 +3342,10 @@ case "${1:-}" in
     snooze)   shift; do_snooze "$@" ;;
     unsnooze) shift; do_unsnooze "$@" ;;
     tick)     do_tick ;;
-    list)     do_list ;;
-    when)     shift; when "${1:-}" || die "cannot read '${1:-}' as a time" ;;
-    *)        echo "usage: hat-snooze snooze|unsnooze|tick|list|when" >&2; exit 2 ;;
+    list)     shift; do_list "$@" ;;
+    tz)       shift; do_tz "$@" ;;
+    when)     shift; when "$*" || exit 1 ;;
+    *)        echo "usage: hat-snooze snooze|unsnooze|tick|list [--text]|when|tz" >&2; exit 2 ;;
 esac
 HATSNOOZE
 chmod +x "$HOME/.local/bin/hat-snooze"
