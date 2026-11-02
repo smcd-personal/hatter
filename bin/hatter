@@ -4286,7 +4286,8 @@ cmd_snoozed() {
         seen+="$host"$'\n'
         i=${#asked[@]}
         asked+=("$hat")
-        ( snooze_sh "$host" list > "$tmp/$i" 2>/dev/null; echo $? > "$tmp/$i.rc" ) &
+        # set -e holds in the subshell: catch the status, or it never gets written.
+        ( rc=0; snooze_sh "$host" list > "$tmp/$i" 2>/dev/null || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
     done
     wait
     t=$(date +%s)
