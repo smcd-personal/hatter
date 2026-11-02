@@ -130,6 +130,7 @@ if "$SN" tz >/dev/null 2>&1; then fail "tz printed something with none set"; fi
 for bad in Mars/Olympus "../etc/x" "Europe/Lon don"; do
     if "$SN" tz "$bad" >/dev/null 2>&1; then fail "tz took '$bad'"; fi
 done
+"$SN" tz UTC >/dev/null || fail "tz UTC was refused"
 "$SN" tz $LA >/dev/null
 HAT_TZ= "$SN" when "tomorrow" >/dev/null || fail "the tz file is not read"
 

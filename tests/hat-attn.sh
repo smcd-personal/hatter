@@ -191,12 +191,16 @@ wire
 [[ "$(jq -r .description "$c")" == mine ]] || fail "Codex hooks.json lost its own keys"
 [[ "$(jq '[.hooks.Stop[].hooks[].command] | length' "$c")" == 2 ]] || fail "Codex Stop: $(jq -c .hooks.Stop "$c")"
 
-# No codex on the login PATH: no hooks.json and no skill for it. No claude:
-# no skill for that.
+# No codex on the login PATH: no hooks.json and no skill for it. No claude
+# on it either, but a Claude config dir: claude is somewhere the login PATH
+# does not show (nvm, say), and gets the skill. Neither: no skill.
 rm -rf "$h/.codex" "$h/.agents" "$h/cfg/skills" "$work/bin/codex" "$work/bin/claude"
 wire
 [[ ! -e "$h/.codex/hooks.json" ]] || fail "wrote Codex hooks where there is no codex"
 [[ ! -e "$h/.agents/skills/hatter" ]] || fail "wrote a Codex skill where there is no codex"
-[[ ! -e "$h/cfg/skills/hatter" ]] || fail "wrote a Claude skill where there is no claude"
+[[ -f "$h/cfg/skills/hatter/SKILL.md" ]] || fail "no Claude skill though Claude has a config dir"
+rm -rf "$h/cfg"
+wire
+[[ ! -e "$h/cfg/skills/hatter" ]] || fail "wrote a Claude skill where there is no claude and no config dir"
 
 echo "ok: hat-attn"
