@@ -2321,7 +2321,7 @@ EOF
 }
 
 cmd_adopt() {
-    local f="${1:-}" wid="${2:-}" meta srv w pane to
+    local f="${1:-}" wid="${2:-}" meta srv w pane to z
     case "$f" in "$PANES"/*.json) ;; *) return 0 ;; esac
     [ -n "$wid" ] || return 0
     meta=$(tmux display-message -p -t "$wid" "#{pid}.#{start_time}$HT#{window_index}$HT#{pane_id}" 2>/dev/null | tr '\t' '\037') || return 0
@@ -2332,7 +2332,12 @@ EOF
     lock || return 0
     to="$PANES/$(slug "$srv")-$(slug "$wid").json"
     # The window's own pane may have recorded itself already: that is newer.
+    # A snooze is only in the old entry, though: it comes along.
     if [ -e "$to" ] && [ "$to" != "$f" ]; then
+        z=$(jq -c '.snooze // empty | objects' "$f" 2>/dev/null) || z=""
+        if [ -n "$z" ] && ! jq -e '.snooze | objects' "$to" >/dev/null 2>&1; then
+            printf 'merge%s%s%s%s%s%s\n' "$US" "$to" "$US" "$to" "$US" "{\"snooze\":$z}" | apply
+        fi
         printf 'rm%s%s%s0\n' "$US" "$f" "$US" | apply
         return 0
     fi
@@ -2427,6 +2432,8 @@ cmd_prune() {
         | (map(select(.w == null) | {e, why: "its window is gone"})) as $gone
         | (map(select(.w != null)) | group_by(.to)) as $per
         | ($per | map(sort_by(.mine, .at) | last)) as $one
+        | ($per | map({key: .[0].to, value: (map(.e.snooze // null | objects) | first)})
+                | from_entries) as $zs
         | ($per | map(sort_by(.mine, .at) | .[:-1][] | {e, why: "another entry has its window"})) as $twice
         | ($one | map(select((.e.session_id // "") != "")) | group_by(.e.session_id)
                 | map(sort_by(.at, .mine) | .[:-1][])) as $dupes
@@ -2440,8 +2447,11 @@ cmd_prune() {
              | "rm\u001f\(.e._file)\u001f\($keep)\u001f\(.why): \(.e.session // ""):\(.e.window // "") (\(.e.name // ""))"),
             ($dupes[] | "rm\u001f\(.e._file)\u001f0\u001fa later record has its session id: \(.e.session // ""):\(.e.window // "")"),
             ($kept[] | . as $k
-             | {session: $k.w.session, window: $k.w.window, name: $k.w.name,
-                window_id: $k.w.id, server: $k.w.server} as $m
+             | ({session: $k.w.session, window: $k.w.window, name: $k.w.name,
+                 window_id: $k.w.id, server: $k.w.server}
+                # A snooze in an entry this one beat for the window stays.
+                + (if ($k.e.snooze // null) == null and $zs[$k.to] != null
+                   then {snooze: $zs[$k.to]} else {} end)) as $m
              | select($k.to != $k.e._file or ($k.e | clean) != (($k.e | clean) + $m))
              | "merge\u001f\($k.e._file)\u001f\($k.to)\u001f\($m | tojson)"),
             ($live[] | select(.id as $x | $held | index([$x]) | not)
@@ -2971,7 +2981,9 @@ move_into() {  # move_into <window id> <session> [index]
     if ! tmux has-session -t "=$2" 2>/dev/null; then
         ph=$(tmux new-session -d -s "$2" -P -F '#{window_id}' 'sleep 600') || return 1
     fi
-    if ! tmux move-window -d -s "$1" -t "=$2:${3:-}" 2>/dev/null; then
+    # In a session made just now the only window an index can collide with
+    # is the placeholder, and -k puts the tab in its place.
+    if ! tmux move-window -d ${ph:+-k} -s "$1" -t "=$2:${3:-}" 2>/dev/null; then
         [ -z "$ph" ] || tmux kill-window -t "$ph" 2>/dev/null
         return 1
     fi
@@ -2995,7 +3007,7 @@ flag() {  # flag <window id> <name>
 }
 
 do_snooze() {
-    local target="" spec until line wid s idx name srv rec after n
+    local target="" spec until line wid s idx name srv rec after an n
     while [ $# -gt 0 ]; do
         case "$1" in
             -t) [ $# -ge 2 ] || die "-t needs a tab"; target="$2"; shift 2 ;;
@@ -3030,11 +3042,14 @@ EOF
 
     n=$(tmux list-windows -t "=$s" -F x 2>/dev/null | wc -l | tr -d ' ')
     [ "${n:-0}" -gt 1 ] || die "'$name' is the only tab in $s; hiding it would close the workspace"
-    after=$(tmux list-windows -t "=$s" -F "#{window_index}$HT#{window_id}" 2>/dev/null \
-            | awk -F '\t' -v i="$idx" '$1 + 0 < i + 0 { a = $2 } END { print a }')
+    line=$(tmux list-windows -t "=$s" -F "#{window_index}$HT#{window_id}$HT#{window_name}" 2>/dev/null \
+            | awk -F '\t' -v i="$idx" '$1 + 0 < i + 0 { a = $2 "\037" $3 } END { print a }')
+    after=${line%%"$US"*} an=${line#*"$US"}
+    [ -n "$after" ] || an=""
     rec=$(jq -cn --argjson u "$until" --arg s "$s" --argjson i "$idx" --arg a "$after" \
-              --arg n "$name" --argjson t "$(now)" \
-              '{until: $u, from: $s, index: $i, after: $a, name: $n, mode: "remind", since: $t}')
+              --arg an "$an" --arg n "$name" --argjson t "$(now)" \
+              '{until: $u, from: $s, index: $i, after: $a, after_name: $an, name: $n,
+                mode: "remind", since: $t}')
     set_record "$wid" "$rec" || die "could not record the snooze; '$name' stays where it is"
     mark "$wid" "$until"
     if ! move_into "$wid" "$BOX"; then
@@ -3047,7 +3062,7 @@ EOF
 
 # wake <window id> <server>: put it back. Assumes the lock.
 wake() {
-    local wid="$1" srv="$2" rec line s idx name from i after a_s first last
+    local wid="$1" srv="$2" rec line s idx name from i after an nb first last
     line=$(winfo "$wid")
     [ -n "$line" ] || return 1
     IFS="$US" read -r wid s idx name srv <<EOF
@@ -3060,18 +3075,30 @@ EOF
         return 0
     fi
     [ -n "$rec" ] || { printf "hat-snooze: '%s' has no record of where it came from; move it with tmux\n" "$name" >&2; return 1; }
-    IFS="$US" read -r from i after <<EOF
-$(printf '%s' "$rec" | jq -r '[.from, (.index | tostring), .after] | map(. // "" | tostring) | join("\u001f")')
+    IFS="$US" read -r from i after an <<EOF
+$(printf '%s' "$rec" | jq -r '[.from, (.index | tostring), .after, .after_name] | map(. // "" | tostring) | join("\u001f")')
 EOF
     [ -n "$from" ] || return 1
     case "$i" in ''|*[!0-9]*) i="" ;; esac
 
     if tmux has-session -t "=$from" 2>/dev/null; then
-        a_s=""
-        [ -z "$after" ] || a_s=$(tmux display-message -p -t "$after" '#{session_name}' 2>/dev/null) || a_s=""
-        if [ -n "$after" ] && [ "$a_s" = "$from" ]; then
-            tmux move-window -d -a -s "$wid" -t "$after" 2>/dev/null || return 1
-        elif [ -z "$after" ]; then
+        # The neighbour by id, if it is still there under the same name; a
+        # reboot gives every window a new id, so else by name. "" means the
+        # tab was first; "-" that its neighbour has gone.
+        nb=""
+        if [ -n "$after" ]; then
+            nb=-
+            if [ "$(tmux display-message -p -t "$after" "#{session_name}$HT#{window_name}" 2>/dev/null)" = "$from$HT$an" ]; then
+                nb="$after"
+            elif [ -n "$an" ]; then
+                nb=$(tmux list-windows -t "=$from" -F "#{window_id}$HT#{window_name}" 2>/dev/null \
+                     | awk -F '\t' -v n="$an" '$2 == n { print $1; exit }')
+                [ -n "$nb" ] || nb=-
+            fi
+        fi
+        if [ -n "$nb" ] && [ "$nb" != - ]; then
+            tmux move-window -d -a -s "$wid" -t "$nb" 2>/dev/null || return 1
+        elif [ -z "$nb" ]; then
             first=$(tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | head -n 1)
             tmux move-window -d -b -s "$wid" -t "=$from:$first" 2>/dev/null || return 1
         elif [ -n "$i" ] && ! tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | grep -qx "$i"; then
@@ -3117,7 +3144,7 @@ do_unsnooze() {
     lock || die "another snooze change is running; try again in a moment"
     hits=$(rows | AWK_W="$which" awk -F '\037' '
         BEGIN { w = ENVIRON["AWK_W"] "" }
-        $1 == w || ($3 ":" $2) == w || $2 == w')
+        $1 == w || ($3 ":" $2) == w || ($3 ":" $4) == w || $2 == w')
     n=$(printf '%s' "$hits" | grep -c . || true)
     [ "$n" -gt 0 ] || die "no snoozed tab matches '$which' (see: hat-snooze list)"
     [ "$n" -eq 1 ] || die "'$which' matches $n snoozed tabs; give the window id:
@@ -3130,17 +3157,18 @@ $(printf '%s\n' "$hits" | awk -F '\037' '{ print "  " $1 "  " $3 ":" $2 }')"
 # a reboot loses (hat-restore rebuilds the tabs, the registry has the times),
 # and clears the record of a tab someone has already moved out by hand.
 do_tick() {
-    local srv t wid u
+    local srv t wid u f
     tmux has-session 2>/dev/null || exit 0
     lock || exit 0
     srv=$(tmux display-message -p -t "$(tmux list-sessions -F '#{session_id}' 2>/dev/null | head -n 1)" '#{pid}.#{start_time}' 2>/dev/null) || exit 0
     [ -n "$srv" ] || exit 0
     t=$(now)
-    set -- "$PANES"/*.json
-    [ -e "$1" ] || exit 0
-    jq -r --arg srv "$srv" 'select(.server == $srv and ((.snooze // null) | type) == "object")
-        | [(.window_id // ""), (.snooze.until // 0 | tostring)] | join("\u001f")' "$@" 2>/dev/null \
-    | while IFS="$US" read -r wid u; do
+    # A file at a time: one that does not parse must not hide the rest.
+    for f in "$PANES"/*.json; do
+        [ -e "$f" ] || continue
+        jq -r --arg srv "$srv" 'select(.server == $srv and ((.snooze // null) | type) == "object")
+            | [(.window_id // ""), (.snooze.until // 0 | tostring)] | join("\u001f")' "$f" 2>/dev/null
+    done | while IFS="$US" read -r wid u; do
         [ -n "$wid" ] || continue
         tmux display-message -p -t "$wid" '#{window_id}' >/dev/null 2>&1 || continue
         case "$u" in ''|*[!0-9]*) u=0 ;; esac
@@ -4238,6 +4266,9 @@ cmd_snooze() {
     # then the snooze is given as that exact second, which this side names.
     until=$(snooze_sh "$TAB_HOST" when "$(sq "${args[2]}")") || rc=$?
     snooze_rc "$rc" "$TAB_HAT"
+    # Only the last line: a login profile may print before it.
+    until=$(printf '%s\n' "$until" | tail -n 1 | tr -d '\r ')
+    [[ "$until" =~ ^[0-9]+$ ]] || die "$TAB_HAT answered with something other than a time: '$until'"
     snooze_sh "$TAB_HOST" snooze -t "$(sq "$TAB_WID")" "$(sq "@$until")" >/dev/null || rc=$?
     snooze_rc "$rc" "$TAB_HAT"
     info "Snoozed '$TAB_NAME' in '$TAB_SESSION' until $(local_stamp "$until") ($(in_words $((until - $(date +%s)))))"

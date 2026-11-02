@@ -9,6 +9,9 @@
 #   - wake, by hand and by the timer: to an intact origin, after the tab it sat
 #     after; when that neighbour has gone; when it was first; when its session
 #     has gone; a tab already moved out by hand; options a reboot lost
+#   - by origin index; a neighbour found by name once a reboot changed its id
+#   - after a reboot: the snooze record survives a window that recorded itself
+#     before hat-restore adopted its entry, and prune settling the two
 #   - hat-restore rebuilds the hidden session after a reboot, though no client
 #     records it
 #
@@ -143,6 +146,54 @@ T move-window -d -s "$B" -t '=s:'
 "$SN" tick
 [[ "$(entry "$B" | jq -r '.snooze // "none"')" == none ]] || fail "tick left the record of a tab moved out by hand"
 [[ -z "$(opt "$B" @hatter-snooze-until)" ]] || fail "tick left the option on a tab moved out by hand"
+
+# --- its session has gone, and it was at the index the remake starts at ------
+T new-session -d -s u -n p -x 120 -y 40
+T new-window -d -t '=u:1' -n q
+P=$(wid u p)
+"$SN" snooze -t "$P" 1h >/dev/null
+T kill-session -t '=u'
+"$SN" snooze -t "$P" @1 >/dev/null
+"$SN" tick >/dev/null
+[[ "$(names u)" == "p" && "$(T display-message -p -t "$P" '#{window_index}')" == 0 ]] \
+    || fail "p should be back in a remade u at index 0: '$(names u)'"
+
+# --- by index, and its neighbour found by name once its id means nothing -----
+T new-session -d -s v -n v0 -x 120 -y 40
+for n in v1 v2 v3; do T new-window -d -t '=v:' -n "$n"; done
+"$SN" snooze -t "$(wid v v1)" 1h >/dev/null
+"$SN" unsnooze v:1 >/dev/null || fail "unsnooze by origin index failed"
+[[ "$(names v)" == "v0 v1 v2 v3" ]] || fail "v1 not back by index: '$(names v)'"
+V2=$(wid v v2)
+"$SN" snooze -t "$V2" 1h >/dev/null
+T move-window -d -s "$(wid v v1)" -t '=v:9'          # v0 v3 v1, index 2 free
+"$work/hat-registry" snooze "$V2" "$(entry "$V2" | jq -c '.snooze | .after = "@9999"')"
+"$SN" unsnooze v:v2 >/dev/null
+[[ "$(names v)" == "v0 v3 v1 v2" ]] || fail "v2 should follow v1, found by name: '$(names v)'"
+
+# --- a reboot: the window records itself before its entry is adopted ---------
+V0=$(wid v v0)
+"$work/hat-registry" put "$(T display-message -p -t "$V0" '#{pane_id}')" shell "" live /tmp
+jq -n '{session: "v", window: 0, name: "v0", cwd: "/tmp", kind: "shell", session_id: "",
+        state: "live", window_id: "@777", server: "9.9",
+        snooze: {until: 1, from: "v", index: 0, after: "", name: "v0", mode: "remind"}}' \
+    > "$XDG_STATE_HOME/hatter/panes/race.json"
+"$work/hat-registry" adopt "$XDG_STATE_HOME/hatter/panes/race.json" "$V0"
+[[ "$(entry "$V0" | jq -r '.snooze.from // "none"')" == v ]] || fail "adopt dropped the snooze: $(entry "$V0")"
+[[ ! -e "$XDG_STATE_HOME/hatter/panes/race.json" ]] || fail "adopt left the old entry"
+"$work/hat-registry" snooze "$V0" null
+
+# ...and prune, settling an old entry against one the window wrote itself.
+V3=$(wid v v3)
+"$work/hat-registry" put "$(T display-message -p -t "$V3" '#{pane_id}')" shell "" live /tmp
+jq -n --argjson w "$(T display-message -p -t "$V3" '#{window_index}')" \
+    '{session: "v", window: $w, name: "v3", cwd: "/tmp", kind: "shell", session_id: "",
+      state: "live", window_id: "@778", server: "9.9", recorded: "2000-01-01T00:00:00Z",
+      snooze: {until: 1, from: "v", index: 1, after: "", name: "v3", mode: "remind"}}' \
+    > "$XDG_STATE_HOME/hatter/panes/race2.json"
+"$work/hat-registry" prune >/dev/null
+[[ "$(entry "$V3" | jq -r '.snooze.from // "none"')" == v ]] || fail "prune dropped the snooze: $(entry "$V3")"
+"$work/hat-registry" snooze "$V3" null
 
 # --- hat-restore after a reboot -----------------------------------------------
 # An entry from an earlier server, filed in hatter-snooze, and a client list
