@@ -704,7 +704,8 @@ session_place() {
 # this hat's server records, and that belong to this hat. Several hats can share
 # one server; a session goes to the hat its name is prefixed with, and one with
 # no such prefix goes to the first of them by name, so each is shown once.
-# The drag healer's own short-lived hop sessions (heal_hop_window) are no one's.
+# The drag healer's own short-lived hop sessions (heal_hop_window) and the
+# session that holds snoozed tabs (hat-snooze) are no one's.
 hat_unrecorded() {
     cfg --arg l "$1" --arg live "$2" '
         .hats[$l].ssh as $h
@@ -713,6 +714,7 @@ hat_unrecorded() {
         | $live | split("\n")[]
         | select(. != "" and (. as $s | $rec | index($s) | not))
         | select(startswith("hatter-hop-") | not)
+        | select(. != "hatter-snooze")
         | select((split("-")[0]) as $p
                  | if ($hats | index($p)) then $p == $l else $hats[0] == $l end)'
 }
@@ -2298,7 +2300,9 @@ EOF
             ({session: $s, window: ($w | tonumber), name: $n, cwd: $c, kind: $k,
               session_id: $i, state: $st, recorded: $t, window_id: $wid, server: $srv, pane: $pane}
              + (if $p != "" then {pid: $p} else {} end)
-             + (if $src != "" then {source: $src} else {} end)) as $new
+             + (if $src != "" then {source: $src} else {} end)
+             # A snoozed tab whose agent records itself again is still snoozed.
+             + (if ($mine.snooze // null) != null then {snooze: $mine.snooze} else {} end)) as $new
             | "put\u001f\($f)\u001f\($new | tojson)",
               (.[] | select(._file != $f)
                # Another entry holding this session id: this record has it
@@ -2317,7 +2321,7 @@ EOF
 }
 
 cmd_adopt() {
-    local f="${1:-}" wid="${2:-}" meta srv w pane to
+    local f="${1:-}" wid="${2:-}" meta srv w pane to z
     case "$f" in "$PANES"/*.json) ;; *) return 0 ;; esac
     [ -n "$wid" ] || return 0
     meta=$(tmux display-message -p -t "$wid" "#{pid}.#{start_time}$HT#{window_index}$HT#{pane_id}" 2>/dev/null | tr '\t' '\037') || return 0
@@ -2328,13 +2332,49 @@ EOF
     lock || return 0
     to="$PANES/$(slug "$srv")-$(slug "$wid").json"
     # The window's own pane may have recorded itself already: that is newer.
+    # A snooze is only in the old entry, though: it comes along.
     if [ -e "$to" ] && [ "$to" != "$f" ]; then
+        z=$(jq -c '.snooze // empty | objects' "$f" 2>/dev/null) || z=""
+        if [ -n "$z" ] && ! jq -e '.snooze | objects' "$to" >/dev/null 2>&1; then
+            printf 'merge%s%s%s%s%s%s\n' "$US" "$to" "$US" "$to" "$US" "{\"snooze\":$z}" | apply
+        fi
         printf 'rm%s%s%s0\n' "$US" "$f" "$US" | apply
         return 0
     fi
     printf 'merge%s%s%s%s%s%s\n' "$US" "$f" "$US" "$to" "$US" \
         "$(jq -cn --arg wid "$wid" --arg srv "$srv" --arg w "$w" --arg p "$pane" \
              '{window_id: $wid, server: $srv, window: ($w | tonumber), pane: $p}')" | apply
+}
+
+# snooze <window id> <json>: set the window's .snooze record (hat-snooze is
+# the only caller); "null" clears it. A window with no entry yet is recorded
+# as the shell it is, so the record has somewhere to live. Unlike the rest of
+# this script it says whether it worked: hat-snooze must not hide a tab whose
+# record did not stick.
+cmd_snooze() {
+    local wid="${1:-}" js="${2:-}" meta s w n srv pane cwd f
+    [ -n "$wid" ] && [ -n "$js" ] || return 1
+    printf '%s' "$js" | jq -e 'type == "object" or type == "null"' >/dev/null 2>&1 || return 1
+    meta=$(tmux display-message -p -t "$wid" \
+        "#{session_name}$HT#{window_index}$HT#{window_name}$HT#{pid}.#{start_time}$HT#{pane_id}$HT#{pane_current_path}$HT#{window_id}" 2>/dev/null | tr '\t' '\037') || return 1
+    IFS="$US" read -r s w n srv pane cwd wid <<EOF
+$meta
+EOF
+    [ -n "$srv" ] && [ -n "$wid" ] || return 1
+    lock || return 1
+    f="$PANES/$(slug "$srv")-$(slug "$wid").json"
+    if [ -f "$f" ]; then
+        printf 'merge%s%s%s%s%s%s\n' "$US" "$f" "$US" "$f" "$US" \
+            "$(jq -cn --argjson z "$js" '{snooze: $z}')" | apply
+    else
+        printf 'put%s%s%s%s\n' "$US" "$f" "$US" \
+            "$(jq -cn --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$cwd" --arg t "$(now)" \
+                 --arg wid "$wid" --arg srv "$srv" --arg pane "$pane" --argjson z "$js" \
+                 '{session: $s, window: ($w | tonumber), name: $n, cwd: $c, kind: "shell",
+                   session_id: "", state: "live", recorded: $t, window_id: $wid,
+                   server: $srv, pane: $pane, source: "snooze", snooze: $z}')" | apply
+    fi
+    jq -e --argjson z "$js" '.snooze == $z' "$f" >/dev/null 2>&1
 }
 
 # This server's entries follow their windows: a window that is gone takes its
@@ -2392,6 +2432,8 @@ cmd_prune() {
         | (map(select(.w == null) | {e, why: "its window is gone"})) as $gone
         | (map(select(.w != null)) | group_by(.to)) as $per
         | ($per | map(sort_by(.mine, .at) | last)) as $one
+        | ($per | map({key: .[0].to, value: (map(.e.snooze // null | objects) | first)})
+                | from_entries) as $zs
         | ($per | map(sort_by(.mine, .at) | .[:-1][] | {e, why: "another entry has its window"})) as $twice
         | ($one | map(select((.e.session_id // "") != "")) | group_by(.e.session_id)
                 | map(sort_by(.at, .mine) | .[:-1][])) as $dupes
@@ -2405,8 +2447,11 @@ cmd_prune() {
              | "rm\u001f\(.e._file)\u001f\($keep)\u001f\(.why): \(.e.session // ""):\(.e.window // "") (\(.e.name // ""))"),
             ($dupes[] | "rm\u001f\(.e._file)\u001f0\u001fa later record has its session id: \(.e.session // ""):\(.e.window // "")"),
             ($kept[] | . as $k
-             | {session: $k.w.session, window: $k.w.window, name: $k.w.name,
-                window_id: $k.w.id, server: $k.w.server} as $m
+             | ({session: $k.w.session, window: $k.w.window, name: $k.w.name,
+                 window_id: $k.w.id, server: $k.w.server}
+                # A snooze in an entry this one beat for the window stays.
+                + (if ($k.e.snooze // null) == null and $zs[$k.to] != null
+                   then {snooze: $zs[$k.to]} else {} end)) as $m
              | select($k.to != $k.e._file or ($k.e | clean) != (($k.e | clean) + $m))
              | "merge\u001f\($k.e._file)\u001f\($k.to)\u001f\($m | tojson)"),
             ($live[] | select(.id as $x | $held | index([$x]) | not)
@@ -2445,7 +2490,8 @@ case "${1:-}" in
     adopt)   shift; cmd_adopt "$@" ;;
     refresh) cmd_refresh ;;
     prune)   shift; cmd_prune "$@" ;;
-    *)       echo "usage: hat-registry put|adopt|refresh|prune" >&2 ;;
+    snooze)  shift; cmd_snooze "$@"; exit $? ;;
+    *)       echo "usage: hat-registry put|adopt|refresh|prune|snooze" >&2 ;;
 esac
 exit 0
 HATREGISTRY
@@ -2802,6 +2848,350 @@ exit 0
 HATATTN
 chmod +x "$HOME/.local/bin/hat-attn"
 
+cat > "$HOME/.local/bin/hat-snooze" <<'HATSNOOZE'
+#!/usr/bin/env bash
+# hat-snooze - hide a tab until a time, then put it back where it was.
+#
+#   hat-snooze snooze [-t <tab>] <when>   hide a tab (default: the one this runs in)
+#   hat-snooze unsnooze <which>           bring one back now
+#   hat-snooze tick                       bring back every tab that is due (the timer)
+#   hat-snooze list                       the snoozed tabs, one a line, \037 between:
+#                                         window id, name, origin session,
+#                                         origin index, wake time (epoch), mode
+#   hat-snooze when <when>                the wake time <when> means, in epoch seconds
+#
+# <when> is a duration (30m, 4h, 2d, 1w, 1h30m) or @<epoch seconds>.
+# <which> is a window id (@12), <origin session>:<tab name>, or a tab name.
+#
+# A snoozed tab is its tmux window moved into the session hatter-snooze, which
+# no client mirrors and hatter never adopts: closing a mirrored tab would end
+# its window, moving it away does not. The record of where it came from is in
+# the window's pane-registry entry (.snooze), which follows the window through
+# moves and renames and is what hat-restore rebuilds from after a reboot; so a
+# snoozed tab comes back from a reboot still hidden and still snoozed. The
+# window also carries @hatter-snooze-until, which hat-attn reads to keep quiet.
+#
+# Coming back, a tab goes after the tab it sat after, if that is still in its
+# session; first, if it was first; else to its old index, if free; else last. A session that has gone meanwhile is made again for it. Then it
+# is flagged the way hat-attn flags an agent waiting for its human.
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+PANES="$STATE/panes"
+REG="${HAT_REGISTRY:-$HOME/.local/bin/hat-registry}"
+BOX=hatter-snooze
+HT=$'\t'
+US=$'\037'
+# The longest snooze: past this a typo (400d for 4d) is likelier than intent.
+MAX=$((400 * 86400))
+
+die() { printf 'hat-snooze: %s\n' "$*" >&2; exit 1; }
+# -u: a client with no UTF-8 locale (the timer's) gets even a tab back as "_".
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
+command -v tmux >/dev/null 2>&1 || die "no tmux here"
+command -v jq   >/dev/null 2>&1 || die "no jq here"
+
+now() { date +%s; }
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+stamp() { date -d "@$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -r "$1" '+%a %d %b %H:%M %Z'; }
+
+# when <spec>: the epoch second it names, or fail.
+when() {
+    local rest n u total=0
+    case "$1" in
+        @*) n=${1#@}
+            case "$n" in ''|*[!0-9]*) return 1 ;; esac
+            [ "${#n}" -le 12 ] || return 1
+            printf '%s\n' "$((10#$n))"; return 0 ;;
+    esac
+    rest=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -d ' ')
+    [ -n "$rest" ] || return 1
+    while [ -n "$rest" ]; do
+        n=${rest%%[!0-9]*}
+        [ -n "$n" ] && [ "${#n}" -le 6 ] || return 1
+        rest=${rest#"$n"}
+        u=${rest%%[0-9]*}
+        rest=${rest#"$u"}
+        n=$((10#$n))
+        case "$u" in
+            m|min|mins|minute|minutes) total=$((total + n * 60)) ;;
+            h|hr|hrs|hour|hours)       total=$((total + n * 3600)) ;;
+            d|day|days)                total=$((total + n * 86400)) ;;
+            w|wk|wks|week|weeks)       total=$((total + n * 604800)) ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$total" -gt 0 ] && [ "$total" -le "$MAX" ] || return 1
+    printf '%s\n' "$(( $(now) + total ))"
+}
+
+# One snooze change at a time: the timer and a person can both be at it. A
+# lock left by a process that died is taken over.
+LOCK="$STATE/snooze.lock"
+lock() {
+    local i=0 owner
+    mkdir -p "$STATE" 2>/dev/null || return 1
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 100 ]; then
+            owner=$(cat "$LOCK/pid" 2>/dev/null) || owner=""
+            if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then return 1; fi
+            rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; i=0
+            continue
+        fi
+        sleep 0.1
+    done
+    echo $$ > "$LOCK/pid"
+    trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null' EXIT
+}
+
+# winfo <target>: window id, session, index, name, server (\037 between).
+winfo() {
+    tmux display-message -p -t "$1" \
+        "#{window_id}$HT#{session_name}$HT#{window_index}$HT#{window_name}$HT#{pid}.#{start_time}" 2>/dev/null \
+        | tr '\t' '\037'
+}
+
+# record <window id> <server>: its .snooze from the registry, or nothing.
+record() {
+    jq -c '.snooze // empty | objects' "$PANES/$(slug "$2")-$(slug "$1").json" 2>/dev/null
+}
+
+set_record() { "$REG" snooze "$1" "$2" >/dev/null 2>&1; }
+
+mark() {  # mark <window id> <until>
+    tmux set-option -w -t "$1" @hatter-snooze-until "$2" 2>/dev/null
+    # Hidden, it belongs to no client's view, and tmux would shrink it to the
+    # box's size; it keeps the size it had until it is back.
+    tmux set-option -w -t "$1" window-size manual 2>/dev/null
+    return 0
+}
+
+unmark() {
+    tmux set-option -wu -t "$1" @hatter-snooze-until 2>/dev/null
+    tmux set-option -wu -t "$1" window-size 2>/dev/null
+    return 0
+}
+
+# A tab is moved into a session that does not exist yet by making the session
+# with a placeholder window, which goes as soon as the tab is in. The box
+# closes itself when its last tab leaves.
+move_into() {  # move_into <window id> <session> [index]
+    local ph=""
+    if ! tmux has-session -t "=$2" 2>/dev/null; then
+        ph=$(tmux new-session -d -s "$2" -P -F '#{window_id}' 'sleep 600') || return 1
+    fi
+    # In a session made just now the only window an index can collide with
+    # is the placeholder, and -k puts the tab in its place.
+    if ! tmux move-window -d ${ph:+-k} -s "$1" -t "=$2:${3:-}" 2>/dev/null; then
+        [ -z "$ph" ] || tmux kill-window -t "$ph" 2>/dev/null
+        return 1
+    fi
+    [ -z "$ph" ] || tmux kill-window -t "$ph" 2>/dev/null
+    return 0
+}
+
+# The tab is back: say so on it, the way hat-attn says an agent is waiting.
+flag() {  # flag <window id> <name>
+    local tty body
+    tmux set-option -w -t "$1" @hatter-waiting woken 2>/dev/null
+    body=$(printf 'Snooze over: %s' "$2" | tr -d '\000-\037\177' | cut -c1-120)
+    tty=$(tmux display-message -p -t "$1" '#{pane_tty}' 2>/dev/null) || return 0
+    [ -n "$tty" ] && [ -w "$tty" ] || return 0
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 2 sh -c 'printf "\033]9;%s\007" "$1" > "$2"' sh "$body" "$tty" 2>/dev/null
+    else
+        printf '\033]9;%s\007' "$body" > "$tty" 2>/dev/null
+    fi
+    return 0
+}
+
+do_snooze() {
+    local target="" spec until line wid s idx name srv rec after an n
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -t) [ $# -ge 2 ] || die "-t needs a tab"; target="$2"; shift 2 ;;
+            --) shift; break ;;
+            -*) die "unknown flag: $1" ;;
+            *) break ;;
+        esac
+    done
+    spec="${1:-}"
+    [ -n "$spec" ] || die "usage: hat-snooze snooze [-t <tab>] <when>"
+    until=$(when "$spec") || die "cannot read '$spec' as a time: give a duration like 30m, 4h, 2d or 1w (up to 400d)"
+    if [ -z "$target" ]; then
+        [ -n "${TMUX_PANE:-}" ] || die "not running in tmux: say which tab with -t"
+        target="$TMUX_PANE"
+    fi
+    line=$(winfo "$target")
+    [ -n "$line" ] || die "no such tab: $target"
+    IFS="$US" read -r wid s idx name srv <<EOF
+$line
+EOF
+    lock || die "another snooze change is running; try again in a moment"
+
+    if [ "$s" = "$BOX" ]; then
+        rec=$(record "$wid" "$srv")
+        [ -n "$rec" ] || die "'$name' is in $BOX with no record of where it came from"
+        set_record "$wid" "$(printf '%s' "$rec" | jq -c --argjson u "$until" '.until = $u')" \
+            || die "could not record the new time"
+        mark "$wid" "$until"
+        printf "hat-snooze: '%s' was already snoozed; it now wakes %s\n" "$name" "$(stamp "$until")"
+        return 0
+    fi
+
+    n=$(tmux list-windows -t "=$s" -F x 2>/dev/null | wc -l | tr -d ' ')
+    [ "${n:-0}" -gt 1 ] || die "'$name' is the only tab in $s; hiding it would close the workspace"
+    line=$(tmux list-windows -t "=$s" -F "#{window_index}$HT#{window_id}$HT#{window_name}" 2>/dev/null \
+            | awk -F '\t' -v i="$idx" '$1 + 0 < i + 0 { a = $2 "\037" $3 } END { print a }')
+    after=${line%%"$US"*} an=${line#*"$US"}
+    [ -n "$after" ] || an=""
+    rec=$(jq -cn --argjson u "$until" --arg s "$s" --argjson i "$idx" --arg a "$after" \
+              --arg an "$an" --arg n "$name" --argjson t "$(now)" \
+              '{until: $u, from: $s, index: $i, after: $a, after_name: $an, name: $n,
+                mode: "remind", since: $t}')
+    set_record "$wid" "$rec" || die "could not record the snooze; '$name' stays where it is"
+    mark "$wid" "$until"
+    if ! move_into "$wid" "$BOX"; then
+        unmark "$wid"; set_record "$wid" null
+        die "could not move '$name' out of sight; it stays where it is"
+    fi
+    "$REG" refresh >/dev/null 2>&1
+    printf "hat-snooze: '%s' snoozed from %s until %s\n" "$name" "$s" "$(stamp "$until")"
+}
+
+# wake <window id> <server>: put it back. Assumes the lock.
+wake() {
+    local wid="$1" srv="$2" rec line s idx name from i after an nb first last
+    line=$(winfo "$wid")
+    [ -n "$line" ] || return 1
+    IFS="$US" read -r wid s idx name srv <<EOF
+$line
+EOF
+    rec=$(record "$wid" "$srv")
+    if [ "$s" != "$BOX" ]; then
+        # Moved out by hand already: it is back, only the record is left.
+        unmark "$wid"; [ -z "$rec" ] || set_record "$wid" null
+        return 0
+    fi
+    [ -n "$rec" ] || { printf "hat-snooze: '%s' has no record of where it came from; move it with tmux\n" "$name" >&2; return 1; }
+    IFS="$US" read -r from i after an <<EOF
+$(printf '%s' "$rec" | jq -r '[.from, (.index | tostring), .after, .after_name] | map(. // "" | tostring) | join("\u001f")')
+EOF
+    [ -n "$from" ] || return 1
+    case "$i" in ''|*[!0-9]*) i="" ;; esac
+
+    if tmux has-session -t "=$from" 2>/dev/null; then
+        # The neighbour by id, if it is still there under the same name; a
+        # reboot gives every window a new id, so else by name. "" means the
+        # tab was first; "-" that its neighbour has gone.
+        nb=""
+        if [ -n "$after" ]; then
+            nb=-
+            if [ "$(tmux display-message -p -t "$after" "#{session_name}$HT#{window_name}" 2>/dev/null)" = "$from$HT$an" ]; then
+                nb="$after"
+            elif [ -n "$an" ]; then
+                nb=$(tmux list-windows -t "=$from" -F "#{window_id}$HT#{window_name}" 2>/dev/null \
+                     | awk -F '\t' -v n="$an" '$2 == n { print $1; exit }')
+                [ -n "$nb" ] || nb=-
+            fi
+        fi
+        if [ -n "$nb" ] && [ "$nb" != - ]; then
+            tmux move-window -d -a -s "$wid" -t "$nb" 2>/dev/null || return 1
+        elif [ -z "$nb" ]; then
+            first=$(tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | head -n 1)
+            tmux move-window -d -b -s "$wid" -t "=$from:$first" 2>/dev/null || return 1
+        elif [ -n "$i" ] && ! tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | grep -qx "$i"; then
+            tmux move-window -d -s "$wid" -t "=$from:$i" 2>/dev/null || return 1
+        else
+            # Not "=$from:", which takes the lowest free index, not the end.
+            last=$(tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | tail -n 1)
+            tmux move-window -d -a -s "$wid" -t "=$from:$last" 2>/dev/null || return 1
+        fi
+    else
+        move_into "$wid" "$from" "$i" || return 1
+        printf "hat-snooze: %s had closed; it is open again, with '%s' in it\n" "$from" "$name"
+    fi
+    # Unsetting window-size has tmux size it for the session's clients again.
+    # Not resize-window: that sets window-size back to manual.
+    unmark "$wid"
+    set_record "$wid" null
+    "$REG" refresh >/dev/null 2>&1
+    flag "$wid" "$name"
+    printf "hat-snooze: '%s' is back in %s\n" "$name" "$from"
+    return 0
+}
+
+# Every snoozed tab, from the box as tmux has it, with its record.
+rows() {
+    local wid name srv rec
+    tmux list-windows -t "=$BOX" -F "#{window_id}$HT#{window_name}$HT#{pid}.#{start_time}" 2>/dev/null \
+    | tr '\t' '\037' | while IFS="$US" read -r wid name srv; do
+        [ -n "$wid" ] || continue
+        rec=$(record "$wid" "$srv")
+        [ -n "$rec" ] || rec='{}'
+        printf '%s' "$rec" | jq -r --arg w "$wid" --arg n "$name" \
+            '[$w, $n, (.from // ""), (.index // ""), (.until // ""), (.mode // "")]
+             | map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")'
+    done
+}
+
+do_list() { rows; return 0; }
+
+do_unsnooze() {
+    local which="${1:-}" hits n wid
+    [ -n "$which" ] || die "usage: hat-snooze unsnooze <window id | session:tab | tab>"
+    lock || die "another snooze change is running; try again in a moment"
+    hits=$(rows | AWK_W="$which" awk -F '\037' '
+        BEGIN { w = ENVIRON["AWK_W"] "" }
+        $1 == w || ($3 ":" $2) == w || ($3 ":" $4) == w || $2 == w')
+    n=$(printf '%s' "$hits" | grep -c . || true)
+    [ "$n" -gt 0 ] || die "no snoozed tab matches '$which' (see: hat-snooze list)"
+    [ "$n" -eq 1 ] || die "'$which' matches $n snoozed tabs; give the window id:
+$(printf '%s\n' "$hits" | awk -F '\037' '{ print "  " $1 "  " $3 ":" $2 }')"
+    wid=${hits%%"$US"*}
+    wake "$wid" "" || die "could not bring '$which' back"
+}
+
+# The timer's turn: wake whatever is due. It also puts back the window options
+# a reboot loses (hat-restore rebuilds the tabs, the registry has the times),
+# and clears the record of a tab someone has already moved out by hand.
+do_tick() {
+    local srv t wid u f
+    tmux has-session 2>/dev/null || exit 0
+    lock || exit 0
+    srv=$(tmux display-message -p -t "$(tmux list-sessions -F '#{session_id}' 2>/dev/null | head -n 1)" '#{pid}.#{start_time}' 2>/dev/null) || exit 0
+    [ -n "$srv" ] || exit 0
+    t=$(now)
+    # A file at a time: one that does not parse must not hide the rest.
+    for f in "$PANES"/*.json; do
+        [ -e "$f" ] || continue
+        jq -r --arg srv "$srv" 'select(.server == $srv and ((.snooze // null) | type) == "object")
+            | [(.window_id // ""), (.snooze.until // 0 | tostring)] | join("\u001f")' "$f" 2>/dev/null
+    done | while IFS="$US" read -r wid u; do
+        [ -n "$wid" ] || continue
+        tmux display-message -p -t "$wid" '#{window_id}' >/dev/null 2>&1 || continue
+        case "$u" in ''|*[!0-9]*) u=0 ;; esac
+        if [ "$u" -le "$t" ] || [ "$(tmux display-message -p -t "$wid" '#{session_name}' 2>/dev/null)" != "$BOX" ]; then
+            wake "$wid" "$srv"
+        else
+            [ -n "$(tmux show-options -wqv -t "$wid" @hatter-snooze-until 2>/dev/null)" ] || mark "$wid" "$u"
+        fi
+    done
+    exit 0
+}
+
+case "${1:-}" in
+    snooze)   shift; do_snooze "$@" ;;
+    unsnooze) shift; do_unsnooze "$@" ;;
+    tick)     do_tick ;;
+    list)     do_list ;;
+    when)     shift; when "${1:-}" || die "cannot read '${1:-}' as a time" ;;
+    *)        echo "usage: hat-snooze snooze|unsnooze|tick|list|when" >&2; exit 2 ;;
+esac
+HATSNOOZE
+chmod +x "$HOME/.local/bin/hat-snooze"
+
 cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 #!/usr/bin/env bash
 # hat-restore - rebuild tmux from the durable registry, with the agents resumed.
@@ -2994,7 +3384,9 @@ while IFS=$'\x1f' read -r s w n cwd kind sid state wid srv file; do
         skipped=$((skipped+1))
         continue
     fi
-    if [ -f "$KEEP" ] && ! grep -qxF -- "$s" "$KEEP"; then
+    # hatter-snooze holds snoozed tabs (hat-snooze). No client records it,
+    # and it has to come back with them, still hidden.
+    if [ "$s" != hatter-snooze ] && [ -f "$KEEP" ] && ! grep -qxF -- "$s" "$KEEP"; then
         [ "$dry" = 1 ] && printf '  would leave closed: %s:%s  (not in the client config)\n' "$s" "$w"
         unwanted=$((unwanted+1))
         continue
@@ -3388,6 +3780,45 @@ SAVETIMER
     fi
 fi
 
+# hat-snooze brings snoozed tabs back when they are due. A minute is as fine
+# as a snooze gets. AccuracySec, because systemd otherwise lets a timer drift
+# by up to a minute to batch wakeups; OnStartupSec for the reason the save
+# timer has it (#133).
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1; then
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/hatter-snooze.service" <<'SNOOZESVC'
+[Unit]
+Description=hatter: bring back snoozed tabs that are due
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hat-snooze tick
+SNOOZESVC
+    cat > "$HOME/.config/systemd/user/hatter-snooze.timer" <<'SNOOZETIMER'
+[Unit]
+Description=hatter: check for snoozed tabs that are due, every minute
+
+[Timer]
+OnBootSec=1min
+OnStartupSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+SNOOZETIMER
+    systemctl --user daemon-reload
+    if systemctl --user enable --now hatter-snooze.timer >/dev/null 2>&1; then
+        systemctl --user restart hatter-snooze.timer >/dev/null 2>&1 \
+            || echo "WARNING: could not restart the snooze timer" >&2
+        echo "snooze timer enabled (every minute)"
+    else
+        echo "WARNING: could not enable the snooze timer; snoozed tabs will not come back on their own" >&2
+    fi
+else
+    echo "no systemd --user here - snoozed tabs only come back with 'hat-snooze tick' (cron it every minute)"
+fi
+
 # ~/.local/bin is only on PATH for a login shell if the shell's profile adds it.
 # Ubuntu's ~/.profile does, but only when the directory already existed at login,
 # and zsh never reads ~/.profile at all. Make it deterministic.
@@ -3536,6 +3967,10 @@ if printf '{}' | "$HOME/.local/bin/hat-record" >/dev/null 2>&1; then
 else
     echo "SELFTEST FAILED: 'hat-record' must never exit non-zero" >&2
 fi
+case "$("$HOME/.local/bin/hat-snooze" when 1h 2>/dev/null)" in
+    ''|*[!0-9]*) echo "SELFTEST FAILED: 'hat-snooze' cannot read a time" >&2 ;;
+    *) echo "selftest ok: 'hat-snooze' runs" ;;
+esac
 if systemctl --user is-enabled hatter-restore.service >/dev/null 2>&1; then
     echo "selftest ok: boot restore is enabled"
 else
@@ -3779,6 +4214,136 @@ tab_find() {
     [[ -n "$line" ]] || die "no tab '$tab' in '$TAB_SESSION' - give its index or its name"
     IFS=$'\x1f' read -r TAB_WID TAB_IDX TAB_NAME TAB_WAS <<<"$line"
     TAB_NAMES=$(cut -d $'\x1f' -f 1,3 <<<"$TAB_NAMES")
+}
+
+# --- snooze (#136) ------------------------------------------------------------
+# A snoozed tab is moved out of sight on its server and brought back there by
+# hat-snooze, on a timer, so it comes back whether or not this client is
+# awake. These only ask the server to do it.
+
+# local_stamp <epoch>: a time in this client's own timezone, which it names.
+local_stamp() {
+    date -r "$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -d "@$1" '+%a %d %b %H:%M %Z'
+}
+
+# in_words <seconds from now>: "in 3h 20m", "in 2d 4h", "now".
+in_words() {
+    local s="$1" d h m
+    (( s > 0 )) || { echo "now"; return 0; }
+    d=$((s / 86400)) h=$((s % 86400 / 3600)) m=$((s % 3600 / 60))
+    if (( d > 0 )); then echo "in ${d}d ${h}h"
+    elif (( h > 0 )); then echo "in ${h}h ${m}m"
+    else echo "in $(( m > 0 ? m : 1 ))m"; fi
+}
+
+# snooze_sh <host> <hat-snooze args, already quoted>: run hat-snooze there.
+# Exit 3 means the server has none yet.
+snooze_sh() {
+    local host="$1"; shift
+    remote_sh "$host" 'h="$HOME/.local/bin/hat-snooze"; [ -x "$h" ] || exit 3; "$h" '"$*"
+}
+
+snooze_rc() {  # snooze_rc <rc> <hat>
+    [[ "$1" != 3 ]] || die "hat '$2' has no hat-snooze yet: run  hatter provision $2"
+    [[ "$1" == 0 ]] || exit 1
+}
+
+# hatter snooze <session> <tab> <when> [--hat <hat>]
+cmd_snooze() {
+    local want="" args=() rc=0 until
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --) shift; args+=("$@"); break ;;
+            -*) die "unknown flag: $1  (try: hatter help snooze)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [[ ${#args[@]} -eq 3 ]] || { usage_cmd snooze; exit 1; }
+    tab_target "${args[0]}" "$want"
+    tab_find "${args[1]}"
+    # The server reads the time, so a duration means the same there as here;
+    # then the snooze is given as that exact second, which this side names.
+    until=$(snooze_sh "$TAB_HOST" when "$(sq "${args[2]}")") || rc=$?
+    snooze_rc "$rc" "$TAB_HAT"
+    # Only the last line: a login profile may print before it.
+    until=$(printf '%s\n' "$until" | tail -n 1 | tr -d '\r ')
+    [[ "$until" =~ ^[0-9]+$ ]] || die "$TAB_HAT answered with something other than a time: '$until'"
+    snooze_sh "$TAB_HOST" snooze -t "$(sq "$TAB_WID")" "$(sq "@$until")" >/dev/null || rc=$?
+    snooze_rc "$rc" "$TAB_HAT"
+    info "Snoozed '$TAB_NAME' in '$TAB_SESSION' until $(local_stamp "$until") ($(in_words $((until - $(date +%s)))))"
+}
+
+# hatter unsnooze <session> <tab> [--hat <hat>]   - the session it came from
+# hatter unsnooze --hat <hat> <tab|window id>
+cmd_unsnooze() {
+    local want="" args=() hat which rc=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --) shift; args+=("$@"); break ;;
+            -*) die "unknown flag: $1  (try: hatter help unsnooze)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    case "${#args[@]}" in
+        1) [[ -n "$want" ]] || { usage_cmd unsnooze; exit 1; }
+           hat="$want" which="${args[0]}" ;;
+        2) if [[ -n "$want" ]]; then hat="$want"
+           else hat=$(session_hat_typed "${args[0]}" "hatter unsnooze ${args[0]} ${args[1]} --hat <hat>") || exit 1; fi
+           which="${args[0]}:${args[1]}" ;;
+        *) usage_cmd unsnooze; exit 1 ;;
+    esac
+    [[ -n "$hat" ]] && hat_exists "$hat" || die "no hat for '${args[0]}': say which with --hat (see: hatter snoozed)"
+    snooze_sh "$(hat_ssh "$hat")" unsnooze "$(sq "$which")" >/dev/null || rc=$?
+    snooze_rc "$rc" "$hat"
+    info "Woke '$which' on $hat"
+}
+
+# hatter snoozed [hat]: every snoozed tab, each server asked once, all at once.
+cmd_snoozed() {
+    local hats=() asked=() hat host i n tmp t found=0 seen=$'\n'
+    if [[ $# -gt 0 ]]; then
+        hat_exists "$1" || die "unknown hat: $1"
+        hats=("$1")
+    else
+        while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
+    fi
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-snoozed.XXXXXX")
+    for hat in ${hats[@]+"${hats[@]}"}; do
+        host=$(hat_ssh "$hat")
+        # Hats that share a server share its snoozed tabs: ask once.
+        [[ -n "$host" && "$seen" != *$'\n'"$host"$'\n'* ]] || continue
+        seen+="$host"$'\n'
+        i=${#asked[@]}
+        asked+=("$hat")
+        # set -e holds in the subshell: catch the status, or it never gets written.
+        ( rc=0; snooze_sh "$host" list > "$tmp/$i" 2>/dev/null || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
+    done
+    wait
+    t=$(date +%s)
+    n=${#asked[@]}
+    for ((i = 0; i < n; i++)); do
+        case "$(cat "$tmp/$i.rc" 2>/dev/null)" in
+            0) ;;
+            3) echo "  ${asked[$i]}: no hat-snooze yet (hatter provision ${asked[$i]})"; continue ;;
+            *) echo "  ${asked[$i]}: could not ask"; continue ;;
+        esac
+        local wid name from idx until mode
+        while IFS=$'\x1f' read -r wid name from idx until mode; do
+            [[ -n "$wid" ]] || continue
+            found=$((found + 1))
+            if [[ "$until" =~ ^[0-9]+$ ]]; then
+                printf '  %-10s %-34s wakes %s (%s)\n' "${asked[$i]}" "${from:-?}:$name" \
+                    "$(local_stamp "$until")" "$(in_words $((until - t)))"
+            else
+                printf '  %-10s %-34s %s\n' "${asked[$i]}" "?:$name ($wid)" "no record of where it came from"
+            fi
+        done < "$tmp/$i"
+    done
+    rm -rf "$tmp"
+    [[ "$found" -gt 0 ]] || echo "Nothing is snoozed."
+    return 0
 }
 
 # hatter tab pin|unpin <session> <tab> [--hat <hat>]   - <tab> is a window
@@ -9014,6 +9579,9 @@ hatter - cmux windows, groups and workspaces backed by remote tmux
 Commands:
   new <session>          Create or reattach a workspace  ("new" is optional)
   tab <session> [name]   Add a tab to a workspace
+  snooze <session> <tab> <when>  Hide a tab until a time, then put it back
+  unsnooze <session> <tab>       Bring a snoozed tab back now
+  snoozed [hat]          List snoozed tabs and when they wake
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   find <terms>...        Find the Claude session working on something, and go to it
   key add <key> <hat>... Authorise another machine's ssh key on hats
@@ -9179,6 +9747,41 @@ on takes that window's hat, so `hatter atlas` while wearing dev means
 dev-atlas. An explicit --hat, a known prefix, or the group's hat all still win.
 Off the Mac - in a mirrored pane on a shell server - there is no window to read
 and the name must say which hat it belongs to.
+USAGE
+    ;;
+    snooze|unsnooze|snoozed) cat <<'USAGE'
+hatter snooze <session> <tab> <when> [--hat <hat>]
+hatter unsnooze <session> <tab> [--hat <hat>]
+hatter unsnooze --hat <hat> <tab|window id>
+hatter snoozed [hat]
+
+Snooze a tab to get it out of sight until you need it. It disappears from its
+workspace, and at the wake time it comes back to the same place, flagged the
+way a tab with an agent waiting for you is.
+
+<tab> is a window index or name. <when> is a duration: 30m, 4h, 2d, 1w, or a
+mix like 1h30m, up to 400d. Times are shown in this machine's timezone, named.
+
+The tab is not closed. Its tmux window moves to a hidden session on its
+server, hatter-snooze, and keeps running there: an agent in it carries on with
+whatever it was doing. The server brings it back on its own, once a minute
+(the hatter-snooze timer that provision sets up), so the tab wakes whether or
+not this machine is awake, and a reboot keeps it snoozed.
+
+Coming back, a tab goes after the tab it sat after, if that is still there;
+first, if it was first; else to its old index, if free; else last. If its
+workspace has closed meanwhile, the workspace is started again with it.
+
+  snooze      hide it; snoozing a snoozed tab again sets a new wake time
+  unsnooze    bring it back now. <session> is the one it came from; a tab
+              whose workspace is gone can be named by --hat and its window
+              id, from `hatter snoozed`
+  snoozed     every snoozed tab, the workspace it came from and when it wakes
+
+The only tab of a workspace cannot be snoozed: that would close the workspace.
+
+On the server, `hat-snooze` does the same for the tab it runs in:
+  hat-snooze snooze 4h       hat-snooze list       hat-snooze unsnooze <tab>
 USAGE
     ;;
     tab) cat <<'USAGE'
@@ -9704,6 +10307,8 @@ the Mac being involved at all:
                  prompt. Quiet for an agent started by another agent, and for a
                  snoozed tab. Goes in Codex's hooks.json where codex is
                  installed.
+  - hat-snooze   hides a tab until a time and brings it back (see: hatter help
+                 snooze), with a systemd timer that checks once a minute
   - hat-restore  replays the registry at boot: sessions, windows, names, working
                  directories, and `claude --resume <id>` in each pane.
                  --dry-run prints the plan; --no-agents rebuilds plain shells;
@@ -9796,7 +10401,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|resize|shortcuts|sync|_drag-plan|_drag-heal) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -9822,6 +10427,9 @@ case "$cmd" in
     # These need arguments, so bare invocation shows the command's options.
     new)       [[ $# -gt 0 ]] || { usage_cmd new; exit 1; };       cmd_new "$@" ;;
     tab)       [[ $# -gt 0 ]] || { usage_cmd tab; exit 1; };       cmd_tab "$@" ;;
+    snooze)    [[ $# -gt 0 ]] || { usage_cmd snooze; exit 1; };    cmd_snooze "$@" ;;
+    unsnooze)  [[ $# -gt 0 ]] || { usage_cmd unsnooze; exit 1; };  cmd_unsnooze "$@" ;;
+    snoozed)   cmd_snoozed "$@" ;;
     attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     find)      cmd_find "$@" ;;
