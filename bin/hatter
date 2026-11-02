@@ -992,6 +992,88 @@ $(cmux_probe_err_quoted)
 # id this script stores or passes around is a UUID.
 cmux_json() { have_cmux || return 1; cmux --id-format both "$@" --json; }
 
+# ------------------------------------------ cmux keeps the order the user set
+#
+# cmux moves a workspace that gets a notification toward the top of its window,
+# taking its group with it. The setting is app.reorderOnNotification in
+# cmux.json, and it is on unless set. hatter saves cmux's order as the user's
+# order (#83), so with it on, every sync records wherever the last notification
+# left things, and a restore brings that back (#143).
+#
+# When the setting is absent, hatter turns it off: the file is backed up first,
+# and cmux reloads its config. When the user set it themselves, to anything,
+# that choice stands; a value that reorders gets a warning instead.
+CMUX_SETTINGS_FILE="${HATTER_CMUX_SETTINGS:-$HOME/.config/cmux/cmux.json}"
+CMUX_ORDER_CHECKED=""
+
+# Prints one line naming what it found or did, for the caller to show:
+#   ok                   the setting is off
+#   set <backup>         it was absent; now off, the old file kept at <backup>
+#   created              there was no cmux.json; one now holds just the setting
+#   on <value>           the user set a value that reorders
+#   unreadable           cmux.json is not JSON hatter can edit
+#   failed               the write did not happen
+cmux_order_check() {
+    local f="$CMUX_SETTINGS_FILE" val bak tmp
+    if [[ ! -e "$f" ]]; then
+        mkdir -p "$(dirname "$f")" 2>/dev/null || { echo failed; return 0; }
+        printf '{\n  "app": { "reorderOnNotification": "off" }\n}\n' > "$f" 2>/dev/null \
+            || { echo failed; return 0; }
+        echo created
+        return 0
+    fi
+    # Absent prints "absent"; a set value prints as JSON, so "off" and false
+    # stay apart from a missing key.
+    val=$(jq -c 'if (.app | type) == "object" and (.app | has("reorderOnNotification"))
+                 then .app.reorderOnNotification else "absent" end' "$f" 2>/dev/null) \
+        || { echo unreadable; return 0; }
+    case "$val" in
+        '"off"'|false) echo ok; return 0 ;;
+        '"absent"') ;;
+        *) echo "on $val"; return 0 ;;
+    esac
+    bak="$f.$(date +%Y%m%d-%H%M%S).hatter.bak"
+    tmp="$f.hatter.$$"
+    cp -p "$f" "$bak" 2>/dev/null || { echo failed; return 0; }
+    if jq '.app = ((if (.app | type) == "object" then .app else {} end)
+                   + {reorderOnNotification: "off"})' "$f" > "$tmp" 2>/dev/null \
+        && mv "$tmp" "$f"; then
+        echo "set $bak"
+    else
+        rm -f "$tmp"
+        echo failed
+    fi
+}
+
+# Runs the check once per process and reports through <say>, a function taking
+# one message (info, or watch_log for the watcher). The reload is best effort:
+# a cmux that is not running reads the file when it starts.
+cmux_order_guard() {
+    local say=$1 res
+    [[ -z "$CMUX_ORDER_CHECKED" ]] || return 0
+    # Only a Mac driving cmux has this setting; other clients are left alone.
+    have_cmux || return 0
+    CMUX_ORDER_CHECKED=1
+    res=$(cmux_order_check)
+    case "$res" in
+        ok) return 0 ;;
+        set\ *|created)
+            if have_cmux; then cmux_change reload-config >/dev/null 2>&1 || true; fi
+            if [[ "$res" == created ]]; then
+                "$say" "Turned off cmux's reordering on notifications in $CMUX_SETTINGS_FILE, so groups stay where you put them"
+            else
+                "$say" "Turned off cmux's reordering on notifications in $CMUX_SETTINGS_FILE, so groups stay where you put them (the old file is ${res#set })"
+            fi ;;
+        on\ *)
+            "$say" "cmux moves workspaces to the top on notifications (app.reorderOnNotification is ${res#on } in $CMUX_SETTINGS_FILE), so the order hatter saves will follow them. Set it to \"off\" to keep the order you set." ;;
+        unreadable)
+            "$say" "could not read $CMUX_SETTINGS_FILE as JSON, so cmux may still reorder workspaces on notifications; set \"app\": { \"reorderOnNotification\": \"off\" } there" ;;
+        *)
+            "$say" "could not turn off cmux's reordering on notifications in $CMUX_SETTINGS_FILE; set \"app\": { \"reorderOnNotification\": \"off\" } there" ;;
+    esac
+    return 0
+}
+
 # ------------------------------------------- focus: leave it where it was found
 #
 # Some cmux commands act on the focused window and take no target:
@@ -6082,6 +6164,7 @@ cmd_sync() {
     # A dead socket makes every hat look empty; refuse rather than report a
     # no-op as success.
     require_cmux sync
+    cmux_order_guard info
     local try
     for try in 1 2 3; do
         sync_once && return 0
@@ -6542,6 +6625,7 @@ restore_resize() {
 
 cmd_restore() {
     require_cmux restore
+    cmux_order_guard info
     local hats only_missing=0
 
     local args=() a want_order=""
@@ -7337,6 +7421,7 @@ watch_run() {
     WATCH_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
     WATCH_SELF_MTIME=$(lock_mtime "$WATCH_SELF")
     watch_log "following cmux events"
+    cmux_order_guard watch_log
     while :; do
         CMUX_ALIVE=""
         if ! cmux_alive; then
@@ -9461,6 +9546,13 @@ renaming or rearranging anything in the cmux sidebar.
 
 Groups, workspaces and tabs are saved in the order the sidebar shows them, and
 list, edit, the pickers and restore all use that order.
+
+That order is only yours if cmux leaves it alone. cmux moves a workspace that
+gets a notification to the top of its window, group and all, unless
+app.reorderOnNotification in ~/.config/cmux/cmux.json is off. So sync,
+restore and the autosave watcher turn it off when it is not set, keeping a
+copy of the old file next to it and reloading cmux. A value you set yourself
+is left alone; one that reorders gets a warning.
 
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.

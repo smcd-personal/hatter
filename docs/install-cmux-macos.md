@@ -23,6 +23,10 @@ Download it from [cmux.com](https://cmux.com) and drag it to `/Applications`.
 
 Open it once so it can finish setting itself up.
 
+hatter turns off cmux's reordering on notifications the first time it syncs or
+restores, so the order you give your groups stays put; `hatter help sync` says
+why.
+
 ## 2. Put the cmux CLI on your PATH
 
 cmux puts its CLI on the PATH of terminals **it** launches. hatter also runs
