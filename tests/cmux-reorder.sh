@@ -94,7 +94,7 @@ expect "  and its target is the file changed" "$([[ "$(jq -c '.app.reorderOnNoti
 fresh '{"app":{}}'
 chmod 600 "$CMUX_SETTINGS_FILE"
 res=$(cmux_order_check)
-mode=$(stat -f '%Lp' "$CMUX_SETTINGS_FILE" 2>/dev/null || stat -c '%a' "$CMUX_SETTINGS_FILE")
+mode=$(stat -c '%a' "$CMUX_SETTINGS_FILE" 2>/dev/null || stat -f '%Lp' "$CMUX_SETTINGS_FILE")
 expect "the file keeps its mode" "$([[ "$res" == set\ * && "$mode" == 600 ]] && echo y || echo n)"
 
 fresh ""
