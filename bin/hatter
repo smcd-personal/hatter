@@ -1030,19 +1030,24 @@ cmux_order_check() {
     case "$val" in
         '"off"'|false) echo ok; return 0 ;;
         '"absent"') ;;
+        # An empty file parses to nothing at all.
+        "") echo unreadable; return 0 ;;
         *) echo "on $val"; return 0 ;;
     esac
     bak="$f.$(date +%Y%m%d-%H%M%S).hatter.bak"
-    tmp="$f.hatter.$$"
     cp -p "$f" "$bak" 2>/dev/null || { echo failed; return 0; }
+    tmp=$(mktemp "${TMPDIR:-/tmp}/hatter-cmux-json.XXXXXX") || { echo failed; return 0; }
+    # Written back through the existing file rather than renamed over it, so a
+    # cmux.json that is a symlink (into a dotfiles repo, say) stays one and the
+    # file keeps its mode. A write that fails part way puts the backup back.
     if jq '.app = ((if (.app | type) == "object" then .app else {} end)
-                   + {reorderOnNotification: "off"})' "$f" > "$tmp" 2>/dev/null \
-        && mv "$tmp" "$f"; then
+                   + {reorderOnNotification: "off"})' "$f" > "$tmp" 2>/dev/null         && [[ -s "$tmp" ]] && cat "$tmp" > "$f" 2>/dev/null; then
         echo "set $bak"
     else
-        rm -f "$tmp"
+        cat "$bak" > "$f" 2>/dev/null || true
         echo failed
     fi
+    rm -f "$tmp"
 }
 
 # Runs the check once per process and reports through <say>, a function taking
@@ -1099,7 +1104,7 @@ cmux_change() {
         # new verb is covered until someone shows it does not.
         "workspace-group set-color"|"workspace-group set-icon"|"workspace-group pin"|\
         "workspace-group collapse"|"workspace-group rename"|"workspace-group add"|\
-        "rename-workspace "*|"reorder-workspace "*) ;;
+        "rename-workspace "*|"reorder-workspace "*|"reload-config ") ;;
         *) focus_save ;;
     esac
     cmux "$@"

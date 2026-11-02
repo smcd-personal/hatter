@@ -81,6 +81,27 @@ before=$(cat "$CMUX_SETTINGS_FILE")
 res=$(cmux_order_check)
 expect "a file that is not JSON is left alone" "$([[ "$res" == unreadable && "$(cat "$CMUX_SETTINGS_FILE")" == "$before" ]] && echo y || echo n)"
 
+# A cmux.json kept as a symlink (into a dotfiles repo) stays one, and the file
+# it points at gets the change.
+fresh ""
+real="$(dirname "$CMUX_SETTINGS_FILE")/dotfiles-cmux.json"
+printf '{"sidebar":{}}\n' > "$real"
+ln -s "$real" "$CMUX_SETTINGS_FILE"
+res=$(cmux_order_check)
+expect "a symlinked cmux.json stays a symlink" "$([[ "$res" == set\ * && -L "$CMUX_SETTINGS_FILE" ]] && echo y || echo n)"
+expect "  and its target is the file changed" "$([[ "$(jq -c '.app.reorderOnNotification' "$real")" == '"off"' ]] && echo y || echo n)"
+
+fresh '{"app":{}}'
+chmod 600 "$CMUX_SETTINGS_FILE"
+res=$(cmux_order_check)
+mode=$(stat -f '%Lp' "$CMUX_SETTINGS_FILE" 2>/dev/null || stat -c '%a' "$CMUX_SETTINGS_FILE")
+expect "the file keeps its mode" "$([[ "$res" == set\ * && "$mode" == 600 ]] && echo y || echo n)"
+
+fresh ""
+: > "$CMUX_SETTINGS_FILE"
+res=$(cmux_order_check)
+expect "an empty file is unreadable, and left alone" "$([[ "$res" == unreadable && ! -s "$CMUX_SETTINGS_FILE" && "$(baks)" == 0 ]] && echo y || echo n)"
+
 # --- the guard -------------------------------------------------------------
 PATH="$work/bin:$base_path"
 fresh '{"app":{}}'
@@ -98,6 +119,16 @@ expect "the guard is silent and does not reload when it is off" "$([[ -z "$said"
 fresh '{"app":{"reorderOnNotification":true}}'
 cmux_order_guard say
 expect "the guard warns about a value the user set, without reloading" "$([[ "$said" == *"is true"* && "$(reloaded)" == n && "$(setting)" == true ]] && echo y || echo n)"
+
+# reload-config leaves focus where it is, so it must not save focus for a later
+# restore: the watcher would pull the user back to where they were at start.
+rm -f "$work/cmux.calls" "$work/focus"
+HATTER_FOCUS_FILE="$work/focus" cmux_change reload-config
+expect "reloading saves no focus" "$([[ "$(cat "$work/cmux.calls")" == reload-config && ! -e "$work/focus" ]] && echo y || echo n)"
+# and a verb not on the list does, so the check above can tell them apart
+rm -f "$work/cmux.calls" "$work/focus"
+HATTER_FOCUS_FILE="$work/focus" cmux_change new-workspace
+expect "  while a verb that may move focus saves it" "$([[ -e "$work/focus" ]] && echo y || echo n)"
 
 # A client with no cmux CLI (WezTerm, Linux) has no such setting to change.
 fresh '{"app":{}}'
