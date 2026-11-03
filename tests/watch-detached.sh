@@ -92,6 +92,13 @@ close() {
     teardown "$1" 2026-01-01T00:00:02.500Z
 }
 lost() { teardown "$1"; }
+# keyed / unkeyed <window>: a cmux window gaining or losing the keyboard.
+keyed() {
+    printf '{"type":"event","category":"window","name":"window.keyed","window_id":"%s","payload":{"window_id":"%s","is_key_window":true}}\n' "$1" "$1"
+}
+unkeyed() {
+    printf '{"type":"event","category":"window","name":"window.unkeyed","window_id":"%s","payload":{"window_id":"%s","is_key_window":false}}\n' "$1" "$1"
+}
 # A cmux showing the given titles in one window.
 tree_of() {
     jq -nc --args '{windows: [{id: "W1", workspaces: [$ARGS.positional[] | {id: ("WS-" + .), title: .}]}]}' "$@"
@@ -265,6 +272,51 @@ $(teardown dev-web)
 $(lost dev-api)
 SLEEP 2")
 expect "a workspace selected when the stream opened, then closed, is a person's close" \
+    "$(logged "$out" dev-web dev-web && grep -qx 'reattach dev-api into Work' <<<"$out" \
+       && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
+
+# The selected workspace torn down while no window has the keyboard (#152):
+# cmux selects the next one first, as for a person's close, but nobody is at
+# the window. Then the window gets the keyboard back and a person closes one.
+d="$work/unkeyed"
+out=$(watch unkeyed <<<"$ack
+$(keyed W1)
+$(unkeyed W1)
+SLEEP 2
+$(close dev-api)
+$(keyed W1)
+$(close dev-web)
+SLEEP 2")
+expect "the selected workspace, closed while no window has the keyboard, is reattached" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
+expect "  and once a window has it again, a person's close is reported" \
+    "$(logged "$out" dev-web dev-web && [[ "$(said "$out")" == 1 ]] && echo y)" "$out"
+
+# The same from list-windows when the stream opens: the window that holds the
+# selected workspace is not key.
+mkdir -p "$work/seeded-unkeyed"
+echo '[{"id":"W1","key":false,"selected_workspace_id":"WS-dev-web"}]' > "$work/seeded-unkeyed/windows"
+d="$work/seeded-unkeyed"
+out=$(watch seeded-unkeyed <<<"$ack
+SLEEP 2
+$(teardown dev-web)
+$(keyed W1)
+$(close dev-api)
+SLEEP 2")
+expect "a workspace selected in a window that was not key when the stream opened is reattached" \
+    "$(grep -qx 'reattach dev-web into Work' <<<"$out" && logged "$out" dev-api dev-api \
+       && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
+
+# Seeded key: the selected workspace's close is still a person's.
+mkdir -p "$work/seeded-keyed"
+echo '[{"id":"W1","key":true,"selected_workspace_id":"WS-dev-web"}]' > "$work/seeded-keyed/windows"
+d="$work/seeded-keyed"
+out=$(watch seeded-keyed <<<"$ack
+SLEEP 2
+$(teardown dev-web)
+$(lost dev-api)
+SLEEP 2")
+expect "a workspace selected in the key window when the stream opened, then closed, is a person's close" \
     "$(logged "$out" dev-web dev-web && grep -qx 'reattach dev-api into Work' <<<"$out" \
        && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
 

@@ -8008,12 +8008,23 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 # the stream opened). A close by a script, or from the sidebar of a workspace
 # not selected, reads as "lost" too: watch_closed brings such a workspace back
 # only once in a while, so closing it again keeps it closed.
+#
+# Selection alone is not enough (#152): when cmux tears down the selected
+# workspace, it selects the next one first, just as for a person's close. A
+# person can only close a workspace in a window that has the keyboard, so
+# while no cmux window is key every close is "lost". The jq keeps each
+# window's key state from window.keyed and window.unkeyed, starting from
+# $keys (each window's when the stream opened). With nothing known, as when
+# list-windows could not be read, it falls back to selection alone.
 WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try fromdateiso8601 catch null));
   (foreach (inputs | fromjson? | objects) as $e
-    ({sel: ([$seed[] | {(.): true}] | add // {}), at: {}, out: null};
+    ({sel: ([$seed[] | {(.): true}] | add // {}), key: $keys, at: {}, out: null};
      .out = null
      | if $e.type == "ack" then .out = "full"
        elif $e.type != "event" then .
+       elif $e.name == "window.keyed" or $e.name == "window.unkeyed" then
+         ($e.window_id // $e.payload.window_id? // null) as $win
+         | if $win != null then .key[$win] = ($e.name == "window.keyed") else . end
        elif $e.name == "workspace.selected" then
          ($e.payload.workspace_id? // $e.workspace_id // null) as $w
          | ($e.payload.previous_workspace_id? // null) as $p
@@ -8025,7 +8036,8 @@ WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try f
        elif $e.name == "workspace.closed" then
          ($e.workspace_id // $e.payload.workspace_id? // "") as $w
          | ($e | at) as $t
-         | (if .sel[$w] == true or (.at[$w] != null and $t != null and ($t - .at[$w]) <= 3)
+         | ((.key | length) == 0 or any(.key[]; . == true)) as $keyed
+         | (if $keyed and (.sel[$w] == true or (.at[$w] != null and $t != null and ($t - .at[$w]) <= 3))
             then "user" else "lost" end) as $k
          | .sel[$w] = false
          | .out = "closed\t\(($e.payload | objects | .title) // "" | tostring | gsub("[\t\n\r]"; " "))\t\($k)"
@@ -8043,6 +8055,17 @@ watch_seed() {
         | jq -c '[.[]? | .selected_workspace_id // empty]' 2>/dev/null) || seed=""
     [[ "$seed" == "["* ]] || seed='[]'
     printf '%s' "$seed"
+}
+
+# Each window's key state, as a JSON object of window id to true or false,
+# for WATCH_JQ's $keys. A window that does not say is left out; unreadable is
+# {}, which WATCH_JQ reads as nothing known.
+watch_keys() {
+    local keys
+    keys=$(cmux_json list-windows 2>/dev/null \
+        | jq -c '[.[]? | select(.id != null and (.key | type) == "boolean") | {(.id): .key}] | add // {}' 2>/dev/null) || keys=""
+    [[ "$keys" == "{"* ]] || keys='{}'
+    printf '%s' "$keys"
 }
 
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') watch: $*"; }
@@ -8291,7 +8314,7 @@ watch_stream() {
     mkfifo "$fifo" || { watch_cleanup; return 0; }
     cmux events --category workspace --category surface \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
-        | jq -nR --unbuffered -r --argjson seed "$(watch_seed)" "$WATCH_JQ" > "$fifo" &
+        | jq -nR --unbuffered -r --argjson seed "$(watch_seed)" --argjson keys "$(watch_keys)" "$WATCH_JQ" > "$fifo" &
     exec 3<"$fifo"
     while :; do
         if IFS= read -r -t "$WATCH_QUIET" line <&3; then
@@ -10050,8 +10073,10 @@ When cmux closes the workspace of a recorded session and the tmux session
 still runs on its server, the watcher looks at who closed it. cmux closes a
 mirror by itself when the ssh connection under it drops, as can happen after
 the Mac sleeps. A workspace nobody was on, closed that way, is reattached
-into its group, as `hatter new <session>` would, and the log says so. A
-workspace someone closed (the one selected in its window) is left closed:
+into its group, as `hatter new <session>` would, and the log says so. So is
+any workspace closed while no cmux window has the keyboard, as when the Mac
+is asleep, even the one selected in its window. A workspace someone closed
+(the one selected in a window that has the keyboard) is left closed:
 the watcher logs "'<session>' closed in cmux while its tmux session still
 runs" and posts a macOS notification naming `hatter new <session>`, which
 brings it back. A close from a script, or from the sidebar of a workspace
