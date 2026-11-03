@@ -8012,19 +8012,26 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 # Selection alone is not enough (#152): when cmux tears down the selected
 # workspace, it selects the next one first, just as for a person's close. A
 # person can only close a workspace in a window that has the keyboard, so
-# while no cmux window is key every close is "lost". The jq keeps each
-# window's key state from window.keyed and window.unkeyed, starting from
-# $keys (each window's when the stream opened). With nothing known, as when
-# list-windows could not be read, it falls back to selection alone.
+# while no cmux window is key every close is "lost". Only one window is key
+# at a time, so the jq keeps just which one, from window.keyed and
+# window.unkeyed (category "window", which the stream must ask for), starting
+# from $keys (each window's state when the stream opened). Keeping one id
+# rather than a flag per window means a key window that closes without an
+# unkeyed event is replaced by the next keyed one, not left key forever.
+# With nothing known, as when list-windows could not be read, it falls back
+# to selection alone until the first window event.
 WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try fromdateiso8601 catch null));
   (foreach (inputs | fromjson? | objects) as $e
-    ({sel: ([$seed[] | {(.): true}] | add // {}), key: $keys, at: {}, out: null};
+    ({sel: ([$seed[] | {(.): true}] | add // {}), kw: ([$keys | to_entries[] | select(.value == true) | .key][0] // null),
+     known: (($keys | length) > 0), at: {}, out: null};
      .out = null
      | if $e.type == "ack" then .out = "full"
        elif $e.type != "event" then .
        elif $e.name == "window.keyed" or $e.name == "window.unkeyed" then
          ($e.window_id // $e.payload.window_id? // null) as $win
-         | if $win != null then .key[$win] = ($e.name == "window.keyed") else . end
+         | if $win == null then .
+           elif $e.name == "window.keyed" then .kw = $win | .known = true
+           else (if .kw == $win then .kw = null else . end) | .known = true end
        elif $e.name == "workspace.selected" then
          ($e.payload.workspace_id? // $e.workspace_id // null) as $w
          | ($e.payload.previous_workspace_id? // null) as $p
@@ -8036,7 +8043,7 @@ WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try f
        elif $e.name == "workspace.closed" then
          ($e.workspace_id // $e.payload.workspace_id? // "") as $w
          | ($e | at) as $t
-         | ((.key | length) == 0 or any(.key[]; . == true)) as $keyed
+         | ((.known | not) or .kw != null) as $keyed
          | (if $keyed and (.sel[$w] == true or (.at[$w] != null and $t != null and ($t - .at[$w]) <= 3))
             then "user" else "lost" end) as $k
          | .sel[$w] = false
@@ -8312,7 +8319,7 @@ watch_stream() {
     WATCH_DIR=$dir
     fifo="$dir/events"
     mkfifo "$fifo" || { watch_cleanup; return 0; }
-    cmux events --category workspace --category surface \
+    cmux events --category workspace --category surface --category window \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
         | jq -nR --unbuffered -r --argjson seed "$(watch_seed)" --argjson keys "$(watch_keys)" "$WATCH_JQ" > "$fifo" &
     exec 3<"$fifo"

@@ -33,7 +33,14 @@ case "$1" in
     [[ -f "$STUB_DIR/tree" ]] || { echo "Error: boom" >&2; exit 1; }
     cat "$STUB_DIR/tree" ;;
   events)
+    # Like cmux, pass on only the categories asked for with --category, so a
+    # watcher that forgets one never sees its events.
+    cats=" "; while [[ $# -gt 0 ]]; do [[ "$1" == --category ]] && { cats+="$2 "; shift; }; shift; done
     while IFS= read -r l; do
+      if [[ "$l" == *'"category":"'* ]]; then
+        c=${l#*\"category\":\"}; c=${c%%\"*}
+        [[ "$cats" == *" $c "* ]] || continue
+      fi
       case "$l" in
         "SLEEP "*)  sleep "${l#SLEEP }" ;;
         LOCK)       mkdir "$STUB_DIR/config/hatter/.lock" ;;
@@ -291,6 +298,23 @@ expect "the selected workspace, closed while no window has the keyboard, is reat
     "$(grep -qx 'reattach dev-api into Work' <<<"$out" && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
 expect "  and once a window has it again, a person's close is reported" \
     "$(logged "$out" dev-web dev-web && [[ "$(said "$out")" == 1 ]] && echo y)" "$out"
+
+# The key window closes without an unkeyed event; another takes the keyboard
+# and then loses it. No window is key now, so the selected workspace's
+# teardown is cmux's own.
+d="$work/key-moved"
+out=$(watch key-moved <<<"$ack
+$(keyed W1)
+$(keyed W2)
+$(unkeyed W2)
+SLEEP 2
+$(close dev-api)
+$(keyed W2)
+$(close dev-web)
+SLEEP 2")
+expect "a key window replaced by another, which then loses the keyboard, leaves none key" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && logged "$out" dev-web dev-web \
+       && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
 
 # The same from list-windows when the stream opens: the window that holds the
 # selected workspace is not key.
