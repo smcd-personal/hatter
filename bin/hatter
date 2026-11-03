@@ -3104,6 +3104,12 @@ record() {
 
 set_record() { "$REG" snooze "$1" "$2" >/dev/null 2>&1; }
 
+# What to call a tab in a message: its name, or, for a tab with none, the
+# index it has in its workspace (what `hatter unsnooze` takes).
+label() {  # label <name> <index>
+    if [ -n "$1" ]; then printf '%s' "$1"; else printf 'tab %s' "$2"; fi
+}
+
 mark() {  # mark <window id> <until>
     tmux set-option -w -t "$1" @hatter-snooze-until "$2" 2>/dev/null
     # Hidden, it belongs to no client's view, and tmux would shrink it to the
@@ -3152,7 +3158,7 @@ flag() {  # flag <window id> <name>
 }
 
 do_snooze() {
-    local target="" spec until line wid s idx name srv rec after an n
+    local target="" spec until line wid s idx name srv rec after an n lb
     while [ $# -gt 0 ]; do
         case "$1" in
             -t) [ $# -ge 2 ] || die "-t needs a tab"; target="$2"; shift 2 ;;
@@ -3174,20 +3180,22 @@ do_snooze() {
     IFS="$US" read -r wid s idx name srv <<EOF
 $line
 EOF
+    lb=$(label "$name" "$idx")
     lock || die "another snooze change is running; try again in a moment"
 
     if [ "$s" = "$BOX" ]; then
         rec=$(record "$wid" "$srv")
-        [ -n "$rec" ] || die "'$name' is in $BOX with no record of where it came from"
+        [ -n "$rec" ] || die "'$lb' is in $BOX with no record of where it came from"
+        lb=$(label "$name" "$(printf '%s' "$rec" | jq -r '.index // "?"')")
         set_record "$wid" "$(printf '%s' "$rec" | jq -c --argjson u "$until" '.until = $u')" \
             || die "could not record the new time"
         mark "$wid" "$until"
-        printf "hat-snooze: '%s' was already snoozed; it now wakes %s\n" "$name" "$(stamp "$until")"
+        printf "hat-snooze: '%s' was already snoozed; it now wakes %s\n" "$lb" "$(stamp "$until")"
         return 0
     fi
 
     n=$(tmux list-windows -t "=$s" -F x 2>/dev/null | wc -l | tr -d ' ')
-    [ "${n:-0}" -gt 1 ] || die "'$name' is the only tab in $s; hiding it would close the workspace"
+    [ "${n:-0}" -gt 1 ] || die "'$lb' is the only tab in $s; hiding it would close the workspace"
     line=$(tmux list-windows -t "=$s" -F "#{window_index}$HT#{window_id}$HT#{window_name}" 2>/dev/null \
             | awk -F '\t' -v i="$idx" '$1 + 0 < i + 0 { a = $2 "\037" $3 } END { print a }')
     after=${line%%"$US"*} an=${line#*"$US"}
@@ -3196,14 +3204,14 @@ EOF
               --arg an "$an" --arg n "$name" --argjson t "$(now)" \
               '{until: $u, from: $s, index: $i, after: $a, after_name: $an, name: $n,
                 mode: "remind", since: $t}')
-    set_record "$wid" "$rec" || die "could not record the snooze; '$name' stays where it is"
+    set_record "$wid" "$rec" || die "could not record the snooze; '$lb' stays where it is"
     mark "$wid" "$until"
     if ! move_into "$wid" "$BOX"; then
         unmark "$wid"; set_record "$wid" null
-        die "could not move '$name' out of sight; it stays where it is"
+        die "could not move '$lb' out of sight; it stays where it is"
     fi
     "$REG" refresh >/dev/null 2>&1
-    printf "hat-snooze: '%s' snoozed from %s until %s\n" "$name" "$s" "$(stamp "$until")"
+    printf "hat-snooze: '%s' snoozed from %s until %s\n" "$lb" "$s" "$(stamp "$until")"
 }
 
 # wake <window id> <server>: put it back. Assumes the lock.
@@ -3220,12 +3228,13 @@ EOF
         unmark "$wid"; [ -z "$rec" ] || set_record "$wid" null
         return 0
     fi
-    [ -n "$rec" ] || { printf "hat-snooze: '%s' has no record of where it came from; move it with tmux\n" "$name" >&2; return 1; }
+    [ -n "$rec" ] || { printf "hat-snooze: '%s' has no record of where it came from; move it with tmux\n" "${name:-$wid}" >&2; return 1; }
     IFS="$US" read -r from i after an <<EOF
 $(printf '%s' "$rec" | jq -r '[.from, (.index | tostring), .after, .after_name] | map(. // "" | tostring) | join("\u001f")')
 EOF
     [ -n "$from" ] || return 1
     case "$i" in ''|*[!0-9]*) i="" ;; esac
+    name=$(label "$name" "${i:-?}")
 
     if tmux has-session -t "=$from" 2>/dev/null; then
         # The neighbour by id, if it is still there under the same name; a
@@ -3287,8 +3296,8 @@ do_list() {
     if [ "${1:-}" != --text ]; then rows; return 0; fi
     rows | while IFS="$US" read -r wid name from idx until mode; do
         case "$until" in
-            ''|*[!0-9]*) printf '%s  %s  (no record of where it came from)\n' "$wid" "$name" ;;
-            *) printf '%s:%s  wakes %s\n' "$from" "$name" "$(stamp "$until")" ;;
+            ''|*[!0-9]*) printf '%s  %s  (no record of where it came from)\n' "$wid" "${name:-(no name)}" ;;
+            *) printf '%s:%s  wakes %s\n' "$from" "${name:-$idx}" "$(stamp "$until")" ;;
         esac
     done
     [ -n "$(rows)" ] || echo "Nothing is snoozed on this server."
@@ -3325,7 +3334,7 @@ do_unsnooze() {
     n=$(printf '%s' "$hits" | grep -c . || true)
     [ "$n" -gt 0 ] || die "no snoozed tab matches '$which' (see: hat-snooze list)"
     [ "$n" -eq 1 ] || die "'$which' matches $n snoozed tabs; give the window id:
-$(printf '%s\n' "$hits" | awk -F '\037' '{ print "  " $1 "  " $3 ":" $2 }')"
+$(printf '%s\n' "$hits" | awk -F '\037' '{ print "  " $1 "  " $3 ":" ($2 != "" ? $2 : $4) }')"
     wid=${hits%%"$US"*}
     wake "$wid" "" || die "could not bring '$which' back"
 }
@@ -4639,7 +4648,7 @@ cmd_snooze() {
     [[ "$until" =~ ^[0-9]+$ ]] || die "$TAB_HAT answered with something other than a time: '$until'"
     snooze_sh "$TAB_HOST" snooze -t "$(sq "$TAB_WID")" "$(sq "@$until")" >/dev/null || rc=$?
     snooze_rc "$rc" "$TAB_HAT"
-    info "Snoozed '$TAB_NAME' in '$TAB_SESSION' until $(local_stamp "$until") ($(in_words $((until - $(date +%s)))))"
+    info "Snoozed '${TAB_NAME:-tab $TAB_IDX}' in '$TAB_SESSION' until $(local_stamp "$until") ($(in_words $((until - $(date +%s)))))"
 }
 
 # hatter unsnooze <session> <tab> [--hat <hat>]   - the session it came from
@@ -4702,10 +4711,10 @@ cmd_snoozed() {
             [[ -n "$wid" ]] || continue
             found=$((found + 1))
             if [[ "$until" =~ ^[0-9]+$ ]]; then
-                printf '  %-10s %-34s wakes %s (%s)\n' "${asked[$i]}" "${from:-?}:$name" \
+                printf '  %-10s %-34s wakes %s (%s)\n' "${asked[$i]}" "${from:-?}:${name:-$idx}" \
                     "$(local_stamp "$until")" "$(in_words $((until - t)))"
             else
-                printf '  %-10s %-34s %s\n' "${asked[$i]}" "?:$name ($wid)" "no record of where it came from"
+                printf '  %-10s %-34s %s\n' "${asked[$i]}" "?:${name:-(no name)} ($wid)" "no record of where it came from"
             fi
         done < "$tmp/$i"
     done

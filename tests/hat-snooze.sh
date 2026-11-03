@@ -240,6 +240,24 @@ T move-window -d -s "$(wid v v1)" -t '=v:9'          # v0 v3 v1, index 2 free
 "$SN" unsnooze v:v2 >/dev/null
 [[ "$(names v)" == "v0 v3 v1 v2" ]] || fail "v2 should follow v1, found by name: '$(names v)'"
 
+# --- a tab with no name is called by its index ---------------------------------
+T new-session -d -s w -n w0 -x 120 -y 40
+T new-window -d -t '=w:1' -n w1
+N=$(wid w w1)
+T set-option -w -t "$N" automatic-rename off
+T rename-window -t "$N" ''
+[[ -z "$(T display-message -p -t "$N" '#{window_name}')" ]] || fail "could not clear w1's name"
+out=$("$SN" snooze -t "$N" 1h) || fail "snoozing an unnamed tab failed"
+[[ "$out" == "hat-snooze: 'tab 1' snoozed from w until "* ]] || fail "unnamed snooze: $out"
+[[ "$(entry "$N" | jq -r '.snooze.name')" == "" ]] || fail "the record should keep the real (empty) name"
+[[ "$("$SN" list --text)" == *"w:1  wakes "* ]] || fail "list --text for an unnamed tab: $("$SN" list --text)"
+out=$("$SN" snooze -t "$N" 2h) || fail "re-snoozing an unnamed tab failed"
+[[ "$out" == "hat-snooze: 'tab 1' was already snoozed;"* ]] || fail "unnamed re-snooze: $out"
+out=$("$SN" unsnooze w:1) || fail "unsnooze of an unnamed tab by index failed"
+[[ "$out" == *"'tab 1' is back in w"* ]] || fail "unnamed wake: $out"
+[[ "$(T display-message -p -t "$N" '#{session_name}:#{window_index}')" == w:1 ]] || fail "unnamed tab not back at w:1"
+T kill-session -t '=w'
+
 # --- a reboot: the window records itself before its entry is adopted ---------
 V0=$(wid v v0)
 "$work/hat-registry" put "$(T display-message -p -t "$V0" '#{pane_id}')" shell "" live /tmp
