@@ -5,6 +5,8 @@
 #     clears @hatter-waiting and writes an OSC 9 notification into the pane
 #     (caught with pipe-pane), or stays quiet - for idle_prompt, any tool but
 #     AskUserQuestion, a snoozed tab, and an agent run by another agent.
+#   - the hatter skill (#137): written for Claude Code and Codex where each is,
+#     rewritten each run, and someone's own SKILL.md left alone
 #   - the settings wiring: provision adds hat-attn to Claude's settings.json and
 #     Codex's hooks.json next to what is there, once, however often it runs.
 #
@@ -128,6 +130,7 @@ grep -q 'hat-attn wired into \$codex_hooks' "$work/wire.sh" || fail "could not e
 
 h="$work/home"; mkdir -p "$h/cfg" "$h/.codex" "$work/bin"
 printf '#!/bin/sh\nexit 0\n' > "$work/bin/codex"; chmod +x "$work/bin/codex"
+printf '#!/bin/sh\nexit 0\n' > "$work/bin/claude"; chmod +x "$work/bin/claude"
 # A settings file with a hook of its own, under a CLAUDE_CONFIG_DIR.
 printf '%s\n' '{"model":"x","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/usr/bin/true"}]}]}}' > "$h/cfg/settings.json"
 # A login shell that is only a shell: a real one would find whatever codex this
@@ -155,6 +158,26 @@ jq -e --arg a "$a" '[.hooks.PreToolUse[] | select(.hooks[].command == $a)] == [{
 [[ "$(jq --arg c "$h/.local/bin/hat-record" '[.hooks.SessionStart[].hooks[] | select(.command == $c)] | length' "$s")" == 1 ]] \
     || fail "hat-record is not in SessionStart exactly once"
 
+# The hatter skill (#137): in Claude Code's config dir and Codex's user
+# skills folder, one file, the same in both, and marked as hatter's.
+ks="$h/cfg/skills/hatter/SKILL.md"; xs="$h/.agents/skills/hatter/SKILL.md"
+[[ -f "$ks" ]] || fail "no hatter skill under CLAUDE_CONFIG_DIR"
+[[ -f "$xs" ]] || fail "no hatter skill in ~/.agents/skills for Codex"
+cmp -s "$ks" "$xs" || fail "the Claude and Codex skills differ"
+[[ "$(sed -n 2p "$ks")" == "name: hatter" ]] || fail "SKILL.md frontmatter: $(head -3 "$ks")"
+grep -q '^description: ' "$ks" || fail "SKILL.md has no description"
+grep -q 'hatter-managed' "$ks"  || fail "SKILL.md is not marked as hatter's"
+grep -q "hat-snooze snooze '<when>'" "$ks" || fail "the skill does not run hat-snooze"
+[[ ! -e "$h/.claude/skills" ]] || fail "skill written to ~/.claude despite CLAUDE_CONFIG_DIR"
+# Someone's own hatter skill is left alone; hatter's own is rewritten.
+printf 'mine\n' > "$xs"
+echo stale >> "$ks"
+wire
+[[ "$(cat "$xs")" == mine ]] || fail "provision overwrote a SKILL.md that is not hatter's"
+grep -q 'not hatter' "$work/wire.err" || fail "no warning about the skill left alone"
+grep -q '^stale$' "$ks" && fail "provision did not rewrite its own skill"
+rm -rf "$h/.agents"
+
 c="$h/.codex/hooks.json"
 [[ -f "$c" ]] || fail "no Codex hooks.json written"
 for ev in PermissionRequest Stop UserPromptSubmit; do
@@ -168,9 +191,16 @@ wire
 [[ "$(jq -r .description "$c")" == mine ]] || fail "Codex hooks.json lost its own keys"
 [[ "$(jq '[.hooks.Stop[].hooks[].command] | length' "$c")" == 2 ]] || fail "Codex Stop: $(jq -c .hooks.Stop "$c")"
 
-# No codex on the login PATH: no hooks.json is made.
-rm -rf "$h/.codex" "$work/bin/codex"
+# No codex on the login PATH: no hooks.json and no skill for it. No claude
+# on it either, but a Claude config dir: claude is somewhere the login PATH
+# does not show (nvm, say), and gets the skill. Neither: no skill.
+rm -rf "$h/.codex" "$h/.agents" "$h/cfg/skills" "$work/bin/codex" "$work/bin/claude"
 wire
 [[ ! -e "$h/.codex/hooks.json" ]] || fail "wrote Codex hooks where there is no codex"
+[[ ! -e "$h/.agents/skills/hatter" ]] || fail "wrote a Codex skill where there is no codex"
+[[ -f "$h/cfg/skills/hatter/SKILL.md" ]] || fail "no Claude skill though Claude has a config dir"
+rm -rf "$h/cfg"
+wire
+[[ ! -e "$h/cfg/skills/hatter" ]] || fail "wrote a Claude skill where there is no claude and no config dir"
 
 echo "ok: hat-attn"

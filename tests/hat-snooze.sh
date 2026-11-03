@@ -3,6 +3,8 @@
 # writes them, against a real tmux on a private socket:
 #
 #   - reading a time: durations, @epoch, and what is refused
+#   - absolute times on the human's clock, daylight-saving edges, refusing to
+#     guess with no timezone, and setting one (#137)
 #   - snooze: the window goes to the hidden session, its record goes to the
 #     registry, the only tab of a session is refused, a second snooze resets
 #     the time, and an agent recording itself again keeps the record
@@ -67,6 +69,71 @@ for bad in "" x 0m 4 4x 401d 1h-2m @ @12a; do
     if "$SN" when "$bad" >/dev/null 2>&1; then fail "'$bad' was read as a time"; fi
 done
 
+# --- absolute times, on the human's clock (#137) ------------------------------
+# A fixed now: Monday 2026-11-02 08:00 in Los Angeles.
+LA=America/Los_Angeles
+epoch() { python3 -c 'import sys, datetime as d, zoneinfo
+print(int(d.datetime(*map(int, sys.argv[2:]), tzinfo=zoneinfo.ZoneInfo(sys.argv[1])).timestamp()))' "$@"; }
+MON8=$(epoch $LA 2026 11 2 8 0)
+at() { HAT_NOW="$MON8" HAT_TZ="${Z:-$LA}" "$SN" when "$1"; }
+wall() { TZ=$LA date -r "$1" '+%a %F %H:%M' 2>/dev/null || TZ=$LA date -d "@$1" '+%a %F %H:%M'; }
+while IFS='|' read -r w want; do
+    got=$(at "$w" 2>/dev/null) || fail "'$w' was refused, want $want"
+    [[ "$(wall "$got")" == "$want" ]] || fail "'$w' is $(wall "$got"), want $want"
+done <<'TABLE'
+tomorrow|Tue 2026-11-03 09:00
+tomorrow 2pm|Tue 2026-11-03 14:00
+Fri 9AM|Fri 2026-11-06 09:00
+friday|Fri 2026-11-06 09:00
+mon|Mon 2026-11-02 09:00
+mon 7am|Mon 2026-11-09 07:00
+next mon|Mon 2026-11-09 09:00
+next fri 2pm|Fri 2026-11-06 14:00
+14:00|Mon 2026-11-02 14:00
+7:30am|Tue 2026-11-03 07:30
+9 am|Mon 2026-11-02 09:00
+noon|Mon 2026-11-02 12:00
+midnight|Tue 2026-11-03 00:00
+today 5pm|Mon 2026-11-02 17:00
+2026-11-03|Tue 2026-11-03 09:00
+2026-11-03 14:00|Tue 2026-11-03 14:00
+2026-11-03T14:00|Tue 2026-11-03 14:00
+TABLE
+for bad in "today 7am" "today" 2026-10-01 25:00 "fri 13pm" 2026-02-30 "next" "next 9am" 2027-12-31; do
+    if at "$bad" >/dev/null 2>&1; then fail "'$bad' was read as a time"; fi
+done
+[[ "$(at "today 7am" 2>&1)" == *"in the past"* ]] || fail "a time gone by today is not called past"
+# In another zone the same words are another instant.
+[[ "$(Z=Europe/London at 'tomorrow 9am')" == "$(epoch Europe/London 2026 11 3 9 0)" ]] \
+    || fail "tomorrow 9am is not read in the zone given"
+if Z=Mars/Olympus at tomorrow >/dev/null 2>&1; then fail "an unknown zone was used"; fi
+
+# Daylight saving: 02:30 on 2027-03-14 never happens in Los Angeles, and 01:30
+# on 2026-11-01 happens twice. Each is worked out, and said.
+out=$(HAT_NOW=$(epoch $LA 2027 3 13 12 0) HAT_TZ=$LA "$SN" when "2027-03-14 02:30" 2>"$work/err")
+[[ "$out" == "$(epoch $LA 2027 3 14 3 30)" ]] || fail "02:30 on a spring-forward day is not taken as 03:30: $(wall "$out")"
+grep -q "does not happen" "$work/err" || fail "a skipped time is not said"
+out=$(HAT_NOW=$(epoch $LA 2026 10 31 12 0) HAT_TZ=$LA "$SN" when "tomorrow 1:30am" 2>"$work/err")
+[[ "$out" == "$(epoch $LA 2026 11 1 1 30)" ]] || fail "a repeated time is not the first"
+grep -q "happens twice" "$work/err" || fail "a repeated time is not said"
+
+# With no timezone known, an absolute time is refused, not read on the
+# server's clock; a duration still works.
+if HAT_TZ= "$SN" when "tomorrow" >/dev/null 2>"$work/err"; then fail "read 'tomorrow' with no timezone"; fi
+grep -q 'hatter tz' "$work/err" || fail "the refusal does not say how to set a timezone"
+HAT_TZ= "$SN" when 4h >/dev/null || fail "a duration needs no timezone"
+
+# tz: set, print, and what is refused. The file is what provision writes.
+if "$SN" tz >/dev/null 2>&1; then fail "tz printed something with none set"; fi
+"$SN" tz Europe/London >/dev/null || fail "tz Europe/London was refused"
+[[ "$("$SN" tz)" == Europe/London ]] || fail "tz does not print what was set"
+for bad in Mars/Olympus "../etc/x" "Europe/Lon don"; do
+    if "$SN" tz "$bad" >/dev/null 2>&1; then fail "tz took '$bad'"; fi
+done
+"$SN" tz UTC >/dev/null || fail "tz UTC was refused"
+"$SN" tz $LA >/dev/null
+HAT_TZ= "$SN" when "tomorrow" >/dev/null || fail "the tz file is not read"
+
 # --- snooze -------------------------------------------------------------------
 B=$(wid s b); A=$(wid s a)
 out=$("$SN" snooze -t "$B" 1h) || fail "snooze failed: $out"
@@ -79,6 +146,8 @@ near "$(opt "$B" @hatter-snooze-until)" 3600 || fail "@hatter-snooze-until not s
 [[ "$(opt "$B" window-size)" == manual ]] || fail "a hidden tab should keep its size"
 [[ "$("$SN" list | awk -F '\037' '{ print $1, $2, $3, $4, $6 }')" == "$B b s 1 remind" ]] \
     || fail "list: $("$SN" list | tr '\037' '|')"
+[[ "$out" == *"($LA)"* ]] || fail "the snooze does not name the timezone: $out"
+[[ "$("$SN" list --text)" == "s:b  wakes "*"($LA)" ]] || fail "list --text: $("$SN" list --text)"
 
 # Again: a new time, not a second move.
 "$SN" snooze -t "$B" 2h >/dev/null || fail "re-snooze failed"

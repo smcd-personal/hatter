@@ -1649,12 +1649,14 @@ apply_group_style() {
 
 # ------------------------------------------------------------ provisioning
 
-# provision_host <user@host> [launch conf]: the second argument is the body of
-# the server's launch.tmux.conf (see hat_launch_conf); empty clears it.
+# provision_host <user@host> [launch conf] [timezone]: the second argument is
+# the body of the server's launch.tmux.conf (see hat_launch_conf); empty
+# clears it. The third is the human's timezone (hatter tz); empty leaves the
+# server's as it is.
 provision_host() {
-    local host="$1" launch="${2:-}"
+    local host="$1" launch="${2:-}" tz="${3:-}"
     info "Provisioning tmux persistence on $host"
-    remote_sh_stdin "$host" "bash -s -- $(sq "$launch")" <<'REMOTE_EOF'
+    remote_sh_stdin "$host" "bash -s -- $(sq "$launch") $(sq "$tz")" <<'REMOTE_EOF'
 set -euo pipefail
 
 CONF="$HOME/.tmux.conf"
@@ -1671,6 +1673,16 @@ if [ "${1:-}" != "@@keep" ]; then
     { [ -z "${1:-}" ] || printf '%s\n' "$1"; } > "$LAUNCH_CONF.new"
     mv "$LAUNCH_CONF.new" "$LAUNCH_CONF"
 fi
+
+# The human's timezone, for hat-snooze to read "tomorrow 9am" on their clock.
+HAT_TZ_NAME="${2:-}"
+case "$HAT_TZ_NAME" in
+    "") ;;
+    *[!A-Za-z0-9_+/-]*|/*|*..*) echo "WARNING: not a timezone name, not written: $HAT_TZ_NAME" >&2 ;;
+    *) printf '%s\n' "$HAT_TZ_NAME" > "$(dirname "$LAUNCH_CONF")/tz.new" \
+           && mv "$(dirname "$LAUNCH_CONF")/tz.new" "$(dirname "$LAUNCH_CONF")/tz"
+       echo "timezone: $HAT_TZ_NAME" ;;
+esac
 
 if [ ! -d "$HOME/.tmux/plugins/tpm" ]; then
     echo "installing tpm"
@@ -2855,12 +2867,19 @@ cat > "$HOME/.local/bin/hat-snooze" <<'HATSNOOZE'
 #   hat-snooze snooze [-t <tab>] <when>   hide a tab (default: the one this runs in)
 #   hat-snooze unsnooze <which>           bring one back now
 #   hat-snooze tick                       bring back every tab that is due (the timer)
-#   hat-snooze list                       the snoozed tabs, one a line, \037 between:
+#   hat-snooze list [--text]              the snoozed tabs; --text for people. Else
+#                                         one a line, \037 between:
 #                                         window id, name, origin session,
 #                                         origin index, wake time (epoch), mode
 #   hat-snooze when <when>                the wake time <when> means, in epoch seconds
+#   hat-snooze tz [zone]                  the human's timezone: print it, or set it
 #
-# <when> is a duration (30m, 4h, 2d, 1w, 1h30m) or @<epoch seconds>.
+# <when> is a duration (30m, 4h, 2d, 1w, 1h30m), @<epoch seconds>, or a time
+# in the human's timezone: tomorrow, tomorrow 2pm, fri, fri 9am, 14:00, 9:30pm,
+# noon, 2026-11-03, 2026-11-03 14:00. A day with no time means 09:00; a time
+# with no day means the next time it comes round. The timezone is the one
+# `hatter tz` set on the client and provision copied here ($STATE/tz), or
+# HAT_TZ; with neither, an absolute time is refused rather than guessed.
 # <which> is a window id (@12), <origin session>:<tab name>, or a tab name.
 #
 # A snoozed tab is its tmux window moved into the session hatter-snooze, which
@@ -2891,12 +2910,26 @@ command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 command -v tmux >/dev/null 2>&1 || die "no tmux here"
 command -v jq   >/dev/null 2>&1 || die "no jq here"
 
-now() { date +%s; }
+now() { printf '%s\n' "${HAT_NOW:-$(date +%s)}"; }
+TZFILE="$STATE/tz"
+human_tz() {
+    local z="${HAT_TZ:-}"
+    [ -n "$z" ] || z=$(cat "$TZFILE" 2>/dev/null) || z=""
+    printf '%s' "$z"
+}
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
-stamp() { date -d "@$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -r "$1" '+%a %d %b %H:%M %Z'; }
+# stamp <epoch>: in the human's timezone, named, when it is known.
+stamp() {
+    local z t
+    z=$(human_tz)
+    t=$( { [ -z "$z" ] || export TZ="$z"; }
+         date -d "@$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -r "$1" '+%a %d %b %H:%M %Z')
+    printf '%s%s' "$t" "${z:+ ($z)}"
+}
 
-# when <spec>: the epoch second it names, or fail.
-when() {
+# when_rel <spec>: a duration or @epoch as an epoch second; fails quietly on
+# anything else, and with 2 on a duration past MAX.
+when_rel() {
     local rest n u total=0
     case "$1" in
         @*) n=${1#@}
@@ -2921,8 +2954,120 @@ when() {
             *) return 1 ;;
         esac
     done
-    [ "$total" -gt 0 ] && [ "$total" -le "$MAX" ] || return 1
+    [ "$total" -gt 0 ] || return 1
+    [ "$total" -le "$MAX" ] || return 2
     printf '%s\n' "$(( $(now) + total ))"
+}
+
+# when_abs <spec> <zone>: a day and time on the human's clock. Python, for
+# its timezone database: a day that loses or repeats an hour to daylight
+# saving is worked out, not guessed, and said when it matters.
+when_abs() {
+    command -v python3 >/dev/null 2>&1 || { echo "hat-snooze: no python3 here for an absolute time" >&2; return 1; }
+    python3 - "$1" "$2" "$(now)" "$MAX" <<'PYWHEN'
+import datetime as dt, re, sys
+spec, zone, now_s, max_s = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+def die(msg):
+    sys.stderr.write("hat-snooze: %s\n" % msg); sys.exit(1)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    die("python3 here is too old for timezones (needs 3.9 or later); durations like 4h still work")
+try:
+    tz = ZoneInfo(zone)
+except Exception:
+    import zoneinfo
+    if not zoneinfo.available_timezones():
+        die("this server has no timezone database (install tzdata); durations like 4h still work")
+    die("unknown timezone '%s': set it again with `hatter tz` on your client" % zone)
+HINT = ("cannot read '%s' as a time. Try 30m, 4h, 2d, tomorrow, tomorrow 2pm, "
+        "fri 9am, 14:00 or 2026-11-03 14:00" % spec)
+now = dt.datetime.fromtimestamp(now_s, tz)
+s = " ".join(spec.lower().replace(",", " ").split())
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+def weekday(w):
+    for i, d in enumerate(DAYS):
+        if len(w) >= 3 and d.startswith(w.rstrip(".")):
+            return i
+    return None
+def clock(t):
+    if t == "noon": return (12, 0)
+    if t == "midnight": return (0, 0)
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))? ?(am|pm)", t)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if not 1 <= h <= 12 or mi > 59: return None
+        return (h % 12 + (12 if m.group(3) == "pm" else 0), mi)
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+        if h > 23 or mi > 59: return None
+        return (h, mi)
+    return None
+
+# kind: what the day was given as, which decides what a time gone by means.
+kind, day, rest = "time", None, s
+m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:[ t](.+))?", s)
+if m:
+    try: day = dt.date.fromisoformat(m.group(1))
+    except ValueError: die("there is no date %s" % m.group(1))
+    kind, rest = "date", m.group(2) or ""
+else:
+    words, nxt = s.split(" "), False
+    if words[0] == "next" and len(words) > 1 and weekday(words[1]) is not None:
+        words, nxt = words[1:], True
+    head, tail = words[0], " ".join(words[1:])
+    wd = weekday(head)
+    if head in ("today", "tomorrow"):
+        kind, rest = head, tail
+        day = now.date() + dt.timedelta(days=1 if head == "tomorrow" else 0)
+    elif wd is not None:
+        kind, rest = "weekday", tail
+        # "next mon" said on a Monday is a week away; "mon" may be today.
+        ahead = (wd - now.weekday()) % 7
+        day = now.date() + dt.timedelta(days=7 if nxt and ahead == 0 else ahead)
+    else:
+        day = now.date()
+if kind == "time" and rest == "": die(HINT)
+if kind == "today" and rest == "": die("today needs a time, like today 5pm")
+hm = clock(rest) if rest else (9, 0)
+if hm is None: die(HINT)
+def at(d):
+    wall = dt.datetime(d.year, d.month, d.day, hm[0], hm[1])
+    when = wall.replace(tzinfo=tz)
+    real = when.astimezone(dt.timezone.utc).astimezone(tz)
+    return wall, when, real
+wall, when, real = at(day)
+if when.timestamp() <= now_s:
+    # A weekday or a bare time already gone by means the next one; a day
+    # named outright that has gone by is a mistake to say, not to fix.
+    if kind == "weekday":  wall, when, real = at(day + dt.timedelta(days=7))
+    elif kind == "time":   wall, when, real = at(day + dt.timedelta(days=1))
+    else: die("%s is in the past" % s)
+if real.replace(tzinfo=None) != wall:
+    sys.stderr.write("hat-snooze: %s does not happen on %s in %s (the clocks go forward); "
+                     "taking %s\n" % (wall.strftime("%H:%M"), wall.date(), zone, real.strftime("%H:%M")))
+elif when.replace(fold=1).utcoffset() != when.utcoffset():
+    sys.stderr.write("hat-snooze: %s happens twice on %s in %s (the clocks go back); "
+                     "taking the first\n" % (wall.strftime("%H:%M"), wall.date(), zone))
+t = int(when.timestamp())
+if t - now_s > max_s: die("%s is more than 400 days away" % s)
+print(t)
+PYWHEN
+}
+
+# when <spec>: the epoch second it names, or say why not and fail.
+when() {
+    local t rc=0 z
+    t=$(when_rel "$1") || rc=$?
+    if [ "$rc" = 0 ]; then printf '%s\n' "$t"; return 0; fi
+    if [ "$rc" = 2 ]; then echo "hat-snooze: '$1' is more than 400 days" >&2; return 1; fi
+    z=$(human_tz)
+    if [ -z "$z" ]; then
+        echo "hat-snooze: cannot read '$1' as a duration (30m, 4h, 2d, 1w), and an absolute time needs the human's timezone, which is not set here: run \`hatter tz\` on the client" >&2
+        return 1
+    fi
+    when_abs "$1" "$z"
 }
 
 # One snooze change at a time: the timer and a person can both be at it. A
@@ -3016,9 +3161,10 @@ do_snooze() {
             *) break ;;
         esac
     done
-    spec="${1:-}"
+    # "fri 9am" may come as one word or two.
+    spec="$*"
     [ -n "$spec" ] || die "usage: hat-snooze snooze [-t <tab>] <when>"
-    until=$(when "$spec") || die "cannot read '$spec' as a time: give a duration like 30m, 4h, 2d or 1w (up to 400d)"
+    until=$(when "$spec") || exit 1
     if [ -z "$target" ]; then
         [ -n "${TMUX_PANE:-}" ] || die "not running in tmux: say which tab with -t"
         target="$TMUX_PANE"
@@ -3136,7 +3282,38 @@ rows() {
     done
 }
 
-do_list() { rows; return 0; }
+do_list() {
+    local wid name from idx until mode
+    if [ "${1:-}" != --text ]; then rows; return 0; fi
+    rows | while IFS="$US" read -r wid name from idx until mode; do
+        case "$until" in
+            ''|*[!0-9]*) printf '%s  %s  (no record of where it came from)\n' "$wid" "$name" ;;
+            *) printf '%s:%s  wakes %s\n' "$from" "$name" "$(stamp "$until")" ;;
+        esac
+    done
+    [ -n "$(rows)" ] || echo "Nothing is snoozed on this server."
+    return 0
+}
+
+# tz [zone]: print the human's timezone, or set it (the client does, through
+# `hatter tz` and provision). A zone this server's timezone database does not
+# know is refused.
+do_tz() {
+    local z="${1:-}"
+    if [ -z "$z" ]; then
+        z=$(human_tz)
+        [ -n "$z" ] || die "no timezone set here: run \`hatter tz\` on the client"
+        printf '%s\n' "$z"; return 0
+    fi
+    case "$z" in *[!A-Za-z0-9_+/-]*|/*|*..*) die "not a timezone name: $z" ;; esac
+    python3 -c 'import zoneinfo' 2>/dev/null \
+        || die "python3 here is too old for timezones (needs 3.9 or later)"
+    python3 -c 'import sys, zoneinfo; zoneinfo.ZoneInfo(sys.argv[1])' "$z" 2>/dev/null \
+        || die "this server does not know the timezone '$z' (is tzdata installed?)"
+    mkdir -p "$STATE" && printf '%s\n' "$z" > "$TZFILE.new" && mv "$TZFILE.new" "$TZFILE" \
+        || die "could not write $TZFILE"
+    printf 'hat-snooze: timezone %s\n' "$z"
+}
 
 do_unsnooze() {
     local which="${1:-}" hits n wid
@@ -3185,9 +3362,10 @@ case "${1:-}" in
     snooze)   shift; do_snooze "$@" ;;
     unsnooze) shift; do_unsnooze "$@" ;;
     tick)     do_tick ;;
-    list)     do_list ;;
-    when)     shift; when "${1:-}" || die "cannot read '${1:-}' as a time" ;;
-    *)        echo "usage: hat-snooze snooze|unsnooze|tick|list|when" >&2; exit 2 ;;
+    list)     shift; do_list "$@" ;;
+    tz)       shift; do_tz "$@" ;;
+    when)     shift; when "$*" || exit 1 ;;
+    *)        echo "usage: hat-snooze snooze|unsnooze|tick|list [--text]|when|tz" >&2; exit 2 ;;
 esac
 HATSNOOZE
 chmod +x "$HOME/.local/bin/hat-snooze"
@@ -3594,6 +3772,89 @@ if [ -n "$codex_home" ] && command -v jq >/dev/null 2>&1; then
     rm -f "$codex_hooks.hatter.new"
 fi
 
+# The hatter skill: /hatter in Claude Code, $hatter in Codex. Both read
+# skills/<name>/SKILL.md, so one file serves both. It is thin on purpose: the
+# agent runs hat-snooze on its own tab, which does the reading of times and
+# the moving, the same as `hatter snooze` from a client.
+#   Claude Code: <its config dir>/skills/hatter, where claude is installed
+#   Codex:       ~/.agents/skills/hatter (its user skills folder), where codex is
+# Rewritten on every provision, so a new hatter reaches it. A SKILL.md there
+# without the hatter-managed line is someone's own, and is left alone.
+HATTER_SKILL_SRC="$HOME/.local/state/hatter/hatter-skill.md"
+mkdir -p "$(dirname "$HATTER_SKILL_SRC")"
+cat > "$HATTER_SKILL_SRC" <<'HATSKILL'
+---
+name: hatter
+description: Snooze this tab with hatter, hiding it until a time and then bringing it back where it was. Use when the human types /hatter or $hatter, or asks to snooze this tab or session, hide it until later, or see it again at a time.
+---
+
+<!-- hatter-managed: `hatter provision` writes this file and rewrites it on every run. To keep your own version, delete this line and provision will leave the file alone. -->
+
+# hatter
+
+This session runs in a tab that hatter manages: a tmux window on this server, mirrored to the human's terminal. `~/.local/bin/hat-snooze` acts on the tab it is run in.
+
+In Claude Code this skill is `/hatter`; in Codex it is `$hatter`. Use the form that fits when you mention it.
+
+## snooze <when>
+
+Hide this tab until <when>, then put it back where it was, flagged so the human sees it. This session keeps running while the tab is hidden. Nothing is sent to it when it wakes.
+
+1. Run this, with <when> exactly as the human gave it, in single quotes. If it holds a quote or a character other than letters, digits, spaces and `:` `-` `.`, ask the human for the time again instead.
+
+   ```
+   ~/.local/bin/hat-snooze snooze '<when>'
+   ```
+
+2. Reply with one line: what it printed, which names the wake time and the timezone. Then end your turn. Do not start other work. The tab is out of sight, and anything you do next happens unseen.
+
+<when> can be:
+
+- a duration: `30m`, `4h`, `2d`, `1w`, `1h30m`
+- a day: `tomorrow`, `fri`, `next mon`, `2026-11-03` (09:00 on that day)
+- a time: `14:00`, `9:30pm`, `noon` (the next time it comes round)
+- both: `tomorrow 2pm`, `fri 9am`, `2026-11-03 14:00`
+
+Days and times are on the human's clock. If hat-snooze says no timezone is set, tell the human to run `hatter tz` on their computer. Never choose a timezone yourself.
+
+If no <when> was given, ask for one. If the command fails (not in tmux, the only tab in its workspace, a time it cannot read, no hat-snooze on this server), pass its message on and change nothing. If a sandbox stopped it reaching tmux, say so and ask the human to let it run outside the sandbox.
+
+## list
+
+`~/.local/bin/hat-snooze list --text` shows every snoozed tab on this server and when each wakes. Show its output as it is.
+
+## continue
+
+Snoozing and having the session carry on with a prompt at the wake time is not available yet. Say so, and offer a plain snooze.
+
+## Anything else
+
+Say what this skill can do: `snooze <when>` and `list`.
+HATSKILL
+
+install_hatter_skill() {  # install_hatter_skill <skills dir> <for whom>
+    local d="$1/hatter" f="$1/hatter/SKILL.md"
+    if [ -f "$f" ] && ! grep -q 'hatter-managed' "$f"; then
+        echo "WARNING: $f is not hatter's - left alone, so $2 has no hatter skill" >&2
+        return 0
+    fi
+    if mkdir -p "$d" && cp "$HATTER_SKILL_SRC" "$f.new" && mv "$f.new" "$f"; then
+        echo "hatter skill installed for $2: $f"
+    else
+        rm -f "$f.new"
+        echo "WARNING: could not write $f" >&2
+    fi
+    return 0
+}
+has_claude=$("${SHELL:-/bin/bash}" -lc 'command -v claude >/dev/null 2>&1 && printf HATCLAUDE' </dev/null 2>/dev/null) || has_claude=""
+# Where claude is on the login PATH, or Claude Code has a config dir: a
+# claude installed through nvm or the like may be on neither PATH we see.
+case "$has_claude" in
+    *HATCLAUDE*) install_hatter_skill "$claude_cfg/skills" "Claude Code" ;;
+    *) [ ! -d "$claude_cfg" ] || install_hatter_skill "$claude_cfg/skills" "Claude Code" ;;
+esac
+[ -z "$codex_home" ] || install_hatter_skill "$HOME/.agents/skills" "Codex"
+
 # A systemd user unit only fires at boot with lingering on, which is also what
 # keeps the tmux server alive across logout. Say so rather than installing a
 # unit that will never run.
@@ -3971,6 +4232,9 @@ case "$("$HOME/.local/bin/hat-snooze" when 1h 2>/dev/null)" in
     ''|*[!0-9]*) echo "SELFTEST FAILED: 'hat-snooze' cannot read a time" >&2 ;;
     *) echo "selftest ok: 'hat-snooze' runs" ;;
 esac
+for f in "$HOME/.agents/skills/hatter/SKILL.md" "$claude_cfg/skills/hatter/SKILL.md"; do
+    if [ -f "$f" ] && grep -q hatter-managed "$f"; then echo "selftest ok: hatter skill in $f"; fi
+done
 if systemctl --user is-enabled hatter-restore.service >/dev/null 2>&1; then
     echo "selftest ok: boot restore is enabled"
 else
@@ -4221,9 +4485,98 @@ tab_find() {
 # hat-snooze, on a timer, so it comes back whether or not this client is
 # awake. These only ask the server to do it.
 
-# local_stamp <epoch>: a time in this client's own timezone, which it names.
+# The human's timezone, as `hatter tz` set it; empty until then.
+human_tz() { cfg '.prefs.timezone // empty'; }
+
+# local_stamp <epoch>: a time in the human's timezone, named; in this
+# machine's own until one is set.
 local_stamp() {
-    date -r "$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -d "@$1" '+%a %d %b %H:%M %Z'
+    local z t
+    z=$(human_tz)
+    t=$( { [[ -z "$z" ]] || export TZ="$z"; }
+         date -r "$1" '+%a %d %b %H:%M %Z' 2>/dev/null || date -d "@$1" '+%a %d %b %H:%M %Z')
+    printf '%s%s' "$t" "${z:+ ($z)}"
+}
+
+# This machine's timezone name, if it can tell: macOS and most Linux link
+# /etc/localtime into the zoneinfo tree, Debian also writes /etc/timezone,
+# and Android keeps it in a property.
+detect_tz() {
+    local z=""
+    z=$(readlink /etc/localtime 2>/dev/null) && z=${z##*zoneinfo/}
+    tz_name_ok "$z" || z=$(cat /etc/timezone 2>/dev/null) || z=""
+    tz_name_ok "$z" || z=$(getprop persist.sys.timezone 2>/dev/null) || z=""
+    tz_name_ok "$z" || z=""
+    printf '%s' "$z"
+}
+
+tz_name_ok() { [[ -n "$1" && "$1" != *[!A-Za-z0-9_+/-]* && "$1" != /* && "$1" != *..* ]]; }
+
+# tz_set <zone>: record it, then tell every hat's server, all at once. A
+# server that cannot be reached gets it at its next provision.
+tz_set() {
+    local z="$1" hat host i=0 tmp seen=$'\n' names=()
+    tz_name_ok "$z" || die "not a timezone name: '$z' (like Europe/London, America/New_York or UTC)"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys, zoneinfo; zoneinfo.ZoneInfo(sys.argv[1])' "$z" 2>/dev/null \
+            || die "unknown timezone: $z"
+    fi
+    jq_write --arg z "$z" '.prefs.timezone = $z'
+    info "Timezone: $z"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-tz.XXXXXX")
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        host=$(hat_ssh "$hat")
+        [[ -n "$host" && "$seen" != *$'\n'"$host"$'\n'* ]] || continue
+        seen+="$host"$'\n'
+        names+=("$hat")
+        ( rc=0; snooze_sh "$host" tz "$(sq "$z")" > "$tmp/$i" 2>&1 || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
+        i=$((i + 1))
+    done < <(hat_names)
+    wait
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        case "$(cat "$tmp/$i.rc" 2>/dev/null)" in
+            0) echo "  ${names[$i]}: set" ;;
+            3) echo "  ${names[$i]}: no hat-snooze yet; hatter provision ${names[$i]} sets it" ;;
+            *) echo "  ${names[$i]}: not set ($(tail -n 1 "$tmp/$i" 2>/dev/null)); hatter provision ${names[$i]} sets it" ;;
+        esac
+    done
+    rm -rf "$tmp"
+    return 0
+}
+
+# tz_confirm: the first time an absolute time needs the timezone, offer this
+# machine's and ask. Fails when nobody is there to ask.
+tz_confirm() {
+    local z ans
+    [[ -t 0 && -t 1 ]] || return 1
+    z=$(detect_tz)
+    if [[ -n "$z" ]]; then
+        printf 'Times like "tomorrow 9am" need your timezone. This machine is on %s. Use it? [Y/n] ' "$z"
+        read -r ans || return 1
+        case "$ans" in ""|y|Y|yes) ;; *) z="" ;; esac
+    fi
+    if [[ -z "$z" ]]; then
+        printf 'Your timezone (like Europe/London): '
+        read -r z || return 1
+    fi
+    [[ -n "$z" ]] || return 1
+    tz_set "$z"
+}
+
+# hatter tz [zone]
+cmd_tz() {
+    local z
+    case "${1:-}" in
+        "") z=$(human_tz)
+            if [[ -n "$z" ]]; then echo "$z"; return 0; fi
+            tz_confirm && return 0
+            z=$(detect_tz)
+            die "no timezone set. This machine is on ${z:-a zone hatter cannot tell}; set one with:
+  hatter tz <zone>" ;;
+        *) [[ $# -eq 1 ]] || { usage_cmd tz; exit 1; }
+           tz_set "$1" ;;
+    esac
 }
 
 # in_words <seconds from now>: "in 3h 20m", "in 2d 4h", "now".
@@ -4238,9 +4591,12 @@ in_words() {
 
 # snooze_sh <host> <hat-snooze args, already quoted>: run hat-snooze there.
 # Exit 3 means the server has none yet.
+# The human's timezone goes along, so a server that has not been told it yet
+# still reads "tomorrow 9am" on the human's clock.
 snooze_sh() {
-    local host="$1"; shift
-    remote_sh "$host" 'h="$HOME/.local/bin/hat-snooze"; [ -x "$h" ] || exit 3; "$h" '"$*"
+    local host="$1" z; shift
+    z=$(human_tz)
+    remote_sh "$host" 'h="$HOME/.local/bin/hat-snooze"; [ -x "$h" ] || exit 3; '"${z:+HAT_TZ=$(sq "$z") }"'"$h" '"$*"
 }
 
 snooze_rc() {  # snooze_rc <rc> <hat>
@@ -4259,12 +4615,24 @@ cmd_snooze() {
             *) args+=("$1"); shift ;;
         esac
     done
-    [[ ${#args[@]} -eq 3 ]] || { usage_cmd snooze; exit 1; }
+    # The time may come as several words: fri 9am.
+    [[ ${#args[@]} -ge 3 ]] || { usage_cmd snooze; exit 1; }
+    local spec="${args[*]:2}"
     tab_target "${args[0]}" "$want"
     tab_find "${args[1]}"
     # The server reads the time, so a duration means the same there as here;
     # then the snooze is given as that exact second, which this side names.
-    until=$(snooze_sh "$TAB_HOST" when "$(sq "${args[2]}")") || rc=$?
+    local err
+    err=$(mktemp "${TMPDIR:-/tmp}/hatter-snooze.XXXXXX")
+    until=$(snooze_sh "$TAB_HOST" when "$(sq "$spec")" 2>"$err") || rc=$?
+    # No timezone yet, for a time that needs one: ask, once, and go again.
+    if [[ "$rc" == 1 && -z "$(human_tz)" ]] && grep -q "timezone, which is not set" "$err" \
+       && { : > "$err"; tz_confirm; }; then
+        rc=0
+        until=$(snooze_sh "$TAB_HOST" when "$(sq "$spec")" 2>"$err") || rc=$?
+    fi
+    [[ ! -s "$err" ]] || sed 's/^hat-snooze: //' "$err" >&2
+    rm -f "$err"
     snooze_rc "$rc" "$TAB_HAT"
     # Only the last line: a login profile may print before it.
     until=$(printf '%s\n' "$until" | tail -n 1 | tr -d '\r ')
@@ -7400,7 +7768,7 @@ cmd_provision() {
     if [[ -n "$(cfg --arg h "$host" '.hats[]? | select(.ssh == $h) | .ssh' | head -n 1)" ]]; then
         launch=$(hat_launch_conf "$host") || exit 1
     fi
-    provision_host "$host" "$launch"
+    provision_host "$host" "$launch" "$(human_tz)"
     check_max_sessions "$host"
 }
 
@@ -9582,6 +9950,7 @@ Commands:
   snooze <session> <tab> <when>  Hide a tab until a time, then put it back
   unsnooze <session> <tab>       Bring a snoozed tab back now
   snoozed [hat]          List snoozed tabs and when they wake
+  tz [zone]              Your timezone, for times like "tomorrow 9am"
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   find <terms>...        Find the Claude session working on something, and go to it
   key add <key> <hat>... Authorise another machine's ssh key on hats
@@ -9749,6 +10118,17 @@ Off the Mac - in a mirrored pane on a shell server - there is no window to read
 and the name must say which hat it belongs to.
 USAGE
     ;;
+    tz) cat <<'USAGE'
+hatter tz            show your timezone; the first time, offer this machine's
+hatter tz <zone>     set it, like Europe/London or America/New_York
+
+Snooze times like "tomorrow 9am" or "fri 2pm" are read on your clock, not the
+server's. hatter keeps your timezone in its config and tells every hat's
+server (a server it cannot reach gets it at its next provision). Times are
+then shown in it, named. The first absolute time you give asks for it if it
+is not set yet, offering this machine's.
+USAGE
+    ;;
     snooze|unsnooze|snoozed) cat <<'USAGE'
 hatter snooze <session> <tab> <when> [--hat <hat>]
 hatter unsnooze <session> <tab> [--hat <hat>]
@@ -9759,8 +10139,14 @@ Snooze a tab to get it out of sight until you need it. It disappears from its
 workspace, and at the wake time it comes back to the same place, flagged the
 way a tab with an agent waiting for you is.
 
-<tab> is a window index or name. <when> is a duration: 30m, 4h, 2d, 1w, or a
-mix like 1h30m, up to 400d. Times are shown in this machine's timezone, named.
+<tab> is a window index or name. <when> is one of:
+  a duration    30m, 4h, 2d, 1w, or a mix like 1h30m, up to 400d
+  a day         tomorrow, fri, next mon, 2026-11-03     (at 09:00)
+  a time        14:00, 9:30pm, noon      (the next time it comes round)
+  both          tomorrow 2pm, fri 9am, 2026-11-03 14:00
+Days and times are on your clock: see `hatter help tz`. A time the clocks skip
+or repeat for daylight saving is moved to the hour after, or taken the first
+time, and you are told. Wake times are shown in your timezone, named.
 
 The tab is not closed. Its tmux window moves to a hidden session on its
 server, hatter-snooze, and keeps running there: an agent in it carries on with
@@ -10309,6 +10695,11 @@ the Mac being involved at all:
                  installed.
   - hat-snooze   hides a tab until a time and brings it back (see: hatter help
                  snooze), with a systemd timer that checks once a minute
+  - the hatter skill, /hatter in Claude Code and $hatter in Codex, so an agent
+                 can snooze its own tab ("/hatter snooze fri 9am"). In Claude
+                 Code's skills folder where claude is installed, and in
+                 ~/.agents/skills where codex is. Rewritten on each provision;
+                 a SKILL.md there that hatter did not write is left alone.
   - hat-restore  replays the registry at boot: sessions, windows, names, working
                  directories, and `claude --resume <id>` in each pane.
                  --dry-run prints the plan; --no-agents rebuilds plain shells;
@@ -10430,6 +10821,7 @@ case "$cmd" in
     snooze)    [[ $# -gt 0 ]] || { usage_cmd snooze; exit 1; };    cmd_snooze "$@" ;;
     unsnooze)  [[ $# -gt 0 ]] || { usage_cmd unsnooze; exit 1; };  cmd_unsnooze "$@" ;;
     snoozed)   cmd_snoozed "$@" ;;
+    tz)        cmd_tz "$@" ;;
     attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     find)      cmd_find "$@" ;;
