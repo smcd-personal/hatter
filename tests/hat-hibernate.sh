@@ -217,4 +217,29 @@ grep -q "left alone" <<<"$out" && fail "tick reports what it leaves alone: $out"
 T list-windows -a -F '#{window_id}' | grep -qx "$LATE" && fail "w:late's tab is still open"
 ok "auto and tick"
 
+# --- the client: the age a server gets, and what is refused ------------------------
+mkdir -p "$work/xdg/hatter"
+lib="$work/hatter-lib.sh"
+sed '/^# -* main$/,$d' "$root/bin/hatter" > "$lib"
+config() { printf '%s\n' "$1" > "$work/xdg/hatter/config.json"; }
+client() { XDG_CONFIG_HOME="$work/xdg" bash -c "source '$lib'; \"\$@\"" _ "$@"; }
+config '{"version":3,"groups":{},"hats":{
+  "dev":  {"ssh":"u@dev.example.com","hibernate_after":"2d"},
+  "dev2": {"ssh":"u@dev.example.com","hibernate_after":"2d"},
+  "dev3": {"ssh":"u@dev.example.com"},
+  "ops":  {"ssh":"o@ops.example.com"},
+  "odd1": {"ssh":"x@odd.example.com","hibernate_after":"2d"},
+  "odd2": {"ssh":"x@odd.example.com","hibernate_after":"3d"},
+  "bad":  {"ssh":"b@bad.example.com","hibernate_after":"soon"}}}'
+[[ "$(client hat_hibernate_after u@dev.example.com)" == 2d ]] || fail "hats that agree do not give their age"
+[[ -z "$(client hat_hibernate_after o@ops.example.com)" ]] || fail "a server with no age set gets one"
+if client hat_hibernate_after x@odd.example.com >/dev/null 2>&1; then fail "hats that disagree were not refused"; fi
+if client hat_hibernate_after b@bad.example.com >/dev/null 2>&1; then fail "an age that is not one was passed on"; fi
+for args in "--idle 2d" "--hat dev --idle soon" "--hat dev --auto 2x" "--hat dev --idle 2d --auto 2d" \
+            "--hat nosuch --idle 2d" "--hat dev --auto 2d --dry-run" "--hat dev ws --idle 2d"; do
+    # shellcheck disable=SC2086
+    if client cmd_hibernate $args >/dev/null 2>&1; then fail "hatter hibernate $args was not refused"; fi
+done
+ok "client: the age a server gets, and what is refused"
+
 echo "hat-hibernate: all passed"

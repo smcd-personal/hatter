@@ -1755,11 +1755,13 @@ apply_group_style() {
 # provision_host <user@host> [launch conf] [timezone]: the second argument is
 # the body of the server's launch.tmux.conf (see hat_launch_conf); empty
 # clears it. The third is the human's timezone (hatter tz); empty leaves the
-# server's as it is.
+# server's as it is. The fourth is the idle age past which the server
+# hibernates Claude sessions (hatter hibernate --auto); empty turns that off,
+# and "@@keep" leaves it as it is.
 provision_host() {
-    local host="$1" launch="${2:-}" tz="${3:-}"
+    local host="$1" launch="${2:-}" tz="${3:-}" hib="${4:-@@keep}"
     info "Provisioning tmux persistence on $host"
-    remote_sh_stdin "$host" "bash -s -- $(sq "$launch") $(sq "$tz")" <<'REMOTE_EOF'
+    remote_sh_stdin "$host" "bash -s -- $(sq "$launch") $(sq "$tz") $(sq "$hib")" <<'REMOTE_EOF'
 set -euo pipefail
 
 CONF="$HOME/.tmux.conf"
@@ -1779,6 +1781,8 @@ fi
 
 # The human's timezone, for hat-snooze to read "tomorrow 9am" on their clock.
 HAT_TZ_NAME="${2:-}"
+# The idle age for hat-hibernate, written once hat-hibernate is in place.
+HAT_HIBERNATE_AFTER="${3:-@@keep}"
 case "$HAT_TZ_NAME" in
     "") ;;
     *[!A-Za-z0-9_+/-]*|/*|*..*) echo "WARNING: not a timezone name, not written: $HAT_TZ_NAME" >&2 ;;
@@ -4624,6 +4628,48 @@ else
     echo "no systemd --user here - snoozed tabs only come back with 'hat-snooze tick' (cron it every minute)"
 fi
 
+# The age past which idle Claude sessions are hibernated, from the hat's
+# config; none turns it off. Then the hourly timer that does it, which does
+# nothing while no age is set.
+case "$HAT_HIBERNATE_AFTER" in
+    @@keep) ;;
+    "") "$HOME/.local/bin/hat-hibernate" auto off >/dev/null 2>&1 || true ;;
+    *) "$HOME/.local/bin/hat-hibernate" auto "$HAT_HIBERNATE_AFTER" || echo "WARNING: could not set the hibernate age" >&2 ;;
+esac
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-system-running >/dev/null 2>&1; then
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/hatter-hibernate.service" <<'HIBSVC'
+[Unit]
+Description=hatter: hibernate Claude sessions idle past the age set
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/hat-hibernate tick
+HIBSVC
+    cat > "$HOME/.config/systemd/user/hatter-hibernate.timer" <<'HIBTIMER'
+[Unit]
+Description=hatter: hibernate idle Claude sessions, every hour
+
+[Timer]
+OnBootSec=15min
+OnStartupSec=15min
+OnUnitActiveSec=1h
+
+[Install]
+WantedBy=timers.target
+HIBTIMER
+    systemctl --user daemon-reload
+    if systemctl --user enable --now hatter-hibernate.timer >/dev/null 2>&1; then
+        systemctl --user restart hatter-hibernate.timer >/dev/null 2>&1 \
+            || echo "WARNING: could not restart the hibernate timer" >&2
+        echo "hibernate timer enabled (every hour; hibernates after: $("$HOME/.local/bin/hat-hibernate" auto 2>/dev/null))"
+    else
+        echo "WARNING: could not enable the hibernate timer" >&2
+    fi
+else
+    echo "no systemd --user here - idle sessions are only hibernated by 'hat-hibernate tick' (cron it hourly)"
+fi
+
 # ~/.local/bin is only on PATH for a login shell if the shell's profile adds it.
 # Ubuntu's ~/.profile does, but only when the directory already existed at login,
 # and zsh never reads ~/.profile at all. Make it deterministic.
@@ -4776,6 +4822,11 @@ case "$("$HOME/.local/bin/hat-snooze" when 1h 2>/dev/null)" in
     ''|*[!0-9]*) echo "SELFTEST FAILED: 'hat-snooze' cannot read a time" >&2 ;;
     *) echo "selftest ok: 'hat-snooze' runs" ;;
 esac
+if "$HOME/.local/bin/hat-hibernate" auto >/dev/null 2>&1; then
+    echo "selftest ok: 'hat-hibernate' runs"
+else
+    echo "SELFTEST FAILED: 'hat-hibernate' did not run" >&2
+fi
 for f in "$HOME/.agents/skills/hatter/SKILL.md" "$claude_cfg/skills/hatter/SKILL.md"; do
     if [ -f "$f" ] && grep -q hatter-managed "$f"; then echo "selftest ok: hatter skill in $f"; fi
 done
@@ -5256,6 +5307,173 @@ cmd_snoozed() {
     done
     rm -rf "$tmp"
     [[ "$found" -gt 0 ]] || echo "Nothing is snoozed."
+    return 0
+}
+
+# --- hibernate (#167) ---------------------------------------------------------
+# A hibernated Claude session is stopped and its tab closed, with what it
+# takes to resume it kept in its server's registry history. hat-hibernate
+# does the work there, by hand or on an hourly timer; these ask it to.
+
+# hib_sh <host> <hat-hibernate args, already quoted>. Exit 3: none there yet.
+hib_sh() {
+    local host="$1"; shift
+    remote_sh "$host" 'h="$HOME/.local/bin/hat-hibernate"; [ -x "$h" ] || exit 3; "$h" '"$*"
+}
+
+hib_rc() {  # hib_rc <rc> <hat>
+    [[ "$1" != 3 ]] || die "hat '$2' has no hat-hibernate yet: run  hatter provision $2"
+    [[ "$1" == 0 ]] || exit 1
+}
+
+# An age as hat-hibernate reads it: 2d, 36h, 1w, 1d12h.
+hib_age_ok() { [[ "$1" =~ ^([0-9]+[mhdw])+$ ]]; }
+
+# hat_hibernate_after <user@host>: the idle age the hats on that server set,
+# empty for none. They share one state directory, so they must agree.
+hat_hibernate_after() {
+    local vals
+    vals=$(cfg --arg h "$1" '[.hats[]? | select(.ssh == $h) | .hibernate_after // empty] | unique | .[]') \
+        || die "cannot read hibernate_after for $1 from $CONFIG"
+    [[ "$(grep -c . <<<"$vals")" -le 1 ]] \
+        || die "hats on $1 share a server but set hibernate_after differently - make them agree: hatter hibernate --hat <hat> --auto <age>"
+    [[ -z "$vals" ]] || hib_age_ok "$vals" || die "hibernate_after for $1 is '$vals', not an age like 2d"
+    printf '%s' "$vals"
+}
+
+# hatter hibernate <session> <tab> [--hat <hat>]
+# hatter hibernate --hat <hat> --idle <age> [--dry-run]
+# hatter hibernate --hat <hat> --auto <age>|off
+cmd_hibernate() {
+    local want="" idle="" auto="" dry="" args=() rc=0 host h out
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat)  [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --idle) [[ $# -ge 2 && -n "$2" ]] || die "--idle needs an age, like 2d"; idle="$2"; shift 2 ;;
+            --auto) [[ $# -ge 2 && -n "$2" ]] || die "--auto needs an age, like 2d, or off"; auto="$2"; shift 2 ;;
+            --dry-run) dry=1; shift ;;
+            --) shift; args+=("$@"); break ;;
+            -*) die "unknown flag: $1  (try: hatter help hibernate)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    if [[ -n "$idle" || -n "$auto" ]]; then
+        [[ ${#args[@]} -eq 0 ]] || die "--idle and --auto act on a whole hat; name it with --hat, not a workspace"
+        [[ -z "$idle" || -z "$auto" ]] || die "--idle or --auto, not both"
+        [[ -n "$want" ]] || die "say which hat with --hat"
+        hat_exists "$want" || die "unknown hat: $want"
+        host=$(hat_ssh "$want")
+    fi
+    if [[ -n "$auto" ]]; then
+        [[ -z "$dry" ]] || die "--dry-run goes with --idle: try  hatter hibernate --hat $want --idle $auto --dry-run"
+        [[ "$auto" == off ]] || hib_age_ok "$auto" || die "not an age: '$auto' (like 2d, 36h, 1w; an hour or more)"
+        # Every hat on the server shares the setting, so all of them take it.
+        for h in $(cfg --arg s "$host" '.hats | to_entries[] | select(.value.ssh == $s) | .key'); do
+            if [[ "$auto" == off ]]; then
+                jq_write --arg l "$h" 'del(.hats[$l].hibernate_after)'
+            else
+                jq_write --arg l "$h" --arg a "$auto" '.hats[$l].hibernate_after = $a'
+            fi
+        done
+        out=$(hib_sh "$host" auto "$(sq "$auto")") || rc=$?
+        if [[ "$rc" == 3 ]]; then
+            info "Saved; hatter provision $want puts it on the server"
+            return 0
+        fi
+        hib_rc "$rc" "$want"
+        printf '%s\n' "$out" | sed 's/^hat-hibernate: //' | tail -n 1
+        return 0
+    fi
+    if [[ -n "$idle" ]]; then
+        hib_age_ok "$idle" || die "not an age: '$idle' (like 2d, 36h, 1w; an hour or more)"
+        out=$(hib_sh "$host" idle "$(sq "$idle")" ${dry:+--dry-run}) || rc=$?
+        [[ -z "$out" ]] || printf '%s\n' "$out" | sed 's/^hat-hibernate: /  /'
+        hib_rc "$rc" "$want"
+        return 0
+    fi
+    [[ -z "$dry" ]] || die "--dry-run goes with --idle"
+    [[ ${#args[@]} -eq 2 ]] || { usage_cmd hibernate; exit 1; }
+    tab_target "${args[0]}" "$want"
+    tab_find "${args[1]}"
+    out=$(hib_sh "$TAB_HOST" tab -t "$(sq "$TAB_WID")") || rc=$?
+    hib_rc "$rc" "$TAB_HAT"
+    info "$(printf '%s\n' "$out" | tail -n 1 | sed 's/^hat-hibernate: //')"
+}
+
+# hatter hibernated [hat]: every hibernated session, each server asked once,
+# all at once.
+cmd_hibernated() {
+    local hats=() asked=() hat host i n tmp t found=0 seen=$'\n'
+    if [[ $# -gt 0 ]]; then
+        hat_exists "$1" || die "unknown hat: $1"
+        hats=("$1")
+    else
+        while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
+    fi
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-hibernated.XXXXXX")
+    for hat in ${hats[@]+"${hats[@]}"}; do
+        host=$(hat_ssh "$hat")
+        [[ -n "$host" && "$seen" != *$'\n'"$host"$'\n'* ]] || continue
+        seen+="$host"$'\n'
+        i=${#asked[@]}
+        asked+=("$hat")
+        ( rc=0; hib_sh "$host" list > "$tmp/$i" 2>/dev/null || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
+    done
+    wait
+    t=$(date +%s)
+    n=${#asked[@]}
+    for ((i = 0; i < n; i++)); do
+        case "$(cat "$tmp/$i.rc" 2>/dev/null)" in
+            0) ;;
+            3) echo "  ${asked[$i]}: no hat-hibernate yet (hatter provision ${asked[$i]})"; continue ;;
+            *) echo "  ${asked[$i]}: could not ask"; continue ;;
+        esac
+        local sid s name idx since cwd
+        while IFS=$'\x1f' read -r sid s name idx since cwd; do
+            [[ "$sid" =~ ^[0-9a-f-]+$ ]] || continue
+            found=$((found + 1))
+            [[ "$since" =~ ^[0-9]+$ ]] || since=$t
+            printf '  %-10s %-34s %-9s %s\n' "${asked[$i]}" "${s:-?}:${name:-$idx}" \
+                "$(find_age "$since") ago" "$sid"
+        done < "$tmp/$i"
+    done
+    rm -rf "$tmp"
+    [[ "$found" -gt 0 ]] || echo "Nothing is hibernated."
+    return 0
+}
+
+# hatter wake <session> <tab> [--hat <hat>]   - the workspace it came from
+# hatter wake --hat <hat> <tab|session id>
+cmd_wake() {
+    local want="" args=() hat which rc=0 out session idx wid made win
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --) shift; args+=("$@"); break ;;
+            -*) die "unknown flag: $1  (try: hatter help wake)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    case "${#args[@]}" in
+        1) [[ -n "$want" ]] || { usage_cmd wake; exit 1; }
+           hat="$want" which="${args[0]}" ;;
+        2) if [[ -n "$want" ]]; then hat="$want"
+           else hat=$(session_hat_typed "${args[0]}" "hatter wake ${args[0]} ${args[1]} --hat <hat>") || exit 1; fi
+           which="${args[0]}:${args[1]}" ;;
+        *) usage_cmd wake; exit 1 ;;
+    esac
+    [[ -n "$hat" ]] && hat_exists "$hat" || die "no hat for '${args[0]}': say which with --hat (see: hatter hibernated)"
+    out=$(hib_sh "$(hat_ssh "$hat")" wake "$(sq "$which")") || rc=$?
+    hib_rc "$rc" "$hat"
+    IFS=$'\x1f' read -r session idx wid made <<<"$(printf '%s\n' "$out" | tail -n 1)"
+    [[ -n "$session" ]] || die "$hat did not say where it woke '$which'"
+    info "Waking '$which' in '$session', tab $idx"
+    have_cmux || return 0
+    # A workspace made again is not in cmux yet: new mirrors and records it.
+    win=$(find_hat_window "$hat")
+    if [[ "$made" == 1 || -z "$win" || -z "$(workspace_ref_by_title "$session" "$win")" ]]; then
+        "$0" new "$session" --hat "$hat" </dev/tty || warn "could not bring '$session' into cmux: hatter new $session --focus"
+    fi
     return 0
 }
 
@@ -8372,7 +8590,9 @@ cmd_provision() {
     if [[ -n "$(cfg --arg h "$host" '.hats[]? | select(.ssh == $h) | .ssh' | head -n 1)" ]]; then
         launch=$(hat_launch_conf "$host") || exit 1
     fi
-    provision_host "$host" "$launch" "$(human_tz)"
+    local hib="@@keep"
+    [[ "$launch" == "@@keep" ]] || hib=$(hat_hibernate_after "$host") || exit 1
+    provision_host "$host" "$launch" "$(human_tz)" "$hib"
     check_max_sessions "$host"
 }
 
@@ -10584,6 +10804,9 @@ Commands:
   snooze <session> <tab> <when>  Hide a tab until a time, then put it back
   unsnooze <session> <tab>       Bring a snoozed tab back now
   snoozed [hat]          List snoozed tabs and when they wake
+  hibernate <session> <tab>      Stop a Claude session and close its tab, to wake later
+  hibernated [hat]       List hibernated Claude sessions
+  wake <session> <tab>           Bring a hibernated session back
   tz [zone]              Your timezone, for times like "tomorrow 9am"
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   find <terms>...        Find the Claude session working on something, and go to it
@@ -10805,6 +11028,57 @@ The only tab of a workspace cannot be snoozed: that would close the workspace.
 
 On the server, `hat-snooze` does the same for the tab it runs in:
   hat-snooze snooze 4h       hat-snooze list       hat-snooze unsnooze <tab>
+USAGE
+    ;;
+    hibernate|hibernated|wake) cat <<'USAGE'
+hatter hibernate <session> <tab> [--hat <hat>]
+hatter hibernate --hat <hat> --idle <age> [--dry-run]
+hatter hibernate --hat <hat> --auto <age>|off
+hatter hibernated [hat]
+hatter wake <session> <tab> [--hat <hat>]
+hatter wake --hat <hat> <tab|session id>
+
+Put a Claude session away and bring it back later. Hibernating stops the
+agent and closes its tab; its server keeps the session id, the workspace, the
+tab's name and place, and the directory. Waking opens a tab in the same place
+that resumes the conversation.
+
+  hatter hibernate dev-atlas notes          this one, now
+  hatter hibernate --hat dev --idle 2d --dry-run
+                                            what is idle 2 days, and what
+                                            would be left alone
+  hatter hibernate --hat dev --idle 2d      hibernate all of it, now
+  hatter hibernate --hat dev --auto 2d      do that every hour from now on
+  hatter hibernate --hat dev --auto off     stop doing it
+  hatter hibernated                         every hibernated session
+  hatter wake dev-atlas notes               bring one back
+
+An <age> is a duration of an hour or more: 2d, 36h, 1w, 1d12h. A session is
+idle when neither its transcript nor its tab's output has changed for that
+long, so an agent running a long tool is not idle.
+
+--auto is kept in the hat's config (hibernate_after) and put on its server
+at once, and again by every provision. Hats that share a server share it.
+The server checks once an hour (the hatter-hibernate timer that provision
+sets up), whether or not this machine is awake.
+
+A tab whose workspace has no other tab, or that is pinned, stays open as a
+shell; the session in it is still hibernated. --idle leaves a pinned tab
+alone. Also left alone, and said: a session with no transcript to resume
+from, a tab split into panes, and a snoozed tab.
+
+A woken tab goes after the tab it sat after, if that is still there; first,
+if it was first; else to its old index, if free; else last. If its workspace
+has closed meanwhile, it is started again. <session> is the one it came
+from; `hatter hibernated` shows each session id, for --hat <hat> <id>.
+
+Hibernated sessions are kept in the server's registry history, which drops
+entries after 90 days; the conversation itself stays with Claude Code, and
+`hatter find --all` can still find it.
+
+On the server, `hat-hibernate` does the same:
+  hat-hibernate tab          hat-hibernate idle 2d --dry-run
+  hat-hibernate list --text  hat-hibernate wake <tab|session id>
 USAGE
     ;;
     tab) cat <<'USAGE'
@@ -11353,6 +11627,9 @@ the Mac being involved at all:
                  installed.
   - hat-snooze   hides a tab until a time and brings it back (see: hatter help
                  snooze), with a systemd timer that checks once a minute
+  - hat-hibernate  stops idle Claude sessions and wakes them again (see:
+                 hatter help hibernate), with an hourly systemd timer that
+                 does nothing until the hat sets an age
   - the hatter skill, /hatter in Claude Code and $hatter in Codex, so an agent
                  can snooze its own tab ("/hatter snooze fri 9am"). In Claude
                  Code's skills folder where claude is installed, and in
@@ -11450,7 +11727,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -11479,6 +11756,9 @@ case "$cmd" in
     snooze)    [[ $# -gt 0 ]] || { usage_cmd snooze; exit 1; };    cmd_snooze "$@" ;;
     unsnooze)  [[ $# -gt 0 ]] || { usage_cmd unsnooze; exit 1; };  cmd_unsnooze "$@" ;;
     snoozed)   cmd_snoozed "$@" ;;
+    hibernate) [[ $# -gt 0 ]] || { usage_cmd hibernate; exit 1; }; cmd_hibernate "$@" ;;
+    hibernated) cmd_hibernated "$@" ;;
+    wake)      [[ $# -gt 0 ]] || { usage_cmd wake; exit 1; };      cmd_wake "$@" ;;
     tz)        cmd_tz "$@" ;;
     attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
