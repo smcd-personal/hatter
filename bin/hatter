@@ -2229,6 +2229,9 @@ cat > "$HOME/.local/bin/hat-registry" <<'HATREGISTRY'
 #   hat-registry prune [--dry-run]  refresh, settle entries from before this
 #                                   server started, record any window that
 #                                   has no entry as a shell, age out history
+#   hat-registry snooze <window id> <json>     set a window's .snooze
+#   hat-registry hibernate <window id> <json>  set a window's .hibernate
+#   hat-registry hibernate-done <session id>   take .hibernate off its history
 #
 # An entry is filed under its window's tmux id and the server's (pid and start
 # time), and follows the window when windows close, move or renumber. Keyed by
@@ -2417,7 +2420,11 @@ EOF
              + (if $p != "" then {pid: $p} else {} end)
              + (if $src != "" then {source: $src} else {} end)
              # A snoozed tab whose agent records itself again is still snoozed.
-             + (if ($mine.snooze // null) != null then {snooze: $mine.snooze} else {} end)) as $new
+             + (if ($mine.snooze // null) != null then {snooze: $mine.snooze} else {} end)
+             # A hibernating agent recording its own end (SessionEnd) is still
+             # the one being put away; anything else in the window is not.
+             + (if ($mine.hibernate // null) != null and $i != "" and ($mine.session_id // "") == $i
+                then {hibernate: $mine.hibernate} else {} end)) as $new
             | "put\u001f\($f)\u001f\($new | tojson)",
               (.[] | select(._file != $f)
                # Another entry holding this session id: this record has it
@@ -2461,13 +2468,14 @@ EOF
              '{window_id: $wid, server: $srv, window: ($w | tonumber), pane: $p}')" | apply
 }
 
-# snooze <window id> <json>: set the window's .snooze record (hat-snooze is
-# the only caller); "null" clears it. A window with no entry yet is recorded
-# as the shell it is, so the record has somewhere to live. Unlike the rest of
-# this script it says whether it worked: hat-snooze must not hide a tab whose
-# record did not stick.
-cmd_snooze() {
-    local wid="${1:-}" js="${2:-}" meta s w n srv pane cwd f
+# mark <field> <window id> <json>: set the window's .snooze record (for
+# hat-snooze) or its .hibernate one (for hat-hibernate); "null" clears it. A
+# window with no entry yet is recorded as the shell it is, so the record has
+# somewhere to live. Unlike the rest of this script it says whether it
+# worked: neither may hide or stop a tab whose record did not stick.
+cmd_mark() {
+    local k="${1:-}" wid="${2:-}" js="${3:-}" meta s w n srv pane cwd f
+    case "$k" in snooze|hibernate) ;; *) return 1 ;; esac
     [ -n "$wid" ] && [ -n "$js" ] || return 1
     printf '%s' "$js" | jq -e 'type == "object" or type == "null"' >/dev/null 2>&1 || return 1
     meta=$(tmux display-message -p -t "$wid" \
@@ -2480,16 +2488,28 @@ EOF
     f="$PANES/$(slug "$srv")-$(slug "$wid").json"
     if [ -f "$f" ]; then
         printf 'merge%s%s%s%s%s%s\n' "$US" "$f" "$US" "$f" "$US" \
-            "$(jq -cn --argjson z "$js" '{snooze: $z}')" | apply
+            "$(jq -cn --arg k "$k" --argjson z "$js" '{($k): $z}')" | apply
     else
         printf 'put%s%s%s%s\n' "$US" "$f" "$US" \
             "$(jq -cn --arg s "$s" --arg w "$w" --arg n "$n" --arg c "$cwd" --arg t "$(now)" \
-                 --arg wid "$wid" --arg srv "$srv" --arg pane "$pane" --argjson z "$js" \
+                 --arg wid "$wid" --arg srv "$srv" --arg pane "$pane" --argjson z "$js" --arg k "$k" \
                  '{session: $s, window: ($w | tonumber), name: $n, cwd: $c, kind: "shell",
                    session_id: "", state: "live", recorded: $t, window_id: $wid,
-                   server: $srv, pane: $pane, source: "snooze", snooze: $z}')" | apply
+                   server: $srv, pane: $pane, source: $k, ($k): $z}')" | apply
     fi
-    jq -e --argjson z "$js" '.snooze == $z' "$f" >/dev/null 2>&1
+    jq -e --arg k "$k" --argjson z "$js" '.[$k] == $z' "$f" >/dev/null 2>&1
+}
+
+# hibernate-done <session id>: it is awake again, so its history is no longer
+# a hibernated session; hat-launch's own record takes the history away once
+# the agent is running.
+cmd_hibernate_done() {
+    local f
+    [ -n "${1:-}" ] || return 0
+    f="$PANES/closed/$(slug "$1").json"
+    [ -f "$f" ] || return 0
+    lock || return 0
+    write "$f" "$(jq -c 'del(.hibernate)' "$f" 2>/dev/null)"
 }
 
 # This server's entries follow their windows: a window that is gone takes its
@@ -2605,8 +2625,10 @@ case "${1:-}" in
     adopt)   shift; cmd_adopt "$@" ;;
     refresh) cmd_refresh ;;
     prune)   shift; cmd_prune "$@" ;;
-    snooze)  shift; cmd_snooze "$@"; exit $? ;;
-    *)       echo "usage: hat-registry put|adopt|refresh|prune|snooze" >&2 ;;
+    snooze)  shift; cmd_mark snooze "$@"; exit $? ;;
+    hibernate) shift; cmd_mark hibernate "$@"; exit $? ;;
+    hibernate-done) shift; cmd_hibernate_done "$@" ;;
+    *)       echo "usage: hat-registry put|adopt|refresh|prune|snooze|hibernate|hibernate-done" >&2 ;;
 esac
 exit 0
 HATREGISTRY
@@ -3481,6 +3503,416 @@ case "${1:-}" in
 esac
 HATSNOOZE
 chmod +x "$HOME/.local/bin/hat-snooze"
+
+cat > "$HOME/.local/bin/hat-hibernate" <<'HATHIBERNATE'
+#!/usr/bin/env bash
+# hat-hibernate - put an idle Claude session away, and bring it back later.
+#
+#   hat-hibernate tab [-t <tab>]           hibernate one tab now (default: this one)
+#   hat-hibernate idle <age> [--dry-run]   hibernate every session idle that long
+#   hat-hibernate tick                     the timer: idle, at the age `auto` set
+#   hat-hibernate auto [<age>|off]         print or set that age; off by default
+#   hat-hibernate list [--text]            the hibernated sessions; --text for
+#                                          people. Else one a line, \037 between:
+#                                          session id, session, tab name, index,
+#                                          hibernated at (epoch), cwd
+#   hat-hibernate wake <which>             bring one back; prints its session,
+#                                          index, window id and 1 if the session
+#                                          was made again, \037 between
+#
+# <age> is a duration: 2d, 36h, 1w, 1d12h. <which> is a session id,
+# <session>:<tab name>, <session>:<index> or a tab name.
+#
+# Hibernating stops the agent and closes its tab, but keeps what it takes to
+# resume it: the session id, the workspace, the tab's name and place, and the
+# directory. That is the window's pane-registry entry, marked .hibernate before
+# anything is stopped, and filed by hat-registry under $PANES/closed when the
+# agent's entry goes. hat-restore never rebuilds from there, so a hibernated
+# session stays asleep through a reboot; waking it opens a tab that resumes it
+# through hat-launch, whose record takes it out of closed/ again.
+#
+# The tab stays open, as a shell, when it is the only one in its workspace
+# (closing it would close the workspace) or pinned (a pinned tab is one hatter
+# keeps). Idle is the later of the transcript's last change and the pane's
+# last output, so an agent still running a tool is never idle. Left alone:
+# a tab with no transcript to resume from, a split window (its other panes
+# would go with it), a snoozed tab, and, when hibernating by age, a pinned one.
+set -uo pipefail
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
+PANES="$STATE/panes"
+REG="${HAT_REGISTRY:-$HOME/.local/bin/hat-registry}"
+LAUNCH="${HAT_LAUNCH:-$HOME/.local/bin/hat-launch}"
+AFTER="$STATE/hibernate-after"
+BOX=hatter-snooze
+HT=$'\t'
+US=$'\037'
+# Below this, a typo (2m for 2d) is likelier than intent.
+MIN=3600
+# How long an agent gets to exit on SIGTERM before it is killed.
+GRACE="${HAT_HIBERNATE_GRACE:-10}"
+
+die() { printf 'hat-hibernate: %s\n' "$*" >&2; exit 1; }
+say() { printf 'hat-hibernate: %s\n' "$*"; }
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
+command -v tmux >/dev/null 2>&1 || die "no tmux here"
+command -v jq   >/dev/null 2>&1 || die "no jq here"
+
+now() { printf '%s\n' "${HAT_NOW:-$(date +%s)}"; }
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+# GNU stat first: BSD's -f means something else to GNU (the file system).
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+# secs <age>: the seconds it names; fails on anything else, or under MIN.
+secs() {
+    local rest n u total=0
+    rest=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -d ' ')
+    [ -n "$rest" ] || return 1
+    while [ -n "$rest" ]; do
+        n=${rest%%[!0-9]*}
+        [ -n "$n" ] && [ "${#n}" -le 6 ] || return 1
+        rest=${rest#"$n"}
+        u=${rest%%[0-9]*}
+        rest=${rest#"$u"}
+        n=$((10#$n))
+        case "$u" in
+            m|min|mins|minute|minutes) total=$((total + n * 60)) ;;
+            h|hr|hrs|hour|hours)       total=$((total + n * 3600)) ;;
+            d|day|days)                total=$((total + n * 86400)) ;;
+            w|wk|wks|week|weeks)       total=$((total + n * 604800)) ;;
+            *) return 1 ;;
+        esac
+    done
+    [ "$total" -ge "$MIN" ] || return 1
+    printf '%s\n' "$total"
+}
+
+words() {  # words <seconds>: 3d 4h, 5h 20m, 12m
+    local s="$1"
+    if [ "$s" -ge 86400 ]; then printf '%dd %dh' $((s / 86400)) $((s % 86400 / 3600))
+    elif [ "$s" -ge 3600 ]; then printf '%dh %dm' $((s / 3600)) $((s % 3600 / 60))
+    else printf '%dm' $((s / 60)); fi
+}
+
+# Where Claude Code keeps its transcripts. The timer runs with none of the
+# login profile, which is where CLAUDE_CONFIG_DIR is set, so it is asked of a
+# login shell the way hat-launch asks: the account's own shell, 10 seconds,
+# and only what follows the marker.
+CFG=""
+cfgdir() {
+    local sh out to=""
+    [ -z "$CFG" ] || { printf '%s' "$CFG"; return 0; }
+    CFG="${CLAUDE_CONFIG_DIR:-}"
+    if [ -z "$CFG" ] && [ -z "${HAT_NO_LOGIN_ENV:-}" ]; then
+        sh=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+        [ -x "${sh:-}" ] || sh="${SHELL:-/bin/bash}"
+        command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
+        out=$($to "$sh" -lc 'printf "HATENV%s" "${CLAUDE_CONFIG_DIR:-}"' </dev/null 2>/dev/null) || out=""
+        case "$out" in *HATENV*) CFG=${out##*HATENV} ;; esac
+    fi
+    [ -n "$CFG" ] || CFG="$HOME/.claude"
+    printf '%s' "$CFG"
+}
+
+transcript() {  # transcript <session id>: its file, or fail
+    local t
+    for t in "$(cfgdir)"/projects/*/"$1".jsonl; do
+        [ -f "$t" ] && { printf '%s' "$t"; return 0; }
+    done
+    return 1
+}
+
+# agent_pid <pane pid>: the outermost claude under the pane. Matched on the
+# command and on its first argument, so a claude run by an interpreter counts.
+agent_pid() {
+    ps -eo pid=,ppid=,args= 2>/dev/null | awk -v root="$1" '
+        function base(s) { sub(/.*\//, "", s); return s }
+        { pid[NR] = $1; par[NR] = $2; a = base($3); b = base($4)
+          isc[NR] = (a == "claude" || ((a == "bash" || a == "sh" || a == "node") && b == "claude")) }
+        END {
+            front[root] = 1
+            for (round = 0; round < 40; round++) {
+                found = 0
+                for (i = 1; i <= NR; i++) if ((par[i] in front) && !(pid[i] in seen)) {
+                    if (isc[i]) { print pid[i]; exit }
+                    next_[pid[i]] = 1; seen[pid[i]] = 1; found = 1
+                }
+                if (!found) exit
+                delete front
+                for (p in next_) front[p] = 1
+                delete next_
+            }
+        }'
+}
+
+LOCK="$STATE/hibernate.lock"
+lock() {
+    local i=0 owner
+    mkdir -p "$STATE" 2>/dev/null || return 1
+    while ! mkdir "$LOCK" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 100 ]; then
+            owner=$(cat "$LOCK/pid" 2>/dev/null) || owner=""
+            if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then return 1; fi
+            rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; i=0
+            continue
+        fi
+        sleep 0.1
+    done
+    echo $$ > "$LOCK/pid"
+    trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null' EXIT
+}
+
+label() {  # label <session> <name> <index>
+    if [ -n "$2" ]; then printf '%s:%s' "$1" "$2"; else printf '%s:tab %s' "$1" "$3"; fi
+}
+
+# Every window, one a line, \037 between: window id, session, index, name,
+# server, panes, first pane id, its pid, its cwd, last output (epoch), pinned,
+# snoozed until, windows in its session.
+windows() {
+    tmux list-windows -a -F "#{window_id}$HT#{session_name}$HT#{window_index}$HT#{window_name}$HT#{pid}.#{start_time}$HT#{window_panes}$HT#{pane_id}$HT#{pane_pid}$HT#{pane_current_path}$HT#{window_activity}$HT#{@hatter-pinned}$HT#{@hatter-snooze-until}$HT#{session_windows}" 2>/dev/null \
+        | tr '\t' '\037'
+}
+
+# check <window line> <age seconds, 0 for any>: sets the window's fields,
+# SID, T (transcript), PID (agent) and IDLE; or fails with WHY it is left
+# alone. Status 2: not an agent at all, or not idle long enough, which no one
+# needs telling about. Not in $(...): what it sets is what it is for.
+check() {
+    local f
+    WHY="" IDLE=0
+    IFS="$US" read -r W S I N SRV NP PANE PPID_ CWD ACT PIN SNZ NW <<EOF
+$1
+EOF
+    f="$PANES/$(slug "$SRV")-$(slug "$W").json"
+    IFS="$US" read -r KIND SID STATE_ ECWD <<EOF
+$(jq -r '[.kind // "", .session_id // "", .state // "", .cwd // ""] | map(tostring) | join("\u001f")' "$f" 2>/dev/null)
+EOF
+    [ "${KIND:-}" = claude ] && [ -n "${SID:-}" ] && [ "${STATE_:-}" = live ] || return 2
+    PID=$(agent_pid "$PPID_")
+    [ -n "$PID" ] || return 2
+    T=$(transcript "$SID") || { WHY="no transcript for $SID to resume from"; return 1; }
+    local last tm
+    last=${ACT:-0}; case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    tm=$(mtime "$T"); case "$tm" in ''|*[!0-9]*) tm=0 ;; esac
+    [ "$tm" -le "$last" ] || last=$tm
+    IDLE=$(( $(now) - last ))
+    [ "$IDLE" -ge "$2" ] || return 2
+    [ "$S" != "$BOX" ] && [ -z "$SNZ" ] || { WHY="snoozed"; return 1; }
+    [ "${NP:-1}" -le 1 ] || { WHY="split into $NP panes"; return 1; }
+    [ -n "$CWD" ] || CWD="$ECWD"
+    return 0
+}
+
+# put_away: hibernate the window check just read. Assumes the lock.
+put_away() {
+    local line after an rec keep=0 i=0
+    [ "${NW:-1}" -gt 1 ] && [ -z "$PIN" ] || keep=1
+    line=$(tmux list-windows -t "=$S" -F "#{window_index}$HT#{window_id}$HT#{window_name}" 2>/dev/null \
+            | awk -F '\t' -v i="$I" '$1 + 0 < i + 0 { a = $2 "\037" $3 } END { print a }')
+    after=${line%%"$US"*} an=${line#*"$US"}
+    [ -n "$after" ] || an=""
+    rec=$(jq -cn --arg s "$S" --argjson i "$I" --arg a "$after" --arg an "$an" --arg n "$N" \
+              --arg c "${CWD:-}" --argjson t "$(now)" --argjson idle "$IDLE" \
+              '{from: $s, index: $i, after: $a, after_name: $an, name: $n, cwd: $c,
+                since: $t, idle: $idle}')
+    "$REG" hibernate "$W" "$rec" >/dev/null 2>&1 \
+        || { echo "could not record it, so it is left running"; return 1; }
+    kill -TERM "$PID" 2>/dev/null
+    while kill -0 "$PID" 2>/dev/null && [ "$i" -lt $((GRACE * 5)) ]; do sleep 0.2; i=$((i + 1)); done
+    kill -0 "$PID" 2>/dev/null && kill -KILL "$PID" 2>/dev/null
+    if [ "$keep" = 1 ]; then
+        # The agent's entry gives way to the shell, and goes to closed/ as it
+        # does. hat-launch records the shell itself; a claude typed at a
+        # prompt has nothing that would.
+        "$REG" put "$PANE" shell "" live "${CWD:-$HOME}" >/dev/null 2>&1
+    else
+        tmux kill-window -t "$W" 2>/dev/null
+        "$REG" refresh >/dev/null 2>&1
+    fi
+    [ -f "$PANES/closed/$(slug "$SID").json" ] \
+        || echo "stopped, but its record did not reach the history: resume it with claude --resume $SID"
+    return 0
+}
+
+do_tab() {
+    local target="" line w why lb rc=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -t) [ $# -ge 2 ] || die "-t needs a tab"; target="$2"; shift 2 ;;
+            *) die "unknown argument: $1" ;;
+        esac
+    done
+    if [ -z "$target" ]; then
+        [ -n "${TMUX_PANE:-}" ] || die "not running in tmux: say which tab with -t"
+        target="$TMUX_PANE"
+    fi
+    w=$(tmux display-message -p -t "$target" '#{window_id}' 2>/dev/null) || w=""
+    [ -n "$w" ] || die "no such tab: $target"
+    lock || die "another hibernate is running; try again in a moment"
+    line=$(windows | awk -F '\037' -v w="$w" '$1 == w')
+    check "$line" 0 || rc=$?
+    lb=$(label "$S" "$N" "$I")
+    [ "$rc" != 2 ] || die "'$lb' has no Claude session running in it"
+    [ "$rc" = 0 ] || die "'$lb' is left as it is: $WHY"
+    why=$(put_away) || die "'$lb': $why"
+    [ -z "$why" ] || printf 'hat-hibernate: %s\n' "$why" >&2
+    say "'$lb' hibernated ($SID)$([ "${NW:-1}" -gt 1 ] && [ -z "$PIN" ] || echo '; its tab stays, as a shell')"
+}
+
+do_idle() {
+    local age="" raw dry=0 quiet=0 line why rc lb n=0 left=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry=1; shift ;;
+            --quiet) quiet=1; shift ;;
+            -*) die "unknown flag: $1" ;;
+            *) [ -z "$age" ] || die "one age only"; age="$1"; shift ;;
+        esac
+    done
+    [ -n "$age" ] || die "usage: hat-hibernate idle <age> [--dry-run]"
+    raw=$age
+    age=$(secs "$raw") || die "'$raw' is not an age of an hour or more (2d, 36h, 1w)"
+    tmux has-session 2>/dev/null || { [ "$quiet" = 1 ] || say "no tmux server running"; return 0; }
+    lock || die "another hibernate is running; try again in a moment"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        rc=0; check "$line" "$age" || rc=$?
+        [ "$rc" != 2 ] || continue
+        lb=$(label "$S" "$N" "$I") why="$WHY"
+        if [ "$rc" = 0 ] && [ -n "$PIN" ]; then rc=1; why="pinned"; fi
+        if [ "$rc" != 0 ]; then
+            left=$((left + 1))
+            [ "$quiet" = 1 ] || say "left alone: $lb (idle $(words "$IDLE")): $why"
+            continue
+        fi
+        if [ "$dry" = 1 ]; then
+            say "would hibernate: $lb (idle $(words "$IDLE"))$([ "$NW" -gt 1 ] || echo ', its tab kept as a shell')"
+            n=$((n + 1)); continue
+        fi
+        if why=$(put_away); then
+            n=$((n + 1))
+            say "hibernated: $lb (idle $(words "$IDLE"))${why:+: $why}"
+        else
+            say "not hibernated: $lb: $why"
+        fi
+    done <<EOF
+$(windows)
+EOF
+    [ "$quiet" = 1 ] && [ "$n" = 0 ] && return 0
+    say "$([ "$dry" = 1 ] && echo would hibernate || echo hibernated) $n session(s) idle $(words "$age") or more$([ "$left" = 0 ] || echo ", left $left alone")"
+}
+
+do_tick() {
+    local a
+    a=$(cat "$AFTER" 2>/dev/null) || exit 0
+    [ -n "$a" ] || exit 0
+    secs "$a" >/dev/null || die "$AFTER holds '$a', not an age"
+    do_idle --quiet "$a"
+}
+
+do_auto() {
+    case "${1:-}" in
+        "") cat "$AFTER" 2>/dev/null || echo off ;;
+        off) rm -f "$AFTER"; say "off: nothing is hibernated by age" ;;
+        *) secs "$1" >/dev/null || die "'$1' is not an age of an hour or more (2d, 36h, 1w)"
+           mkdir -p "$STATE" && printf '%s\n' "$1" > "$AFTER.new" && mv "$AFTER.new" "$AFTER" \
+               || die "could not write $AFTER"
+           say "sessions idle $1 are hibernated, checked every hour" ;;
+    esac
+}
+
+# Every hibernated session, from the registry's history.
+rows() {
+    local f
+    for f in "$PANES"/closed/*.json; do
+        [ -e "$f" ] || continue
+        jq -r 'select((.hibernate // null) | type == "object")
+            | [.session_id, .hibernate.from, .hibernate.name, .hibernate.index,
+               .hibernate.since, (.hibernate.cwd // .cwd)]
+            | map(. // "" | tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")' "$f" 2>/dev/null
+    done
+}
+
+do_list() {
+    local sid s n i t c any=""
+    if [ "${1:-}" != --text ]; then rows; return 0; fi
+    while IFS="$US" read -r sid s n i t c; do
+        [ -n "$sid" ] || continue
+        any=1
+        case "$t" in ''|*[!0-9]*) t=$(now) ;; esac
+        printf '%s  %s ago  %s\n' "$(label "$s" "$n" "$i")" "$(words $(( $(now) - t )))" "$sid"
+    done <<EOF
+$(rows)
+EOF
+    [ -n "$any" ] || echo "Nothing is hibernated on this server."
+}
+
+do_wake() {
+    local which="${1:-}" hits n sid from name i c nb an first last out made=0 cmd
+    [ -n "$which" ] || die "usage: hat-hibernate wake <session id | session:tab | tab>"
+    lock || die "another hibernate is running; try again in a moment"
+    hits=$(rows | AWK_W="$which" awk -F '\037' '
+        BEGIN { w = ENVIRON["AWK_W"] "" }
+        $1 == w || ($2 ":" $3) == w || ($2 ":" $4) == w || ($3 != "" && $3 == w)')
+    n=$(printf '%s' "$hits" | grep -c . || true)
+    [ "$n" -gt 0 ] || die "nothing hibernated matches '$which' (see: hat-hibernate list --text)"
+    [ "$n" -eq 1 ] || die "'$which' matches $n hibernated sessions; give the session id:
+$(printf '%s\n' "$hits" | awk -F '\037' '{ print "  " $1 "  " $2 ":" ($3 != "" ? $3 : $4) }')"
+    IFS="$US" read -r sid from name i _ c <<EOF
+$hits
+EOF
+    # The rest of the record: the tab it sat after.
+    IFS="$US" read -r nb an <<EOF
+$(jq -r '[.hibernate.after, .hibernate.after_name] | map(. // "") | join("\u001f")' "$PANES/closed/$(slug "$sid").json" 2>/dev/null)
+EOF
+    [ -d "$c" ] || c="$HOME"
+    case "$i" in ''|*[!0-9]*) i="" ;; esac
+    cmd="'$LAUNCH' --resume claude '$sid'"
+    if tmux has-session -t "=$from" 2>/dev/null; then
+        # The neighbour by id, if it is still there under its name; else by
+        # name; "" means it was first.
+        if [ -n "$nb" ] && [ "$(tmux display-message -p -t "$nb" "#{session_name}$HT#{window_name}" 2>/dev/null)" != "$from$HT$an" ]; then
+            nb=$( [ -z "$an" ] || tmux list-windows -t "=$from" -F "#{window_id}$HT#{window_name}" 2>/dev/null \
+                  | awk -F '\t' -v n="$an" '$2 == n { print $1; exit }')
+            [ -n "$nb" ] || nb=-
+        fi
+        set -- -d -P -F "#{window_index}$HT#{window_id}" -c "$c" ${name:+-n "$name"}
+        if [ -n "$nb" ] && [ "$nb" != - ]; then
+            out=$(tmux new-window "$@" -a -t "$nb" "$cmd")
+        elif [ -z "$nb" ]; then
+            first=$(tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | head -n 1)
+            out=$(tmux new-window "$@" -b -t "=$from:$first" "$cmd")
+        elif [ -n "$i" ] && ! tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | grep -qx "$i"; then
+            out=$(tmux new-window "$@" -t "=$from:$i" "$cmd")
+        else
+            last=$(tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | tail -n 1)
+            out=$(tmux new-window "$@" -a -t "=$from:$last" "$cmd")
+        fi
+    else
+        made=1
+        out=$(tmux new-session -d -s "$from" -P -F "#{window_index}$HT#{window_id}" -c "$c" ${name:+-n "$name"} "$cmd")
+    fi
+    [ -n "$out" ] || die "could not open a tab for it in $from"
+    # Out of the list now, not only once hat-launch records the agent.
+    "$REG" hibernate-done "$sid" >/dev/null 2>&1
+    printf "hat-hibernate: '%s' is waking in %s%s\n" "$(label "$from" "$name" "$i")" "$from" \
+        "$([ "$made" = 0 ] || echo ', which had closed and is open again')" >&2
+    printf '%s\037%s\037%s\n' "$from" "$(printf '%s' "$out" | tr '\t' '\037')" "$made"
+}
+
+case "${1:-}" in
+    tab)  shift; do_tab "$@" ;;
+    idle) shift; do_idle "$@" ;;
+    tick) do_tick ;;
+    auto) shift; do_auto "$@" ;;
+    list) shift; do_list "$@" ;;
+    wake) shift; do_wake "$@" ;;
+    *)    echo "usage: hat-hibernate tab|idle|tick|auto|list [--text]|wake" >&2; exit 2 ;;
+esac
+HATHIBERNATE
+chmod +x "$HOME/.local/bin/hat-hibernate"
 
 cat > "$HOME/.local/bin/hat-restore" <<'HATRESTORE'
 #!/usr/bin/env bash
