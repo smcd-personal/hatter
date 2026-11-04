@@ -4,9 +4,11 @@
 # private socket and a stand-in claude that runs until it is signalled:
 #
 #   - ages: what is read, and what is refused (under an hour, not an age)
-#   - idle: only an agent idle long enough, by transcript and by pane output;
-#     a split window, a pinned tab and one with no transcript are left alone
-#     and said; --dry-run changes nothing
+#   - idle: only an agent idle long enough, by what was last said in its
+#     transcript, not by the file's time, which Claude Code's bookkeeping
+#     keeps fresh; a tool call still running, a split window, a pinned tab
+#     and one with no transcript are left alone and said, and a tool call
+#     only waiting for approval is not; --dry-run changes nothing
 #   - hibernating: the agent stops, the tab closes, and the history keeps the
 #     session id, workspace, name, neighbour and directory; the only tab of a
 #     workspace stays, as a shell; a pinned tab hibernated by hand stays too
@@ -62,26 +64,35 @@ HB="$work/hat-hibernate"
 REG="$work/hat-registry"
 T() { tmux -L "$k" "$@"; }
 slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
-# setmtime <file> <epoch>
-setmtime() { python3 -c 'import os, sys; t = int(sys.argv[2]); os.utime(sys.argv[1], (t, t))' "$1" "$2"; }
 
-# Times: every pane's last output is about now, so "now" for the script is
-# three days on, and a transcript's age is set against that.
-NOW=$(( $(date +%s) + 3 * 86400 ))
+NOW=$(date +%s)
 export HAT_NOW="$NOW"
+iso() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.123Z 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%S.123Z; }
 
-# agent <session> <name> <session id> <transcript age in seconds, or none>:
-# a tab running the stand-in claude, recorded as the agent it is.
+# agent <session> <name> <session id> <age in seconds, or none> [tool]: a tab
+# running the stand-in claude, recorded as the agent it is. Its transcript's
+# last words are <age> old, or a tool call that old with "tool"; after them
+# comes the untimed bookkeeping Claude Code appends to an open session, and
+# the file itself was written just now, as it is for every open session.
 AGENT="bash -c '$work/bin/claude; exec sleep 100000'"
 agent_tab() {
-    local s="$1" n="$2" sid="$3" age="$4" w pane
+    local s="$1" n="$2" sid="$3" age="$4" tool="${5:-}" w pane f
     if T has-session -t "=$s" 2>/dev/null; then
         w=$(T new-window -d -P -F '#{window_id}' -t "=$s:" -n "$n" -c "$work" "$AGENT")
     else
         w=$(T new-session -d -P -F '#{window_id}' -s "$s" -n "$n" -c "$work" -x 120 -y 40 "$AGENT")
     fi
     pane=$(T display-message -p -t "$w" '#{pane_id}')
-    [[ "$age" == none ]] || { : > "$CLAUDE_CONFIG_DIR/projects/-p/$sid.jsonl"; setmtime "$CLAUDE_CONFIG_DIR/projects/-p/$sid.jsonl" $((NOW - age)); }
+    f="$CLAUDE_CONFIG_DIR/projects/-p/$sid.jsonl"
+    if [[ "$age" != none ]]; then
+        printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":"go"}}\n' "$(iso $((NOW - age - 60)))" > "$f"
+        if [[ -n "$tool" ]]; then
+            printf '{"type":"assistant","timestamp":"%s","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}]}}\n' "$(iso $((NOW - age)))" >> "$f"
+        else
+            printf '{"type":"assistant","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}\n' "$(iso $((NOW - age)))" >> "$f"
+        fi
+        printf '{"type":"cost-state"}\n{"type":"bridge-session"}\n{"type":"last-prompt"}\n' >> "$f"
+    fi
     TMUX_PANE="$pane" "$REG" put "$pane" claude "$sid" live "$work"
     printf '%s' "$w"
 }
@@ -104,10 +115,13 @@ SPL=$(agent_tab w split 11111111-0000-0000-0000-000000000004 $((3 * DAY)))
 T split-window -d -t "$SPL" 'sleep 100000'
 PIN=$(agent_tab w pinned 11111111-0000-0000-0000-000000000005 $((3 * DAY)))
 T set-option -w -t "$PIN" @hatter-pinned 1
+BUSY=$(agent_tab w busy 11111111-0000-0000-0000-000000000008 $((3 * DAY)) tool)
+ASKS=$(agent_tab w asks 11111111-0000-0000-0000-000000000009 $((3 * DAY)) tool)
+T set-option -w -t "$ASKS" @hatter-waiting approval
 SOLO=$(agent_tab only solo 11111111-0000-0000-0000-000000000006 $((3 * DAY)))
 T new-window -d -t '=w:' -n plain -c "$work"
 sleep 1
-[[ "$(nagents)" == 6 ]] || fail "want 6 stand-in agents running, have $(nagents)"
+[[ "$(nagents)" == 8 ]] || fail "want 8 stand-in agents running, have $(nagents)"
 
 # --- ages --------------------------------------------------------------------
 for bad in 2m 59m x "" 2x 2d-1h; do
@@ -121,7 +135,7 @@ ok "ages: an hour or more, and only an age"
 
 # --- tick with no age set does nothing ----------------------------------------
 "$HB" tick || fail "tick failed with no age set"
-[[ "$(nagents)" == 6 ]] || fail "tick with no age set stopped an agent"
+[[ "$(nagents)" == 8 ]] || fail "tick with no age set stopped an agent"
 ok "tick does nothing until an age is set"
 
 # --- dry run --------------------------------------------------------------------
@@ -133,18 +147,20 @@ grep -q "w:plain" <<<"$out"                      && fail "dry run mentions a tab
 grep -q "left alone: w:nofile .*no transcript" <<<"$out" || fail "no-transcript tab is not said: $out"
 grep -q "left alone: w:split .*split into 2 panes" <<<"$out" || fail "split tab is not said: $out"
 grep -q "left alone: w:pinned .*pinned" <<<"$out" || fail "pinned tab is not said: $out"
-[[ "$(nagents)" == 6 ]] || fail "dry run stopped an agent"
-[[ "$(names w)" == "first old new nofile split pinned plain" ]] || fail "dry run changed the tabs: $(names w)"
+grep -q "left alone: w:busy .*tool call" <<<"$out" || fail "a running tool call is not said: $out"
+grep -q "would hibernate: w:asks " <<<"$out" || fail "a tool call waiting for approval is not offered: $out"
+[[ "$(nagents)" == 8 ]] || fail "dry run stopped an agent"
+[[ "$(names w)" == "first old new nofile split pinned busy asks plain" ]] || fail "dry run changed the tabs: $(names w)"
 ok "dry run: says what it would do and why it leaves tabs alone, changes nothing"
 
 # --- idle -------------------------------------------------------------------------
 out=$("$HB" idle 2d) || fail "idle failed: $out"
 grep -q "hibernated: w:old" <<<"$out"  || fail "w:old not hibernated: $out"
 grep -q "hibernated: only:solo" <<<"$out" || fail "only:solo not hibernated: $out"
-grep -q "hibernated 2 session" <<<"$out" || fail "summary is not 2: $out"
-[[ "$(names w)" == "first new nofile split pinned plain" ]] || fail "w:old's tab did not close: $(names w)"
+grep -q "hibernated 3 session" <<<"$out" || fail "summary is not 3: $out"
+[[ "$(names w)" == "first new nofile split pinned busy plain" ]] || fail "w:old's and w:asks's tabs did not close: $(names w)"
 [[ "$(names only)" == solo ]] || fail "the only tab of 'only' did not stay: $(names only)"
-[[ "$(nagents)" == 4 ]] || fail "want 4 agents left running, have $(nagents)"
+[[ "$(nagents)" == 5 ]] || fail "want 5 agents left running, have $(nagents)"
 h=$(hist 11111111-0000-0000-0000-000000000001)
 jq -e --arg a "$NEW" '.hibernate.from == "w" and .hibernate.name == "old" and .hibernate.index == 1
     and .hibernate.after_name == "first" and .hibernate.cwd != "" and .hibernate.idle >= 259200
@@ -159,7 +175,7 @@ ok "idle: stops the agents, closes the tab, keeps the only one as a shell, histo
 # --- by hand: a pinned tab stays, as a shell ------------------------------------------
 out=$("$HB" tab -t "$PIN") || fail "tab -t on the pinned tab failed: $out"
 grep -q "stays, as a shell" <<<"$out" || fail "hibernating a pinned tab does not say it stays: $out"
-[[ "$(names w)" == "first new nofile split pinned plain" ]] || fail "the pinned tab closed: $(names w)"
+[[ "$(names w)" == "first new nofile split pinned busy plain" ]] || fail "the pinned tab closed: $(names w)"
 if "$HB" tab -t "$(T list-windows -t '=w' -F '#{window_id} #{window_name}' | awk '$2 == "plain" { print $1 }')" 2>"$work/err"; then
     fail "a tab with no agent was hibernated"
 fi
@@ -184,14 +200,14 @@ ok "registry: SessionEnd keeps the mark, a shell after it does not"
 out=$("$HB" list --text)
 grep -q "^w:old  0m ago  11111111-0000-0000-0000-000000000001" <<<"$out" || fail "list --text does not show w:old: $out"
 grep -q "^only:solo" <<<"$out" || fail "list --text does not show only:solo: $out"
-[[ "$("$HB" list | wc -l | tr -d ' ')" == 3 ]] || fail "want 3 hibernated (old, solo, pinned): $("$HB" list)"
+[[ "$("$HB" list | wc -l | tr -d ' ')" == 4 ]] || fail "want 4 hibernated (old, asks, solo, pinned): $("$HB" list)"
 ok "list"
 
 # --- wake -------------------------------------------------------------------------------
 out=$("$HB" wake w:old 2>/dev/null) || fail "wake w:old failed"
 IFS=$'\037' read -r s i wid made <<<"$out"
 [[ "$s" == w && "$made" == 0 && -n "$wid" ]] || fail "wake printed '$out'"
-[[ "$(names w)" == "first old new nofile split pinned plain" ]] || fail "w:old did not come back after 'first': $(names w)"
+[[ "$(names w)" == "first old new nofile split pinned busy plain" ]] || fail "w:old did not come back after 'first': $(names w)"
 sleep 1
 grep -q -- "--resume claude 11111111-0000-0000-0000-000000000001" "$work/woke/$wid" \
     || fail "the woken tab did not run hat-launch --resume: $(cat "$work/woke/$wid" 2>/dev/null)"
