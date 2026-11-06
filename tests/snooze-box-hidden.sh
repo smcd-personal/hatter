@@ -25,9 +25,12 @@ sed '/^# -* main$/,$d' "$hatter" > "$work/hatter-lib.sh"
 ws() { jq -nc --arg id "$1" --arg t "$2" --arg s "$3" '{id: $id, title: $t, panes: [{surfaces: [{id: $s}]}]}'; }
 tree() { jq -nc --argjson w "[$(IFS=,; echo "$*")]" '{windows: [{id: "W1", workspaces: $w}]}'; }
 STUBS='
-hat_names() { echo one; echo two; }
-hat_ssh() { case "$1" in one) echo u@a.example.com ;; two) echo u@a.example.com ;; esac; }
-cmux_pane_map() { echo "map $1 $2" >> "$W/log"; cat "$W/map.$2" 2>/dev/null || echo "{\"mirrored\": false}"; }
+hat_names() { echo one; echo two; echo three; }
+# Like the real one: no newline after the destination.
+hat_ssh() { case "$1" in one|two) printf %s u@a.example.com ;; three) printf %s v@b.example.com ;; esac; }
+# Only the first server has its box mirrored.
+cmux_pane_map() { echo "map $1 $2" >> "$W/log"
+    if [ "$1" = u@a.example.com ] && [ -f "$W/map.$2" ]; then cat "$W/map.$2"; else echo "{\"mirrored\": false}"; fi; }
 cmux_json() { cat "$W/tree.json"; }
 cmux_change() { echo "change $*" >> "$W/log"; }
 autosave_sync() { echo "sync" >> "$W/log"; }
@@ -44,8 +47,8 @@ expect "the mirrored box's workspace is closed, with --force" \
     "$(yes_if grep -qx "change close-workspace --force --workspace ws-box" "$work/log")"
 expect "no other workspace is closed" "$(yes_if [ "$(grep -c '^change' "$work/log")" = 1 ])"
 expect "it names the host whose box it closed" "$(yes_if [ "$out" = u@a.example.com ])"
-expect "two hats on one server ask cmux once" \
-    "$(yes_if [ "$(grep -c '^map ' "$work/log")" = 1 ])"
+expect "each server is asked once, two hats on one server included" \
+    "$(yes_if [ "$(grep '^map ' "$work/log" | sort | tr '\n' ';')" = "map u@a.example.com hatter-snooze;map v@b.example.com hatter-snooze;" ])"
 
 # --- a local workspace with the box's name is the user's --------------------------
 tree "$(ws ws-local hatter-snooze S-LOCAL)" "$(ws ws-root Root S-ROOT)" > "$work/tree.json"
