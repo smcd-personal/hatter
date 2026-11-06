@@ -1720,7 +1720,7 @@ hide_snooze_box() {
         done < <(jq -r --argjson s "$sids" '.windows[]?.workspaces[]?
                     | select(any(.panes[]?.surfaces[]?; .id as $x | $s | index([$x])))
                     | .id' <<<"$tree" 2>/dev/null)
-    done < <(hat_names | while IFS= read -r n; do hat_ssh "$n"; done | sort -u)
+    done < <(hat_names | while IFS= read -r n; do printf '%s\n' "$(hat_ssh "$n")"; done | sort -u)
     return 0
 }
 
