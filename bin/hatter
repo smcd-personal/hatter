@@ -8279,6 +8279,66 @@ watch_notify() {
     return 0
 }
 
+# watch_signin: bring back a hat whose mirror cmux gave up on (#174). When
+# cmux cannot reconnect a mirror, it opens a workspace titled "Sign in to
+# <dest>" that runs ssh by hand, and stops trying until someone retries there.
+# A Mac's brief maintenance wake does it: cmux reconnects within a second or
+# two of waking, before the network is up, and the hat stays dark. No
+# workspace closes, so watch_closed never hears of it.
+#
+# So at most every WATCH_SIGNIN_EVERY seconds the watcher looks for such
+# workspaces whose <dest> is a hat's. Once <dest> answers ssh, it restores the
+# hat, which re-mirrors it, and cmux closes the sign-in workspace when its
+# connection succeeds. A hat is restored at most once in WATCH_SIGNIN_REDO
+# seconds, so a sign-in workspace that stays open cannot loop it. Until the
+# host answers, why not is logged once; a lapsed Cloudflare Access login is
+# also posted as a notification, since only a person can renew it.
+WATCH_SIGNIN_EVERY=30
+WATCH_SIGNIN_REDO=300
+WATCH_SIGNIN_LAST=0
+WATCH_SIGNIN_SAID=""
+WATCH_SIGNIN_DONE=""
+watch_signin() {
+    local now tree dests dest hats hat err why done_at line
+    now=$(date +%s)
+    (( now - WATCH_SIGNIN_LAST >= WATCH_SIGNIN_EVERY )) || return 0
+    WATCH_SIGNIN_LAST=$now
+    # A hatter command holds the config; look again next round.
+    [[ ! -d "$LOCK_DIR" ]] || return 0
+    tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    dests=$(jq -r '.windows[]?.workspaces[]?.title // empty
+        | select(startswith("Sign in to ")) | ltrimstr("Sign in to ")' <<<"$tree" 2>/dev/null | sort -u) || return 0
+    [[ -n "$dests" ]] || { WATCH_SIGNIN_SAID=""; return 0; }
+    while IFS= read -r dest; do
+        [[ -n "$dest" ]] || continue
+        hats=$(cfg --arg d "$dest" '.hats | to_entries[] | select(.value.ssh == $d) | .key' 2>/dev/null) || continue
+        [[ -n "$hats" ]] || continue
+        done_at=$(printf '%s' "$WATCH_SIGNIN_DONE" | awk -F '\t' -v d="$dest" '$1 == d { print $2 }' | tail -n 1)
+        [[ -z "$done_at" || $((now - done_at)) -ge $WATCH_SIGNIN_REDO ]] || continue
+        err=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$dest" "$(posix_sh true)" 2>&1 >/dev/null) && err="" || {
+            why=$(printf '%s\n' "$err" | sed -n 's/^  !! //p; s/^ssh: //p' | head -n 1)
+            [[ -n "$why" ]] || why="no answer"
+            if [[ $'\n'"$WATCH_SIGNIN_SAID" != *$'\n'"$dest"$'\t'"$why"$'\n'* ]]; then
+                watch_log "cmux gave up reconnecting to $dest; waiting for it to answer ($why)"
+                WATCH_SIGNIN_SAID+="$dest"$'\t'"$why"$'\n'
+                [[ "$why" != *"Cloudflare Access login"* ]] \
+                    || watch_notify "hatter: $dest is waiting" "The Cloudflare Access login has lapsed. Run: hatter login"
+            fi
+            continue
+        }
+        WATCH_SIGNIN_DONE+="$dest"$'\t'"$now"$'\n'
+        while IFS= read -r hat; do
+            [[ -n "$hat" ]] || continue
+            watch_log "cmux gave up reconnecting to $dest; restoring hat '$hat'"
+            if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then echo "restore $hat"; continue; fi
+            "${WATCH_SELF:-$HATTER_SELF}" restore "$hat" </dev/null 2>&1 | while IFS= read -r line; do
+                watch_log "  $line"
+            done || true
+        done <<<"$hats"
+    done <<<"$dests"
+    return 0
+}
+
 # watch_closed <title TAB user|lost lines>: the workspaces cmux closed while
 # their tmux sessions still run. cmux can close a mirrored workspace by itself:
 # when the ssh connection under its tmux mirror drops (after the Mac sleeps,
@@ -8462,6 +8522,7 @@ watch_act() {
         done < <(printf '%s' "$heals" | sort -u)
     fi
     heals=""; heal_all=0
+    watch_signin
     [[ "$sync" == 1 ]] || return 0
     if [[ -d "$LOCK_DIR" ]]; then
         mtime=$(lock_mtime "$LOCK_DIR")
