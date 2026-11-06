@@ -6354,8 +6354,9 @@ cmd_login() {
             continue
         fi
         info "Logging in to $host through Cloudflare Access: finish in the browser"
-        # cloudflared prints the token on stdout, so stdout goes nowhere.
-        if "$bin" access login "https://$host" >/dev/null \
+        # cloudflared prints the token on stdout, so stdout goes nowhere. Its
+        # stdin is not the loop's: reading it would swallow the hat names left.
+        if "$bin" access login "https://$host" </dev/null >/dev/null \
            && left=$(access_left "$host") && (( left > ACCESS_MARGIN )); then
             info "$host: logged in, $(fmt_left "$left") left"
         else
