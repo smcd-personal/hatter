@@ -2413,6 +2413,15 @@ EOF
             --arg mates " $mates" --arg rest "$rest" "$JQ_DEFS"'
         ({server: $srv, id: $wid} | keyfile($dir)) as $f
         | (map(select(._file == $f)) | first) as $mine
+        # The snooze of an entry from an older server that this record is
+        # about to remove (the two rm branches below). After a reboot the
+        # agent can record itself before hat-restore has re-filed its old
+        # entry (#172), and that old entry is the only place the snooze is.
+        | ([.[] | select(._file != $f and .server != $srv)
+               | select(($i != "" and .session_id == $i)
+                        or ($rest == "0" and .session == $s and .window == ($w | tonumber)))
+               | .snooze // null | objects] | first) as $theirs
+        | ((($mine.snooze // null) | objects) // $theirs) as $z
         # A shell starting in a split of a window whose agent still runs in
         # another of its panes is not what the window is: leave its entry be.
         | if $k == "shell" and $i == "" and $mine != null and ($mine.session_id // "") != ""
@@ -2424,7 +2433,7 @@ EOF
              + (if $p != "" then {pid: $p} else {} end)
              + (if $src != "" then {source: $src} else {} end)
              # A snoozed tab whose agent records itself again is still snoozed.
-             + (if ($mine.snooze // null) != null then {snooze: $mine.snooze} else {} end)
+             + (if $z != null then {snooze: $z} else {} end)
              # A hibernating agent recording its own end (SessionEnd) is still
              # the one being put away; anything else in the window is not.
              + (if ($mine.hibernate // null) != null and $i != "" and ($mine.session_id // "") == $i
