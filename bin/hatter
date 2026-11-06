@@ -3620,21 +3620,47 @@ cfgdir() {
 }
 
 # said <transcript>: when the conversation last moved, in epoch seconds, and
-# 1 if that was a tool call (\037 between). Only what the human or the agent
-# said counts: Claude Code also appends its own bookkeeping to an open
-# session's transcript (cost-state, bridge-session, last-prompt, with no
-# timestamp), hours after anyone last spoke, so the file's own time says
-# nothing; and the lines just before them may all be system or tool
-# progress, so the whole file is read. Prints nothing when there is no such
+# when the latest tool call still waiting for its result was made, 0 for none
+# (\037 between). Only what the human or the agent said counts: Claude Code
+# also appends its own bookkeeping to an open session's transcript
+# (cost-state, bridge-session, last-prompt, with no timestamp), hours after
+# anyone last spoke, so the file's own time says nothing; and the lines just
+# before them may all be system or tool progress, so the whole file is read.
+# A tool call is waiting until a tool_result names its id: with calls made in
+# parallel, a quick one's result can come after a slow one is made. A new
+# prompt from the human starts over. Prints nothing when there is no such
 # line, and the file's time stands in.
 said() {
     grep -a -e '"type":"user"' -e '"type":"assistant"' "$1" 2>/dev/null \
-        | jq -R -r 'fromjson? | objects | select(.type == "user" or .type == "assistant")
-                    | select(.timestamp | type == "string")
-                    | [(.timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601? // empty),
-                       (if .type == "assistant" and any(.message.content[]?; type == "object" and .type == "tool_use")
-                        then 1 else 0 end)]
-                    | map(tostring) | join("\u001f")' 2>/dev/null | tail -n 1
+        | jq -n -R -r 'reduce (inputs | fromjson? | objects
+                            | select(.type == "user" or .type == "assistant")
+                            | select(.timestamp | type == "string")) as $l
+                ({last: null, p: {}};
+                 ($l.timestamp | sub("\\.[0-9]+"; "") | fromdateiso8601? // null) as $t
+                 | if $t == null then . else
+                     .last = $t
+                     | ($l.message.content // null) as $c
+                     | [$c | arrays | .[] | objects] as $items
+                     | if $l.type == "assistant" then
+                         reduce ($items[] | select(.type == "tool_use") | .id | strings) as $id (.; .p[$id] = $t)
+                       elif any($items[]; .type == "tool_result") then
+                         reduce ($items[] | select(.type == "tool_result") | .tool_use_id | strings) as $id (.; del(.p[$id]))
+                       else .p = {} end
+                   end)
+                | select(.last != null)
+                | [.last, ([.p[]] | max // 0)] | map(tostring) | join("\u001f")' 2>/dev/null
+}
+
+# started <pid>: when it started, in epoch seconds by the real clock, not
+# HAT_NOW; nothing if ps cannot say. etime ([[dd-]hh:]mm:ss) rather than
+# etimes, which BSD ps lacks.
+started() {
+    ps -o etime= -p "$1" 2>/dev/null | awk -v now="$(date +%s)" '
+        { gsub(/ /, ""); d = 0; t = $0
+          if (index(t, "-")) { d = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+          n = split(t, a, ":"); s = 0
+          for (i = 1; i <= n; i++) s = s * 60 + a[i]
+          if (t ~ /^[0-9:]+$/) print now - (d * 86400 + s) }'
 }
 
 transcript() {  # transcript <session id>: its file, or fail
@@ -3715,18 +3741,27 @@ EOF
     [ "${KIND:-}" = claude ] && [ -n "${SID:-}" ] && [ "${STATE_:-}" = live ] || return 2
     PID=$(agent_pid "$PPID_")
     [ -n "$PID" ] || return 2
+    # Here, not in transcript's subshell, so the login shell is asked once.
+    [ -n "$CFG" ] || cfgdir >/dev/null
     T=$(transcript "$SID") || { WHY="no transcript for $SID to resume from"; return 1; }
-    local last busy
-    IFS="$US" read -r last busy <<EOF2
+    local last pend start
+    IFS="$US" read -r last pend <<EOF2
 $(said "$T")
 EOF2
     case "$last" in ''|*[!0-9]*) last=$(mtime "$T") ;; esac
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    case "$pend" in ''|*[!0-9]*) pend=0 ;; esac
+    # An agent just started (woken, or resumed by hand) has said nothing new
+    # yet, but is not idle: someone is about to use it.
+    start=$(started "$PID")
+    case "$start" in ''|*[!0-9]*) start=0 ;; esac
+    [ "$start" -le "$last" ] || last=$start
     IDLE=$(( $(now) - last ))
     [ "$IDLE" -ge "$2" ] || return 2
     # A tool call with no result yet is still running, unless the agent is
-    # only waiting for its human to allow it.
-    if [ "$busy" = 1 ] && [ "$WAIT" != approval ] && [ "$WAIT" != question ]; then
+    # only waiting for its human to allow it. One made before this agent
+    # started was cut off by its end, and is running no more.
+    if [ "$pend" -gt 0 ] && [ "$pend" -ge "$start" ] && [ "$WAIT" != approval ] && [ "$WAIT" != question ]; then
         WHY="its last step, a tool call, has not finished"; return 1
     fi
     [ "$S" != "$BOX" ] && [ -z "$SNZ" ] || { WHY="snoozed"; return 1; }
@@ -3737,7 +3772,16 @@ EOF2
 
 # put_away: hibernate the window check just read. Assumes the lock.
 put_away() {
-    local line after an rec keep=0 i=0
+    local line after an rec keep=0 i=0 now_
+    # Read now, not from the list idle started with: tabs it has closed since
+    # may have left this one the last in its workspace, or moved its index.
+    # \037, not a tab: read folds runs of a whitespace IFS, so an empty
+    # field would shift the rest.
+    now_=$(tmux display-message -p -t "$W" "#{session_windows}$US#{@hatter-pinned}$US#{window_index}" 2>/dev/null) \
+        || { echo "its tab is gone"; return 1; }
+    IFS="$US" read -r NW PIN I <<EOF
+$now_
+EOF
     [ "${NW:-1}" -gt 1 ] && [ -z "$PIN" ] || keep=1
     line=$(tmux list-windows -t "=$S" -F "#{window_index}$HT#{window_id}$HT#{window_name}" 2>/dev/null \
             | awk -F '\t' -v i="$I" '$1 + 0 < i + 0 { a = $2 "\037" $3 } END { print a }')
@@ -3761,6 +3805,7 @@ put_away() {
         tmux kill-window -t "$W" 2>/dev/null
         "$REG" refresh >/dev/null 2>&1
     fi
+    [ "$keep" = 0 ] || echo "its tab stays, as a shell"
     [ -f "$PANES/closed/$(slug "$SID").json" ] \
         || echo "stopped, but its record did not reach the history: resume it with claude --resume $SID"
     return 0
@@ -3787,8 +3832,7 @@ do_tab() {
     [ "$rc" != 2 ] || die "'$lb' has no Claude session running in it"
     [ "$rc" = 0 ] || die "'$lb' is left as it is: $WHY"
     why=$(put_away) || die "'$lb': $why"
-    [ -z "$why" ] || printf 'hat-hibernate: %s\n' "$why" >&2
-    say "'$lb' hibernated ($SID)$([ "${NW:-1}" -gt 1 ] && [ -z "$PIN" ] || echo '; its tab stays, as a shell')"
+    say "'$lb' hibernated ($SID)${why:+; $(printf '%s' "$why" | paste -sd ';' - | sed 's/;/; /g')}"
 }
 
 do_idle() {
@@ -3912,8 +3956,13 @@ EOF
         if [ -n "$nb" ] && [ "$nb" != - ]; then
             out=$(tmux new-window "$@" -a -t "$nb" "$cmd")
         elif [ -z "$nb" ]; then
-            first=$(tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | head -n 1)
-            out=$(tmux new-window "$@" -b -t "=$from:$first" "$cmd")
+            # First: after the first tab, then swapped with it. new-window -b
+            # would do it in one, but only from tmux 3.2.
+            first=$(tmux list-windows -t "=$from" -F '#{window_id}' 2>/dev/null | head -n 1)
+            out=$(tmux new-window "$@" -a -t "$first" "$cmd")
+            if [ -n "$out" ] && tmux swap-window -d -s "${out#*"$HT"}" -t "$first" 2>/dev/null; then
+                out=$(tmux display-message -p -t "${out#*"$HT"}" "#{window_index}$HT#{window_id}" 2>/dev/null) || out=""
+            fi
         elif [ -n "$i" ] && ! tmux list-windows -t "=$from" -F '#{window_index}' 2>/dev/null | grep -qx "$i"; then
             out=$(tmux new-window "$@" -t "=$from:$i" "$cmd")
         else
@@ -5352,8 +5401,24 @@ hib_rc() {  # hib_rc <rc> <hat>
     [[ "$1" == 0 ]] || exit 1
 }
 
-# An age as hat-hibernate reads it: 2d, 36h, 1w, 1d12h.
-hib_age_ok() { [[ "$1" =~ ^([0-9]+[mhdw])+$ ]]; }
+# An age as hat-hibernate takes it: 2d, 36h, 1w, 1d12h; an hour or more, as
+# it refuses less. Checked here before any of it is written to the config.
+hib_age_ok() {
+    local rest="$1" n u total=0
+    [[ "$rest" =~ ^([0-9]{1,6}[mhdw])+$ ]] || return 1
+    while [[ -n "$rest" ]]; do
+        n=${rest%%[!0-9]*}; rest=${rest#"$n"}
+        u=${rest:0:1}; rest=${rest:1}
+        n=$((10#$n))
+        case "$u" in
+            m) total=$((total + n * 60)) ;;
+            h) total=$((total + n * 3600)) ;;
+            d) total=$((total + n * 86400)) ;;
+            w) total=$((total + n * 604800)) ;;
+        esac
+    done
+    (( total >= 3600 ))
+}
 
 # hat_hibernate_after <user@host>: the idle age the hats on that server set,
 # empty for none. They share one state directory, so they must agree.
