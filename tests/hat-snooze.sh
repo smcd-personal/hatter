@@ -136,6 +136,7 @@ HAT_TZ= "$SN" when "tomorrow" >/dev/null || fail "the tz file is not read"
 
 # --- snooze -------------------------------------------------------------------
 B=$(wid s b); A=$(wid s a)
+now=$(date +%s)
 out=$("$SN" snooze -t "$B" 1h) || fail "snooze failed: $out"
 [[ "$(names s)" == "a c" ]]             || fail "s should be 'a c' while b is snoozed, is '$(names s)'"
 [[ "$(names hatter-snooze)" == "b" ]]   || fail "b is not in hatter-snooze: '$(names hatter-snooze)'"
@@ -150,6 +151,7 @@ near "$(opt "$B" @hatter-snooze-until)" 3600 || fail "@hatter-snooze-until not s
 [[ "$("$SN" list --text)" == "s:b  wakes "*"($LA)" ]] || fail "list --text: $("$SN" list --text)"
 
 # Again: a new time, not a second move.
+now=$(date +%s)
 "$SN" snooze -t "$B" 2h >/dev/null || fail "re-snooze failed"
 near "$(entry "$B" | jq -r .snooze.until)" 7200 || fail "re-snooze did not set the new time"
 [[ "$(entry "$B" | jq -r .snooze.from)" == s ]] || fail "re-snooze lost the origin"
@@ -174,6 +176,7 @@ if "$SN" unsnooze s:b >/dev/null 2>&1; then fail "unsnoozed a tab that is not sn
 
 # --- the timer: due tabs only -------------------------------------------------
 C=$(wid s c)
+now=$(date +%s)   # near() measures from here: the run is well past its start
 "$SN" snooze -t "$B" 1h >/dev/null
 "$SN" snooze -t "$C" @1 >/dev/null     # long due
 "$SN" tick
