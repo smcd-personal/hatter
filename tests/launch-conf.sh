@@ -106,6 +106,8 @@ step=$(extract REMOTE_EOF | sed -n '/^LAUNCH_CONF=/,/^mv "\$LAUNCH_CONF.new"/p')
 printf '%s\n' "$step" > "$work/step.sh"
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "\$1" = -G ] && exit 0
 cmd="\${*: -1}"
 # Only the provision script; anything else provision asks (#121) gets no answer.
 case "\$cmd" in *"bash -s -- "*) ;; *) exit 255 ;; esac

@@ -30,6 +30,8 @@ esac
 EOF
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "\$1" = -G ] && exit 0
 cmd="\${@: -1}"
 unset XDG_STATE_HOME
 HOME="$hd" CLAUDE_CONFIG_DIR="$claude" PATH="$work/remote:\$PATH" sh -c "\$cmd"

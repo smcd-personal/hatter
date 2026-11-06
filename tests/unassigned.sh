@@ -24,6 +24,8 @@ mkdir -p "$work/bin"
 # session has one window, "w-<session>".
 cat > "$work/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "$1" = -G ] && exit 0
 cmd="${*: -1}"
 dest=""
 for a in "$@"; do case "$a" in *@*.example.com) dest="$a" ;; esac; done
