@@ -125,6 +125,57 @@ expect "...and is posted as a notification" "$(grep -q "hatter login" "$work/not
 run
 expect "...once" "$([[ $(grep -c . "$work/notes") == 1 ]] && echo y || echo n)"
 
+# --- the watcher really calls it, and survives set -euo pipefail -------------
+reset
+unset -f access_gate
+access_gate() { return 0; }
+printf '%s\n' "Sign in to me@dev.example.com" > "$work/titles"
+out=$( set -euo pipefail
+       heals=""; heal_all=0; sync=0; WATCH_SIGNIN_LAST=0
+       watch_act; echo "survived" )
+expect "watch_act runs the sign-in check" "$([[ "$out" == *"restore dev"* ]] && echo y || echo n)"
+expect "...under set -euo pipefail, and carries on" "$([[ "$out" == *survived* ]] && echo y || echo n)"
+echo me@dev.example.com > "$work/down"
+out=$( set -euo pipefail
+       heals=""; heal_all=0; sync=0; WATCH_SIGNIN_LAST=0
+       watch_act; echo "survived" )
+expect "an unreachable host does not end the watcher either" "$([[ "$out" == *survived* && "$out" != *"restore "* ]] && echo y || echo n)"
+
+# --- bookkeeping ---------------------------------------------------------------
+reset
+old=$(( $(date +%s) - WATCH_SIGNIN_REDO - 10 ))
+WATCH_SIGNIN_DONE=$(printf 'a@x.example.com\t%s\nb@y.example.com\t%s\n' "$old" "$old")$'\n'
+run
+expect "restores older than the gap are dropped from the record" \
+    "$([[ "$WATCH_SIGNIN_DONE" != *x.example.com* && "$WATCH_SIGNIN_DONE" == *dev.example.com* ]] && echo y || echo n)"
+reset
+echo me@dev.example.com > "$work/down"; run
+: > "$work/down"; run
+echo me@dev.example.com > "$work/down"; WATCH_SIGNIN_DONE=""; run
+expect "a failure after the host recovered is logged again" \
+    "$([[ $(grep -c "waiting for it to answer" "$work/log") == 2 ]] && echo y || echo n)"
+reset
+printf '#!/bin/sh\n[ "$1" = -G ] && exit 0\necho "Permission denied (publickey)." >&2; exit 255\n' > "$work/bin/ssh"
+run
+expect "an error without an ssh: prefix is logged as itself" \
+    "$(grep -q "(Permission denied (publickey).)" "$work/log" && echo y || echo n)"
+reset; rm -f "$work/args"
+printf '%s\n' "Sign in to me@ops.example.com" > "$work/titles"
+cat > "$work/bin/ssh" <<EOF
+#!/usr/bin/env bash
+[ "\$1" = -G ] && exit 0
+echo "\$*" >> "$work/args"
+exit 0
+EOF
+run
+expect "the probe opens its own connection, not a shared master" \
+    "$(grep -q 'ControlPath=none' "$work/args" && ! grep -q 'ControlMaster=auto' "$work/args" && echo y || echo n)"
+
+# --- wall_cap ------------------------------------------------------------------
+s=$(date +%s); wall_cap 1 sleep 5 2>/dev/null; rc=$?; e=$(date +%s)
+expect "wall_cap ends a command at its cap" "$([[ $rc != 0 && $((e - s)) -le 3 ]] && echo y || echo n)"
+expect "wall_cap passes a command's status through" "$([[ $(wall_cap 5 sh -c 'exit 3'; echo $?) == 3 ]] && echo y || echo n)"
+
 echo
 if (( fails )); then echo "$fails failed"; exit 1; fi
 echo "all passed"

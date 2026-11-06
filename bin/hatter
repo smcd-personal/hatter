@@ -8295,9 +8295,23 @@ watch_notify() {
 # also posted as a notification, since only a person can renew it.
 WATCH_SIGNIN_EVERY=30
 WATCH_SIGNIN_REDO=300
+# The watcher handles no events while these run, so each has a wall-clock cap.
+WATCH_SIGNIN_PROBE_CAP=20
+WATCH_SIGNIN_RESTORE_CAP=300
 WATCH_SIGNIN_LAST=0
 WATCH_SIGNIN_SAID=""
 WATCH_SIGNIN_DONE=""
+# wall_cap <seconds> <command...>: run it, killed after <seconds>. macOS has no
+# timeout(1); perl's alarm survives exec. Without perl it just runs.
+wall_cap() {
+    local secs="$1"; shift
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm shift; exec @ARGV or exit 127' "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 watch_signin() {
     local now tree dests dest hats hat err why done_at line
     now=$(date +%s)
@@ -8315,8 +8329,15 @@ watch_signin() {
         [[ -n "$hats" ]] || continue
         done_at=$(printf '%s' "$WATCH_SIGNIN_DONE" | awk -F '\t' -v d="$dest" '$1 == d { print $2 }' | tail -n 1)
         [[ -z "$done_at" || $((now - done_at)) -ge $WATCH_SIGNIN_REDO ]] || continue
-        err=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$dest" "$(posix_sh true)" 2>&1 >/dev/null) && err="" || {
+        # A connection of its own (ControlPath=none): a master left from before
+        # the drop could answer for a host that does not, or hang. wall_cap
+        # execs the ssh binary, past the ssh() gate, so the gate goes first.
+        err=$( { access_gate "$dest" \
+                 && wall_cap "$WATCH_SIGNIN_PROBE_CAP" ssh -n -o ControlPath=none "${SSH_KEEPALIVE[@]}" \
+                        -o BatchMode=yes -o ConnectTimeout=8 "$dest" "$(posix_sh true)"; } 2>&1 >/dev/null) \
+            && err="" || {
             why=$(printf '%s\n' "$err" | sed -n 's/^  !! //p; s/^ssh: //p' | head -n 1)
+            [[ -n "$why" ]] || why=$(printf '%s\n' "$err" | grep -v '^[[:space:]]*$' | tail -n 1)
             [[ -n "$why" ]] || why="no answer"
             if [[ $'\n'"$WATCH_SIGNIN_SAID" != *$'\n'"$dest"$'\t'"$why"$'\n'* ]]; then
                 watch_log "cmux gave up reconnecting to $dest; waiting for it to answer ($why)"
@@ -8326,12 +8347,19 @@ watch_signin() {
             fi
             continue
         }
+        # It answers: a later failure is news again. Restores older than the
+        # gap no longer matter, so the record stays small.
+        WATCH_SIGNIN_SAID=$(printf '%s' "$WATCH_SIGNIN_SAID" | awk -F '\t' -v d="$dest" '$1 != d && NF')
+        [[ -z "$WATCH_SIGNIN_SAID" ]] || WATCH_SIGNIN_SAID+=$'\n'
+        WATCH_SIGNIN_DONE=$(printf '%s' "$WATCH_SIGNIN_DONE" \
+            | awk -F '\t' -v n="$now" -v g="$WATCH_SIGNIN_REDO" 'NF && n - $2 < g')
+        [[ -z "$WATCH_SIGNIN_DONE" ]] || WATCH_SIGNIN_DONE+=$'\n'
         WATCH_SIGNIN_DONE+="$dest"$'\t'"$now"$'\n'
         while IFS= read -r hat; do
             [[ -n "$hat" ]] || continue
             watch_log "cmux gave up reconnecting to $dest; restoring hat '$hat'"
             if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then echo "restore $hat"; continue; fi
-            "${WATCH_SELF:-$HATTER_SELF}" restore "$hat" </dev/null 2>&1 | while IFS= read -r line; do
+            wall_cap "$WATCH_SIGNIN_RESTORE_CAP" "${WATCH_SELF:-$HATTER_SELF}" restore "$hat" </dev/null 2>&1 | while IFS= read -r line; do
                 watch_log "  $line"
             done || true
         done <<<"$hats"
