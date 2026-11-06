@@ -2417,10 +2417,16 @@ EOF
         # about to remove (the two rm branches below). After a reboot the
         # agent can record itself before hat-restore has re-filed its old
         # entry (#172), and that old entry is the only place the snooze is.
-        | ([.[] | select(._file != $f and .server != $srv)
-               | select(($i != "" and .session_id == $i)
-                        or ($rest == "0" and .session == $s and .window == ($w | tonumber)))
-               | .snooze // null | objects] | first) as $theirs
+        # A session id match first: that is the same agent. An index match
+        # only counts when it carries a snooze, which only a window in the
+        # snooze box does, and only hat-snooze and hat-restore put windows
+        # there; so the window at its index is the same tab.
+        | ([.[] | select(._file != $f and .server != $srv and $i != "" and .session_id == $i)
+               | .snooze // null | objects]
+           + [.[] | select(._file != $f and .server != $srv and $rest == "0"
+                           and .session == $s and .window == ($w | tonumber))
+               | .snooze // null | objects]
+           | first) as $theirs
         | ((($mine.snooze // null) | objects) // $theirs) as $z
         # A shell starting in a split of a window whose agent still runs in
         # another of its panes is not what the window is: leave its entry be.

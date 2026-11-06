@@ -141,6 +141,22 @@ expect "put: and that older entry is gone" "$(yes_if [ -z "$(jq -r 'select(.serv
 "$REG" put "$(pane hatter-snooze:1)" claude plain live /
 expect "put: an older entry with no snooze adds none" \
     "$(yes_if [ "$(jq -c 'select(.session_id == "plain") | .snooze // "none"' "$PANES"/*.json)" = '"none"' ])"
+# The window's own snooze is newer than an older entry's.
+start hatter-snooze 1
+"$REG" put "$(pane hatter-snooze:0)" claude own live /
+"$REG" snooze "$(tmux display-message -p -t "$(pane hatter-snooze:0)" '#{window_id}')" \
+    '{"until": 4100000000, "from": "s", "mode": "remind"}'
+prior @93 hatter-snooze 5 own "$z"
+"$REG" put "$(pane hatter-snooze:0)" claude own live /
+expect "put: a window's own snooze wins over an older entry's" \
+    "$(yes_if [ "$(jq -c 'select(.session_id == "own") | .snooze.until' "$PANES"/*.json)" = 4100000000 ])"
+# Both kinds of older entry: the session id match is the one carried.
+start hatter-snooze 2
+prior @94 hatter-snooze 1 other '{"until": 4200000000, "from": "s", "mode": "remind"}'
+prior @95 hatter-snooze 6 both "$z"
+"$REG" put "$(pane hatter-snooze:1)" claude both live /
+expect "put: a session id match wins over an index match" \
+    "$(yes_if [ "$(jq -c 'select(.session_id == "both") | .snooze.until' "$PANES"/*.json)" = 4000000000 ])"
 # The other removal: an older entry filed at this window's session and index.
 start hatter-snooze 2
 prior @92 hatter-snooze 1 other "$z"
