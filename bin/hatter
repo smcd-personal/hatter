@@ -3549,6 +3549,9 @@ PANES="$STATE/panes"
 REG="${HAT_REGISTRY:-$HOME/.local/bin/hat-registry}"
 LAUNCH="${HAT_LAUNCH:-$HOME/.local/bin/hat-launch}"
 AFTER="$STATE/hibernate-after"
+# When each woken session was woken, a file per session id: idle runs from
+# there until it says something new.
+WOKEN="$STATE/woken"
 BOX=hatter-snooze
 HT=$'\t'
 US=$'\037'
@@ -3751,11 +3754,15 @@ EOF2
     case "$last" in ''|*[!0-9]*) last=$(mtime "$T") ;; esac
     case "$last" in ''|*[!0-9]*) last=0 ;; esac
     case "$pend" in ''|*[!0-9]*) pend=0 ;; esac
-    # An agent just started (woken, or resumed by hand) has said nothing new
-    # yet, but is not idle: someone is about to use it.
+    # A session just woken has said nothing new yet, but is not idle: someone
+    # woke it to use it. Not the agent's start: hat-restore resumes every
+    # agent at boot, and that is no sign of use.
+    local woke
+    woke=$(cat "$WOKEN/$(slug "$SID")" 2>/dev/null) || woke=""
+    case "$woke" in ''|*[!0-9]*) woke=0 ;; esac
+    [ "$woke" -le "$last" ] || last=$woke
     start=$(started "$PID")
     case "$start" in ''|*[!0-9]*) start=0 ;; esac
-    [ "$start" -le "$last" ] || last=$start
     IDLE=$(( $(now) - last ))
     [ "$IDLE" -ge "$2" ] || return 2
     # A tool call with no result yet is still running, unless the agent is
@@ -3976,6 +3983,7 @@ EOF
     [ -n "$out" ] || die "could not open a tab for it in $from"
     # Out of the list now, not only once hat-launch records the agent.
     "$REG" hibernate-done "$sid" >/dev/null 2>&1
+    mkdir -p "$WOKEN" 2>/dev/null && now > "$WOKEN/$(slug "$sid")"
     printf "hat-hibernate: '%s' is waking in %s%s\n" "$(label "$from" "$name" "$i")" "$from" \
         "$([ "$made" = 0 ] || echo ', which had closed and is open again')" >&2
     printf '%s\037%s\037%s\n' "$from" "$(printf '%s' "$out" | tr '\t' '\037')" "$made"

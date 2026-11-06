@@ -10,8 +10,9 @@
 #     and one with no transcript are left alone and said, and a tool call
 #     only waiting for approval is not, nor is one of several made in
 #     parallel whose result has not come, nor one cut off before the agent
-#     started; an agent just started is not idle, however old its last
-#     words; --dry-run changes nothing
+#     started; a session just woken is not idle, however old its last
+#     words, but one only restarted (as at boot) is; --dry-run changes
+#     nothing
 #   - hibernating: the agent stops, the tab closes, and the history keeps the
 #     session id, workspace, name, neighbour and directory; the only tab of a
 #     workspace stays, as a shell, also when the tabs before it in the same
@@ -52,11 +53,14 @@ cat > "$work/bin/claude" <<'EOF'
 trap 'exit 0' TERM HUP
 while :; do sleep 1; done
 EOF
-# The stand-in hat-launch for a wake: says what it was asked, then waits.
+# The stand-in hat-launch for a wake: says what it was asked, records the
+# agent as hat-launch does, and runs it.
 cat > "$work/bin/hat-launch" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" > "$HAT_TEST_WOKE/$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}')"
-while :; do sleep 1; done
+"$HAT_REGISTRY" put "$TMUX_PANE" claude "$3" live "$PWD"
+"$(dirname "$0")/claude"
+exec sleep 100000
 EOF
 chmod +x "$work/bin/claude" "$work/bin/hat-launch"
 mkdir -p "$work/woke"
@@ -262,13 +266,17 @@ grep -q "left alone" <<<"$out" && fail "tick reports what it leaves alone: $out"
 T list-windows -a -F '#{window_id}' | grep -qx "$LATE" && fail "w:late's tab is still open"
 ok "auto and tick"
 
-# --- an agent just started is not idle, however old its last words -------------
-FRESH=$(agent_tab w fresh 11111111-0000-0000-0000-00000000000e $((33 * DAY)))
-out=$(HAT_NOW=$((REAL + 120)) "$HB" idle 1h --dry-run) || fail "idle --dry-run failed: $out"
-grep -q "w:fresh" <<<"$out" && fail "an agent started 2 minutes ago is offered: $out"
+# --- a session just woken is not idle; one only restarted is -----------------
+# w:old was woken above, at NOW; its last words are 3 days older.
 out=$("$HB" idle 1h --dry-run) || fail "idle --dry-run failed: $out"
-grep -q "would hibernate: w:fresh " <<<"$out" || fail "w:fresh is not offered once it has run a month: $out"
-ok "an agent just started is not idle"
+grep -q "w:old" <<<"$out" && fail "a session just woken is offered: $out"
+out=$(HAT_NOW=$((NOW + 2 * 3600)) "$HB" idle 1h --dry-run) || fail "idle --dry-run failed: $out"
+grep -q "would hibernate: w:old (idle 2h" <<<"$out" || fail "w:old is not idle from its waking: $out"
+# Started now and never woken, as hat-restore starts every agent at boot.
+FRESH=$(agent_tab w fresh 11111111-0000-0000-0000-00000000000e $((33 * DAY)))
+out=$(HAT_NOW=$((REAL + 120)) "$HB" idle 2d --dry-run) || fail "idle --dry-run failed: $out"
+grep -q "would hibernate: w:fresh (idle 3d" <<<"$out" || fail "an agent restarted, not woken, lost its idle time: $out"
+ok "a session just woken is not idle; one restarted is"
 
 # --- the client: the age a server gets, and what is refused ------------------------
 mkdir -p "$work/xdg/hatter"
