@@ -340,6 +340,107 @@ hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
 hat_mosh()   { cfg --arg l "$1" '.hats[$l].mosh // false'; }
 hat_names()  { cfg '.hats | keys[]?'; }
 
+# ------------------------------------------------------------ Cloudflare Access
+# A server can sit behind Cloudflare Access, reached with an ssh config entry
+#   ProxyCommand cloudflared access ssh --hostname %h
+# While the Access login lasts that is plain ssh. Once it lapses, cloudflared
+# opens a browser tab and waits for someone to sign in. hatter runs ssh from the
+# autosave timer, the watcher and parallel syncs, so a lapsed login would mean a
+# burst of tabs and commands hung until ssh gives up. Instead, every ssh hatter
+# starts checks the login first, offline, and fails fast saying to run
+# `hatter login`. Nothing here ever prints a token.
+HATTER_CF_DIR="${HATTER_CF_DIR:-$HOME/.cloudflared}"
+# A login with less than this many seconds left counts as lapsed.
+ACCESS_MARGIN=60
+
+# access_info <dest>: "<cloudflared binary><TAB><hostname>" when ssh reaches
+# <dest> through `cloudflared access`; nothing otherwise. `ssh -G` resolves the
+# ssh config without connecting. The binary is the one the ProxyCommand names,
+# so `hatter login` writes the token that ssh will read.
+access_info() {
+    local g pc host w words=() bin="" want="" seen_access="" name=""
+    g=$(command ssh -G "$1" </dev/null 2>/dev/null) || return 0
+    pc=$(awk '$1 == "proxycommand" { sub(/^proxycommand[ \t]+/, ""); print; exit }' <<<"$g")
+    host=$(awk '$1 == "hostname" { print $2; exit }' <<<"$g")
+    [[ -n "$pc" && "$pc" != none ]] || return 0
+    # Word by word, without a shell or globbing: the command is the user's, not
+    # ours to run.
+    read -r -a words <<<"$pc"
+    for w in "${words[@]}"; do
+        if [[ -z "$bin" ]]; then bin="$w"; continue; fi
+        if [[ -n "$want" ]]; then name="$w"; want=""; continue; fi
+        case "$w" in
+            access) seen_access=1 ;;
+            --hostname) want=1 ;;
+            --hostname=*) name="${w#--hostname=}" ;;
+        esac
+    done
+    case "${bin##*/}" in cloudflared*) ;; *) return 0 ;; esac
+    [[ -n "$seen_access" ]] || return 0
+    [[ "$bin" != "~/"* ]] || bin="$HOME/${bin#\~/}"
+    [[ -x "$bin" ]] || bin=$(command -v cloudflared 2>/dev/null) || bin=""
+    [[ -z "$name" || "$name" == "%h" ]] && name="$host"
+    [[ -n "$name" ]] || return 0
+    printf '%s\t%s\n' "${bin:-cloudflared}" "$name"
+}
+
+# jwt_claim <file> <claim>: one claim of the JWT in <file>. The token goes
+# through a pipe and is never printed.
+jwt_claim() {
+    jq -Rr --arg c "$2" 'split(".")[1] | gsub("-"; "+") | gsub("_"; "/")
+        | . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson | .[$c] // empty' \
+        < "$1" 2>/dev/null | head -n 1 || true
+}
+
+# access_left <hostname>: seconds the Access login for <hostname> has left, 0
+# if none. An app token counts, and so does the org token of the team that
+# issued it: cloudflared trades a live org token for a new app token without a
+# browser.
+access_left() {
+    local f e iss now best=0
+    now=$(date +%s)
+    for f in "$HATTER_CF_DIR/$1"-*-token; do
+        [[ -f "$f" ]] || continue
+        e=$(jwt_claim "$f" exp)
+        [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
+        iss=$(jwt_claim "$f" iss); iss="${iss#https://}"; iss="${iss%%/*}"
+        if [[ -n "$iss" && -f "$HATTER_CF_DIR/$iss-org-token" ]]; then
+            e=$(jwt_claim "$HATTER_CF_DIR/$iss-org-token" exp)
+            [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
+        fi
+    done
+    echo $(( best > now ? best - now : 0 ))
+}
+
+# access_gate <dest>: fails, saying what to run, when <dest> is behind
+# Cloudflare Access and its login has lapsed. Succeeds for any other dest.
+access_gate() {
+    local ai
+    ai=$(access_info "$1")
+    [[ -n "$ai" ]] || return 0
+    (( $(access_left "${ai#*$'\t'}") > ACCESS_MARGIN )) && return 0
+    warn "the Cloudflare Access login for ${ai#*$'\t'} has lapsed; run: hatter login"
+    return 255
+}
+
+# Every `ssh` hatter runs goes through here, including ones not written yet,
+# so none of them can open a login tab from a timer. The destination is the
+# first argument that is not an option or an option's value.
+ssh() {
+    local a d="" skip=""
+    for a in "$@"; do
+        if [[ -n "$skip" ]]; then skip=""; continue; fi
+        case "$a" in
+            -G|-V|-O) command ssh "$@"; return ;;
+            -[BbcDEeFIiJLlmOoPpQRSWw]) skip=1 ;;
+            -*) ;;
+            *) d="$a"; break ;;
+        esac
+    done
+    if [[ -n "$d" ]]; then access_gate "$d" || return 255; fi
+    command ssh "$@"
+}
+
 # How a hat's panes start their agents, as the tmux options hat-launch reads:
 #   "launch": {"kind": "claude", "args": {"claude": "--permission-mode auto"}}
 # gives @hat_default_kind and @hat_claude_args. A kind is a word; args are
@@ -1585,6 +1686,8 @@ mirror_hat() {
     local hat="$1" win="$2" host
     host=$(hat_ssh "$hat")
     cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
+    # cmux runs its own ssh, which the ssh() gate never sees.
+    access_gate "$host" || die "not mirroring hat '$hat' until the Cloudflare Access login is renewed"
     info "Mirroring $host into the '$hat' window"
     cmux_change ssh-tmux "$host" --no-focus >/dev/null
 }
@@ -4417,6 +4520,7 @@ hat_status_row() {
         # a very different problem from "auth"
         case "$(cat "$err")" in
             *"Could not resolve hostname"*) reach="no DNS" ;;
+            *"Cloudflare Access login"*)    reach="login" ;;
             *"Connection refused"*)         reach="refused" ;;
             *"Permission denied"*)          reach="auth" ;;
             *"timed out"*|*"Timeout"*)      reach="timeout" ;;
@@ -5551,6 +5655,8 @@ attach_session() {
     # mosh survives a phone sleeping, roaming and changing networks, where ssh
     # drops. It runs the command itself rather than through a shell, so the
     # shell that expands "$HOME" is asked for by name.
+    # exec runs the binary, not the ssh() gate, and mosh starts over ssh too.
+    access_gate "$dest" || exit 1
     if [[ "$(hat_mosh "$hat")" == true ]]; then
         if command -v mosh >/dev/null 2>&1; then
             exec mosh "$dest" -- sh -c "$cmd"
@@ -6205,6 +6311,62 @@ cmd_shortcuts() {
     done < <(hat_names)
     info "Wrote $n shortcuts to $dir"
     return 0
+}
+
+# --------------------------------------------------------------------- login
+# hatter login [--status] [<hat>]: log in to Cloudflare Access for each server
+# a hat reaches through `cloudflared access` (see access_gate), once per
+# server. A login with more than a day left is kept.
+fmt_left() {
+    local s="$1"
+    if (( s >= 86400 )); then echo "$(( s / 86400 ))d $(( s % 86400 / 3600 ))h"
+    else echo "$(( s / 3600 ))h $(( s % 3600 / 60 ))m"; fi
+}
+
+cmd_login() {
+    local status="" want="" hat dest ai bin host seen="" left n=0 rc=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --status) status=1; shift ;;
+            -h|--help) usage_cmd login; return 0 ;;
+            -*) die "unknown option '$1' (see: hatter help login)" ;;
+            *) [[ -z "$want" ]] || die "one hat at most (see: hatter help login)"
+               want="$1"; shift ;;
+        esac
+    done
+    [[ -z "$want" ]] || hat_exists "$want" || die "no hat named '$want'"
+    while IFS= read -r hat; do
+        [[ -n "$hat" && ( -z "$want" || "$hat" == "$want" ) ]] || continue
+        dest=$(hat_ssh "$hat")
+        [[ -n "$dest" ]] || continue
+        ai=$(access_info "$dest")
+        [[ -n "$ai" ]] || continue
+        bin="${ai%%$'\t'*}"; host="${ai#*$'\t'}"
+        case $'\n'"$seen" in *$'\n'"$host"$'\n'*) continue ;; esac
+        seen+="$host"$'\n'; n=$((n + 1))
+        left=$(access_left "$host")
+        if [[ -n "$status" ]] || (( left > 86400 )); then
+            if (( left > ACCESS_MARGIN )); then
+                info "$host: logged in, $(fmt_left "$left") left"
+            else
+                info "$host: not logged in (run: hatter login${want:+ $want})"; rc=1
+            fi
+            continue
+        fi
+        info "Logging in to $host through Cloudflare Access: finish in the browser"
+        # cloudflared prints the token on stdout, so stdout goes nowhere.
+        if "$bin" access login "https://$host" >/dev/null \
+           && left=$(access_left "$host") && (( left > ACCESS_MARGIN )); then
+            info "$host: logged in, $(fmt_left "$left") left"
+        else
+            warn "$host: the login did not complete"; rc=1
+        fi
+    done < <(hat_names)
+    if (( n == 0 )); then
+        if [[ -n "$want" ]]; then info "Hat '$want' does not reach its server through Cloudflare Access."
+        else info "No hat reaches its server through Cloudflare Access."; fi
+    fi
+    return "$rc"
 }
 
 # A new machine's ssh key cannot log in to a server that only takes keys, so
@@ -9992,6 +10154,7 @@ Commands:
   tz [zone]              Your timezone, for times like "tomorrow 9am"
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   find <terms>...        Find the Claude session working on something, and go to it
+  login [hat]            Log in to Cloudflare Access for hats whose ssh goes through it
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
   rm <session>           End a workspace and forget it (--keep-running: forget only)
@@ -10367,6 +10530,27 @@ prompt or tab name has every term come first.
 
 Running sessions are the ones in a hat's pane registry (see provision) whose
 tmux window is still open.
+USAGE
+    ;;
+    login) cat <<'USAGE'
+hatter login [--status] [<hat>]
+
+Log in to Cloudflare Access for every server a hat reaches through
+`cloudflared access`, or just <hat>'s. That is any hat whose ssh config entry
+has a ProxyCommand like
+
+  Host ssh.example.com
+      ProxyCommand cloudflared access ssh --hostname %h
+
+Each server is logged in once, however many hats share it, with the cloudflared
+the ProxyCommand names. A login with more than a day left is kept. The token is
+never printed.
+
+hatter never lets a lapsed Access login open a browser by itself: every ssh it
+starts, the cmux mirror and attach check the login first and stop with
+"run: hatter login" instead. `hatter hat` shows such a hat as "login".
+
+  --status   Only say how long each login has left; exits 1 if one has lapsed
 USAGE
     ;;
     attach) cat <<'USAGE'
@@ -10866,6 +11050,7 @@ case "$cmd" in
     attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     find)      cmd_find "$@" ;;
+    login)     cmd_login "$@" ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
     rm|remove) [[ $# -gt 0 ]] || { usage_cmd rm; exit 1; };        cmd_rm "$@" ;;

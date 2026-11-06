@@ -111,6 +111,8 @@ exit 0
 STUB
 cat > "$work/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "$1" = -G ] && exit 0
 cmd="${*: -1}"
 # hatter sends every command as `sh -c '<script>'`; take the script out.
 [[ "$cmd" == "sh -c "* ]] && { eval "set -- $cmd"; cmd="$3"; }

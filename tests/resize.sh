@@ -95,6 +95,8 @@ esac
 EOF
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "\$1" = -G ] && exit 0
 while [ \$# -gt 0 ]; do
     case "\$1" in -n) shift ;; -o) shift 2 ;; *) break ;; esac
 done

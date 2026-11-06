@@ -59,6 +59,8 @@ STUB
 # line; a server listed in $STUB_DIR/down does not answer.
 cat > "$work/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "$1" = -G ] && exit 0
 dest=""
 while [[ $# -gt 1 ]]; do
   case "$1" in -o) shift 2 ;; -*) shift ;; *) dest=$1; shift; break ;; esac

@@ -25,6 +25,8 @@ printf 'dev-a\t1\t@11\ndev-a\t2\t@12\n'
 EOF
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "\$1" = -G ] && exit 0
 cmd="\${@: -1}"
 unset XDG_STATE_HOME
 HOME="$hd" CLAUDE_CONFIG_DIR="$claude" PATH="$work/remote:\$PATH" sh -c "\$cmd"
@@ -156,6 +158,8 @@ grep -q 'more:' <<<"$(find_ --all parser)" && fail "find --all parser: under the
 # --- a hat that cannot be reached is reported, not taken for no matches -----
 cat > "$work/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "$1" = -G ] && exit 0
 exit 255
 EOF
 out=$(find_ parser) && fail "find with ssh down: exit 0:

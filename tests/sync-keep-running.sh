@@ -27,6 +27,8 @@ mkdir -p "$work/bin" "$work/tbin"
 # makes it unreachable. Each session has one window, "w-<session>".
 cat > "$work/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "$1" = -G ] && exit 0
 n=$(($# - 1)); printf '%s ' "${@:1:$n}" >> "$STUB_DIR/sshargs"; echo >> "$STUB_DIR/sshargs"
 [[ -e "$STUB_DIR/down" ]] && { echo "ssh: connect to host: Connection refused" >&2; exit 255; }
 cmd="${*: -1}"

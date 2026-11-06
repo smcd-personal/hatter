@@ -88,6 +88,8 @@ esac
 EOF
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
+# `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
+[ "\$1" = -G ] && exit 0
 # The remote command is the last argument.
 cmd="\${@: -1}"
 PATH="$work/remote:\$PATH" sh -c "\$cmd"
