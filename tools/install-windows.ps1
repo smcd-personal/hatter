@@ -567,15 +567,10 @@ $Marker
 local wezterm = require 'wezterm'
 local config = wezterm.config_builder()
 
--- hatter: Ctrl+Shift+O opens a workspace on any hat.
+-- hatter: Ctrl+Shift+O opens a workspace on any hat, as a tab in that hat's
+-- window. Ctrl+Shift+S switches between hats.
 local hatter = dofile '$luaPlugin/plugin/init.lua'
-hatter.apply_to_config(config)
-
--- Ctrl+Shift+S: switch between the hats you have open.
-table.insert(config.keys, {
-  key = 'S', mods = 'CTRL|SHIFT',
-  action = wezterm.action.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' },
-})
+hatter.apply_to_config(config, { maximize = $maximize })
 
 -- Open maximized.
 if $maximize then
