@@ -426,19 +426,82 @@ access_gate() {
 # Every `ssh` hatter runs goes through here, including ones not written yet,
 # so none of them can open a login tab from a timer. The destination is the
 # first argument that is not an option or an option's value.
+#
+# The binary is run by its path, not with `command ssh`: bash 3.2 runs
+# `command <program>` without forking when it comes first in a background
+# `{ ...; } &` group, so the program replaces the group and nothing after it
+# runs (#185). A path forks as usual.
 ssh() {
-    local a d="" skip=""
+    local a d="" skip="" bin
+    bin=$(type -P ssh) || { echo "ssh: command not found" >&2; return 127; }
     for a in "$@"; do
         if [[ -n "$skip" ]]; then skip=""; continue; fi
         case "$a" in
-            -G|-V|-O) command ssh "$@"; return ;;
+            -G|-V|-O) "$bin" "$@"; return ;;
             -[BbcDEeFIiJLlmOoPpQRSWw]) skip=1 ;;
             -*) ;;
             *) d="$a"; break ;;
         esac
     done
     if [[ -n "$d" ]]; then access_gate "$d" || return 255; fi
-    command ssh "$@"
+    "$bin" "$@"
+}
+
+# Why an ssh that exited 255 failed, from what it wrote to stderr (#185).
+# "Unreachable" alone hides very different problems: a key the agent does not
+# hold looks just like a server that is down, because BatchMode cannot prompt
+# for a passphrase. Every probe that gives up on a hat says which it was.
+#
+# ssh_fail_code <stderr>: a short code, for a table column:
+#   auth login timeout refused "no DNS" hostkey "no route" closed down
+ssh_fail_code() {
+    case "$1" in
+        *"Cloudflare Access login"*)                          echo login ;;
+        *"Could not resolve hostname"*)                       echo "no DNS" ;;
+        *"Host key verification"*|*"IDENTIFICATION HAS CHANGED"*) echo hostkey ;;
+        *"Permission denied"*|*"Too many authentication failures"*) echo auth ;;
+        *"Connection refused"*)                               echo refused ;;
+        *"timed out"*|*"Timeout"*)                            echo timeout ;;
+        *"No route to host"*|*"Network is unreachable"*)      echo "no route" ;;
+        *"Connection closed"*|*"kex_exchange_identification"*|*"Connection reset"*) echo closed ;;
+        *)                                                    echo down ;;
+    esac
+}
+
+# ssh_why <stderr>: the same, as a few words for a message, with what to do
+# when there is one thing to do. Anything unrecognised is ssh's own first
+# complaint, or its last line, so nothing is ever reduced to "unreachable".
+ssh_why() {
+    local line
+    case "$(ssh_fail_code "$1")" in
+        auth)
+            if [[ "$(uname -s 2>/dev/null)" == Darwin ]]; then
+                echo "key refused - is it loaded? try: ssh-add --apple-use-keychain"
+            else
+                echo "key refused - is it loaded? try: ssh-add"
+            fi ;;
+        login)      echo "Cloudflare Access login lapsed - run: hatter login" ;;
+        "no DNS")   echo "host name not found" ;;
+        hostkey)    echo "host key unknown or changed - check known_hosts" ;;
+        refused)    echo "connection refused" ;;
+        timeout)    echo "timed out" ;;
+        "no route") echo "no route to host" ;;
+        closed)     echo "connection closed before login" ;;
+        *)
+            line=$(printf '%s\n' "$1" | sed -n 's/^  !! //p; s/^ssh: //p' | head -n 1)
+            [[ -n "$line" ]] || line=$(printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | tail -n 1) || true
+            echo "${line:-no answer}" ;;
+    esac
+}
+
+# ssh_probe <dest>: succeeds when <dest> answers; otherwise prints why, and
+# fails. Use as: why=$(ssh_probe "$host") || ...
+ssh_probe() {
+    local err
+    err=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" "$(posix_sh true)" 2>&1 >/dev/null) \
+        && return 0
+    ssh_why "$err"
+    return 1
 }
 
 # How a hat's panes start their agents, as the tmux options hat-launch reads:
@@ -771,18 +834,25 @@ fi'
 
 # hat_live_sessions <host>: the tmux sessions running there, one per line.
 # Returns 1 when the server cannot be reached and 2 when it answers but its
-# tmux cannot be read (the reason goes to stderr). Neither is the same as a
-# server with no sessions, and callers must not treat them as one.
+# tmux cannot be read (either way the reason goes to stderr). Neither is the
+# same as a server with no sessions, and callers must not treat them as one.
 hat_live_sessions() {
-    local out
+    local out errf
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-live.XXXXXX")
     out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$1" "$(posix_sh "$REMOTE_LIST_SH"'
         if [ -n "$lerr" ]; then printf "@@hatter-err %s\n" "$lerr"
-        else [ -z "$list" ] || printf "%s\n" "$list"; echo @@hatter-ok; fi')" 2>/dev/null) || true
+        else [ -z "$list" ] || printf "%s\n" "$list"; echo @@hatter-ok; fi')" 2>"$errf") || true
     if grep -q '^@@hatter-err ' <<<"$out"; then
+        rm -f "$errf"
         sed -n 's/^@@hatter-err //p' <<<"$out" | head -n 1 >&2
         return 2
     fi
-    grep -qx '@@hatter-ok' <<<"$out" || return 1
+    if ! grep -qx '@@hatter-ok' <<<"$out"; then
+        echo "server not reached: $(ssh_why "$(cat "$errf")")" >&2
+        rm -f "$errf"
+        return 1
+    fi
+    rm -f "$errf"
     grep -vx '@@hatter-ok' <<<"$out" || true
     return 0
 }
@@ -5084,15 +5154,7 @@ hat_status_row() {
     else
         # say *why* it is down - "no DNS" on a server you have not built yet is
         # a very different problem from "auth"
-        case "$(cat "$err")" in
-            *"Could not resolve hostname"*) reach="no DNS" ;;
-            *"Cloudflare Access login"*)    reach="login" ;;
-            *"Connection refused"*)         reach="refused" ;;
-            *"Permission denied"*)          reach="auth" ;;
-            *"timed out"*|*"Timeout"*)      reach="timeout" ;;
-            *"Host key verification"*)      reach="hostkey" ;;
-            *)                              reach="down" ;;
-        esac
+        reach=$(ssh_fail_code "$(cat "$err")")
         tmuxv="-"; resurrect="-"; sessions="-"
     fi
     rm -f "$err"
@@ -6925,7 +6987,7 @@ cmd_find() {
     info "Searching $( [[ "$all" == 1 ]] && echo "live and closed (last ${days}d)" || echo live ) Claude sessions on ${#dests[@]} hat(s)..." >&2
     for ((i = 0; i < ${#dests[@]}; i++)); do
         printf '%s\n' "$FIND_SH" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
-            "${dests[$i]}" "$(posix_sh "$args")" > "$tmp/$i" 2>/dev/null &
+            "${dests[$i]}" "$(posix_sh "$args")" > "$tmp/$i" 2>"$tmp/$i.err" &
     done
     wait
 
@@ -6933,7 +6995,7 @@ cmd_find() {
     local line score state mtime session window wid sid cwd name title snip owner h
     for ((i = 0; i < ${#dests[@]}; i++)); do
         if ! grep -qx '@@hatter-ok' "$tmp/$i"; then
-            warn "could not reach ${hats_of[$i]# } (${dests[$i]}) - not searched"
+            warn "could not reach ${hats_of[$i]# } (${dests[$i]}): $(ssh_why "$(cat "$tmp/$i.err")") - not searched"
             continue
         fi
         while IFS= read -r line; do
@@ -7133,10 +7195,12 @@ key_valid() {
 }
 
 key_add_to() {
-    # key_add_to <hat> <key> -> prints added | present; non-zero if unreachable
+    # key_add_to <hat> <key> -> prints added | present. 255 (ssh's own) when
+    # the hat cannot be reached, with ssh's complaint on stderr; any other
+    # failure is the server's.
     local dest script
     dest=$(hat_ssh "$1")
-    [[ -n "$dest" ]] || return 1
+    [[ -n "$dest" ]] || { echo "no ssh destination" >&2; return 255; }
     # Run under sh whatever the login shell is: `set -- $k` needs word splitting.
     script='IFS= read -r k || exit 3
 umask 077
@@ -7189,17 +7253,24 @@ cmd_key() {
     fi
     [[ ${#hats[@]} -gt 0 ]] || die "name the hats to add the key to, or pass --all"
 
-    local fp result failed=0
+    local fp result failed=0 rc errf
     fp=$(printf '%s\n' "$key" | ssh-keygen -l -f /dev/stdin 2>/dev/null | awk '{print $2}')
     info "Adding $fp"
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-key.XXXXXX")
     for hat in "${hats[@]}"; do
-        if result=$(key_add_to "$hat" "$key" 2>/dev/null) && [[ -n "$result" ]]; then
+        rc=0; result=$(key_add_to "$hat" "$key" 2>"$errf") || rc=$?
+        if [[ "$rc" == 0 && -n "$result" ]]; then
             printf '  %-12s %s\n' "$hat" "$result"
+        elif [[ "$rc" == 255 ]]; then
+            printf '  %-12s unreachable (%s) - not added\n' "$hat" "$(ssh_why "$(cat "$errf")")"
+            failed=1
         else
-            printf '  %-12s unreachable - not added\n' "$hat"
+            # It answered, but could not write authorized_keys.
+            printf '  %-12s failed on the server (exit %s) - not added\n' "$hat" "$rc"
             failed=1
         fi
     done
+    rm -f "$errf"
     return $failed
 }
 
@@ -7244,8 +7315,16 @@ exit 0'
 # Returns 1 when the server cannot be reached, 2 when its tmux cannot be read
 # or would not end the session (the reason goes to stderr).
 remote_end_session() {
-    local out
-    out=$(remote_sh "$1" "s=$(sq "$2"); $REMOTE_END_SH" 2>/dev/null) || return 1
+    local out errf rc=0
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-end.XXXXXX")
+    out=$(remote_sh "$1" "s=$(sq "$2"); $REMOTE_END_SH" 2>"$errf") || rc=$?
+    if [[ "$rc" != 0 ]]; then
+        # 1 either way; on 255 say why the server could not be reached.
+        [[ "$rc" != 255 ]] || ssh_why "$(cat "$errf")" >&2
+        rm -f "$errf"
+        return 1
+    fi
+    rm -f "$errf"
     if grep -q '^@@hatter-err ' <<<"$out"; then
         sed -n 's/^@@hatter-err //p' <<<"$out" | head -n 1 >&2
         return 2
@@ -7329,7 +7408,7 @@ cmd_rm() {
         0) ;;
         2) die "tmux on $host could not end '$session': ${why:-no reason given}
   Nothing was changed in the config. --keep-running forgets the entry only." ;;
-        *) die "could not reach $host to end '$session'; nothing changed.
+        *) die "could not reach $host to end '$session'${why:+ ($why)}; nothing changed.
   --keep-running forgets the entry and leaves the server alone." ;;
     esac
     if [[ -n "$group" ]] && ! ( forget_session "$session" "$hat" ); then
@@ -8072,7 +8151,9 @@ sync_once() {
     # Every server at once: its sessions, and every session's windows.
     for ((i = 0; i < n; i++)); do
         [[ -n "${wins[$i]}" && -n "${hosts[$i]}" ]] || continue
-        remote_tmux_state "${hosts[$i]}" > "$tmp/ssh.$i" 2>/dev/null &
+        # The exit status and stderr too: an unreachable server says why.
+        { rc=0; remote_tmux_state "${hosts[$i]}" > "$tmp/ssh.$i" 2>"$tmp/ssh-err.$i" || rc=$?
+          echo "$rc" > "$tmp/ssh-rc.$i"; } &
     done
     wait
 
@@ -8108,7 +8189,11 @@ sync_once() {
         live=""
         [[ -s "$tmp/ssh.$i" ]] && live=$(awk -F '\t' '$1 == "S" { print $2 }' "$tmp/ssh.$i")
         if [[ -z "$live" ]]; then
-            echo "  $hat: $host unreachable or idle, leaving its config untouched"
+            if [[ "$(cat "$tmp/ssh-rc.$i" 2>/dev/null)" == 255 ]]; then
+                echo "  $hat: $host unreachable ($(ssh_why "$(cat "$tmp/ssh-err.$i")")), leaving its config untouched"
+            else
+                echo "  $hat: $host has no tmux sessions, leaving its config untouched"
+            fi
             continue
         fi
         reached+="$host"$'\n'
@@ -8347,8 +8432,9 @@ hat_missing() {
     host=$(hat_ssh "$hat")
     [[ -n "$host" ]] || { printf '\037no ssh destination\n'; return 0; }
 
-    if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" "$(posix_sh true)" 2>/dev/null; then
-        printf '\037unreachable\n'
+    local why
+    if ! why=$(ssh_probe "$host"); then
+        printf '\037unreachable (%s)\n' "$why"
         return 0
     fi
     live=$(remote_sessions "$host" 2>/dev/null || true)
@@ -8557,8 +8643,9 @@ cmd_restore() {
 
         # Probe before opening a window, so an unreachable hat does not leave an
         # empty one behind, and never let one bad hat abort the whole restore.
-        if ! ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" "$(posix_sh true)" 2>/dev/null; then
-            warn "$hat: $host unreachable, skipping"
+        local why
+        if ! why=$(ssh_probe "$host"); then
+            warn "$hat: $host unreachable ($why), skipping"
             continue
         fi
 
@@ -9899,9 +9986,20 @@ creds_push_to() {
     return 1
 }
 
+# creds_probe_hat <hat>: hat-creds' status JSON, or nothing. On a server that
+# cannot be reached, prints "@@unreachable <why>" instead.
 creds_probe_hat() {
-    ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$(hat_ssh "$1")" \
-        "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" status')" 2>/dev/null || true
+    local out errf rc=0
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-creds.XXXXXX")
+    out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$(hat_ssh "$1")" \
+        "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" status')" 2>"$errf") || rc=$?
+    if [[ "$rc" == 255 ]]; then
+        printf '@@unreachable %s\n' "$(ssh_why "$(cat "$errf")")"
+    else
+        printf '%s' "$out"
+    fi
+    rm -f "$errf"
+    return 0
 }
 
 cmd_creds() {
@@ -9959,8 +10057,12 @@ cmd_creds() {
                 [[ -z "$hat" ]] && continue
                 [[ -n "$want" && "$hat" != "$want" ]] && continue
                 js=$(creds_probe_hat "$hat")
+                if [[ "$js" == "@@unreachable "* ]]; then
+                    printf '  %-11s unreachable (%s)\n' "$hat" "${js#@@unreachable }"
+                    continue
+                fi
                 if [[ -z "$js" ]]; then
-                    printf '  %-11s %s\n' "$hat" "unreachable, or hat-creds not installed"
+                    printf '  %-11s %s\n' "$hat" "no answer from hat-creds - is it installed? run: hatter provision $hat"
                     continue
                 fi
                 printf '  %-11s %s\n' "$hat" "$(printf '%s' "$js" | jq -r '
@@ -10133,10 +10235,14 @@ edit_sessions_file() { printf '%s/sessions.%s' "$EDIT_CACHE" "$1"; }
 edit_fetch_hat() {
     local hat="$1" host f
     host=$(hat_ssh "$hat"); f=$(edit_sessions_file "$hat")
-    : > "$f"; : > "$f.cred"
+    : > "$f"; : > "$f.cred"; rm -f "$f.down"
+    # A server that cannot be reached is not one with no tmux: keep why (#185).
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
         "$(posix_sh "tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' 2>/dev/null; printf '@@@\n'; python3 \"\$HOME/.local/bin/hat-creds\" status 2>/dev/null || true")" \
-        > "$f.raw" 2>/dev/null || : > "$f.raw"
+        > "$f.raw" 2>"$f.err" || {
+        [[ $? != 255 ]] || ssh_fail_code "$(cat "$f.err")" > "$f.down"
+        : > "$f.raw"; }
+    rm -f "$f.err"
     awk -v sf="$f" -v cf="$f.cred" \
         '/^@@@$/ { seen = 1; next } seen { print > cf; next } { print > sf }' \
         "$f.raw" 2>/dev/null || true
@@ -10338,6 +10444,8 @@ edit_top() {
                 if [[ -s "$(edit_sessions_file "$hat")" ]]; then
                     sess=$(wc -l < "$(edit_sessions_file "$hat")" | tr -d ' ')
                     state="● up $sess ws"; scol="$C_GR"
+                elif [[ -s "$(edit_sessions_file "$hat").down" ]]; then
+                    state="✕ $(cat "$(edit_sessions_file "$hat").down")"; scol="$C_RD"
                 elif [[ -f "$(edit_sessions_file "$hat")" ]]; then
                     state="○ no tmux"; scol="$C_YL"
                 else
@@ -11399,7 +11507,7 @@ tools/install-windows.ps1 - gets in.
   hatter key add 'ssh-ed25519 AAAAC3Nz... me@windows' dev ops
 
 The key is checked with ssh-keygen first, and each hat reports "added",
-"present" (already there, whatever its comment) or "unreachable".
+"present" (already there, whatever its comment) or "unreachable", with why.
 USAGE
     ;;
     find) cat <<'USAGE'
@@ -11726,7 +11834,10 @@ the saved one. Keeping it offers a sync, so the config records the order you
 kept. With no terminal to ask at, the current order is kept.
 
 With no arguments, every hat. Hats with nothing recorded, or whose server is
-unreachable, are skipped rather than failing the run.
+unreachable, are skipped rather than failing the run. An unreachable one says
+why: a key refused (often one with a passphrase that is not loaded in the
+agent: ssh-add), a timeout, a host name not found, a changed host key, or a
+lapsed Cloudflare Access login.
 
 Options:
   --missing      Only touch hats that are actually incomplete: a recorded

@@ -13,7 +13,13 @@ You need:
 - **macOS.** The system `bash` (3.2) is fine — hatter is written for it.
 - **An ssh key that reaches your servers**, and `ssh you@host` working from
   Terminal without a password prompt. hatter never handles ssh auth itself; if
-  ssh works, hatter works.
+  ssh works, hatter works. hatter's ssh cannot prompt, so a key with a
+  passphrase has to be in the agent. On a new Mac, add it once and keep the
+  passphrase in the Keychain:
+
+  ```sh
+  ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+  ```
 - **A shell server or two.** Any Linux box you can ssh into. hatter installs
   tmux persistence on it for you.
 
@@ -125,7 +131,7 @@ hatter restore
 ```
 
 This is idempotent. Hats whose server is unreachable are skipped rather than
-failing the run.
+failing the run, each with the reason (`hatter help restore` lists them).
 
 ## 6. Turn on autosave
 
