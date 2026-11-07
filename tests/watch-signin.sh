@@ -47,9 +47,11 @@ chmod +x "$work/bin/ssh"
 PATH="$work/bin:$PATH"
 : > "$work/down"
 
-# Stub cmux tree: one window holding the titles in $work/titles.
+# Stub cmux tree: one window holding the titles in $work/titles, each with
+# one tab whose id is "SF-<title>".
 cmux_json() {
-    jq -R . < "$work/titles" | jq -s '{windows: [{workspaces: map({title: .})}]}'
+    jq -R . < "$work/titles" \
+        | jq -s '{windows: [{workspaces: map({title: ., panes: [{surfaces: [{id: ("SF-" + .)}]}]})}]}'
 }
 # A notification is recorded, not posted.
 watch_notify() { printf '%s\n' "$*" >> "$work/notes"; }
@@ -122,6 +124,8 @@ access_gate() { warn "the Cloudflare Access login for dev.example.com has lapsed
 run
 expect "a lapsed Access login is not restored" "$([[ -z "$out" ]] && echo y || echo n)"
 expect "...and is posted as a notification" "$(grep -q "hatter login" "$work/notes" 2>/dev/null && echo y || echo n)"
+expect "...on the sign-in workspace's tab (#188)" \
+    "$(grep -q "SF-Sign in to me@dev.example.com$" "$work/notes" 2>/dev/null && echo y || echo n)"
 run
 expect "...once" "$([[ $(grep -c . "$work/notes") == 1 ]] && echo y || echo n)"
 
@@ -170,6 +174,51 @@ EOF
 run
 expect "the probe opens its own connection, not a shared master" \
     "$(grep -q 'ControlPath=none' "$work/args" && ! grep -q 'ControlMaster=auto' "$work/args" && echo y || echo n)"
+
+# --- watch_notify: whatever posts it, a click brings up cmux (#188) ------------
+unset -f watch_notify
+eval "$(sed -n '/^watch_notify() {/,/^}/p; /^cmux_change() {/,/^}/p' "$lib")"
+focus_save() { echo "focus_save" >> "$work/posted"; }
+notify_bin="$work/notify-bin"
+mkdir -p "$notify_bin"
+# Each stub records its name and arguments; $work/fail-<name> makes it fail.
+for t in cmux terminal-notifier osascript; do
+    printf '#!/bin/bash\necho "%s $*" >> "%s/posted"\n[ ! -e "%s/fail-%s" ]\n' \
+        "$t" "$work" "$work" "$t" > "$notify_bin/$t"
+    chmod +x "$notify_bin/$t"
+done
+# post <tools...> -- <args>: watch_notify with only those tools on PATH.
+post() {
+    local d="$work/notify-path" t
+    rm -rf "$work/notify-path" "$work/posted"; mkdir -p "$d"
+    while [[ "$1" != -- ]]; do ln -s "$notify_bin/$1" "$d/$1"; shift; done; shift
+    for t in perl; do ln -s "$(command -v "$t")" "$d/$t"; done
+    ( PATH="$d"; watch_notify "$@" ); echo "rc=$?" >> "$work/posted"
+}
+post cmux terminal-notifier osascript -- "T" "B" "SF-1"
+expect "with a tab, cmux posts it on that tab, and nothing else does" \
+    "$(grep -q '^cmux notify --surface SF-1 --title T --body B$' "$work/posted" \
+        && [[ $(grep -c . "$work/posted") == 2 ]] && echo y || echo n)"
+expect "...without saving focus: a notification moves none" \
+    "$(! grep -q '^focus_save' "$work/posted" && echo y || echo n)"
+post cmux terminal-notifier osascript -- "T" "B"
+expect "without a tab, terminal-notifier posts it and brings cmux forward" \
+    "$(grep -q "^terminal-notifier -title T -message B -activate $CMUX_BUNDLE$" "$work/posted" \
+        && ! grep -q '^cmux' "$work/posted" && ! grep -q '^osascript' "$work/posted" && echo y || echo n)"
+touch "$work/fail-cmux"
+post cmux terminal-notifier osascript -- "T" "B" "SF-1"
+expect "a tab cmux cannot post on falls back to terminal-notifier" \
+    "$(grep -q '^terminal-notifier' "$work/posted" && echo y || echo n)"
+rm -f "$work/fail-cmux"
+post cmux osascript -- "T" "B"
+expect "without terminal-notifier, osascript is the last resort" \
+    "$(grep -q '^osascript' "$work/posted" && ! grep -q '^cmux' "$work/posted" && echo y || echo n)"
+touch "$work/fail-terminal-notifier"
+post terminal-notifier -- "T" "B"
+expect "a failing notifier never fails the watcher" "$(grep -q '^rc=0$' "$work/posted" && echo y || echo n)"
+rm -f "$work/fail-terminal-notifier"
+post -- "T" "B" "SF-1"
+expect "...nor does having none" "$(grep -q '^rc=0$' "$work/posted" && echo y || echo n)"
 
 # --- wall_cap ------------------------------------------------------------------
 s=$(date +%s); wall_cap 1 sleep 5 2>/dev/null; rc=$?; e=$(date +%s)

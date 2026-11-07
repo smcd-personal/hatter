@@ -3,7 +3,7 @@
 # recorded session whose tmux session still runs, the watcher logs it and
 # posts one notification, and says nothing when the session is gone, is not
 # recorded, is shown again, or its server does not answer. Stub cmux, ssh and
-# osascript; needs only bash and jq.
+# terminal-notifier; needs only bash and jq.
 #
 # Each case closes a session that must be reported alongside the one that
 # must not, so a watcher that reports nothing fails every case, and one that
@@ -74,12 +74,13 @@ esac
 exit 0
 STUB
 
-cat > "$work/bin/osascript" <<'STUB'
+# A closed workspace has no tab, so its notice goes to terminal-notifier
+# (#188). Its message follows -message.
+cat > "$work/bin/terminal-notifier" <<'STUB'
 #!/usr/bin/env bash
-# The message is the last argument.
-printf '%s\n' "${@: -1}" >> "$STUB_DIR/notes"
+while [[ $# -gt 0 ]]; do [[ "$1" == -message ]] && printf '%s\n' "$2" >> "$STUB_DIR/notes"; shift; done
 STUB
-chmod +x "$work/bin/cmux" "$work/bin/ssh" "$work/bin/osascript"
+chmod +x "$work/bin/cmux" "$work/bin/ssh" "$work/bin/terminal-notifier"
 
 ack='{"type":"ack","resume":{"gap":false}}'
 # selected <session> [previous] [time]: a workspace selected in the sidebar.

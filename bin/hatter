@@ -1207,7 +1207,7 @@ cmux_change() {
         # new verb is covered until someone shows it does not.
         "workspace-group set-color"|"workspace-group set-icon"|"workspace-group pin"|\
         "workspace-group collapse"|"workspace-group rename"|"workspace-group add"|\
-        "rename-workspace "*|"reorder-workspace "*|"reload-config ") ;;
+        "rename-workspace "*|"reorder-workspace "*|"reload-config "|"notify "*) ;;
         *) focus_save ;;
     esac
     cmux "$@"
@@ -9073,10 +9073,30 @@ watch_word() {
     esac
 }
 
-# A macOS notification, where there is one to post. Never fails the watcher.
+# watch_notify <title> <body> [surface]: a macOS notification, where there is
+# one to post (#188). Never fails the watcher. Clicking it must bring up cmux:
+#   - with a surface (a tab's UUID) it is cmux's own notification on that tab,
+#     so a click opens that tab;
+#   - without one, there is no tab it belongs to. cmux would pin it on
+#     whichever workspace is selected, so terminal-notifier posts it and a
+#     click brings cmux forward;
+#   - osascript is the last resort. macOS credits that to Script Editor, and a
+#     click opens Script Editor.
+# The other two are capped: the watcher handles no events while one waits.
+WATCH_NOTIFY_CAP=10
+CMUX_BUNDLE=com.cmuxterm.app
 watch_notify() {
+    if [[ -n "${3:-}" ]] && have_cmux \
+        && cmux_change notify --surface "$3" --title "$1" --body "$2" >/dev/null 2>&1 </dev/null; then
+        return 0
+    fi
+    if command -v terminal-notifier >/dev/null 2>&1; then
+        wall_cap "$WATCH_NOTIFY_CAP" terminal-notifier -title "$1" -message "$2" -activate "$CMUX_BUNDLE" \
+            >/dev/null 2>&1 </dev/null || true
+        return 0
+    fi
     command -v osascript >/dev/null 2>&1 || return 0
-    osascript -e 'on run argv' \
+    wall_cap "$WATCH_NOTIFY_CAP" osascript -e 'on run argv' \
         -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
         -e 'end run' "$1" "$2" >/dev/null 2>&1 </dev/null || true
     return 0
@@ -9145,8 +9165,11 @@ watch_signin() {
             if [[ $'\n'"$WATCH_SIGNIN_SAID" != *$'\n'"$dest"$'\t'"$why"$'\n'* ]]; then
                 watch_log "cmux gave up reconnecting to $dest; waiting for it to answer ($why)"
                 WATCH_SIGNIN_SAID+="$dest"$'\t'"$why"$'\n'
+                # On the sign-in workspace's tab: that is the hat that waits.
                 [[ "$why" != *"Cloudflare Access login"* ]] \
-                    || watch_notify "hatter: $dest is waiting" "The Cloudflare Access login has lapsed. Run: hatter login"
+                    || watch_notify "hatter: $dest is waiting" "The Cloudflare Access login has lapsed. Run: hatter login" \
+                        "$(jq -r --arg t "Sign in to $dest" '[.windows[]?.workspaces[]? | select(.title == $t)
+                            | .panes[]?.surfaces[]?.id // empty][0] // empty' <<<"$tree" 2>/dev/null)"
             fi
             continue
         }
@@ -11150,6 +11173,12 @@ that is not selected, looks like cmux's own. So a session is reattached at
 most once in 30 minutes: closing it again keeps it closed, with the notice.
 A server that does not answer gets nothing. The rack lists such sessions at
 the top.
+
+A notification about a tab that still exists is cmux's own, on that tab, so
+clicking it opens the tab. One with no tab left (a closed workspace) is posted
+with terminal-notifier if it is installed, and clicking it brings cmux
+forward. Without it, macOS credits the notification to Script Editor, and
+clicking it opens Script Editor.
 
 Two layers, on purpose:
 
