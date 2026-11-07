@@ -8,8 +8,9 @@
 --   ssh -t <dest> tmux new-session -A -s <session>
 --
 -- so the server's tmux holds the state, exactly as it does under cmux. A hat
--- becomes a WezTerm workspace, and a hatter workspace a tab titled with its
+-- becomes a WezTerm window, and a hatter workspace a tab in it titled with its
 -- session name; choosing one that is already open switches to it.
+-- (layout = 'workspace' makes each hat a WezTerm workspace instead.)
 --
 --   local hatter = wezterm.plugin.require 'https://github.com/smcd-personal/hatter'
 --   hatter.apply_to_config(config)
@@ -112,11 +113,109 @@ end
 
 local function notify(window, msg)
   wezterm.log_warn('hatter: ' .. msg)
-  window:toast_notification('hatter', msg, nil, 5000)
+  if window then
+    window:toast_notification('hatter', msg, nil, 5000)
+  end
 end
 
--- Switch to the hat's workspace and the session's tab, opening either if it
--- is not there yet. Tabs are matched on the title set when they were opened.
+local function layout(opts)
+  return opts.layout or 'window'
+end
+
+-- The hat a tab title belongs to: the hat of a recorded session with that
+-- name, else the hat whose "<hat>-" prefix it carries (the longest, so that
+-- "web-app" beats "web" for "web-app-api").
+function M.hat_of_title(cfg, title)
+  if type(title) ~= 'string' or title == '' then return nil end
+  for _, e in ipairs(M.entries(cfg)) do
+    if e.session == title then return e.hat end
+  end
+  local best
+  for name in pairs(cfg.hats or {}) do
+    if title:sub(1, #name + 1) == name .. '-' and (not best or #name > #best) then
+      best = name
+    end
+  end
+  return best
+end
+
+-- Which window holds which hat. wezterm.GLOBAL lasts as long as the WezTerm
+-- process, so it survives a config reload. Window ids are never reused.
+local function remember(hat_name, mw)
+  local id = mw:window_id()
+  wezterm.GLOBAL['hatter.win.' .. hat_name] = id
+  wezterm.GLOBAL['hatter.hat.' .. tostring(id)] = hat_name
+end
+
+function M.hat_of_window(window_id)
+  return wezterm.GLOBAL['hatter.hat.' .. tostring(window_id)]
+end
+
+-- The mux window showing a hat, or nil. Under the window layout: the window
+-- remembered for it if it is still open, else the first window with a tab
+-- whose title belongs to the hat. Under the workspace layout: a window in
+-- the workspace named after the hat.
+function M.hat_window(opts, cfg, hat_name)
+  local windows = mux.all_windows()
+  if layout(opts) == 'workspace' then
+    for _, mw in ipairs(windows) do
+      if mw:get_workspace() == hat_name then return mw end
+    end
+    return nil
+  end
+  local id = wezterm.GLOBAL['hatter.win.' .. hat_name]
+  if id then
+    for _, mw in ipairs(windows) do
+      if mw:window_id() == id then return mw end
+    end
+  end
+  for _, mw in ipairs(windows) do
+    for _, tab in ipairs(mw:tabs()) do
+      if M.hat_of_title(cfg, tab:get_title()) == hat_name then
+        remember(hat_name, mw)
+        return mw
+      end
+    end
+  end
+  return nil
+end
+
+-- The GUI window for a mux window, or nil. gui_window() raises, rather than
+-- returning nil, where there is no GUI (wezterm-mux-server).
+local function gui_of(mw)
+  local ok, gui = pcall(function() return mw:gui_window() end)
+  if ok then return gui end
+  return nil
+end
+
+-- Show a mux window: switch to its workspace, then raise it.
+local function bring_forward(mw)
+  local ws = mw:get_workspace()
+  if ws ~= mux.get_active_workspace() then
+    mux.set_active_workspace(ws)
+  end
+  local gui = gui_of(mw)
+  if gui then pcall(function() gui:focus() end) end
+end
+
+-- A new window starts at WezTerm's default size; opts.maximize fills the
+-- screen instead. The GUI window appears some time after the mux window
+-- (at startup, only once gui-startup has returned), so it is marked here and
+-- maximized by the update-status handler apply_to_config registers, which
+-- WezTerm runs for each GUI window once it is up.
+local function maybe_maximize(opts, mw)
+  if not opts.maximize then return end
+  local gui = gui_of(mw)
+  if gui then
+    gui:maximize()
+  else
+    wezterm.GLOBAL['hatter.maximize.' .. tostring(mw:window_id())] = true
+  end
+end
+
+-- Switch to the session's tab in its hat's window (or, under the workspace
+-- layout, its hat's workspace), opening the tab, and the window, if they are
+-- not there yet. Tabs are matched on the title set when they were opened.
 function M.open(window, opts, cfg, hat_name, session)
   local args, err = M.ssh_args(opts, cfg.hats[hat_name], session)
   if not args then
@@ -124,17 +223,25 @@ function M.open(window, opts, cfg, hat_name, session)
     return
   end
 
-  local target
-  for _, mw in ipairs(mux.all_windows()) do
-    if mw:get_workspace() == hat_name then
+  local target = M.hat_window(opts, cfg, hat_name)
+  if target then
+    -- Under the workspace layout the session may be in any of the hat's
+    -- windows, so look in all of them.
+    local look = { target }
+    if layout(opts) == 'workspace' then
+      look = {}
+      for _, mw in ipairs(mux.all_windows()) do
+        if mw:get_workspace() == hat_name then table.insert(look, mw) end
+      end
+    end
+    for _, mw in ipairs(look) do
       for _, tab in ipairs(mw:tabs()) do
         if tab:get_title() == session then
-          mux.set_active_workspace(hat_name)
           tab:activate()
+          bring_forward(mw)
           return
         end
       end
-      target = target or mw
     end
   end
 
@@ -142,11 +249,18 @@ function M.open(window, opts, cfg, hat_name, session)
   if target then
     tab = target:spawn_tab { args = args }
   else
-    tab = mux.spawn_window { workspace = hat_name, args = args }
+    local workspace = hat_name
+    if layout(opts) == 'window' then
+      workspace = mux.get_active_workspace()
+    end
+    local _
+    tab, _, target = mux.spawn_window { workspace = workspace, args = args }
+    if layout(opts) == 'window' then remember(hat_name, target) end
+    maybe_maximize(opts, target)
   end
   tab:set_title(session)
-  mux.set_active_workspace(hat_name)
   tab:activate()
+  bring_forward(target)
 end
 
 local function prompt_new(window, pane, opts, cfg, hat_name)
@@ -181,7 +295,49 @@ function M.pull(window, opts)
 end
 
 -- The picker: every workspace, a "new workspace" line per hat, and a line to
--- pull the config from its git remote.
+-- pull the config from its git remote. Given only_hat, just that hat's
+-- workspaces and its "new workspace" line.
+local function show_picker(window, pane, opts, cfg, only_hat)
+  local choices, by_id = {}, {}
+  for _, e in ipairs(M.entries(cfg)) do
+    if not only_hat or e.hat == only_hat then
+      local id = 'w' .. #choices
+      by_id[id] = e
+      table.insert(choices, {
+        id = id,
+        label = e.hat .. '  ›  ' .. e.group .. '  ›  ' .. e.session,
+      })
+    end
+  end
+  for _, h in ipairs(hat_names(cfg)) do
+    if not only_hat or h == only_hat then
+      local id = 'n' .. #choices
+      by_id[id] = { hat = h }
+      table.insert(choices, { id = id, label = h .. '  ›  + new workspace' })
+    end
+  end
+  if not only_hat then
+    table.insert(choices, { id = 'pull', label = 'Update config from git (git pull)' })
+  end
+
+  window:perform_action(act.InputSelector {
+    title = only_hat and ('hatter: open ' .. only_hat) or 'hatter',
+    fuzzy = true,
+    fuzzy_description = 'Workspace: ',
+    choices = choices,
+    action = wezterm.action_callback(function(win, p, id)
+      if not id then return end
+      if id == 'pull' then return M.pull(win, opts) end
+      local e = by_id[id]
+      if e.session then
+        M.open(win, opts, cfg, e.hat, e.session)
+      else
+        prompt_new(win, p, opts, cfg, e.hat)
+      end
+    end),
+  }, pane)
+end
+
 function M.picker(opts)
   opts = opts or {}
   return wezterm.action_callback(function(window, pane)
@@ -190,45 +346,61 @@ function M.picker(opts)
       notify(window, err)
       return
     end
+    show_picker(window, pane, opts, cfg)
+  end)
+end
 
-    local choices, by_id = {}, {}
-    for _, e in ipairs(M.entries(cfg)) do
-      local id = 'w' .. #choices
-      by_id[id] = e
-      table.insert(choices, {
-        id = id,
-        label = e.hat .. '  ›  ' .. e.group .. '  ›  ' .. e.session,
-      })
+-- The hat switcher: every hat, open ones first. Choosing an open hat brings
+-- its window forward; choosing one that is not open offers its workspaces.
+function M.switcher(opts)
+  opts = opts or {}
+  return wezterm.action_callback(function(window, pane)
+    local cfg, err = M.read(opts)
+    if not cfg then
+      notify(window, err)
+      return
     end
+    local open, closed = {}, {}
     for _, h in ipairs(hat_names(cfg)) do
-      local id = 'n' .. #choices
-      by_id[id] = { hat = h }
-      table.insert(choices, { id = id, label = h .. '  ›  + new workspace' })
+      if M.hat_window(opts, cfg, h) then
+        table.insert(open, { id = h, label = h })
+      else
+        table.insert(closed, { id = h, label = h .. '  (not open)' })
+      end
     end
-    table.insert(choices, { id = 'pull', label = 'Update config from git (git pull)' })
+    for _, c in ipairs(closed) do table.insert(open, c) end
 
     window:perform_action(act.InputSelector {
-      title = 'hatter',
+      title = 'hatter: switch hat',
       fuzzy = true,
-      fuzzy_description = 'Workspace: ',
-      choices = choices,
-      action = wezterm.action_callback(function(win, p, id)
-        if not id then return end
-        if id == 'pull' then return M.pull(win, opts) end
-        local e = by_id[id]
-        if e.session then
-          M.open(win, opts, cfg, e.hat, e.session)
+      fuzzy_description = 'Hat: ',
+      choices = open,
+      action = wezterm.action_callback(function(win, p, h)
+        if not h then return end
+        local mw = M.hat_window(opts, cfg, h)
+        if mw then
+          bring_forward(mw)
         else
-          prompt_new(win, p, opts, cfg, e.hat)
+          show_picker(win, p, opts, cfg, h)
         end
       end),
     }, pane)
   end)
 end
 
--- Bind the picker (CTRL+SHIFT+O unless opts.key / opts.mods say otherwise),
--- add every workspace to the launch menu, and reload when the config changes.
+-- Bind the picker and the hat switcher, add every workspace to the launch
+-- menu, reload when the config changes, and (window layout) start each hat
+-- window's title with its hat.
 --
+-- opts.layout       'window' (default): one WezTerm window per hat.
+--                   'workspace': one WezTerm workspace per hat.
+-- opts.key, opts.mods         the picker       (default CTRL+SHIFT+O)
+-- opts.switch_key, opts.switch_mods
+--                             the hat switcher (default CTRL+SHIFT+S);
+--                             switch_key = false leaves it unbound
+-- opts.maximize     open new hat windows maximized (default false)
+-- opts.window_title false leaves window titles to WezTerm (or to your own
+--                   format-window-title handler)
 -- opts.config_path  hatter's config.json  (default ~/.config/hatter/config.json)
 -- opts.ssh          the ssh to run        (default "ssh", which on Windows is
 --                                          the built-in OpenSSH client)
@@ -241,6 +413,33 @@ function M.apply_to_config(config, opts)
     mods = opts.mods or 'CTRL|SHIFT',
     action = M.picker(opts),
   })
+  if opts.switch_key ~= false then
+    table.insert(config.keys, {
+      key = opts.switch_key or 'S',
+      mods = opts.switch_mods or 'CTRL|SHIFT',
+      action = M.switcher(opts),
+    })
+  end
+
+  if layout(opts) == 'window' and opts.window_title ~= false then
+    wezterm.on('format-window-title', function(tab)
+      local hat_name = M.hat_of_window(tab.window_id)
+      if not hat_name then return nil end
+      local title = tab.tab_title
+      if not title or title == '' then title = tab.active_pane.title end
+      return hat_name .. ' | ' .. title
+    end)
+  end
+
+  if opts.maximize then
+    wezterm.on('update-status', function(window)
+      local key = 'hatter.maximize.' .. tostring(window:window_id())
+      if wezterm.GLOBAL[key] then
+        wezterm.GLOBAL[key] = nil
+        window:maximize()
+      end
+    end)
+  end
 
   local path = opts.config_path or default_config_path()
   wezterm.add_to_config_reload_watch_list(path)

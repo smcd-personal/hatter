@@ -26,7 +26,7 @@ jobs:
       - name: shellcheck
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh tests/drag-plan.sh tests/drag-heal.sh tests/sync-keep-running.sh tests/hat-restore-names.sh tests/focus-restore.sh tests/unassigned.sh tests/find.sh tests/registry-history.sh tests/watch-detached.sh tests/find-resume.sh tests/launch-suspend.sh tests/tab-rename.sh
+          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh tests/drag-plan.sh tests/drag-heal.sh tests/sync-keep-running.sh tests/hat-restore-names.sh tests/focus-restore.sh tests/unassigned.sh tests/find.sh tests/registry-history.sh tests/watch-detached.sh tests/find-resume.sh tests/launch-suspend.sh tests/tab-rename.sh tests/wezterm-plugin.sh
 
       - name: Help runs with no config and no cmux
         run: |
@@ -201,3 +201,26 @@ jobs:
           $entries
           if ($entries.Count -ne 2) { $out; throw "expected 2 entries, got $($entries.Count)" }
           if ($out -notmatch [regex]::Escape("ssh ci@127.0.0.1 tmux new-session -A -s 'ci two' -c `"`$HOME`"")) { throw 'wrong ssh command' }
+
+      # tests/wezterm-plugin.lua opens tabs through the plugin in WezTerm's
+      # real mux (wezterm-mux-server, no GUI) and checks which window each
+      # lands in. ping stands in for ssh, so nothing leaves the runner.
+      - name: The plugin's window per hat, inside WezTerm's mux on Windows
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'wez-test'
+          New-Item -ItemType Directory $dir | Out-Null
+          $env:HATTER_PLUGIN = "$env:GITHUB_WORKSPACE\plugin\init.lua" -replace '\\','/'
+          $env:HATTER_TEST_DIR = $dir -replace '\\','/'
+          $env:HATTER_TEST_SLEEP = 'ping'
+          $gui = Start-Process -PassThru "$env:ProgramFiles\WezTerm\wezterm-mux-server.exe" -ArgumentList @(
+            '--config-file', "$env:GITHUB_WORKSPACE\tests\wezterm-plugin.lua")
+          $results = Join-Path $dir 'results.txt'
+          for ($i = 0; $i -lt 60; $i++) {
+            if ((Test-Path $results) -and (Select-String -Quiet '^DONE' $results)) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          Stop-Process -Id $gui.Id -Force -ErrorAction SilentlyContinue
+          if (-not ((Test-Path $results) -and (Select-String -Quiet '^DONE' $results))) { throw 'no results from WezTerm' }
+          Get-Content $results
+          if (Select-String -Quiet '^FAIL' $results) { throw 'plugin test failed' }

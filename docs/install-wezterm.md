@@ -8,9 +8,9 @@ What you get today:
 
 - **Your hats, from anywhere.** A picker (`Ctrl+Shift+O`) lists every
   workspace in your hatter config. Choosing one attaches to its tmux session
-  over ssh, in a tab named after it, inside a WezTerm workspace named after
-  its hat. Choosing it again switches to that tab. The picker also creates new
-  workspaces and pulls the config from git.
+  over ssh, in a tab named after it, in its hat's own WezTerm window. Choosing
+  it again switches to that tab. The picker also creates new workspaces and
+  pulls the config from git. `Ctrl+Shift+S` switches between hats.
 - **No bash needed on Windows.** The picker is a WezTerm plugin that reads
   hatter's `config.json` and runs Windows' own `ssh`. WSL is not required.
 - **`hatter attach`** does the same from any bash terminal (macOS, Linux, WSL).
@@ -234,6 +234,10 @@ Start WezTerm. The first start clones the plugin, which takes a few seconds.
 ```lua
 hatter.apply_to_config(config, {
   key = 'O', mods = 'CTRL|SHIFT',   -- the picker binding
+  switch_key = 'S', switch_mods = 'CTRL|SHIFT', -- the hat switcher (false: none)
+  layout = 'window',                -- or 'workspace': see "Hats and windows"
+  maximize = true,                  -- open new hat windows maximized
+  window_title = false,             -- leave window titles to WezTerm
   config_path = 'D:/sync/hatter/config.json',  -- if the config lives elsewhere
   ssh = 'C:/Windows/System32/OpenSSH/ssh.exe', -- if `ssh` on PATH is the wrong one
 })
@@ -253,8 +257,8 @@ Update config from git (git pull)
 ```
 
 - **A workspace** opens a tab running
-  `ssh -t <hat> tmux new-session -A -s <workspace>`, in a WezTerm workspace
-  named after the hat. If that tab is already open, you are switched to it.
+  `ssh -t <hat> tmux new-session -A -s <workspace>`, in the hat's window
+  (see below). If that tab is already open, you are switched to it.
 - **+ new workspace** asks for a name, prefixes it with the hat
   (`atlas-ui` becomes `work-atlas-ui`), and creates the session on the server.
 - **Update config from git** runs `git pull` in the config folder.
@@ -267,16 +271,24 @@ prefix, and detach with prefix then `d`. The session keeps running. Under cmux
 each tmux window is a native tab; WezTerm cannot mirror tmux that way yet
 ([wezterm#336](https://github.com/wezterm/wezterm/issues/336)).
 
-Switch between hats with `Ctrl+Shift+O` again, or with WezTerm's workspace
-switcher, which lists one entry per hat you have open. It has no default key;
-`Ctrl+Shift+S` is free:
+#### Hats and windows
 
-```lua
-table.insert(config.keys, {
-  key = 'S', mods = 'CTRL|SHIFT',
-  action = wezterm.action.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' },
-})
-```
+Each hat gets its own WezTerm window, as it does under cmux. The first
+workspace you open on a hat creates the window, and later ones open as tabs
+in it. The window's title starts with the hat (`work | work-atlas`), so
+Alt+Tab and the taskbar tell the windows apart.
+
+**`Ctrl+Shift+S`** switches hats. It lists every hat, open ones first.
+Choosing an open hat brings its window forward. Choosing one that is not
+open lists its workspaces, and opening one creates the window.
+
+The plugin remembers which window belongs to which hat until WezTerm quits. A
+window it has forgotten is found again by its tabs, whose titles are the hat's
+session names.
+
+`layout = 'workspace'` puts each hat in a WezTerm workspace instead, in
+windows of its own. WezTerm shows one workspace at a time, so only one hat is
+on screen at once.
 
 ### A8. Keeping it current
 
