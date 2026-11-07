@@ -7264,6 +7264,9 @@ cmd_key() {
         elif [[ "$rc" == 255 ]]; then
             printf '  %-12s unreachable (%s) - not added\n' "$hat" "$(ssh_why "$(cat "$errf")")"
             failed=1
+        elif [[ "$rc" == 0 ]]; then
+            printf '  %-12s no answer from the server - not added\n' "$hat"
+            failed=1
         else
             # It answered, but could not write authorized_keys.
             printf '  %-12s failed on the server (exit %s) - not added\n' "$hat" "$rc"
@@ -8189,11 +8192,13 @@ sync_once() {
         live=""
         [[ -s "$tmp/ssh.$i" ]] && live=$(awk -F '\t' '$1 == "S" { print $2 }' "$tmp/ssh.$i")
         if [[ -z "$live" ]]; then
-            if [[ "$(cat "$tmp/ssh-rc.$i" 2>/dev/null)" == 255 ]]; then
-                echo "  $hat: $host unreachable ($(ssh_why "$(cat "$tmp/ssh-err.$i")")), leaving its config untouched"
-            else
-                echo "  $hat: $host has no tmux sessions, leaving its config untouched"
-            fi
+            local src
+            src=$(cat "$tmp/ssh-rc.$i" 2>/dev/null) || src=""
+            case "$src" in
+                255) echo "  $hat: $host unreachable ($(ssh_why "$(cat "$tmp/ssh-err.$i")")), leaving its config untouched" ;;
+                0)   echo "  $hat: $host has no tmux sessions, leaving its config untouched" ;;
+                *)   echo "  $hat: $host did not answer${src:+ (exit $src)}, leaving its config untouched" ;;
+            esac
             continue
         fi
         reached+="$host"$'\n'
@@ -8745,7 +8750,7 @@ cmd_restore() {
         # 4. the mirror brings every session on the server, recorded or not:
         # the ones no group records go into Unassigned rather than run loose.
         local live
-        live=$(hat_live_sessions "$host") || live=""
+        live=$(hat_live_sessions "$host" 2>/dev/null) || live=""
         settle_ungrouped "$hat" "$win" "$live"
         discard_stray_workspace "$win"
 
