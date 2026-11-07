@@ -1699,11 +1699,12 @@ mirror_hat() {
 # For a mirrored workspace a close only detaches: the tabs run on and the
 # timer still wakes them. Only a workspace whose tabs cmux maps to a hat's
 # hatter-snooze is closed; a local workspace that happens to have the name is
-# the user's.
+# the user's. A pass that runs before cmux has drawn the box misses it; the
+# watcher's next sync, on cmux's workspace.created, closes it then.
 SNOOZE_BOX=hatter-snooze
 hide_snooze_box() {
     # hide_snooze_box [tree json] - prints the hosts whose box it closed; never fails
-    local tree="${1:-}" h n sids id
+    local tree="${1:-}" h n sids win id
     [[ -n "$tree" ]] || tree=$(cmux_json tree --all 2>/dev/null) || return 0
     # The cheap check first: nothing by that name, nothing to ask cmux about.
     jq -e --arg t "$SNOOZE_BOX" 'any(.windows[]?.workspaces[]?; .title == $t)' \
@@ -1713,13 +1714,13 @@ hide_snooze_box() {
         sids=$(cmux_pane_map "$h" "$SNOOZE_BOX" </dev/null \
                | jq -c 'select(.mirrored == true) | [.panes[]?.surface_id]' 2>/dev/null) || sids=""
         [[ -n "$sids" && "$sids" != "[]" ]] || continue
-        while IFS= read -r id; do
-            [[ -n "$id" ]] || continue
-            cmux_change close-workspace --force --workspace "$id" >/dev/null 2>&1 </dev/null \
+        while IFS=$'\t' read -r win id; do
+            [[ -n "$win" && -n "$id" ]] || continue
+            cmux_change close-workspace --force --workspace "$id" --window "$win" >/dev/null 2>&1 </dev/null \
                 && printf '%s\n' "$h"
-        done < <(jq -r --argjson s "$sids" '.windows[]?.workspaces[]?
+        done < <(jq -r --argjson s "$sids" '.windows[]? | .id as $w | .workspaces[]?
                     | select(any(.panes[]?.surfaces[]?; .id as $x | $s | index([$x])))
-                    | .id' <<<"$tree" 2>/dev/null)
+                    | [$w, .id] | @tsv' <<<"$tree" 2>/dev/null)
     done < <(hat_names | while IFS= read -r n; do printf '%s\n' "$(hat_ssh "$n")"; done | sort -u)
     return 0
 }
