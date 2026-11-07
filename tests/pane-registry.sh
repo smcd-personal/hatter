@@ -119,6 +119,51 @@ tmux move-window -s '=t:1' -t '=t:7'
 settle '[ "$(entry moved)" = "t:7 " ]' || true
 expect "a moved window's entry follows it" "$(yes_if [ "$(entry moved)" = "t:7 " ])"
 
+# --- a snooze survives the agent recording itself before adopt (#172) ----------
+# After a reboot hat-restore starts the agent, then re-files the old entry. If
+# the agent records itself in between, the old entry (an older server's, with
+# the same session id) is removed, and its snooze has to come along.
+prior() {  # prior <window id> <session> <index> <session id> <snooze json|null>
+    jq -n --arg wid "$1" --arg s "$2" --argjson w "$3" --arg i "$4" --argjson z "$5" \
+        '{session: $s, window: $w, name: "n", cwd: "/", kind: "claude", session_id: $i,
+          state: "live", recorded: "2026-01-01T00:00:00Z", window_id: $wid,
+          server: "1.1", pane: "%1"} + (if $z != null then {snooze: $z} else {} end)' \
+        > "$PANES/1.1-$1.json"
+}
+z='{"until": 4000000000, "from": "s", "index": 1, "mode": "remind"}'
+start hatter-snooze 2
+prior @90 hatter-snooze 1 zid "$z"
+prior @91 hatter-snooze 7 plain null
+"$REG" put "$(pane hatter-snooze:0)" claude zid live /
+expect "put: the snooze of the older entry it replaces comes along" \
+    "$(yes_if [ "$(jq -c 'select(.session_id == "zid") | .snooze.until' "$PANES"/*.json)" = 4000000000 ])"
+expect "put: and that older entry is gone" "$(yes_if [ -z "$(jq -r 'select(.server == "1.1" and .session_id == "zid") | .session_id' "$PANES"/*.json)" ])"
+"$REG" put "$(pane hatter-snooze:1)" claude plain live /
+expect "put: an older entry with no snooze adds none" \
+    "$(yes_if [ "$(jq -c 'select(.session_id == "plain") | .snooze // "none"' "$PANES"/*.json)" = '"none"' ])"
+# The window's own snooze is newer than an older entry's.
+start hatter-snooze 1
+"$REG" put "$(pane hatter-snooze:0)" claude own live /
+"$REG" snooze "$(tmux display-message -p -t "$(pane hatter-snooze:0)" '#{window_id}')" \
+    '{"until": 4100000000, "from": "s", "mode": "remind"}'
+prior @93 hatter-snooze 5 own "$z"
+"$REG" put "$(pane hatter-snooze:0)" claude own live /
+expect "put: a window's own snooze wins over an older entry's" \
+    "$(yes_if [ "$(jq -c 'select(.session_id == "own") | .snooze.until' "$PANES"/*.json)" = 4100000000 ])"
+# Both kinds of older entry: the session id match is the one carried.
+start hatter-snooze 2
+prior @94 hatter-snooze 1 other '{"until": 4200000000, "from": "s", "mode": "remind"}'
+prior @95 hatter-snooze 6 both "$z"
+"$REG" put "$(pane hatter-snooze:1)" claude both live /
+expect "put: a session id match wins over an index match" \
+    "$(yes_if [ "$(jq -c 'select(.session_id == "both") | .snooze.until' "$PANES"/*.json)" = 4000000000 ])"
+# The other removal: an older entry filed at this window's session and index.
+start hatter-snooze 2
+prior @92 hatter-snooze 1 other "$z"
+"$REG" put "$(pane hatter-snooze:1)" shell "" live /
+expect "put: the snooze of an older entry at its index comes along" \
+    "$(yes_if [ "$(jq -c 'select(.session == "hatter-snooze" and .window == 1) | .snooze.until' "$PANES"/*.json)" = 4000000000 ])"
+
 # --- an older registry, keyed by index ------------------------------------------
 start s 2
 quiet
