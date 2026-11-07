@@ -1881,10 +1881,14 @@ setw -g aggressive-resize on
 # resize, so after-refresh-client runs hat-resize --follow, which sizes every
 # window of the session from the client. Not client-resized: tmux does not fire
 # it for a control client. Not window-resized: the resizes --follow makes fire
-# it again. The key - client width and current window size - stops a repeat
-# run when nothing changed, and a client at 80 columns is one cmux has not
-# sized yet. Index 43, beside the registry's 42.
-set-hook -g 'after-refresh-client[43]' "if -F '#{&&:#{!=:#{client_width},80},#{!=:#{client_width}/#{window_width}x#{window_height},#{@hat_size_key}}}' \"run-shell -b '$HOME/.local/bin/hat-resize --follow #{q:session_id} #{client_width}/#{window_width}x#{window_height}'\""
+# it again. Only a control client counts, and it is named, so a plain terminal
+# attached to the same session is never the one read. The key - client width
+# and current window size - stops a repeat run when nothing changed; tmux has
+# resized the current window by the time the hook runs, so the key is already
+# the size --follow leaves. A client at 80 columns is one cmux has not sized
+# yet. Index 43, beside the registry's 42.
+set-hook -g 'after-refresh-client[43]' "if -F '#{&&:#{client_control_mode},#{&&:#{!=:#{client_width},80},#{!=:#{client_width}/#{window_width}x#{window_height},#{@hat_size_key}}}}' \"run-shell -b '$HOME/.local/bin/hat-resize --follow #{q:session_id} #{client_width}/#{window_width}x#{window_height} #{q:client_name}'\""
+
 
 # A window made with no client attached - every window a restore makes - takes
 # default-size, which is 80x24 unless set, and a control-mode client such as
@@ -4326,24 +4330,29 @@ cat > "$HOME/.local/bin/hat-resize" <<'HATRESIZE'
 #   hat-resize                     every session
 #   hat-resize <session>           one session
 #   hat-resize [<session>] --size 180x57   windows stuck at 80x24, to this size
-#   hat-resize --follow <session> [<key>]  what the tmux hook runs (#169)
+#   hat-resize --follow <session> [<key> [<client>]]  what the tmux hook runs (#169)
 #
-# A session whose client has a size: every window is sized from that client,
-# smaller or larger. A control-mode client such as cmux resizes only tmux's
-# current window when its own size changes, so the rest keep whatever size
-# they had, such as a larger display's. resize-window -a takes the client's
-# size, except for a window the client sized on its own (cmux does that for a
-# tab in a split), which keeps it. The .tmux.conf hook runs --follow on every
-# client size change; it also records the size, so new windows start at it.
+# A session whose control-mode client (cmux's) has a size: every window is
+# sized from that client, smaller or larger. A control-mode client resizes
+# only tmux's current window when its own size changes, so the rest keep
+# whatever size they had, such as a larger display's. resize-window -a takes
+# the client's size, except for a window the client sized on its own (cmux
+# does that for a tab in a split), which keeps it. The .tmux.conf hook runs
+# --follow on every client size change, naming the client that changed; it
+# also records the size, so new windows start at it. A plain terminal
+# attached to the same session is not the client windows follow, but
+# resize-window -a takes the smallest client, so a smaller one still wins.
 #
-# A session with no client, or one cmux has not sized yet (a control client
-# shows 80 columns until then): only windows stuck at 80x24 are resized, to
-# the record hat-save keeps. With no record yet (hat-save has not run since
-# the server was set up, or its timer stalled: #133), the size is read off the
-# windows a client has sized, the way hat-save reads it. --size skips the
-# client and resizes stuck windows to that size. Each window is resized by
-# its id: resize-window with no target acts on the session's current window,
-# which under a control-mode client is not the window you are in.
+# A session with no control-mode client, or one cmux has not sized yet (a
+# control client shows 80 columns until then): only windows stuck at 80x24
+# are resized, to the record hat-save keeps. So is a window resize-window -a
+# fails on (it closed meanwhile, or a tmux too old for -a). With no record
+# yet (hat-save has not run since the server was set up, or its timer
+# stalled: #133), the size is read off the windows a client has sized, the
+# way hat-save reads it. --size skips the client and resizes stuck windows to
+# that size. Each window is resized by its id: resize-window with no target
+# acts on the session's current window, which under a control-mode client is
+# not the window you are in.
 #
 # resize-window leaves a window at window-size manual, held at that size even
 # when the client resizes. The option is unset straight after, so the window
@@ -4354,45 +4363,83 @@ command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
 set -u
 state="${XDG_STATE_HOME:-$HOME/.local/state}/hatter"
 
-# The width of a session's client, or failure when it has none cmux has sized.
+# The width of a session's control-mode client (the named one, when a name is
+# given), or failure when it has none cmux has sized. Not the first client
+# listed: a plain terminal attached to the session would decide then.
 client_width() {
     local cw
-    cw=$(tmux list-clients -t "$1" -F '#{client_width}' 2>/dev/null | head -n 1)
+    cw=$(tmux list-clients -t "$1" -F '#{client_name}	#{client_control_mode}	#{client_width}' 2>/dev/null \
+        | awk -F '\t' -v c="${2:-}" '$2 == 1 && $3 != 80 && (c == "" || $1 == c) {print $3; exit}')
     case "$cw" in ""|80|*[!0-9]*) return 1 ;; esac
     printf '%s\n' "$cw"
 }
 
 # follow <target>: size every window of a session from its client. Adds the
-# number of windows whose size changed to $followed.
-followed=0
+# number of windows whose size changed to $followed. A window resize-window -a
+# fails on is counted in $unfollowed_n and added to $unfollowed as
+# "<id> <WxH>", so the stuck-window pass can still take it.
+followed=0 unfollowed="" unfollowed_n=0
 follow() {
-    local before after id
+    local before after id failed=""
     before=$(tmux list-windows -t "$1" -F '#{window_id} #{window_width}x#{window_height}' 2>/dev/null) || return 1
     for id in $(printf '%s\n' "$before" | awk '{print $1}'); do
-        tmux resize-window -a -t "$id" 2>/dev/null || continue
-        tmux set-window-option -u -t "$id" window-size 2>/dev/null || true
+        if tmux resize-window -a -t "$id" 2>/dev/null; then
+            tmux set-window-option -u -t "$id" window-size 2>/dev/null || true
+        else
+            failed="$failed $id"
+            unfollowed_n=$((unfollowed_n + 1))
+        fi
     done
-    after=$(tmux list-windows -t "$1" -F '#{window_id} #{window_width}x#{window_height}' 2>/dev/null) || return 0
-    followed=$((followed + $(printf '%s\n' "$after" | grep -cvxF -e "$before")))
+    after=$(tmux list-windows -t "$1" -F '#{window_id} #{window_width}x#{window_height}' 2>/dev/null) || after=""
+    [ -z "$after" ] || followed=$((followed + $(printf '%s\n' "$after" | grep -cvxF -e "$before")))
+    for id in $failed; do
+        unfollowed="$unfollowed$(printf '%s\n' "$after" | awk -v id="$id" '$1 == id')
+"
+    done
+    return 0
+}
+
+# unstick <WxH> <id>...: resize each window to WxH and let it go. Adds the
+# number resized to $n.
+n=0
+unstick() {
+    local sz="$1" id
+    shift
+    [ $# -gt 0 ] || return 0
+    for id in "$@"; do
+        tmux resize-window -t "$id" -x "${sz%x*}" -y "${sz#*x}" || continue
+        tmux set-window-option -u -t "$id" window-size 2>/dev/null || true
+        n=$((n + 1))
+    done
+    return 0
 }
 
 if [ "${1:-}" = --follow ]; then
-    target="${2:-}" key="${3:-}"
+    target="${2:-}" key="${3:-}" client="${4:-}"
     [ -n "$target" ] || { echo "hat-resize: --follow needs a session" >&2; exit 2; }
-    client_width "$target" >/dev/null || exit 0
+    client_width "$target" "$client" >/dev/null || exit 0
     follow "$target" || exit 0
-    [ -z "$key" ] || tmux set-option -t "$target" @hat_size_key "$key" 2>/dev/null || true
     # The session's commonest size is the client's: only a split tab differs.
     size=$(tmux list-windows -t "$target" -F '#{window_width}x#{window_height}' 2>/dev/null \
         | grep -vxF 80x24 | sort | uniq -c | sort -rn | awk 'NR == 1 {print $2}')
-    case "$size" in
-        [1-9]*x[1-9]*)
-            if [ "$(cat "$state/window-size" 2>/dev/null)" != "$size" ] && mkdir -p "$state" \
-               && printf '%s\n' "$size" > "$state/window-size.tmp.$$" \
-               && mv "$state/window-size.tmp.$$" "$state/window-size"; then
-                tmux set-option -g default-size "$size" 2>/dev/null || true
-            fi ;;
-    esac
+    case "$size" in [1-9]*x[1-9]*) ;; *) size="" ;; esac
+    # A window that would not follow and sits at 80x24 is resized to that
+    # size. The key is left unset, so the client's next refresh tries again.
+    if [ "$unfollowed_n" != 0 ]; then
+        [ -z "$size" ] || unstick "$size" $(printf '%s' "$unfollowed" | awk '$2 == "80x24" {print $1}') 2>/dev/null
+    elif [ -n "$key" ]; then
+        tmux set-option -t "$target" @hat_size_key "$key" 2>/dev/null || true
+    fi
+    if [ -n "$size" ]; then
+        # Set default-size whether or not the record changes: hat-save writes
+        # the same record, so a record already at this size says nothing about
+        # default-size.
+        tmux set-option -g default-size "$size" 2>/dev/null || true
+        if [ "$(cat "$state/window-size" 2>/dev/null)" != "$size" ]; then
+            mkdir -p "$state" && printf '%s\n' "$size" > "$state/window-size.tmp.$$" \
+                && mv "$state/window-size.tmp.$$" "$state/window-size" || rm -f "$state/window-size.tmp.$$"
+        fi
+    fi
     exit 0
 fi
 
@@ -4428,8 +4475,10 @@ done <<RESIZESESSIONS
 $sessions
 RESIZESESSIONS
 [ "$followed" = 0 ] || echo "hat-resize: $followed window(s) resized to their client's size"
+[ "$unfollowed_n" = 0 ] || echo "hat-resize: $unfollowed_n window(s) did not follow their client; resizing them if stuck at 80x24" >&2
 
-windows=""
+# Windows that would not follow join the stuck-window pass.
+windows="$unfollowed"
 while IFS= read -r t; do
     [ -n "$t" ] || continue
     windows="$windows$(tmux list-windows -t "$t" -F '#{window_id} #{window_width}x#{window_height}' 2>/dev/null)
@@ -4459,12 +4508,7 @@ esac
 w=${size%x*} h=${size#*x}
 case "$w$h" in *[!0-9]*) echo "hat-resize: not a size: '$size'" >&2; exit 2 ;; esac
 
-n=0
-for id in $stuck; do
-    tmux resize-window -t "$id" -x "$w" -y "$h" || continue
-    tmux set-window-option -u -t "$id" window-size 2>/dev/null || true
-    n=$((n + 1))
-done
+unstick "$w"x"$h" $stuck
 echo "hat-resize: $n window(s) resized to $size"
 HATRESIZE
 chmod +x "$HOME/.local/bin/hat-resize"
@@ -11490,6 +11534,13 @@ after a restore an agent can sit at 80x24 in a much larger cmux window. The
 save timer and the hook record the size cmux uses, the tmux server starts
 from it, and stuck windows are resized to it unless --size says otherwise.
 --size skips cmux's client and resizes only stuck windows.
+
+Only cmux's client counts: a plain terminal attached to the same session
+does not decide when to resize. Each tab is sized to the smallest client
+attached to its session, though, so a terminal smaller than cmux still makes
+the tabs smaller. A cmux window that really is 80 columns wide looks the same as one
+cmux has not sized yet, so its session is treated as unsized: the hook does
+nothing, and resize fixes only stuck windows.
 
 With no record yet, the size is the one cmux already shows in the tabs it has
 drawn. Each resized window keeps that size until cmux shows it, then follows
