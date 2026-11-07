@@ -338,6 +338,18 @@ touch "$d/down"
 hatter_in sync || true
 expect "sync: an unreachable server leaves the config untouched" \
     "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
+expect "sync: ...and says why it could not reach it (#185)" \
+    "$(yes_if says "dev@example.com unreachable (connection refused)")"
+
+# A server that answers with no tmux sessions is not an unreachable one.
+setup idle
+cp "$d/home/.config/hatter/config.json" "$d/before.json"
+: > "$d/server"
+hatter_in sync || true
+expect "sync: a server with no sessions says so, not 'unreachable'" \
+    "$(yes_if all_of says "dev@example.com has no tmux sessions" -- lacks unreachable)"
+expect "sync: ...and leaves the config untouched" \
+    "$(yes_if same_cfg "$d/before.json" "$d/home/.config/hatter/config.json")"
 
 # --- list: every kind is marked ----------------------------------------------
 setup list
@@ -358,7 +370,7 @@ expect "list: a running session no group records is listed" \
 touch "$d/down"
 hatter_in list || true
 expect "list: an unreachable server says so, lists its sessions, and marks none" \
-    "$(yes_if bash -c 'grep -q "live state unknown: server not reached" "$1" && grep -qx "    dev-c  (1 tabs)" "$1" \
+    "$(yes_if bash -c 'grep -q "live state unknown: server not reached: connection refused" "$1" && grep -qx "    dev-c  (1 tabs)" "$1" \
                        && ! grep -q "not running\|not in cmux" "$1"' _ "$d/out")"
 rm "$d/down"
 STUB_TMUX_ERR=1 hatter_in list || true
@@ -451,7 +463,7 @@ cp "$d/home/.config/hatter/config.json" "$d/before.json"
 touch "$d/down"
 rc=0; hatter_in rm dev-b || rc=$?
 expect "rm: an unreachable server fails, says so, and changes nothing" \
-    "$(yes_if all_of failed "$rc" -- says "could not reach dev@example.com" -- unchanged)"
+    "$(yes_if all_of failed "$rc" -- says "could not reach dev@example.com to end 'dev-b' (connection refused)" -- unchanged)"
 
 setup rm-tmux-err
 printf 'dev-a\ndev-b\n' > "$d/server"
