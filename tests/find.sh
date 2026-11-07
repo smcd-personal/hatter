@@ -160,11 +160,16 @@ cat > "$work/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 # `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
 [ "$1" = -G ] && exit 0
+echo "u@dev.example.com: Permission denied (publickey)." >&2
 exit 255
 EOF
 out=$(find_ parser) && fail "find with ssh down: exit 0:
 $out"
 grep -q 'could not reach dev' <<<"$out" || fail "find with ssh down: no warning:
+$out"
+# ...and why: a key the agent does not hold is not a server that is down (#185).
+grep -q 'could not reach dev (u@dev.example.com): key refused' <<<"$out" \
+    || fail "find with ssh down: no reason:
 $out"
 
 echo "ok: find"
