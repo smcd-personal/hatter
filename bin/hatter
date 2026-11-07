@@ -2720,8 +2720,10 @@ fi
 
 # Extra arguments for every launch of this kind, new or resumed, from a tmux
 # option such as `set -g @hat_claude_args '--permission-mode auto'`. A restored
-# agent then starts the way a hand-started one would. The value is split on
-# whitespace with no quote handling, so each argument must be a single word.
+# agent then starts the way a hand-started one would, except that a resumed
+# Claude session keeps the permission mode it had (see resume_mode). The value
+# is split on whitespace with no quote handling, so each argument must be a
+# single word.
 extra=()
 if [ -n "${TMUX:-}" ]; then
     read -r -a extra <<< "$(tmux show-options -gv "@hat_${kind}_args" 2>/dev/null)" || extra=()
@@ -2783,6 +2785,40 @@ resume_job() {
     resume_job
 }
 
+# resume_mode <transcript>: a resumed Claude session comes back in the
+# permission mode it was last in, which Claude Code writes into every
+# transcript entry, not in whatever @hat_claude_args names. Otherwise a session
+# run with bypassed permissions returns in the hat's mode, with bypass not even
+# in its shift+tab cycle. The permission flags in extra give way to the
+# recorded mode. A session that was in bypass once and has since left it gets
+# --allow-dangerously-skip-permissions, so shift+tab can still reach bypass. A
+# transcript with no mode this knows leaves extra as it is.
+resume_mode() {
+    local modes mode a skip="" kept=()
+    modes=$(grep -ao '"permissionMode":"[A-Za-z]*"' "$1" 2>/dev/null | cut -d'"' -f4)
+    mode=$(printf '%s\n' "$modes" | tail -n 1)
+    case "$mode" in
+        acceptEdits|auto|bypassPermissions|default|manual|dontAsk|plan) ;;
+        *) return 0 ;;
+    esac
+    for a in ${extra[@]+"${extra[@]}"}; do
+        if [ -n "$skip" ]; then skip=""; continue; fi
+        case "$a" in
+            --permission-mode) skip=1 ;;
+            --permission-mode=*|--dangerously-skip-permissions) ;;
+            *) kept+=("$a") ;;
+        esac
+    done
+    kept+=(--permission-mode "$mode")
+    if [ "$mode" != bypassPermissions ] && printf '%s\n' "$modes" | grep -qx bypassPermissions; then
+        case " ${kept[*]} " in
+            *" --allow-dangerously-skip-permissions "*) ;;
+            *) kept+=(--allow-dangerously-skip-permissions) ;;
+        esac
+    fi
+    extra=("${kept[@]}")
+}
+
 run_agent() {
     local bin="$HOME/.local/bin/$kind"
     command -v "$kind" >/dev/null 2>&1 && bin="$(command -v "$kind")"
@@ -2815,6 +2851,7 @@ run_agent() {
                         fi
                     done < <(grep -ao '"cwd":"[^"]*"' "$t" 2>/dev/null | cut -d'"' -f4 | sort -u)
                 fi
+                resume_mode "$t"
                 record claude "$sid" "$$"
                 start=$(date +%s)
                 as_job "$bin" ${extra[@]+"${extra[@]}"} --resume "$sid"; rc=$?
@@ -11555,7 +11592,10 @@ Subcommands:
                                           hat's server: --args gives the extra
                                           arguments for every launch of a kind
                                           (claude, codex or shell), including
-                                          each agent restored at boot. --kind
+                                          each agent restored at boot. A
+                                          resumed Claude session keeps the
+                                          permission mode it last had, over
+                                          any mode named here. --kind
                                           is what a bare `hat-launch` starts.
                                           An empty value clears it. Takes
                                           effect on the server at the next
