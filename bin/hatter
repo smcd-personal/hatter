@@ -1762,6 +1762,39 @@ mirror_hat() {
     cmux_change ssh-tmux "$host" --no-focus >/dev/null
 }
 
+# hat-snooze hides a tab by moving its tmux window into the session
+# hatter-snooze on its server. A mirror brings every session on the server,
+# the box among them (#173), so after each mirror pass, and whenever the
+# watcher sees workspaces come and go, hatter closes the box's workspace again.
+# For a mirrored workspace a close only detaches: the tabs run on and the
+# timer still wakes them. Only a workspace whose tabs cmux maps to a hat's
+# hatter-snooze is closed; a local workspace that happens to have the name is
+# the user's. A pass that runs before cmux has drawn the box misses it; the
+# watcher's next sync, on cmux's workspace.created, closes it then.
+SNOOZE_BOX=hatter-snooze
+hide_snooze_box() {
+    # hide_snooze_box [tree json] - prints the hosts whose box it closed; never fails
+    local tree="${1:-}" h n sids win id
+    [[ -n "$tree" ]] || tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    # The cheap check first: nothing by that name, nothing to ask cmux about.
+    jq -e --arg t "$SNOOZE_BOX" 'any(.windows[]?.workspaces[]?; .title == $t)' \
+        <<<"$tree" >/dev/null 2>&1 || return 0
+    while IFS= read -r h; do
+        [[ -n "$h" ]] || continue
+        sids=$(cmux_pane_map "$h" "$SNOOZE_BOX" </dev/null \
+               | jq -c 'select(.mirrored == true) | [.panes[]?.surface_id]' 2>/dev/null) || sids=""
+        [[ -n "$sids" && "$sids" != "[]" ]] || continue
+        while IFS=$'\t' read -r win id; do
+            [[ -n "$win" && -n "$id" ]] || continue
+            cmux_change close-workspace --force --workspace "$id" --window "$win" >/dev/null 2>&1 </dev/null \
+                && printf '%s\n' "$h"
+        done < <(jq -r --argjson s "$sids" '.windows[]? | .id as $w | .workspaces[]?
+                    | select(any(.panes[]?.surfaces[]?; .id as $x | $s | index([$x])))
+                    | [$w, .id] | @tsv' <<<"$tree" 2>/dev/null)
+    done < <(hat_names | while IFS= read -r n; do printf '%s\n' "$(hat_ssh "$n")"; done | sort -u)
+    return 0
+}
+
 wait_for_workspace() {
     # wait_for_workspace <title> <window> [tries] -> prints ref
     local title="$1" win="$2" tries="${3:-40}" ref="" i
@@ -3134,8 +3167,9 @@ cat > "$HOME/.local/bin/hat-snooze" <<'HATSNOOZE'
 # <which> is a window id (@12), <origin session>:<tab name>, or a tab name.
 #
 # A snoozed tab is its tmux window moved into the session hatter-snooze, which
-# no client mirrors and hatter never adopts: closing a mirrored tab would end
-# its window, moving it away does not. The record of where it came from is in
+# hatter never adopts and the client keeps out of cmux (a mirror brings it in,
+# and the client closes it again, #173): closing a mirrored tab would end its
+# window, moving it away does not. The record of where it came from is in
 # the window's pane-registry entry (.snooze), which follows the window through
 # moves and renames and is what hat-restore rebuilds from after a reboot; so a
 # snoozed tab comes back from a reboot still hidden and still snoozed. The
@@ -5165,6 +5199,7 @@ cmd_new() {
         warn "the session and the config entry are both fine - retry with: hatter new $session"
         die "no cmux workspace appeared for '$session'"
     fi
+    hide_snooze_box >/dev/null
 
     cmux_group_add "$gref" "$wref" || die "cmux would not put '$session' into group '$(group_display "$group")'"
     apply_group_style "$group" "$gref"
@@ -6407,6 +6442,7 @@ remirror_session() {
     local new
     new=$(wait_for_workspace "$session" "$win")
     [[ -n "$new" ]] || die "'$session' did not come back into cmux. $back"
+    hide_snooze_box >/dev/null
 
     if [[ -n "$gname" ]]; then
         local gref
@@ -8803,6 +8839,8 @@ cmd_restore() {
 
         # 4. the mirror brings every session on the server, recorded or not:
         # the ones no group records go into Unassigned rather than run loose.
+        # All but the snooze box, which goes back out of sight (#173).
+        [[ -z "$(hide_snooze_box)" ]] || info "Hid the snoozed tabs again (hatter snoozed lists them)"
         local live
         live=$(hat_live_sessions "$host" 2>/dev/null) || live=""
         settle_ungrouped "$hat" "$win" "$live"
@@ -9146,6 +9184,12 @@ watch_heal() {
 }
 watch_sync() {
     if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then echo "sync"; return 0; fi
+    # cmux can bring the snooze box back by itself, as when it reconnects a
+    # host after the Mac sleeps: out of sight again before sync records it.
+    local h
+    while IFS= read -r h; do
+        [[ -z "$h" ]] || watch_log "closed the snooze box from $h: snoozed tabs stay hidden"
+    done < <(hide_snooze_box)
     autosave_sync watch
 }
 
@@ -11394,7 +11438,9 @@ time, and you are told. Wake times are shown in your timezone, named.
 
 The tab is not closed. Its tmux window moves to a hidden session on its
 server, hatter-snooze, and keeps running there: an agent in it carries on with
-whatever it was doing. The server brings it back on its own, once a minute
+whatever it was doing. hatter keeps that session out of cmux: when a restore,
+a reconnect or cmux itself mirrors it, hatter closes its workspace again,
+which only detaches it. The server brings it back on its own, once a minute
 (the hatter-snooze timer that provision sets up), so the tab wakes whether or
 not this machine is awake, and a reboot keeps it snoozed.
 
