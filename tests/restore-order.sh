@@ -29,7 +29,8 @@ all_of() {
 mkdir -p "$work/bin"
 
 # cmux: $STUB_DIR/tree.json holds the window's workspaces, groups.W1.json its
-# groups in sidebar order. Every change is logged to $STUB_DIR/log.
+# groups in sidebar order. Every change is logged to $STUB_DIR/log. An add
+# appends to the group, or with STUB_ADD_AT=top puts the workspace first.
 cat > "$work/bin/cmux" <<'STUB'
 #!/usr/bin/env bash
 [[ "${1:-}" == --id-format ]] && shift 2
@@ -49,7 +50,9 @@ case "$1 ${2:-}" in
         g=$(arg --group "$@"); ws=$(arg --workspace "$@")
         edit --arg g "$g" --arg ws "$ws" '
             .groups |= map(.member_workspace_ids -= [$ws]
-                           | if .id == $g then .member_workspace_ids += [$ws] else . end)' ;;
+                           | if .id != $g then .
+                             elif env.STUB_ADD_AT == "top" then .member_workspace_ids = [$ws] + .member_workspace_ids
+                             else .member_workspace_ids += [$ws] end)' ;;
     "reorder-workspace "*)
         echo "$*" >> "$log"
         ws=$(arg --workspace "$@"); after=$(arg --after "$@"); before=$(arg --before "$@")
@@ -137,6 +140,29 @@ restore --missing dev || true
 expect "missing first workspaces go ahead of the first one in place, in order" \
     "$(yes_if [ "$(order)" = ws-anchor,ws-a,ws-b,ws-c ])"
 show missing-first
+
+# After a Mac reboot every workspace is out of its group (#193). Restore must
+# put them back in saved order wherever cmux places a new member: at the end,
+# or at the top, which reversed the group before the fix.
+setup empty-end '[]' '["ws-a", "ws-b", "ws-c"]'
+restore --missing dev || true
+expect "an empty group refilled, cmux adding at the end: saved order" \
+    "$(yes_if [ "$(order)" = ws-a,ws-b,ws-c ])"
+show empty-end
+
+setup empty-top '[]' '["ws-a", "ws-b", "ws-c"]'
+STUB_ADD_AT=top restore --missing dev || true
+expect "an empty group refilled, cmux adding at the top: saved order, not reversed" \
+    "$(yes_if [ "$(order)" = ws-a,ws-b,ws-c ])"
+expect "...and each add after the first is placed after the one before it" \
+    "$(yes_if all_of logged "reorder-workspace --workspace ws-b --after ws-a" -- logged "reorder-workspace --workspace ws-c --after ws-b")"
+show empty-top
+
+setup missing-first-top '["ws-anchor", "ws-c"]' '["ws-a", "ws-b"]'
+STUB_ADD_AT=top restore --missing dev || true
+expect "missing first workspaces, cmux adding at the top: still ahead of the one in place, in order" \
+    "$(yes_if [ "$(order)" = ws-anchor,ws-a,ws-b,ws-c ])"
+show missing-first-top
 
 # A workspace cmux will not add is left out of the order restore puts back.
 setup add-fails '["ws-c", "ws-a"]' '["ws-b"]'

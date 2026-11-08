@@ -8770,14 +8770,16 @@ cmd_restore() {
                     warn "could not put '$session' into group '$display'"
                     continue
                 fi
-                # Until one already here comes up, an add lands at the end in
-                # recorded order, and is moved ahead of that one when it does.
-                if [[ "$here" == 1 ]]; then
+                # Each add goes right after the one restored before it. Where
+                # cmux puts a new member is not relied on: it has put them at
+                # the top, which reversed a group restored into an empty one
+                # (#193). Until one already here comes up, the adds are also
+                # moved ahead of it when it does.
+                if [[ -n "$prev" ]]; then
                     cmux_change reorder-workspace --workspace "$wref" --after "$prev" --window "$win" >/dev/null 2>&1 \
                         || warn "could not put '$session' in its recorded place"
-                else
-                    ahead+="${ahead:+ }$wref"
                 fi
+                [[ "$here" == 1 ]] || ahead+="${ahead:+ }$wref"
                 want+="${want:+,}$wref"
                 prev="$wref"
                 members+=$'\n'"$wref"
