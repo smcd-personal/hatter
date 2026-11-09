@@ -155,6 +155,16 @@ grep -q 'and 1 more' <<<"$out" || fail "find --limit 2: no count of the rest:
 $out"
 grep -q 'more:' <<<"$(find_ --all parser)" && fail "find --all parser: under the limit, still says there are more"
 
+# --- --go takes the best match without asking: s2 (title match), attached ----
+# No cmux on the PATH, so it attaches (and, with no terminal, says so).
+nocmux=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v cmux | paste -sd: -)
+out=$(PATH="$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 \
+    "$root/bin/hatter" find --go parser </dev/null 2>&1) && fail "find --go with no terminal succeeded: $out"
+grep -q "attach needs a terminal - 'dev-a'" <<<"$out" || fail "find --go: did not go to the best match:
+$out"
+grep -q 'open which' <<<"$out" && fail "find --go: asked anyway:
+$out"
+
 # --- a hat that cannot be reached is reported, not taken for no matches -----
 cat > "$work/bin/ssh" <<'EOF'
 #!/usr/bin/env bash

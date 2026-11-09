@@ -7083,11 +7083,12 @@ find_resume_pick() {
 }
 
 cmd_find() {
-    local all=0 days=7 only="" limit=20 a
+    local all=0 days=7 only="" limit=20 go=0 a
     local -a terms=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all)  all=1; shift ;;
+            --go)   go=1; shift ;;
             --days) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--days needs a number of days"
                     all=1; days="$2"; shift 2 ;;
             --limit) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--limit needs a number (0 for all)"
@@ -7196,8 +7197,11 @@ cmd_find() {
     [[ "$total" -le "$n" ]] || \
         printf '  %s... and %d more: add a term to narrow it, or --limit 0 for all%s\n' "$C_DIM" $((total - n)) "$C_R"
 
-    [[ -t 0 && -t 1 ]] || return 0
     local pick
+    if [[ "$go" == 1 ]]; then
+        pick=1
+    else
+    [[ -t 0 && -t 1 ]] || return 0
     while true; do
         ask_line "open which (1-$n), Esc to skip" || return 0
         pick="$EDIT_REPLY"
@@ -7205,6 +7209,7 @@ cmd_find() {
         [[ "$pick" =~ ^[1-9][0-9]*$ && "$pick" -ge 1 && "$pick" -le "$n" ]] && break
         echo "  pick a number from 1 to $n" >&2
     done
+    fi
     IFS=$'\037' read -r owner di score state mtime session window wid sid cwd name title snip <<<"${rows[$((pick - 1))]}"
     dest="${dests[$di]}"
 
@@ -7218,6 +7223,570 @@ cmd_find() {
         return 0
     fi
     attach_session "$owner" "$session" "$window"
+}
+
+# ------------------------------------------------------------------- ps
+#
+# hatter ps (#199): a table of every tab on a hat and what its agent is doing.
+#
+# PS_SH runs on the server as `bash -s`, once per ssh destination. It prints
+# "@@hatter-now <epoch>" (the server's clock, which every age is measured
+# against), then one line per tab, fields joined by \037:
+#
+#   1 live|asleep        asleep: hibernated, with no tab open
+#   2 workspace          a snoozed tab's own workspace, not the snooze box
+#   3 window index       4 window id      5 tab name
+#   6 pinned             7 snoozed until  8 @hatter-waiting (hat-attn)
+#   9 agent              claude, codex, or empty for none running
+#  10 session id        11 model         12 model asked for
+#  13 context tokens    14 first said    15 last said
+#  16 oldest open tool call, 0 for none  17 agent started
+#  18 cwd               19 last prompt   20 the pane's command
+#
+# Times are epoch seconds, empty when unknown. "@@hatter-err <why>" means the
+# server could not be read, and "@@hatter-ok" ends every run that got going.
+read -r -d '' PS_SH <<'HATPS' || true
+#!/usr/bin/env bash
+set -uo pipefail
+# Run as `bash -s`, so posix_sh's tmux -u wrapper does not reach it (#109).
+command -v tmux >/dev/null 2>&1 && tmux() { command tmux -u "$@"; }
+trap 'echo @@hatter-ok' EXIT
+command -v jq >/dev/null 2>&1 || { echo "@@hatter-err jq is not installed"; exit 0; }
+command -v tmux >/dev/null 2>&1 || { echo "@@hatter-err tmux is not installed"; exit 0; }
+echo "@@hatter-now ${HAT_NOW:-$(date +%s)}"
+
+# Where the transcripts are: as hat-find asks (CLAUDE_CONFIG_DIR may be set
+# only by the login profile, which ssh does not run).
+cfg="${CLAUDE_CONFIG_DIR:-}"
+if [ -z "$cfg" ] && [ -z "${HAT_NO_LOGIN_ENV:-}" ]; then
+    login_shell=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)
+    [ -x "${login_shell:-}" ] || login_shell="${SHELL:-/bin/bash}"
+    to=""; command -v timeout >/dev/null 2>&1 && to="timeout -k 2 10"
+    cfg=$($to "$login_shell" -lc 'printf "HATCFG<%s>" "${CLAUDE_CONFIG_DIR:-}"' </dev/null 2>/dev/null) || cfg=""
+    case "$cfg" in
+        *"HATCFG<"*) cfg=${cfg##*HATCFG<}; cfg=${cfg%%>*} ;;
+        *) cfg="" ;;
+    esac
+fi
+[ -n "$cfg" ] || cfg="$HOME/.claude"
+PANES="${XDG_STATE_HOME:-$HOME/.local/state}/hatter/panes"
+US=$'\037'
+
+slug() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.@-' '_'; }
+clean() { tr '\t\n\r\037' '    '; }
+transcript() {
+    local t
+    for t in "$cfg"/projects/*/"$1".jsonl; do [ -f "$t" ] && { printf '%s' "$t"; return 0; }; done
+    return 1
+}
+
+# The first time anyone spoke: the session's start, kept across resumes.
+first_said() {
+    grep -a -m 1 -e '"type":"user"' -e '"type":"assistant"' "$1" 2>/dev/null \
+        | jq -r '.timestamp | strings | sub("\\.[0-9]+"; "") | fromdateiso8601? // empty' 2>/dev/null
+}
+
+# From the transcript's last 4 MB: model, model asked for, context in use,
+# last said, oldest open tool call, last prompt. A cut first line is skipped
+# by fromjson?. The open tool calls follow hat-hibernate's `said`: one is open
+# until a tool_result names it, and a new prompt starts over. Context is the
+# last real turn's whole input: uncached, cache read and cache written.
+# "<synthetic>" turns are Claude Code's own (an API error), not the model's.
+tail_facts() {
+    tail -c 4000000 "$1" 2>/dev/null \
+        | grep -a -e '"type":"user"' -e '"type":"assistant"' -e '"type":"last-prompt"' \
+        | jq -n -R -r '
+            def txt: if type == "string" then .
+                     elif type == "array" then
+                        if any(.[]?; type == "object" and .type == "tool_result") then ""
+                        else [.[]? | objects | select(.type == "text") | .text | strings] | join(" ") end
+                     else "" end;
+            reduce (inputs | fromjson? | objects) as $l
+                ({m: "", rm: "", ctx: "", last: "", p: {}, lp: "", up: ""};
+                 if $l.type == "last-prompt" then .lp = ($l.lastPrompt // .lp | tostring)
+                 elif ($l.isSidechain // false) then .
+                 else
+                   (first(($l.timestamp | strings | sub("\\.[0-9]+"; "") | fromdateiso8601?), null)) as $t
+                   | [$l.message.content | arrays | .[] | objects] as $items
+                   | (if $t != null then .last = $t else . end)
+                   | if $l.type == "assistant" then
+                       (if ($l.message.model // "<synthetic>") != "<synthetic>" then
+                          .m = $l.message.model
+                          | .rm = ($l.requestedModel // .rm)
+                          | ($l.message.usage // {}) as $u
+                          | .ctx = (($u.input_tokens // 0) + ($u.cache_read_input_tokens // 0)
+                                    + ($u.cache_creation_input_tokens // 0))
+                        else . end)
+                       | if $t == null then . else
+                           reduce ($items[] | select(.type == "tool_use") | .id | strings) as $id (.; .p[$id] = $t)
+                         end
+                     elif any($items[]; .type == "tool_result") then
+                       reduce ($items[] | select(.type == "tool_result") | .tool_use_id | strings) as $id (.; del(.p[$id]))
+                     elif ($l.isMeta // false) or ($l.isCompactSummary // false) then .
+                     else
+                       ($l.message.content | txt) as $x
+                       | if ($x | length) > 0 and ($x | startswith("<") | not)
+                         then .p = {} | .up = $x else . end
+                     end
+                 end)
+            | [.m, .rm, (.ctx | tostring), (.last | tostring), ([.p[]] | min // 0 | tostring),
+               (if .up != "" then .up else .lp end)]
+            | map(gsub("[\u001f\t\r\n]"; " ")) | join("\u001f")' 2>/dev/null
+}
+
+# agent <pane pid>: "<kind> <pid> <etime>" for the outermost claude or codex
+# under the pane, as hat-hibernate finds it; nothing when none runs.
+PS_ALL=$(ps -eo pid=,ppid=,etime=,args= 2>/dev/null) || PS_ALL=""
+agent() {
+    printf '%s\n' "$PS_ALL" | awk -v root="$1" '
+        function base(s) { sub(/.*\//, "", s); return s }
+        function kind(a, b) {
+            if (a == "claude" || a == "codex") return a
+            if ((a == "bash" || a == "sh" || a == "node") && (b == "claude" || b == "codex")) return b
+            return ""
+        }
+        { pid[NR] = $1; par[NR] = $2; et[NR] = $3; k[NR] = kind(base($4), base($5)) }
+        END {
+            front[root] = 1
+            for (round = 0; round < 40; round++) {
+                found = 0
+                for (i = 1; i <= NR; i++) if ((par[i] in front) && !(pid[i] in seen)) {
+                    if (k[i] != "") { print k[i], pid[i], et[i]; exit }
+                    next_[pid[i]] = 1; seen[pid[i]] = 1; found = 1
+                }
+                if (!found) exit
+                delete front
+                for (p in next_) front[p] = 1
+                delete next_
+            }
+        }'
+}
+
+# etime ([[dd-]hh:]mm:ss) to a start time in epoch seconds.
+started() {
+    printf '%s\n' "$1" | awk -v now="${HAT_NOW:-$(date +%s)}" '
+        { d = 0; t = $0
+          if (index(t, "-")) { d = substr(t, 1, index(t, "-") - 1); t = substr(t, index(t, "-") + 1) }
+          n = split(t, a, ":"); s = 0
+          for (i = 1; i <= n; i++) s = s * 60 + a[i]
+          if (t ~ /^[0-9:]+$/) print now - (d * 86400 + s) }'
+}
+
+wins=$(tmux list-windows -a -F "#{session_name}	#{window_index}	#{window_id}	#{window_name}	#{pid}.#{start_time}	#{pane_pid}	#{pane_current_path}	#{pane_current_command}	#{@hatter-waiting}	#{@hatter-pinned}	#{@hatter-snooze-until}" 2>/dev/null) \
+    || { echo "@@hatter-err tmux is not running"; exit 0; }
+
+# Each tab in the background, into its own file, then printed in order:
+# parsing transcripts one after another is most of the run.
+out=$(mktemp -d "${TMPDIR:-/tmp}/hat-ps.XXXXXX") || { echo "@@hatter-err no temp dir"; exit 0; }
+trap 'rm -rf "$out"; echo @@hatter-ok' EXIT
+k=0
+while IFS="$US" read -r s i w n srv ppid cwd cmd wait pin snz; do
+    [ -n "$w" ] || continue
+    k=$((k + 1))
+    (
+    case "$s" in hatter-hop-*) exit 0 ;; esac
+    f="$PANES/$(slug "$srv")-$(slug "$w").json"
+    IFS="$US" read -r rkind sid from <<EOF
+$(jq -r '[.kind // "", .session_id // "", .snooze.from // ""] | map(tostring) | join("\u001f")' "$f" 2>/dev/null)
+EOF
+    # A snoozed tab: shown in its own workspace, and snoozed by its record
+    # even if the window option was lost.
+    [ -z "${from:-}" ] || { s="$from"; snz="${snz:-1}"; }
+    a=$(agent "$ppid")
+    akind=${a%% *}; apid_et=${a#* }; aet=${apid_et#* }
+    astart=""; [ -z "$a" ] || astart=$(started "$aet")
+    facts="" first="" t=""
+    if [ -n "$akind" ] && [ "${rkind:-}" = claude ] && [ -n "${sid:-}" ] && t=$(transcript "$sid"); then
+        facts=$(tail_facts "$t")
+        first=$(first_said "$t")
+    fi
+    IFS="$US" read -r m rm ctx last pend prompt <<EOF
+$facts
+EOF
+    printf 'live\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+        "$s" "$i" "$w" "$(printf '%s' "$n" | clean)" "$pin" "$snz" "$wait" "$akind" \
+        "$( [ -n "$akind" ] && printf '%s' "${sid:-}")" "${m:-}" "${rm:-}" "${ctx:-}" "$first" "${last:-}" "${pend:-}" \
+        "$astart" "$(printf '%s' "$cwd" | clean)" "$(printf '%s' "${prompt:-}" | cut -c1-300)" "$cmd"
+    ) > "$out/$(printf '%05d' "$k")" &
+done <<WINS
+$(printf '%s\n' "$wins" | tr '\t' '\037')
+WINS
+wait
+cat "$out"/[0-9]* 2>/dev/null
+
+# Hibernated sessions: no tab, but still the hat's.
+for f in "$PANES"/closed/*.json; do
+    [ -e "$f" ] || continue
+    IFS="$US" read -r sid from name idx cwd <<EOF
+$(jq -r 'select((.hibernate // null) | type == "object")
+    | [.session_id, .hibernate.from, .hibernate.name, .hibernate.index, (.hibernate.cwd // .cwd)]
+    | map(. // "" | tostring | gsub("[\u001f\t\r\n]"; " ")) | join("\u001f")' "$f" 2>/dev/null)
+EOF
+    [ -n "${sid:-}" ] || continue
+    facts="" first=""
+    if t=$(transcript "$sid"); then facts=$(tail_facts "$t"); first=$(first_said "$t"); fi
+    IFS="$US" read -r m rm ctx last pend prompt <<EOF
+$facts
+EOF
+    printf 'asleep\037%s\037%s\037\037%s\037\037\037\037\037%s\037%s\037%s\037%s\037%s\037%s\0370\037\037%s\037%s\037\n' \
+        "$from" "$idx" "$name" "$sid" "${m:-}" "${rm:-}" "${ctx:-}" "$first" "${last:-}" "$cwd" \
+        "$(printf '%s' "${prompt:-}" | cut -c1-300)"
+done
+HATPS
+
+# How long a tab may sit at "waiting" before ps calls it idle, and how
+# recently a transcript must have moved to count as working with no tool call
+# open (a reply still streaming).
+PS_IDLE_AFTER=3600
+PS_BUSY_WITHIN=30
+
+# PS_JQ: the server's lines (with "<hat list>\037" in front, the hats on that
+# destination) and the config in, the table's rows out, best first. Reads
+# $now, $idle, $busy, $want (the hats asked for, [] for all) and $f, the
+# filters: {status: [...], model, min, max, match}, each empty or null for none.
+# shellcheck disable=SC2016
+PS_JQ='
+def num: if type == "number" then . elif type == "string" and test("^[0-9]+$") then tonumber else null end;
+def dur: if . == null or . < 0 then "-"
+         elif . < 60 then "\(.)s"
+         elif . < 3600 then "\(. / 60 | floor)m"
+         elif . < 86400 then "\(. / 3600 | floor)h\((. % 3600) / 60 | floor | if . > 0 then "\(.)m" else "" end)"
+         else "\(. / 86400 | floor)d\((. % 86400) / 3600 | floor | if . > 0 then "\(.)h" else "" end)" end;
+def tok: if . == null or . == 0 then "-"
+         elif . < 1000 then "\(.)"
+         elif . < 999500 then "\((. / 1000) | round)k"
+         else "\((. / 100000 | round) / 10)M" end;
+# claude-opus-5-5 -> opus-5.5; claude-3-5-haiku-20241022 -> 3-5-haiku
+def short_model: if . == "" then "-" else
+    sub("^claude-"; "") | sub("-[0-9]{8}$"; "") | sub("-(?<a>[0-9]+)-(?<b>[0-9]+)$"; "-\(.a).\(.b)") end;
+def rank: {approval: 0, question: 0, waiting: 1, working: 2, idle: 3, snoozed: 4, asleep: 5, shell: 6}[.] // 7;
+
+$cfg[0] as $c
+| ([$c.groups | to_entries[] as $g | ($g.value.sessions // {}) | keys_unsorted | to_entries[]
+    | {key: .value, value: {hat: $g.value.hat, group: ($g.value.name // $g.key), order: .key}}]
+   | from_entries) as $where
+| ([$c.groups | to_entries | .[] | .value.name // .key] | to_entries | map({key: .value, value: .key}) | from_entries) as $gorder
+| [inputs | split("\u001f") | select(length >= 21)
+   | {hats: (.[0] | split(" ")), st: .[1], ws: .[2], idx: .[3], wid: .[4], tab: .[5], pin: .[6],
+      snz: .[7], wait: .[8], agent: .[9], sid: .[10], m: .[11], rm: .[12], ctx: (.[13] | num),
+      first: (.[14] | num), last: (.[15] | num), pend: (.[16] | num // 0), start: (.[17] | num),
+      cwd: .[18], prompt: .[19], cmd: .[20]}
+   # The hat it belongs to: the one recording its workspace, if that hat is on
+   # this destination; else the one its name is prefixed with; else the first.
+   | ($where[.ws] // null) as $w
+   | (.ws | split("-")[0]) as $pre
+   | .hat = (if $w != null and (.hats | index($w.hat)) then $w.hat
+             elif (.hats | index($pre)) then $pre else .hats[0] end)
+   | .group = (if $w != null and $w.hat == .hat then $w.group else "-" end)
+   | .gord = (if .group == "-" then 1e9 else ($gorder[.group] // 1e9) end)
+   | .sord = (if $w != null then $w.order else 1e9 end)
+   | select(.hat as $h | ($want | length) == 0 or ($want | index($h)))
+   | (if .last != null then $now - .last else null end) as $idle_s
+   | .status = (
+       if .st == "asleep" then "asleep"
+       elif .snz != "" or .ws == "hatter-snooze" then "snoozed"
+       elif .agent == "" then "shell"
+       elif .wait == "approval" or .wait == "question" then .wait
+       elif .pend > 0 and (.start == null or .pend >= .start) then "working"
+       elif .wait == "" and $idle_s != null and $idle_s < $busy then "working"
+       elif $idle_s != null and $idle_s >= $idle then "idle"
+       else "waiting" end)
+   | .model = (if .agent == "codex" and .m == "" then "codex" else (.m | short_model) end)
+   | .ctxs = (.ctx | tok)
+   | .idles = (if .status == "shell" then "-" else ($idle_s | dur) end)
+   | .ages = (if .first != null then ($now - .first | dur) else "-" end)
+   | .cwd = (.cwd | sub("^/(home|Users)/[^/]+(?=/|$)"; "~"))
+   | .tabs = ((if .pin != "" then "* " else "" end)
+              + (if .tab != "" then .tab elif .idx != "" then "tab \(.idx)" else "-" end))
+   | select(.status as $s | ($f.status | length) == 0 or ($f.status | index($s)))
+   | select($f.model == "" or (.model | ascii_downcase | contains($f.model | ascii_downcase)))
+   | select($f.min == null or (.ctx // 0) >= $f.min)
+   | select($f.max == null or (.ctx != null and .ctx <= $f.max))
+   | select($f.match == "" or ([.group, .ws, .tabs, .cwd, .prompt] | join(" ") | ascii_downcase
+                              | contains($f.match | ascii_downcase)))
+  ]
+| sort_by([(.status | rank), .hat, .gord, .sord, .ws, (.idx | num // 0)])
+| .[]
+| [.hat, .status, .group, .ws, .tabs, .model, .ctxs, .idles, .ages, (.cwd | if . == "" then "-" else . end),
+   (.prompt | if . == "" then "-" else . end), .sid, .wid, .idx]
+| map(tostring | gsub("[\u0000-\u001f\u007f]"; " ")) | join("\u001f")'
+
+# ps_cols: the terminal's width.
+ps_cols() {
+    local c="${COLUMNS:-}"
+    [[ "$c" =~ ^[0-9]+$ ]] || c=$(tput cols 2>/dev/null) || c=""
+    [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] || c=100
+    printf '%s' "$c"
+}
+
+# ps_render <rows file> <width> <wide 0|1> <hat column 0|1>: the table.
+# Columns, best first; each has a width cap (0: none) and a minimum. The
+# lowest drop out until the rest fit at their minimum; model, ctx, idle and
+# age are shown whole or not at all. The rest grow back toward their full
+# width in priority order, and the prompt takes what is left over.
+ps_render() {
+    local file="$1" width="$2" wide="$3" showhat="$4"
+    # name, field in the row (0-based), cap, min
+    local -a names=(STATUS HAT GROUP WORKSPACE TAB MODEL CTX IDLE AGE CWD "LAST PROMPT")
+    local -a fields=(1 0 2 3 4 5 6 7 8 9 10)
+    local -a caps=(8 20 18 22 28 0 0 0 0 32 0)
+    local -a mins=(8 4 5 9 8 5 3 4 3 8 12)
+    local -a order=(0 1 4 3 2 5 6 7 8 9 10)   # priority: status, hat, tab, workspace, group, model, ctx...
+    local -a w=() on=()
+    local k f line v n=${#names[@]}
+    local -a cells
+
+    # Natural widths: the longest cell, or the header, up to the cap.
+    for ((k = 0; k < n; k++)); do w[$k]=${#names[$k]}; on[$k]=0; done
+    while IFS= read -r line; do
+        IFS=$'\037' read -r -a cells <<<"$line"
+        for ((k = 0; k < n; k++)); do
+            f=${fields[$k]}; v="${cells[$f]:-}"
+            [[ ${#v} -le ${w[$k]} ]] || w[$k]=${#v}
+        done
+    done < "$file"
+    for ((k = 0; k < n; k++)); do
+        if [[ "$wide" != 1 && ${caps[$k]} -gt 0 && ${w[$k]} -gt ${caps[$k]} ]]; then w[$k]=${caps[$k]}; fi
+    done
+    [[ "$showhat" == 1 ]] || w[1]=0
+    # model, ctx, idle and age are short and mean nothing cut: whole or not at all.
+    for k in 5 6 7 8; do mins[$k]=${w[$k]}; done
+
+    # Take columns in priority order while they fit at their minimum.
+    local used=0 need o
+    for o in "${order[@]}"; do
+        [[ "$o" == 1 && "$showhat" != 1 ]] && continue
+        if [[ "$wide" == 1 ]]; then on[$o]=1; continue; fi
+        need=${mins[$o]}
+        [[ ${w[$o]} -lt $need ]] && need=${w[$o]}
+        [[ "$used" -eq 0 ]] || need=$((need + 2))
+        if (( used + need <= width )); then on[$o]=1; used=$((used + need))
+        elif [[ "$o" == 0 ]]; then
+            # Status always shows: cut to the width when even it does not fit.
+            on[0]=1; mins[0]=$width; w[0]=$width; used=$width
+        fi
+    done
+
+
+    # Grow them back toward their natural width, best first; the prompt last,
+    # taking whatever is left.
+    if [[ "$wide" != 1 ]]; then
+        local total=0 cnt=0 room grow want
+        for ((k = 0; k < n; k++)); do
+            [[ ${on[$k]} == 1 ]] || continue
+            want=${mins[$k]}; [[ ${w[$k]} -lt $want ]] && want=${w[$k]}
+            total=$((total + want)); cnt=$((cnt + 1))
+        done
+        room=$((width - total - 2 * (cnt - 1)))
+        local -a final=()
+        for ((k = 0; k < n; k++)); do
+            want=${mins[$k]}; [[ ${w[$k]} -lt $want ]] && want=${w[$k]}
+            final[$k]=$want
+        done
+        for o in "${order[@]}"; do
+            [[ ${on[$o]} == 1 && "$o" != 10 ]] || continue
+            grow=$(( w[o] - final[o] ))
+            (( grow > room )) && grow=$room
+            (( grow > 0 )) || continue
+            final[$o]=$(( final[o] + grow )); room=$((room - grow))
+        done
+        if [[ ${on[10]} == 1 ]]; then
+            final[10]=$(( final[10] + room ))
+            (( final[10] > w[10] )) && final[10]=${w[10]}
+        fi
+        for ((k = 0; k < n; k++)); do w[$k]=${final[$k]}; done
+    fi
+
+    # Print: header, then rows. Truncate with an ellipsis; cwd from the left.
+    local last_on=0
+    for ((k = 0; k < n; k++)); do [[ ${on[$k]} == 1 ]] && last_on=$k; done
+
+    local hdr="" sep="" c
+    for ((k = 0; k < n; k++)); do
+        [[ ${on[$k]} == 1 ]] || continue
+        c=$(edit_trunc "${names[$k]}" "${w[$k]}")
+        if [[ "$k" == "$last_on" ]]; then hdr+="$sep$c"; else hdr+="$sep$c$(printf '%*s' $(( w[k] - ${#c} )) '')"; fi
+        sep="  "
+    done
+    printf '%s%s%s\n' "$C_DIM" "$hdr" "$C_R"
+
+    local row
+    while IFS= read -r line; do
+        IFS=$'\037' read -r -a cells <<<"$line"
+        row="" sep=""
+        for ((k = 0; k < n; k++)); do
+            [[ ${on[$k]} == 1 ]] || continue
+            c="${cells[${fields[$k]}]:-}"
+            if [[ ${#c} -gt ${w[$k]} ]]; then
+                if [[ "$k" == 9 ]]; then c=$(edit_trunc_left "$(edit_short_path "$c")" "${w[$k]}")
+                else c=$(edit_trunc "$c" "${w[$k]}"); fi
+            fi
+            if [[ "$k" == 0 ]]; then
+                c="$(ps_status_colour "${cells[1]}")$c$C_R$(printf '%*s' $(( w[k] - ${#c} )) '')"
+                row+="$sep$c"
+            elif [[ "$k" == "$last_on" ]]; then row+="$sep$c"
+            else row+="$sep$c$(printf '%*s' $(( w[k] - ${#c} )) '')"; fi
+            sep="  "
+        done
+        printf '%s\n' "$row"
+    done < "$file"
+}
+
+# ps_go <row>: put the row's tab in front, as find does: in cmux when it shows
+# the workspace, otherwise by attaching over ssh.
+ps_go() {
+    local h status group ws tab model ctx idle age cwd prompt sid wid idx
+    IFS=$'\037' read -r h status group ws tab model ctx idle age cwd prompt sid wid idx <<<"$1"
+    [[ "$status" != asleep ]] || die "'$tab' in $ws is hibernated, with no tab to go to: hatter wake $sid"
+    info "Going to $h: $ws / $tab ($status)" >&2
+    if have_cmux; then
+        find_focus "$h" "$(hat_ssh "$h")" "$ws" "$wid" && return 0
+        warn "cmux does not show '$ws' - open it with: hatter new $ws --focus"
+        return 0
+    fi
+    attach_session "$h" "$ws" "$idx"
+}
+
+ps_status_colour() {
+    case "$1" in
+        approval|question|waiting) printf '%s' "$C_B" ;;
+        working) ;;
+        idle|snoozed|asleep|shell) printf '%s' "$C_DIM" ;;
+    esac
+}
+
+# ps_tokens <120k|1.5M|90000>: the count it names, or fail.
+ps_tokens() {
+    local v
+    v=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+    awk -v v="$v" 'BEGIN {
+        if (v !~ /^[0-9]+(\.[0-9]+)?[km]?$/) exit 1
+        m = 1; if (v ~ /k$/) m = 1000; if (v ~ /m$/) m = 1000000
+        sub(/[km]$/, "", v); printf "%d\n", v * m }'
+}
+
+cmd_ps() {
+    local all=0 wide=0 json=0 only="" go=0
+    local f_status="" f_model="" f_min=null f_max=null f_match="" st
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)  all=1; shift ;;
+            --wide|-w) wide=1; shift ;;
+            --json) json=1; shift ;;
+            --go)   go=1; shift ;;
+            --status)
+                [[ -n "${2:-}" ]] || die "--status needs one or more of: needs approval question waiting working idle snoozed asleep shell"
+                for st in ${2//,/ }; do
+                    case "$st" in
+                        needs) f_status+=" approval question waiting" ;;
+                        approval|question|waiting|working|idle|snoozed|asleep|shell) f_status+=" $st" ;;
+                        *) die "no status '$st' (needs approval question waiting working idle snoozed asleep shell)" ;;
+                    esac
+                done
+                shift 2 ;;
+            --model) [[ -n "${2:-}" ]] || die "--model needs part of a model name (opus, sonnet-5.5)"
+                     f_model="$2"; shift 2 ;;
+            --min-ctx|--max-ctx)
+                st=$(ps_tokens "${2:-}") || die "$1 needs a token count (200k, 1M, 50000)"
+                if [[ "$1" == --min-ctx ]]; then f_min=$st; else f_max=$st; fi
+                shift 2 ;;
+            --match) [[ -n "${2:-}" ]] || die "--match needs some text"
+                     f_match="$2"; shift 2 ;;
+            -*)     die "unknown option: $1  (try: hatter help ps)" ;;
+            *)      [[ -z "$only" ]] || die "one hat at a time (or --all)"
+                    hat_exists "$1" || die "no hat named '$1'"
+                    only="$1"; shift ;;
+        esac
+    done
+    [[ -z "$only" || "$all" == 0 ]] || die "a hat or --all, not both"
+    colour_setup
+
+    # Which hats: the one named, every one, or the one whose window this is.
+    # With no cmux to say which that is, every hat.
+    local hat
+    if [[ -z "$only" && "$all" == 0 ]]; then
+        if hat=$(current_hat 2>/dev/null) && [[ -n "$hat" ]]; then only="$hat"; else all=1; fi
+    fi
+
+    # One run per ssh destination: hats that share an account share its tmux.
+    local -a dests=() hats_of=()
+    local dest i found
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        if [[ -n "$only" ]]; then
+            # Every hat on the destination is passed along, so a session goes
+            # to the right one of them; only $only's rows are kept.
+            [[ "$(hat_ssh "$hat")" == "$(hat_ssh "$only")" ]] || continue
+        fi
+        dest=$(hat_ssh "$hat")
+        [[ -n "$dest" ]] || continue
+        found=""
+        for ((i = 0; i < ${#dests[@]}; i++)); do
+            [[ "${dests[$i]}" == "$dest" ]] && { found=$i; break; }
+        done
+        if [[ -n "$found" ]]; then hats_of[$found]="${hats_of[$found]} $hat"
+        else dests+=("$dest"); hats_of+=("$hat"); fi
+    done < <(hat_names)
+    [[ ${#dests[@]} -gt 0 ]] || die "no hats to list"
+
+    local tmp
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-ps.XXXXXX")
+    for ((i = 0; i < ${#dests[@]}; i++)); do
+        printf '%s\n' "$PS_SH" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
+            "${dests[$i]}" "$(posix_sh "exec bash -s")" > "$tmp/$i" 2>"$tmp/$i.err" &
+    done
+    wait
+
+    # Every line, behind the hats of its destination. Ages are measured by
+    # the clock of the first server reached.
+    local line now=""
+    for ((i = 0; i < ${#dests[@]}; i++)); do
+        if ! grep -qx '@@hatter-ok' "$tmp/$i"; then
+            warn "could not reach ${hats_of[$i]# } (${dests[$i]}): $(ssh_why "$(cat "$tmp/$i.err")")"
+            continue
+        fi
+        while IFS= read -r line; do
+            case "$line" in
+                "@@hatter-err "*) warn "${hats_of[$i]# }: ${line#@@hatter-err }" ;;
+                "@@hatter-now "*) [[ -n "$now" ]] || now="${line#@@hatter-now }" ;;
+                ""|@@hatter-ok) ;;
+                *) printf '%s\037%s\n' "${hats_of[$i]# }" "$line" ;;
+            esac
+        done < "$tmp/$i"
+    done > "$tmp/lines"
+    [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+
+    local want='[]' filt
+    [[ -z "$only" ]] || want=$(jq -nc --arg h "$only" '[$h]')
+    # --go goes to a tab: a hibernated session has none, and a snoozed one's
+    # is in the snooze box. They stay out of what it picks from.
+    [[ "$go" == 0 || -n "$f_status" ]] || f_status=" approval question waiting working idle shell"
+    filt=$(jq -nc --arg s "$f_status" --arg m "$f_model" --argjson min "$f_min" --argjson max "$f_max" \
+        --arg x "$f_match" '{status: ($s | split(" ") | map(select(. != ""))), model: $m, min: $min, max: $max, match: $x}')
+    jq -n -R -r --slurpfile cfg "$CONFIG" --argjson now "$now" --argjson want "$want" --argjson f "$filt" \
+        --argjson idle "$PS_IDLE_AFTER" --argjson busy "$PS_BUSY_WITHIN" "$PS_JQ" \
+        < "$tmp/lines" > "$tmp/rows" || { rm -rf "$tmp"; die "could not build the table"; }
+
+    if [[ "$json" == 1 ]]; then
+        jq -R -s -c 'split("\n") | map(select(length > 0) | split("\u001f")
+            | {hat: .[0], status: .[1], group: .[2], workspace: .[3], tab: .[4], model: .[5],
+               ctx: .[6], idle: .[7], age: .[8], cwd: .[9], last_prompt: .[10],
+               session_id: .[11], window_id: .[12]})' < "$tmp/rows"
+        rm -rf "$tmp"; return 0
+    fi
+    if [[ ! -s "$tmp/rows" ]]; then
+        rm -rf "$tmp"
+        echo "  no tabs${only:+ on $only} match" >&2
+        [[ "$go" == 0 ]] || exit 1
+        return 0
+    fi
+    if [[ "$go" == 1 ]]; then
+        ps_go "$(head -n 1 "$tmp/rows")"
+        rm -rf "$tmp"
+        return 0
+    fi
+    ps_render "$tmp/rows" "$(ps_cols)" "$wide" "$all"
+    rm -rf "$tmp"
 }
 
 # The Termux widget lists the scripts under ~/.shortcuts as home-screen buttons.
@@ -11291,6 +11860,7 @@ Commands:
   tz [zone]              Your timezone, for times like "tomorrow 9am"
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   find <terms>...        Find the Claude session working on something, and go to it
+  ps [<hat>|--all]       Every tab on a hat: agent status, model, context, idle, age
   login [hat]            Log in to Cloudflare Access for hats whose ssh goes through it
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
@@ -11703,8 +12273,49 @@ The key is checked with ssh-keygen first, and each hat reports "added",
 "present" (already there, whatever its comment) or "unreachable", with why.
 USAGE
     ;;
+    ps) cat <<'USAGE'
+hatter ps [<hat> | --all] [filters] [--go] [--wide] [--json]
+
+Every tab on a hat in one table, sized to the terminal: what its agent is
+doing, the model, how much context it holds, and how long it has been idle.
+With no hat, the hat whose window you are in (every hat without cmux). --all
+lists every hat, with a HAT column.
+
+  STATUS       approval, question  the agent asks you something (hat-attn)
+               waiting             its turn ended
+               working             a tool call has no result yet, or the
+                                   transcript moved in the last 30 seconds
+               idle                waiting for an hour or more
+               snoozed, asleep     a snoozed tab; a hibernated session
+               shell               no agent runs in the tab
+  GROUP, WORKSPACE, TAB            where it is; "*" marks a pinned tab
+  MODEL        the model of the last turn
+  CTX          the context in use: the last turn's whole input, cached or
+               not (/1M when the model asked for has a 1M window)
+  IDLE         since you or the agent last said anything
+  AGE          since the session's first message, across resumes
+  CWD, LAST PROMPT
+
+Rows needing you come first, then working, then idle. When the table is too
+wide, the last columns above go first; --wide shows every column in full and
+--json prints the rows. Codex tabs show what tmux knows, with "-" for the rest.
+
+Filters, all of which a row must pass:
+  --status <s,...>  one or more of the statuses above; "needs" is approval,
+                    question and waiting
+  --model <text>    part of the model name: opus, sonnet-5.5
+  --min-ctx <n>     context of at least n tokens: 200k, 1M, 50000
+  --max-ctx <n>     context of at most n tokens
+  --match <text>    part of the group, workspace, tab, cwd or last prompt
+
+  --go              go to the first row instead of listing: its tab in cmux,
+                    or attached over ssh. Snoozed and hibernated rows are
+                    skipped unless --status names them.
+                    e.g. hatter ps --status needs --go
+USAGE
+    ;;
     find) cat <<'USAGE'
-hatter find [--all] [--days N] [--hat <hat>] [--limit N] <term>...
+hatter find [--all] [--days N] [--hat <hat>] [--limit N] [--go] <term>...
 
 Search the Claude sessions on every hat and list the matches, best first. At a
 terminal, pick one to go to its tab in cmux (or, without cmux, to attach to it
@@ -11724,6 +12335,7 @@ prompt or tab name has every term come first.
   --days N     With --all, look back N days instead (implies --all)
   --hat <hat>  Search only this hat
   --limit N    List the best N (default 20; 0 lists every match)
+  --go         Go straight to the best match, without asking
 
 Running sessions are the ones in a hat's pane registry (see provision) whose
 tmux window is still open.
@@ -12227,7 +12839,7 @@ seed_config
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -12240,7 +12852,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -12276,6 +12888,7 @@ case "$cmd" in
     attach)    [[ $# -le 1 ]] || { usage_cmd attach; exit 1; }
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     find)      cmd_find "$@" ;;
+    ps)        cmd_ps "$@" ;;
     login)     cmd_login "$@" ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
