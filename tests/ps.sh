@@ -29,6 +29,7 @@ printf 'dev-a\t2\t@12\tfix\t9.1\t102\t/srv/a\tclaude\tapproval\t\t\n'
 printf 'dev-a\t3\t@13\trun\t9.1\t103\t/srv/a\tclaude\t\t\t\n'
 printf 'dev-a\t4\t@14\tsh\t9.1\t104\t/srv/a\tbash\t\t\t\n'
 printf 'dev-a\t5\t@15\trecent\t9.1\t105\t/srv/b\tclaude\tdone\t\t\n'
+printf 'hatter-snooze\t2\t@17\tlost\t9.1\t106\t/srv/a\tclaude\tdone\t\t\n'
 printf 'hatter-snooze\t1\t@16\tnap\t9.1\t106\t/srv/a\tclaude\tdone\t\t1767300000\n'
 EOF
 # An agent under every pane but 104, each started an hour before NOW.
@@ -98,6 +99,7 @@ pane @13 s3
 # s5 (recent): turn ended 5 minutes ago.
 t="$proj/s5.jsonl"
 user "$t" $((NOW - 400)) "small fix"
+jq -nc '{type: "user", message: {role: "user", content: "no timestamp"}}' >> "$t"
 asst "$t" $((NOW - 300)) claude-haiku-5-5 100 30000
 pane @15 s5
 # s6: snoozed, from dev-a.
@@ -105,6 +107,7 @@ t="$proj/s6.jsonl"
 user "$t" $((NOW - 9000)) "later"
 asst "$t" $((NOW - 9000)) claude-opus-5-5 1 1
 pane @16 s6 dev-a
+pane @17 s6 dev-a
 # s7: hibernated, no tab.
 t="$proj/s7.jsonl"
 user "$t" $((NOW - 90000)) "old work"
@@ -138,6 +141,9 @@ want run status working
 want sh status shell
 want recent status waiting
 want nap status snoozed
+want lost status snoozed    # by its record, with the window option gone
+want recent model haiku-5.5 # a line with no timestamp does not lose what came before
+want recent ctx 30k
 want zz status asleep
 want main model opus-5.5
 want fix model sonnet-5.5
@@ -152,7 +158,7 @@ want main tab "* main"      # pinned
 want sh model -
 # Needs-you first, then working, idle, then the rest.
 order=$(jq -r '.[].status' <<<"$out" | paste -sd' ' -)
-[ "$order" = "approval waiting working idle snoozed asleep shell" ] || fail "order: $order"
+[ "$order" = "approval waiting working idle snoozed snoozed asleep shell" ] || fail "order: $order"
 
 # --- a hat whose server is not reached: a warning, and nothing listed ---------
 out=$(ps_ ops) || fail "ps ops: $out"
@@ -167,7 +173,7 @@ tabs() { ps_ dev --json "$@" | jq -r '.[].tab' | sed 's/^\* //' | paste -sd' ' -
 [ "$(tabs --status working,shell)" = "run sh" ] || fail "--status working,shell: $(tabs --status working,shell)"
 [ "$(tabs --model sonnet)" = "fix" ] || fail "--model sonnet: $(tabs --model sonnet)"
 [ "$(tabs --model OPUS --min-ctx 100k)" = "run main" ] || fail "--model OPUS --min-ctx 100k: $(tabs --model OPUS --min-ctx 100k)"
-[ "$(tabs --max-ctx 10k)" = "nap zz" ] || fail "--max-ctx 10k: $(tabs --max-ctx 10k)"
+[ "$(tabs --max-ctx 10k)" = "nap lost zz" ] || fail "--max-ctx 10k: $(tabs --max-ctx 10k)"
 [ "$(tabs --match LEDGER)" = "main" ] || fail "--match LEDGER: $(tabs --match LEDGER)"
 [ "$(tabs --match /srv/b)" = "recent" ] || fail "--match /srv/b: $(tabs --match /srv/b)"
 out=$(ps_ dev --status bogus) && fail "--status bogus accepted: $out"
@@ -181,8 +187,16 @@ out=$(ps_ dev --go --model haiku) || true
 grep -q 'dev-a / recent' <<<"$out" || fail "--go --model haiku: $out"
 out=$(ps_ dev --go --match old) && fail "--go to a hibernated tab: $out"
 grep -q 'no tabs on dev match' <<<"$out" || fail "--go --match old: $out"
-out=$(ps_ dev --go --status asleep) || true
-grep -q 'Going to dev: dev-a / zz' <<<"$out" || fail "--go --status asleep: $out"
+out=$(ps_ dev --go --status asleep) && fail "--go to a hibernated session succeeded: $out"
+grep -q "hibernated, with no tab to go to: hatter wake s7" <<<"$out" || fail "--go --status asleep: $out"
+# A tab name with an escape in it reaches no terminal raw.
+cp "$work/remote/tmux" "$work/tmux.orig"
+printf '%s\n' "printf 'dev-a\\t6\\t@18\\tbad\\033]0;x\\007name\\t9.1\\t104\\t/srv/a\\tbash\\t\\t\\t\\n'" >> "$work/remote/tmux"
+out=$(ps_out dev)
+grep -q 'bad ]0;x name' <<<"$out" || fail "the tab with an escape is missing:
+$out"
+case "$out" in *$'\033'*) fail "an escape in a tab name reached the table" ;; esac
+cp "$work/tmux.orig" "$work/remote/tmux"
 
 # --- the table fits the width -----------------------------------------------------
 for c in 50 80 120 200; do
@@ -193,6 +207,9 @@ $out"
     grep -q '^STATUS' <<<"$out" || fail "at $c: no header:
 $out"
 done
+out=$(COLS=5 ps_out dev)
+[ "$(printf '%s\n' "$out" | head -n 1)" = "STAT…" ] || fail "at 5 columns: want the status column cut, got:
+$out"
 out=$(COLS=50 ps_ dev)
 grep -q 'LAST PROMPT' <<<"$out" && fail "at 50 columns the prompt column stayed:
 $out"

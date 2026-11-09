@@ -7306,7 +7306,7 @@ tail_facts() {
                  if $l.type == "last-prompt" then .lp = ($l.lastPrompt // .lp | tostring)
                  elif ($l.isSidechain // false) then .
                  else
-                   ($l.timestamp | strings | sub("\\.[0-9]+"; "") | fromdateiso8601?) as $t
+                   (first(($l.timestamp | strings | sub("\\.[0-9]+"; "") | fromdateiso8601?), null)) as $t
                    | [$l.message.content | arrays | .[] | objects] as $items
                    | (if $t != null then .last = $t else . end)
                    | if $l.type == "assistant" then
@@ -7389,7 +7389,9 @@ while IFS="$US" read -r s i w n srv ppid cwd cmd wait pin snz; do
     IFS="$US" read -r rkind sid from <<EOF
 $(jq -r '[.kind // "", .session_id // "", .snooze.from // ""] | map(tostring) | join("\u001f")' "$f" 2>/dev/null)
 EOF
-    [ -z "${from:-}" ] || s="$from"
+    # A snoozed tab: shown in its own workspace, and snoozed by its record
+    # even if the window option was lost.
+    [ -z "${from:-}" ] || { s="$from"; snz="${snz:-1}"; }
     a=$(agent "$ppid")
     akind=${a%% *}; apid_et=${a#* }; aet=${apid_et#* }
     astart=""; [ -z "$a" ] || astart=$(started "$aet")
@@ -7452,7 +7454,7 @@ def dur: if . == null or . < 0 then "-"
          else "\(. / 86400 | floor)d\((. % 86400) / 3600 | floor | if . > 0 then "\(.)h" else "" end)" end;
 def tok: if . == null or . == 0 then "-"
          elif . < 1000 then "\(.)"
-         elif . < 1000000 then "\((. / 1000) | round)k"
+         elif . < 999500 then "\((. / 1000) | round)k"
          else "\((. / 100000 | round) / 10)M" end;
 # claude-opus-5-5 -> opus-5.5; claude-3-5-haiku-20241022 -> 3-5-haiku
 def short_model: if . == "" then "-" else
@@ -7507,7 +7509,7 @@ $cfg[0] as $c
 | .[]
 | [.hat, .status, .group, .ws, .tabs, .model, .ctxs, .idles, .ages, (.cwd | if . == "" then "-" else . end),
    (.prompt | if . == "" then "-" else . end), .sid, .wid, .idx]
-| map(tostring | gsub("[\u001f\n]"; " ")) | join("\u001f")'
+| map(tostring | gsub("[\u0000-\u001f\u007f]"; " ")) | join("\u001f")'
 
 # ps_cols: the terminal's width.
 ps_cols() {
@@ -7527,7 +7529,7 @@ ps_render() {
     # name, field in the row (0-based), cap, min
     local -a names=(STATUS HAT GROUP WORKSPACE TAB MODEL CTX IDLE AGE CWD "LAST PROMPT")
     local -a fields=(1 0 2 3 4 5 6 7 8 9 10)
-    local -a caps=(8 20 18 22 28 12 9 7 7 32 0)
+    local -a caps=(8 20 18 22 28 0 0 0 0 32 0)
     local -a mins=(8 4 5 9 8 5 3 4 3 8 12)
     local -a order=(0 1 4 3 2 5 6 7 8 9 10)   # priority: status, hat, tab, workspace, group, model, ctx...
     local -a w=() on=()
@@ -7558,8 +7560,13 @@ ps_render() {
         need=${mins[$o]}
         [[ ${w[$o]} -lt $need ]] && need=${w[$o]}
         [[ "$used" -eq 0 ]] || need=$((need + 2))
-        if (( used + need <= width )); then on[$o]=1; used=$((used + need)); fi
+        if (( used + need <= width )); then on[$o]=1; used=$((used + need))
+        elif [[ "$o" == 0 ]]; then
+            # Status always shows: cut to the width when even it does not fit.
+            on[0]=1; mins[0]=$width; w[0]=$width; used=$width
+        fi
     done
+
 
     # Grow them back toward their natural width, best first; the prompt last,
     # taking whatever is left.
@@ -7630,6 +7637,7 @@ ps_render() {
 ps_go() {
     local h status group ws tab model ctx idle age cwd prompt sid wid idx
     IFS=$'\037' read -r h status group ws tab model ctx idle age cwd prompt sid wid idx <<<"$1"
+    [[ "$status" != asleep ]] || die "'$tab' in $ws is hibernated, with no tab to go to: hatter wake $sid"
     info "Going to $h: $ws / $tab ($status)" >&2
     if have_cmux; then
         find_focus "$h" "$(hat_ssh "$h")" "$ws" "$wid" && return 0
