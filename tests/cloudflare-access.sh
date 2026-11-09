@@ -39,6 +39,8 @@ if [[ "\$1" == -G ]]; then
             printf 'user u\nhostname access.example.com\nproxycommand $cf access ssh --hostname %%h\n' ;;
         *@named.example.com)
             printf 'hostname named.example.com\nproxycommand $cf access ssh --hostname=gate.example.com\n' ;;
+        *@proxied.example.com)
+            printf 'hostname proxied.example.com\nproxycommand /usr/local/bin/hatter access-proxy $cf access ssh --hostname %%h\n' ;;
         *@other.example.com)
             printf 'hostname other.example.com\nproxycommand nc %%h %%p\n' ;;
         *@glob.example.com)
@@ -77,6 +79,9 @@ expect "a ProxyCommand that is not cloudflared is not an Access host" \
     "$([[ -z "$(access_info u@other.example.com)" ]] && echo y || echo n)"
 expect "cloudflared without 'access' is not an Access host" \
     "$([[ -z "$(access_info u@tool.example.com)" ]] && echo y || echo n)"
+got=$(access_info u@proxied.example.com)
+expect "a ProxyCommand behind hatter access-proxy is still recognised (#196)" \
+    "$([[ "$got" == "$cf"$'\t'proxied.example.com ]] && echo y || echo n)"
 ( cd "$work/cf" && touch stray-file
   got=$(access_info u@glob.example.com)
   [[ "${got#*$'\t'}" == glob.example.com ]] )
@@ -123,6 +128,58 @@ expect "an option's value is not taken for the destination" \
 rm -f "$work/cf/"*-token
 remote_sh u@access.example.com true >/dev/null 2>&1; rc=$?
 expect "remote_sh to a lapsed Access host fails" "$([[ $rc != 0 ]] && echo y || echo n)"
+
+# --- hatter access-proxy (#196) ----------------------------------------------
+# A fake cloudflared that records how it was run and answers on stdout, the way
+# the real one carries the ssh connection.
+cat > "$cf" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/proxied"
+echo tunnel
+EOF
+chmod +x "$cf"
+proxy() { ( cmd_access_proxy "$cf" access ssh --hostname access.example.com ) 2>"$work/proxy.err"; }
+rm -f "$work/cf/"*-token "$work/proxied"
+
+access_interactive() { return 1; }
+out=$(proxy); rc=$?
+expect "access-proxy: a lapsed login with nobody at a terminal fails" "$([[ $rc != 0 ]] && echo y || echo n)"
+expect "and never runs cloudflared (no browser tab)" "$([[ ! -s "$work/proxied" ]] && echo y || echo n)"
+expect "and says to run hatter login" "$(yn grep -q 'run: hatter login' "$work/proxy.err")"
+expect "and writes nothing on stdout, the ssh connection" "$([[ -z "$out" ]] && echo y || echo n)"
+
+access_interactive() { return 0; }
+out=$(proxy); rc=$?
+expect "access-proxy: a lapsed login with a person at a terminal runs cloudflared" \
+    "$([[ $rc == 0 && "$out" == tunnel ]] && echo y || echo n)"
+expect "with its arguments unchanged" "$(yn grep -qx 'access ssh --hostname access.example.com' "$work/proxied")"
+
+rm -f "$work/proxied"
+access_interactive() { return 1; }
+token access.example.com-aud1-token 3600
+out=$(proxy); rc=$?
+expect "access-proxy: a live login runs cloudflared with nobody at a terminal" \
+    "$([[ $rc == 0 && "$out" == tunnel && -s "$work/proxied" ]] && echo y || echo n)"
+rm -f "$work/cf/"*-token "$work/proxied"
+out=$( ( cmd_access_proxy nc access.example.com 22 ) 2>/dev/null ); rc=$?
+expect "access-proxy runs a command that is not cloudflared access as written" \
+    "$([[ $rc != 0 || -z "$out" ]] && echo y || echo n)"
+
+# Run whole, the way ssh runs it: no config read or written, nothing on stdout.
+out=$(XDG_CONFIG_HOME="$work/xdg" HATTER_CF_DIR="$work/cf" bash "$root/bin/hatter" \
+      access-proxy "$cf" access ssh --hostname access.example.com 2>"$work/proxy.err" </dev/null); rc=$?
+expect "hatter access-proxy, run whole with stderr not a terminal, fails fast" \
+    "$([[ $rc != 0 && -z "$out" && ! -s "$work/proxied" ]] && echo y || echo n)"
+expect "and touches no config" "$([[ ! -e "$work/xdg" ]] && echo y || echo n)"
+
+# Who counts as a person at a terminal.
+expect "ssh -o BatchMode=yes is not interactive" "$(yn ssh_args_batch "/usr/bin/ssh -tt -o BatchMode=yes -- u@h")"
+expect "ssh -o batchmode yes is not interactive" "$(yn ssh_args_batch "ssh -o 'batchmode yes' u@h")"
+expect "plain ssh is interactive" "$(ssh_args_batch "ssh u@h" && echo n || echo y)"
+expect "ssh -o BatchMode=no is interactive" "$(ssh_args_batch "ssh -o BatchMode=no u@h" && echo n || echo y)"
+unset -f access_interactive
+source <(sed -n '/^access_interactive() {/,/^}/p' "$lib")
+expect "stderr that is not a terminal is not interactive" "$(access_interactive 2>/dev/null && echo n || echo y)"
 
 # --- hatter login ------------------------------------------------------------
 cat > "$CONFIG" <<'EOF'
