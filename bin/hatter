@@ -358,7 +358,7 @@ ACCESS_MARGIN=60
 # ssh config without connecting. The binary is the one the ProxyCommand names,
 # so `hatter login` writes the token that ssh will read.
 access_info() {
-    local g pc host w words=() bin="" want="" seen_access="" name=""
+    local g pc host words=() ai
     g=$(command ssh -G "$1" </dev/null 2>/dev/null) || return 0
     pc=$(awk '$1 == "proxycommand" { sub(/^proxycommand[ \t]+/, ""); print; exit }' <<<"$g")
     host=$(awk '$1 == "hostname" { print $2; exit }' <<<"$g")
@@ -366,7 +366,20 @@ access_info() {
     # Word by word, without a shell or globbing: the command is the user's, not
     # ours to run.
     read -r -a words <<<"$pc"
-    for w in "${words[@]}"; do
+    ai=$(access_words "${words[@]}") || return 0
+    [[ "${ai#*$'\t'}" == "%h" || -z "${ai#*$'\t'}" ]] && ai="${ai%%$'\t'*}"$'\t'"$host"
+    [[ -n "${ai#*$'\t'}" ]] || return 0
+    printf '%s\n' "$ai"
+}
+
+# access_words <word>...: "<cloudflared binary><TAB><hostname as written>" when
+# the words are a `cloudflared access` command, with or without the
+# `hatter access-proxy` prefix in front; fails otherwise. The hostname may be
+# empty or %h, for the caller to resolve.
+access_words() {
+    local w bin="" want="" seen_access="" name=""
+    if [[ $# -ge 2 && "${1##*/}" == hatter* && "$2" == access-proxy ]]; then shift 2; fi
+    for w in "$@"; do
         if [[ -z "$bin" ]]; then bin="$w"; continue; fi
         if [[ -n "$want" ]]; then name="$w"; want=""; continue; fi
         case "$w" in
@@ -375,12 +388,10 @@ access_info() {
             --hostname=*) name="${w#--hostname=}" ;;
         esac
     done
-    case "${bin##*/}" in cloudflared*) ;; *) return 0 ;; esac
-    [[ -n "$seen_access" ]] || return 0
+    case "${bin##*/}" in cloudflared*) ;; *) return 1 ;; esac
+    [[ -n "$seen_access" ]] || return 1
     [[ "$bin" != "~/"* ]] || bin="$HOME/${bin#\~/}"
     [[ -x "$bin" ]] || bin=$(command -v cloudflared 2>/dev/null) || bin=""
-    [[ -z "$name" || "$name" == "%h" ]] && name="$host"
-    [[ -n "$name" ]] || return 0
     printf '%s\t%s\n' "${bin:-cloudflared}" "$name"
 }
 
@@ -421,6 +432,54 @@ access_gate() {
     (( $(access_left "${ai#*$'\t'}") > ACCESS_MARGIN )) && return 0
     warn "the Cloudflare Access login for ${ai#*$'\t'} has lapsed; run: hatter login"
     return 255
+}
+
+# hatter access-proxy <cloudflared> access ssh --hostname %h (#196): a prefix
+# for the ProxyCommand. access_gate covers the ssh hatter starts, but cmux
+# opens its own ssh to mirror each session and retries it on its own, as can
+# an editor, git or a script. Each retry with a lapsed login is a cloudflared
+# that opens a login tab nobody will finish. Through this prefix a lapsed login
+# opens a browser only for a person at a terminal; anything else fails fast,
+# saying to run `hatter login`. A live login, or any command this does not
+# recognise, runs exactly as written. stdout is the ssh connection, so nothing
+# here may write to it.
+cmd_access_proxy() {
+    local ai name
+    if [[ $# -eq 0 ]]; then
+        echo "usage: hatter access-proxy <cloudflared> access ssh --hostname %h" >&2
+        return 2
+    fi
+    # Without jq no token can be read, so there is no telling; run as written.
+    if command -v jq >/dev/null 2>&1 && ai=$(access_words "$@"); then
+        name="${ai#*$'\t'}"
+        if [[ -n "$name" && "$name" != "%h" ]] \
+           && (( $(access_left "$name") <= ACCESS_MARGIN )) \
+           && ! access_interactive; then
+            echo "hatter: the Cloudflare Access login for $name has lapsed; run: hatter login" >&2
+            return 1
+        fi
+    fi
+    exec "$@"
+}
+
+# access_interactive: succeeds when a person can finish a browser login for the
+# ssh that started this ProxyCommand. ssh hands a ProxyCommand its own stderr,
+# a terminal only when someone is at one; and an ssh run with BatchMode=yes
+# (cmux's, hatter's) has said it is not to ask anyone anything.
+access_interactive() {
+    [[ -t 2 ]] || return 1
+    ! ssh_args_batch "$(ps -o args= -p "$PPID" 2>/dev/null || true)"
+}
+
+# ssh_args_batch <ssh command line>: succeeds when it sets BatchMode yes. ssh
+# reads option names and values in any case, with = or a space.
+ssh_args_batch() {
+    local a
+    a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case " $a " in
+        *batchmode=yes*|*"batchmode yes"*) return 0 ;;
+    esac
+    return 1
 }
 
 # Every `ssh` hatter runs goes through here, including ones not written yet,
@@ -11688,6 +11747,19 @@ hatter never lets a lapsed Access login open a browser by itself: every ssh it
 starts, the cmux mirror and attach check the login first and stop with
 "run: hatter login" instead. `hatter hat` shows such a hat as "login".
 
+cmux also opens ssh connections of its own, to keep each mirror attached, and
+retries them. With a lapsed login, each retry would open another login tab
+that nobody finishes. To stop that, put `hatter access-proxy` in front of the
+ProxyCommand:
+
+  Host ssh.example.com
+      ProxyCommand hatter access-proxy cloudflared access ssh --hostname %h
+
+While the login lasts, this runs cloudflared as written. Once it lapses, only an
+ssh typed at a terminal opens the browser. cmux, scripts and anything run with
+BatchMode=yes fail at once with "run: hatter login". Use hatter's full path if
+ssh's PATH may not include it.
+
   --status   Only say how long each login has left; exits 1 if one has lapsed
 USAGE
     ;;
@@ -12136,11 +12208,15 @@ cmd_help() {
 # means bash never reads past it.
 {
 
-need jq
-seed_config
-
 cmd="${1:-}"
 shift || true
+
+# A ProxyCommand: ssh's own connection is on stdin and stdout, so it runs before
+# anything that might read config, take the lock or print (#196).
+if [[ "$cmd" == access-proxy ]]; then cmd_access_proxy "$@"; exit $?; fi
+
+need jq
+seed_config
 
 # cmux is the client half, and it is macOS-only. The server half - provisioning
 # a shell server, pushing a login to it, adding a tab, backups - is bash, ssh
