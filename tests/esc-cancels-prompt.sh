@@ -85,8 +85,8 @@ bare=$(grep -n 'edit_ask "' "$root/bin/hatter" | grep -v '|| continue' || true)
 $bare"
 grep -q '^edit_ask() { focus_restore; ask_line' "$root/bin/hatter" || fail "edit_ask no longer goes through ask_line"
 # The attach picker.
-grep -q 'ask_line "name (becomes' "$root/bin/hatter" || fail "attach's new-workspace name does not use ask_line"
-grep -q 'ask_line "\${prompt%: }" || return 1' "$root/bin/hatter" || fail "pick_one does not use ask_line"
+grep -q 'ask_line "new workspace name, Esc to cancel"' "$root/bin/hatter" || fail "attach's new-workspace name does not use ask_line"
+grep -q 'ask_line "\${prompt%: }" || return 1' "$root/bin/hatter" || fail "pick_index does not use ask_line"
 
 [[ $fails -eq 0 ]] || exit 1
 echo "esc-cancels-prompt: ok"
