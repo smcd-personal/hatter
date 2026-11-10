@@ -9886,6 +9886,7 @@ watch_resumed() {
     local after gap oldest replay reason
     IFS=$'\t' read -r after gap oldest replay reason <<<"$1"
     if [[ "$gap" == true ]]; then
+        WATCH_GAP_CHECK=1
         watch_log "the event stream resumed after event $after, but cmux had kept events only from $oldest on${reason:+ ($reason)}; whatever happened in between was not seen. Replaying $replay"
     else
         watch_log "the event stream resumed after event $after, replaying $replay"
@@ -10066,23 +10067,42 @@ watch_signin() {
 #
 # watch_act calls this only once the config lock is free, so a hatter command
 # that closes a workspace has finished first: repair has re-opened it, rm and
-# rename have changed the record. Unknown is never "still running": a server
-# that does not answer, or a cmux whose windows cannot be read, brings nothing
-# back and posts no notification, but the log says so, as it does for a
-# session that has ended.
+# rename have changed the record. Unknown is never "still running", and never
+# "ended" either (#203): a close whose server does not answer, or that came
+# while cmux's windows could not be read, is kept in WATCH_PENDING and looked
+# at again every WATCH_PENDING_RETRY seconds until it can be decided, as it
+# would have been at once. The first check after a wake often fails, because
+# the network is not back yet, and the event that told of the close has been
+# read by then, so without the record the close would be lost. After
+# WATCH_PENDING_MAX seconds it is given up, with a line in the log.
+#
+# Each line in is "<title> TAB user|lost", or "<title> TAB kind TAB since" for
+# a close kept from earlier, since being when it was first seen.
 WATCH_REATTACH_GAP=1800
 watch_closed() {
-    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd="" back="" lives="" titles
-    # What is not acted on is still said (#204): a close skipped in silence
-    # leaves nothing to trace it by later.
-    titles=$(printf '%s\n' "$1" | cut -f 1 | awk 'NF && !seen[$0]++' | paste -sd, - | sed 's/,/, /g')
+    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd="" back="" lives="" titles since now
+    now=$(date +%s)
+    # One line per title, in first-seen order; a person closing it wins, and
+    # the earliest time it was seen is kept.
+    titles=$(printf '%s\n' "$1" | AWK_NOW="$now" awk -F '\t' '
+        $1 == "" { next }
+        !($1 in k) { o[++n] = $1; k[$1] = $2; t[$1] = ($3 == "" ? ENVIRON["AWK_NOW"] : $3) }
+        $2 == "user" { k[$1] = "user" }
+        $3 != "" && $3 + 0 < t[$1] + 0 { t[$1] = $3 }
+        END { for (i = 1; i <= n; i++) print o[i] "\t" k[o[i]] "\t" t[o[i]] }')
     tree=$(cmux_json tree --all 2>/dev/null) || tree=""
     if [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" != array ]]; then
-        [[ -z "$titles" ]] || watch_log "cmux closed $titles, but its windows could not be read, so they were not checked"
+        # What is not acted on is still said (#204), and kept for later.
+        while IFS=$'\t' read -r s kind since; do
+            [[ -n "$s" ]] || continue
+            [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || continue
+            watch_log "'$s' closed in cmux, but cmux's windows could not be read; checking again shortly"
+            watch_pending_add "$since" "${kind:-user}" "$s"
+        done <<<"$titles"
         return 0
     fi
     shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
-    while IFS=$'\t' read -r s kind; do
+    while IFS=$'\t' read -r s kind since; do
         [[ -n "$s" ]] || continue
         [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || continue
         if grep -qxF -- "$s" <<<"$shown"; then continue; fi
@@ -10090,22 +10110,18 @@ watch_closed() {
         [[ -n "$hat" ]] || continue
         host=$(hat_ssh "$hat" 2>/dev/null) || continue
         [[ -n "$host" ]] || continue
-        pairs+="$host"$'\t'"$s"$'\t'"${kind:-user}"$'\t'"$hat"$'\n'
-    done < <(printf '%s\n' "$1" | awk -F '\t' '
-        # One line per title, in first-seen order; a person closing it wins.
-        $1 == "" { next }
-        !($1 in k) { o[++n] = $1; k[$1] = $2 }
-        $2 == "user" { k[$1] = "user" }
-        END { for (i = 1; i <= n; i++) print o[i] "\t" k[o[i]] }')
+        pairs+="$host"$'\t'"$s"$'\t'"${kind:-user}"$'\t'"$hat"$'\t'"$since"$'\n'
+    done <<<"$titles"
     # One look per server, however many of its workspaces closed at once.
-    while IFS=$'\t' read -r host s kind hat; do
+    while IFS=$'\t' read -r host s kind hat since; do
         [[ -n "$s" ]] || continue
         if [[ "$host" != "$prev" ]]; then
             prev=$host; ok=1
             live=$(hat_live_sessions "$host" 2>/dev/null) || ok=0
         fi
         if [[ "$ok" != 1 ]]; then
-            watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; left closed"
+            watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; checking again when it answers"
+            watch_pending_add "$since" "$kind" "$s"
             continue
         fi
         if ! grep -qxF -- "$s" <<<"$live"; then
@@ -10146,6 +10162,90 @@ watch_reattached_lately() {
     AWK_S="$1" AWK_T=$((now - WATCH_REATTACH_GAP)) awk -F '\t' '
         ($2 "") == (ENVIRON["AWK_S"] "") && $1 + 0 > ENVIRON["AWK_T"] + 0 { f = 1 } END { exit !f }' \
         "$AUTOSAVE_DIR/reattached" 2>/dev/null
+}
+
+# Closes that could not be decided yet (#203), one "<since> TAB <kind> TAB
+# <session>" line each. A file, so a watcher restarted by an update or by
+# launchd still has them.
+WATCH_PENDING="$AUTOSAVE_DIR/closes-pending"
+WATCH_PENDING_RETRY=${HATTER_WATCH_PENDING_RETRY:-30}
+WATCH_PENDING_MAX=86400
+WATCH_PENDING_NEXT=0
+
+# watch_pending_add <since> <kind> <session>
+watch_pending_add() {
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+    if ! printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$WATCH_PENDING" 2>/dev/null; then
+        watch_log "cannot record '$3' in $WATCH_PENDING; it will not be checked again"
+        return 0
+    fi
+    # Not again at once: the server that just failed gets its interval.
+    WATCH_PENDING_NEXT=$(( $(date +%s) + WATCH_PENDING_RETRY ))
+}
+
+watch_pending_due() {
+    [[ -s "$WATCH_PENDING" ]] || return 1
+    [[ $(date +%s) -ge "$WATCH_PENDING_NEXT" ]]
+}
+
+# Take the kept closes and decide them as watch_closed would have: those still
+# undecided go back in the file. Called by watch_act with the lock free.
+watch_pending_retry() {
+    local lines since kind s keep="" now
+    watch_pending_due || return 0
+    now=$(date +%s)
+    WATCH_PENDING_NEXT=$((now + WATCH_PENDING_RETRY))
+    lines=$(cat "$WATCH_PENDING" 2>/dev/null) || return 0
+    rm -f "$WATCH_PENDING"
+    while IFS=$'\t' read -r since kind s; do
+        [[ -n "$s" && "$since" =~ ^[0-9]+$ ]] || continue
+        if [[ $((now - since)) -ge "$WATCH_PENDING_MAX" ]]; then
+            watch_log "gave up checking '$s': cmux closed it a day ago and it could not be decided since. If its session still runs, hatter new $(watch_word "$s") brings it back"
+            continue
+        fi
+        keep+="$s"$'\t'"$kind"$'\t'"$since"$'\n'
+    done <<<"$lines"
+    [[ -z "$keep" ]] || watch_closed "$keep"
+    return 0
+}
+
+# After a gap (#203): cmux had dropped some of the events the watcher missed,
+# so a workspace it closed in that time is known to no one. List the recorded
+# sessions that still run but no cmux window shows. They are not reattached:
+# a workspace closed by hand looks the same (sync keeps its record, #74), and
+# with the events gone there is no telling the two apart. Said in the log and
+# one notification, naming the command that brings them back.
+WATCH_GAP_CHECK=0
+watch_gap_check() {
+    local tree shown hat host live s missing="" n=0
+    tree=$(cmux_json tree --all 2>/dev/null) || tree=""
+    if [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" != array ]]; then
+        watch_log "after the gap, cmux's windows could not be read, so nothing was checked"
+        return 0
+    fi
+    shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        host=$(hat_ssh "$hat" 2>/dev/null) || continue
+        [[ -n "$host" ]] || continue
+        if ! live=$(hat_live_sessions "$host" 2>/dev/null); then
+            watch_log "after the gap, $host did not answer, so its workspaces were not checked"
+            continue
+        fi
+        while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
+            grep -qxF -- "$s" <<<"$live" || continue
+            grep -qxF -- "$s" <<<"$shown" && continue
+            missing+="${missing:+, }$s"; n=$((n + 1))
+        done < <(cfg --arg h "$hat" '.groups[]? | select(.hat == $h) | .sessions | keys_unsorted[]?')
+    done < <(hat_names)
+    if [[ "$n" == 0 ]]; then
+        watch_log "after the gap, every recorded workspace that still runs is in cmux"
+        return 0
+    fi
+    watch_log "after the gap, $n recorded workspace(s) still run but are not in cmux: $missing. If cmux closed them while the watcher was not listening, hatter restore --missing brings them back"
+    watch_notify "hatter" "cmux's event log had a gap. Not in cmux, though their sessions still run: $missing. Bring them back: hatter restore --missing"
+    return 0
 }
 
 # watch_reattach <hat TAB session lines> <host TAB live-session lines>
@@ -10246,13 +10346,21 @@ watch_act() {
     fi
     heals=""; heal_all=0
     watch_signin
-    [[ "$sync" == 1 ]] || return 0
+    # Kept closes are looked at again in quiet moments too, not only after
+    # events: a server coming back sends cmux nothing.
+    if [[ "$sync" != 1 ]] && ! watch_pending_due; then return 0; fi
     if [[ -d "$LOCK_DIR" ]]; then
         mtime=$(lock_mtime "$LOCK_DIR")
         [[ "$mtime" -gt 0 && $(( $(date +%s) - mtime )) -gt "$LOCK_STALE_SECONDS" ]] || return 0
     fi
     [[ -z "$closes" ]] || watch_closed "$closes"
     closes=""
+    watch_pending_retry
+    [[ "$sync" == 1 ]] || return 0
+    if [[ "$WATCH_GAP_CHECK" == 1 ]]; then
+        WATCH_GAP_CHECK=0
+        watch_gap_check
+    fi
     watch_sync
     sync=0
     return 0
@@ -12076,8 +12184,17 @@ runs" and posts a macOS notification naming `hatter new <session>`, which
 brings it back. A close from a script, or from the sidebar of a workspace
 that is not selected, looks like cmux's own. So a session is reattached at
 most once in 30 minutes: closing it again keeps it closed, with the notice.
-A server that does not answer gets no reattach and no notification, only a
-line in the log. The rack lists such sessions at the top.
+When the server does not answer, as is common in the first seconds after a
+wake, the close is kept and checked again every 30 seconds until the server
+answers, then handled as above. After a day without an answer it is given
+up, with a line in the log. The rack lists such sessions at the top.
+
+When the stream resumes and cmux has already dropped some of the events the
+watcher missed, a workspace cmux closed in that time would go unnoticed. So
+the watcher then lists the recorded sessions that still run on their servers
+but that no cmux window shows, in the log and one notification naming
+`hatter restore --missing`. It does not bring them back itself: one closed
+by hand looks the same, and the events that would tell them apart are gone.
 
 The log also says when the event stream resumes, from which event, and
 whether cmux had already dropped some of what happened while the watcher was

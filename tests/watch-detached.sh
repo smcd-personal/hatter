@@ -19,8 +19,8 @@ mkdir -p "$work/bin" "$work/self"
 cp "$here/../bin/hatter" "$work/self/hatter"
 
 # cmux: the event stream is $STUB_DIR/events, a script of event lines plus
-# "SLEEP n", "LOCK", "UNLOCK" and "FORGET <session>" (a hatter command drops it
-# from the config). `tree --all` answers $STUB_DIR/tree, or fails when that is
+# "SLEEP n", "LOCK", "UNLOCK", "FORGET <session>" (a hatter command drops it
+# from the config) and "UP <dest>" (a server that did not answer does again). `tree --all` answers $STUB_DIR/tree, or fails when that is
 # missing.
 cat > "$work/bin/cmux" <<'STUB'
 #!/usr/bin/env bash
@@ -48,6 +48,8 @@ case "$1" in
         "FORGET "*) c="$STUB_DIR/config/hatter/config.json"
                     jq --arg s "${l#FORGET }" 'del(.groups[].sessions[$s])' "$c" > "$c.new"
                     mv "$c.new" "$c" ;;
+        "UP "*)     { grep -vxF -- "${l#UP }" "$STUB_DIR/down" || true; } > "$STUB_DIR/down.new"
+                    mv "$STUB_DIR/down.new" "$STUB_DIR/down" ;;
         *)          printf '%s\n' "$l" ;;
       esac
     done < "$STUB_DIR/events" ;;
@@ -194,7 +196,64 @@ expect "a server that does not answer is no notice: unknown is not running" \
        && grep -qx 'ssh ops@two.example.com' "$d/calls" && echo y)" "$out
 notes: $(cat "$d/notes")"
 expect "  but the log says the server did not answer (#204)" \
-    "$(grep -qx "'ops-db' closed in cmux, but ops@two.example.com did not answer, so whether its tmux session still runs is unknown; left closed" <<<"$out" && echo y)" "$out"
+    "$(grep -qx "'ops-db' closed in cmux, but ops@two.example.com did not answer, so whether its tmux session still runs is unknown; checking again when it answers" <<<"$out" && echo y)" "$out"
+expect "  and the close is kept to check again (#203)" \
+    "$(grep -qxF "$(printf 'user\tops-db')" <(cut -f 2- "$d/config/hatter/autosave/closes-pending") && echo y)" \
+    "$(cat "$d/config/hatter/autosave/closes-pending" 2>&1)"
+
+# #203: the first check after a wake fails because the network is not back.
+# The close is kept and checked again until the server answers.
+mkdir -p "$work/comes-back"; echo ops@two.example.com > "$work/comes-back/down"
+d="$work/comes-back"
+out=$(watch comes-back HATTER_WATCH_PENDING_RETRY=1 <<<"$ack
+SLEEP 2
+$(lost ops-db)
+SLEEP 2
+UP ops@two.example.com
+SLEEP 3")
+expect "a lost close whose server did not answer is reattached once it does (#203)" \
+    "$([[ "$(reattached "$out")" == 1 ]] && grep -q '^reattach ops-db' <<<"$out" \
+       && [[ ! -s "$d/config/hatter/autosave/closes-pending" ]] && echo y)" "$out"
+
+mkdir -p "$work/stays-down"; echo ops@two.example.com > "$work/stays-down/down"
+d="$work/stays-down"
+out=$(watch stays-down HATTER_WATCH_PENDING_RETRY=1 <<<"$ack
+SLEEP 2
+$(lost ops-db)
+SLEEP 4")
+expect "a server that stays down is asked again, and the close stays kept" \
+    "$([[ "$(reattached "$out")" == 0 && "$(grep -c '^ssh ops@two.example.com$' "$d/calls")" -ge 2 \
+          && "$(grep -c ops-db "$d/config/hatter/autosave/closes-pending")" == 1 ]] && echo y)" "$out
+calls: $(cat "$d/calls")"
+
+mkdir -p "$work/user-back"; echo ops@two.example.com > "$work/user-back/down"
+d="$work/user-back"
+out=$(watch user-back HATTER_WATCH_PENDING_RETRY=1 <<<"$ack
+SLEEP 2
+$(close ops-db)
+SLEEP 2
+UP ops@two.example.com
+SLEEP 3")
+expect "a kept close by a person is reported once the server answers, not reattached" \
+    "$([[ "$(reattached "$out")" == 0 ]] && logged "$out" ops-db ops-db && grep -q ops-db "$d/notes" && echo y)" "$out"
+
+# Kept in a file, so a watcher restarted (by an update, by launchd) still has them.
+mkdir -p "$work/restarted/config/hatter/autosave"
+printf '%s\tlost\tops-db\n' "$(( $(date +%s) - 60 ))" > "$work/restarted/config/hatter/autosave/closes-pending"
+d="$work/restarted"
+out=$(watch restarted <<<"$ack
+SLEEP 2")
+expect "a close kept by an earlier watcher is decided by the next one" \
+    "$(grep -q '^reattach ops-db' <<<"$out" && [[ ! -s "$d/config/hatter/autosave/closes-pending" ]] && echo y)" "$out"
+
+mkdir -p "$work/expired/config/hatter/autosave"
+printf '1000\tlost\tops-db\n' > "$work/expired/config/hatter/autosave/closes-pending"
+d="$work/expired"
+out=$(watch expired <<<"$ack
+SLEEP 2")
+expect "a close undecided for a day is given up, with a line in the log" \
+    "$(grep -q "^gave up checking 'ops-db'" <<<"$out" && [[ "$(reattached "$out")" == 0 ]] \
+       && ! grep -q 'ssh ops@' "$d/calls" && echo y)" "$out"
 
 # repair closes a workspace and mirrors it again, under the lock.
 mkdir -p "$work/shown"; tree_of dev-web > "$work/shown/tree"
@@ -218,8 +277,26 @@ $(close dev-api)
 SLEEP 2")
 expect "a cmux whose windows cannot be read is no notice" \
     "$([[ "$(said "$out")" == 0 && ! -s "$d/notes" ]] && grep -qx tree "$d/calls" && echo y)" "$out"
-expect "  but the log says the close was not checked (#204)" \
-    "$(grep -qx "cmux closed dev-api, but its windows could not be read, so they were not checked" <<<"$out" && echo y)" "$out"
+expect "  but the log says so, and the close is kept to check again (#203)" \
+    "$(grep -qx "'dev-api' closed in cmux, but cmux's windows could not be read; checking again shortly" <<<"$out" \
+       && grep -q "$(printf 'user\tdev-api')" "$d/config/hatter/autosave/closes-pending" && echo y)" "$out"
+
+# #203: when cmux had already dropped events the watcher missed, the recorded
+# sessions that run but are not in cmux are listed, not reattached.
+mkdir -p "$work/gap"; tree_of dev-web > "$work/gap/tree"
+d="$work/gap"
+out=$(watch gap <<<'{"type":"ack","replay_count":0,"resume":{"after_seq":5,"gap":true,"oldest_seq":90}}
+SLEEP 2')
+expect "after a gap, the sessions that run but are not in cmux are listed" \
+    "$(grep -q '^after the gap, 3 recorded workspace(s) still run but are not in cmux: dev-api, dev two, ops-db\. ' <<<"$out" \
+       && [[ "$(reattached "$out")" == 0 ]] && grep -q 'hatter restore --missing' "$d/notes" && echo y)" "$out
+notes: $(cat "$d/notes")"
+mkdir -p "$work/nogap"; tree_of dev-web > "$work/nogap/tree"
+d="$work/nogap"
+out=$(watch nogap <<<'{"type":"ack","replay_count":2,"resume":{"after_seq":5,"gap":false,"oldest_seq":1}}
+SLEEP 2')
+expect "a resume with nothing lost checks nothing" \
+    "$(! grep -q 'after the gap' <<<"$out" && [[ ! -s "$d/notes" ]] && echo y)" "$out"
 
 d="$work/several"
 out=$(watch several <<<"$ack
