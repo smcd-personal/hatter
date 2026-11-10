@@ -156,9 +156,7 @@ want nap workspace dev-a    # a snoozed tab's own workspace, not the box
 want main group Atlas
 want main tab "* main"      # pinned
 want sh model -
-# Needs-you first, then working, idle, then the rest.
-order=$(jq -r '.[].status' <<<"$out" | paste -sd' ' -)
-[ "$order" = "approval waiting working idle snoozed snoozed asleep shell" ] || fail "order: $order"
+want main cwd /srv/a        # in --json, though not in the table
 
 # --- a hat whose server is not reached: a warning, and nothing listed ---------
 out=$(ps_ ops) || fail "ps ops: $out"
@@ -169,19 +167,45 @@ $out"
 
 # --- filters ---------------------------------------------------------------
 tabs() { ps_ dev --json "$@" | jq -r '.[].tab' | sed 's/^\* //' | paste -sd' ' -; }
-[ "$(tabs --status needs)" = "fix recent" ] || fail "--status needs: $(tabs --status needs)"
+[ "$(tabs --status needs)" = "recent fix" ] || fail "--status needs: $(tabs --status needs)"
 [ "$(tabs --status working,shell)" = "run sh" ] || fail "--status working,shell: $(tabs --status working,shell)"
 [ "$(tabs --model sonnet)" = "fix" ] || fail "--model sonnet: $(tabs --model sonnet)"
 [ "$(tabs --model OPUS --min-ctx 100k)" = "run main" ] || fail "--model OPUS --min-ctx 100k: $(tabs --model OPUS --min-ctx 100k)"
 [ "$(tabs --max-ctx 10k)" = "nap lost zz" ] || fail "--max-ctx 10k: $(tabs --max-ctx 10k)"
 [ "$(tabs --match LEDGER)" = "main" ] || fail "--match LEDGER: $(tabs --match LEDGER)"
 [ "$(tabs --match /srv/b)" = "recent" ] || fail "--match /srv/b: $(tabs --match /srv/b)"
+# --- sorting (#218) ---------------------------------------------------------
+# Idle by default, most recent first; a shell has no idle time and comes last.
+# nap and lost tie (one session), and fall back to their place in the workspace.
+[ "$(tabs)" = "recent fix run nap lost zz main sh" ] || fail "default sort: $(tabs)"
+[ "$(tabs --sort idle)" = "$(tabs)" ] || fail "--sort idle is not the default"
+[ "$(tabs --sort age)" = "recent fix run nap lost zz main sh" ] || fail "--sort age: $(tabs --sort age)"
+st=$(ps_ dev --json --sort status | jq -r '.[].status' | paste -sd' ' -)
+[ "$st" = "approval waiting working idle snoozed snoozed asleep shell" ] || fail "--sort status: $st"
+[ "$(tabs --sort ctx)" = "run main fix recent zz nap lost sh" ] || fail "--sort ctx: $(tabs --sort ctx)"
+# Reversed, and the shell with no context is still last; nap and lost, which
+# tie, keep their order.
+[ "$(tabs --sort ctx -r)" = "nap lost zz recent fix main run sh" ] || fail "--sort ctx -r: $(tabs --sort ctx -r)"
+[ "$(tabs --sort tab)" = "fix lost main nap recent run sh zz" ] || fail "--sort tab: $(tabs --sort tab)"
+[ "$(tabs --sort model --reverse)" = "fix main nap lost run zz recent sh" ] || fail "--sort model --reverse: $(tabs --sort model --reverse)"
+out=$(ps_ dev --sort cwd) && fail "--sort cwd accepted: $out"
+grep -q 'sort needs one of' <<<"$out" || fail "--sort cwd: $out"
+# The table has no CWD column, at any width.
+out=$(COLS=300 ps_out --all --wide)
+grep -q 'CWD' <<<"$out" && fail "the table still has a CWD column:
+$out"
+grep -q '/srv/a' <<<"$out" && fail "a cwd is still in the table:
+$out"
+
 out=$(ps_ dev --status bogus) && fail "--status bogus accepted: $out"
 out=$(ps_ dev --min-ctx lots) && fail "--min-ctx lots accepted: $out"
 
 # --- --go picks the first row left, skipping snoozed and asleep -----------------
+out=$(ps_ dev --go --sort status --status needs) && fail "--go with no terminal succeeded: $out"
+grep -q "Going to dev: dev-a / fix (approval)" <<<"$out" || fail "--go --sort status: not the approval:
+$out"
 out=$(ps_ dev --go) && fail "--go with no terminal succeeded: $out"
-grep -q 'Going to dev: dev-a / fix (approval)' <<<"$out" || fail "--go: not the first row:
+grep -q 'Going to dev: dev-a / recent (waiting)' <<<"$out" || fail "--go: not the first row (the most recent):
 $out"
 out=$(ps_ dev --go --model haiku) || true
 grep -q 'dev-a / recent' <<<"$out" || fail "--go --model haiku: $out"
