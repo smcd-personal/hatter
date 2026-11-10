@@ -10096,7 +10096,8 @@ watch_closed() {
         while IFS=$'\t' read -r s kind since; do
             [[ -n "$s" ]] || continue
             [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || continue
-            watch_log "'$s' closed in cmux, but cmux's windows could not be read; checking again shortly"
+            [[ "$WATCH_PENDING_RETRYING" == 1 ]] \
+                || watch_log "'$s' closed in cmux, but cmux's windows could not be read; checking again shortly"
             watch_pending_add "$since" "${kind:-user}" "$s"
         done <<<"$titles"
         return 0
@@ -10120,7 +10121,8 @@ watch_closed() {
             live=$(hat_live_sessions "$host" 2>/dev/null) || ok=0
         fi
         if [[ "$ok" != 1 ]]; then
-            watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; checking again when it answers"
+            [[ "$WATCH_PENDING_RETRYING" == 1 ]] \
+                || watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; checking again when it answers"
             watch_pending_add "$since" "$kind" "$s"
             continue
         fi
@@ -10166,21 +10168,39 @@ watch_reattached_lately() {
 
 # Closes that could not be decided yet (#203), one "<since> TAB <kind> TAB
 # <session>" line each. A file, so a watcher restarted by an update or by
-# launchd still has them.
+# launchd still has them. Retries back off, doubling from WATCH_PENDING_RETRY
+# to WATCH_PENDING_RETRY_MAX while nothing can be decided, since each one can
+# wait out an ssh connect timeout in the watcher's loop; any close decided, or
+# a new one kept, starts again from the shortest wait. A retry logs only what
+# it decides, not each failed look.
 WATCH_PENDING="$AUTOSAVE_DIR/closes-pending"
 WATCH_PENDING_RETRY=${HATTER_WATCH_PENDING_RETRY:-30}
+WATCH_PENDING_RETRY_MAX=900
 WATCH_PENDING_MAX=86400
 WATCH_PENDING_NEXT=0
+WATCH_PENDING_WAIT=0
+WATCH_PENDING_RETRYING=0
+WATCH_PENDING_BUF=""
 
-# watch_pending_add <since> <kind> <session>
+# watch_pending_add <since> <kind> <session>. During a retry the lines are
+# collected, and watch_pending_retry writes them all at once.
 watch_pending_add() {
+    local now
+    if [[ "$WATCH_PENDING_RETRYING" == 1 ]]; then
+        WATCH_PENDING_BUF+="$1"$'\t'"$2"$'\t'"$3"$'\n'
+        return 0
+    fi
     mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
     if ! printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$WATCH_PENDING" 2>/dev/null; then
         watch_log "cannot record '$3' in $WATCH_PENDING; it will not be checked again"
         return 0
     fi
-    # Not again at once: the server that just failed gets its interval.
-    WATCH_PENDING_NEXT=$(( $(date +%s) + WATCH_PENDING_RETRY ))
+    # Not again at once: the server that just failed gets the shortest wait.
+    # A retry already due keeps its time, so a run of new failures does not
+    # hold back the closes kept before them.
+    now=$(date +%s)
+    WATCH_PENDING_WAIT=$WATCH_PENDING_RETRY
+    [[ "$WATCH_PENDING_NEXT" -gt "$now" ]] || WATCH_PENDING_NEXT=$((now + WATCH_PENDING_RETRY))
 }
 
 watch_pending_due() {
@@ -10190,13 +10210,13 @@ watch_pending_due() {
 
 # Take the kept closes and decide them as watch_closed would have: those still
 # undecided go back in the file. Called by watch_act with the lock free.
+# The file is replaced only once the retry is over (written aside, then
+# renamed), so a watcher killed half-way keeps every close it had.
 watch_pending_retry() {
-    local lines since kind s keep="" now
+    local lines since kind s keep="" now before after
     watch_pending_due || return 0
     now=$(date +%s)
-    WATCH_PENDING_NEXT=$((now + WATCH_PENDING_RETRY))
     lines=$(cat "$WATCH_PENDING" 2>/dev/null) || return 0
-    rm -f "$WATCH_PENDING"
     while IFS=$'\t' read -r since kind s; do
         [[ -n "$s" && "$since" =~ ^[0-9]+$ ]] || continue
         if [[ $((now - since)) -ge "$WATCH_PENDING_MAX" ]]; then
@@ -10205,7 +10225,31 @@ watch_pending_retry() {
         fi
         keep+="$s"$'\t'"$kind"$'\t'"$since"$'\n'
     done <<<"$lines"
-    [[ -z "$keep" ]] || watch_closed "$keep"
+    WATCH_PENDING_BUF=""
+    if [[ -n "$keep" ]]; then
+        WATCH_PENDING_RETRYING=1
+        watch_closed "$keep" || true
+        WATCH_PENDING_RETRYING=0
+    fi
+    if [[ -n "$WATCH_PENDING_BUF" ]]; then
+        printf '%s' "$WATCH_PENDING_BUF" > "$WATCH_PENDING.new" 2>/dev/null \
+            && mv "$WATCH_PENDING.new" "$WATCH_PENDING" 2>/dev/null \
+            || watch_log "cannot rewrite $WATCH_PENDING; its closes will be checked again as they were"
+    else
+        rm -f "$WATCH_PENDING"
+    fi
+    # Nothing decided: wait longer before the next look. Anything decided
+    # (fewer left than taken): start again from the shortest wait.
+    before=$(printf '%s' "$keep" | grep -c . || true)
+    after=$(printf '%s' "$WATCH_PENDING_BUF" | grep -c . || true)
+    if [[ "$after" -gt 0 && "$after" -ge "$before" ]]; then
+        WATCH_PENDING_WAIT=$(( WATCH_PENDING_WAIT > 0 ? WATCH_PENDING_WAIT * 2 : WATCH_PENDING_RETRY * 2 ))
+        [[ "$WATCH_PENDING_WAIT" -le "$WATCH_PENDING_RETRY_MAX" ]] || WATCH_PENDING_WAIT=$WATCH_PENDING_RETRY_MAX
+    else
+        WATCH_PENDING_WAIT=$WATCH_PENDING_RETRY
+    fi
+    WATCH_PENDING_NEXT=$(( $(date +%s) + WATCH_PENDING_WAIT ))
+    WATCH_PENDING_BUF=""
     return 0
 }
 
@@ -10217,7 +10261,9 @@ watch_pending_retry() {
 # one notification, naming the command that brings them back.
 WATCH_GAP_CHECK=0
 watch_gap_check() {
-    local tree shown hat host live s missing="" n=0
+    local tree shown hat host live s missing="" n=0 kept
+    # A close already kept is checked, and reported, by its own retry.
+    kept=$(cut -f 3 "$WATCH_PENDING" 2>/dev/null || true)
     tree=$(cmux_json tree --all 2>/dev/null) || tree=""
     if [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" != array ]]; then
         watch_log "after the gap, cmux's windows could not be read, so nothing was checked"
@@ -10236,8 +10282,9 @@ watch_gap_check() {
             [[ -n "$s" ]] || continue
             grep -qxF -- "$s" <<<"$live" || continue
             grep -qxF -- "$s" <<<"$shown" && continue
+            grep -qxF -- "$s" <<<"$kept" && continue
             missing+="${missing:+, }$s"; n=$((n + 1))
-        done < <(cfg --arg h "$hat" '.groups[]? | select(.hat == $h) | .sessions | keys_unsorted[]?')
+        done < <(cfg --arg h "$hat" '.groups[]? | select(.hat == $h) | .sessions | keys_unsorted[]?' | awk '!seen[$0]++')
     done < <(hat_names)
     if [[ "$n" == 0 ]]; then
         watch_log "after the gap, every recorded workspace that still runs is in cmux"
@@ -12185,8 +12232,9 @@ brings it back. A close from a script, or from the sidebar of a workspace
 that is not selected, looks like cmux's own. So a session is reattached at
 most once in 30 minutes: closing it again keeps it closed, with the notice.
 When the server does not answer, as is common in the first seconds after a
-wake, the close is kept and checked again every 30 seconds until the server
-answers, then handled as above. After a day without an answer it is given
+wake, the close is kept and checked again until the server answers, then
+handled as above: after 30 seconds, then waiting twice as long each time
+nothing can be decided, up to 15 minutes. After a day without an answer it is given
 up, with a line in the log. The rack lists such sessions at the top.
 
 When the stream resumes and cmux has already dropped some of the events the

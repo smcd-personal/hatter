@@ -225,6 +225,8 @@ expect "a server that stays down is asked again, and the close stays kept" \
     "$([[ "$(reattached "$out")" == 0 && "$(grep -c '^ssh ops@two.example.com$' "$d/calls")" -ge 2 \
           && "$(grep -c ops-db "$d/config/hatter/autosave/closes-pending")" == 1 ]] && echo y)" "$out
 calls: $(cat "$d/calls")"
+expect "  and only the first failed look is logged" \
+    "$([[ "$(grep -c "'ops-db' closed in cmux, but ops@two.example.com did not answer" <<<"$out")" == 1 ]] && echo y)" "$out"
 
 mkdir -p "$work/user-back"; echo ops@two.example.com > "$work/user-back/down"
 d="$work/user-back"
@@ -291,6 +293,14 @@ expect "after a gap, the sessions that run but are not in cmux are listed" \
     "$(grep -q '^after the gap, 3 recorded workspace(s) still run but are not in cmux: dev-api, dev two, ops-db\. ' <<<"$out" \
        && [[ "$(reattached "$out")" == 0 ]] && grep -q 'hatter restore --missing' "$d/notes" && echo y)" "$out
 notes: $(cat "$d/notes")"
+mkdir -p "$work/gap-kept/config/hatter/autosave"; tree_of dev-web > "$work/gap-kept/tree"
+printf '%s\tlost\tops-db\n' "$(date +%s)" > "$work/gap-kept/config/hatter/autosave/closes-pending"
+echo ops@two.example.com > "$work/gap-kept/down"
+d="$work/gap-kept"
+out=$(watch gap-kept <<<'{"type":"ack","replay_count":0,"resume":{"after_seq":5,"gap":true,"oldest_seq":90}}
+SLEEP 2')
+expect "  but not one already kept to check again" \
+    "$(grep -q '^after the gap, 2 recorded workspace(s) still run but are not in cmux: dev-api, dev two\. ' <<<"$out" && echo y)" "$out"
 mkdir -p "$work/nogap"; tree_of dev-web > "$work/nogap/tree"
 d="$work/nogap"
 out=$(watch nogap <<<'{"type":"ack","replay_count":2,"resume":{"after_seq":5,"gap":false,"oldest_seq":1}}
@@ -575,6 +585,42 @@ mkdir -p "$d/config/hatter" "$d/cache"
 cp "$work/running/config/hatter/config.json" "$d/config/hatter/"
 printf 'dev-api\t2\t0\ndev-web\t1\t0\ndev-stray\t1\t0\n' > "$d/cache/sessions.dev"
 sed '/^# -* main$/,$d' "$work/self/hatter" > "$work/hatter-lib.sh"
+
+# The kept closes, driven directly: a watcher killed during a retry keeps
+# them all, and retries back off while nothing can be decided.
+pd="$work/pending-lib"; mkdir -p "$pd/config/hatter/autosave"
+cp "$work/running/config/hatter/config.json" "$pd/config/hatter/config.json"
+pend="$pd/config/hatter/autosave/closes-pending"
+# A watch_closed that decides nothing: every close goes back to be kept.
+cat > "$pd/undecided.sh" <<'SH'
+watch_closed() {
+    local s k t
+    while IFS=$'\t' read -r s k t; do
+        [[ -n "$s" ]] || continue
+        watch_pending_add "$t" "$k" "$s"
+    done <<<"$1"
+    return 0
+}
+SH
+lib() {
+    env HOME="$pd" XDG_CONFIG_HOME="$pd/config" PATH="$work/bin:$PATH" STUB_DIR="$pd" \
+        bash -c "source '$work/hatter-lib.sh'; $1" 2>&1 || true
+}
+printf '%s\tlost\tops-db\n%s\tuser\tdev-api\n' "$(date +%s)" "$(date +%s)" > "$pend"
+cp "$pend" "$pd/before"
+lib 'watch_closed() { exit 9; }; watch_pending_retry' >/dev/null
+expect "a watcher killed during a retry keeps every kept close" \
+    "$(cmp -s "$pend" "$pd/before" && echo y)" "$(cat "$pend" 2>&1)"
+out=$(lib "source '$pd/undecided.sh'
+           watch_pending_retry; echo \"\$WATCH_PENDING_WAIT\"; WATCH_PENDING_NEXT=0
+           watch_pending_retry; echo \"\$WATCH_PENDING_WAIT\"" | tr '\n' ' ')
+expect "retries that decide nothing wait longer each time" "$([[ "$out" == "60 120 " ]] && echo y)" "$out"
+expect "  and keep the closes, once each" \
+    "$([[ "$(grep -c . "$pend")" == 2 ]] && cmp -s <(cut -f 2- "$pend") <(cut -f 2- "$pd/before") && echo y)" "$(cat "$pend")"
+out=$(lib 'WATCH_PENDING_WAIT=480; watch_closed() { :; }; watch_pending_retry; echo "$WATCH_PENDING_WAIT"')
+expect "a retry that decides them goes back to the shortest wait, and empties the file" \
+    "$([[ "$out" == 30 && ! -e "$pend" ]] && echo y)" "$out"
+
 rack() {
     : > "$d/calls"
     env HOME="$d" XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_DIR="$d" \
