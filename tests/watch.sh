@@ -141,6 +141,44 @@ SLEEP 3")
 expect "no sync while the lock is held" \
     "$([[ "$(grep -c '^sync' <<<"$out")" == 1 ]] && echo y)" "$out"
 
+# The event journal (#204): every frame but heartbeats, filed by the day the
+# event happened; days past the limit are dropped when a stream opens.
+j="$work/journal/config/hatter/autosave/events"
+mkdir -p "$j"
+echo old > "$j/2000-01-01.jsonl"
+today=$(date -u +%Y-%m-%d)
+echo kept > "$j/$today.jsonl"
+echo kept > "$j/notes.jsonl"
+out=$(watch journal <<<"$ack
+SLEEP 2
+{\"type\":\"event\",\"name\":\"workspace.closed\",\"workspace_id\":\"WS-J\",\"occurred_at\":\"2026-01-02T23:59:59.900Z\",\"payload\":{\"title\":\"dev-j\"}}
+{\"type\":\"heartbeat\"}
+{\"type\":\"event\",\"name\":\"workspace.created\",\"workspace_id\":\"WS-K\",\"occurred_at\":\"2026-01-03T00:00:00.100Z\"}
+SLEEP 2")
+expect "an event is journaled under the day it happened" \
+    "$(grep -q '"WS-J"' "$j/2026-01-02.jsonl" && grep -q '"WS-K"' "$j/2026-01-03.jsonl" \
+       && ! grep -q WS-K "$j/2026-01-02.jsonl" && echo y)" "$(ls -la "$j"; cat "$j"/2026-*.jsonl 2>&1)"
+expect "  the ack is journaled, heartbeats are not" \
+    "$(grep -q '"type":"ack"' "$j/$today.jsonl" && ! grep -rq heartbeat "$j" && echo y)" "$(cat "$j/$today.jsonl")"
+expect "  and the watcher still acts on the stream" "$(grep -qx sync <<<"$out" && echo y)" "$out"
+expect "a day past the limit is dropped; today, and a file not named by day, are kept" \
+    "$([[ ! -e "$j/2000-01-01.jsonl" ]] && grep -q kept "$j/$today.jsonl" && [[ -e "$j/notes.jsonl" ]] && echo y)" "$(ls -la "$j")"
+expect "the journal is kept out of git" "$(grep -qx '\*' "$j/.gitignore" && echo y)" "$(ls -la "$j")"
+
+# Where a resumed stream picked up, and whether cmux had already lost events.
+out=$(watch resumed <<<'{"type":"ack","replay_count":3,"resume":{"after_seq":120,"gap":false,"oldest_seq":100}}
+SLEEP 2')
+expect "a resume is logged with the event it picked up after" \
+    "$(grep -qx 'the event stream resumed after event 120, replaying 3' <<<"$out" && echo y)" "$out"
+out=$(watch resumed-gap <<<'{"type":"ack","replay_count":40,"resume":{"after_seq":120,"gap":true,"oldest_seq":500,"gap_reason":"requested sequence is older than the retained in-memory event log"}}
+SLEEP 2')
+expect "a resume past what cmux kept says events were not seen, and why" \
+    "$(grep -qx 'the event stream resumed after event 120, but cmux had kept events only from 500 on (requested sequence is older than the retained in-memory event log); whatever happened in between was not seen. Replaying 40' <<<"$out" && echo y)" "$out"
+out=$(watch fresh <<<"$ack
+SLEEP 2")
+expect "a stream with no cursor to resume from logs no resume" \
+    "$(! grep -q 'resumed' <<<"$out" && grep -q '^heal all' <<<"$out" && echo y)" "$out"
+
 # A stream that fails at once backs off and says so once. Not HATTER_WATCH_ONCE:
 # this is the retry loop, stopped after 9 seconds. (Not with an alarm: bash
 # handles SIGALRM itself.)

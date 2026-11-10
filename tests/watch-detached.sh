@@ -166,6 +166,9 @@ expect "a session that is gone from its server is neither logged nor notified" \
     "$(logged "$out" dev-api dev-api && [[ "$(said "$out")" == 1 ]] \
        && ! grep -q dev-old "$d/notes" && grep -q dev-api "$d/notes" && echo y)" "$out
 notes: $(cat "$d/notes")"
+expect "  but the log says the session has ended (#204)" \
+    "$(grep -qx "'dev-old' closed in cmux; its tmux session has ended too" <<<"$out" \
+       && ! grep -q "'dev-api' closed in cmux; its tmux session has ended" <<<"$out" && echo y)" "$out"
 
 d="$work/unrecorded"
 out=$(watch unrecorded <<<"$ack
@@ -190,6 +193,8 @@ expect "a server that does not answer is no notice: unknown is not running" \
        && ! grep -q ops-db "$d/notes" && grep -q dev-api "$d/notes" \
        && grep -qx 'ssh ops@two.example.com' "$d/calls" && echo y)" "$out
 notes: $(cat "$d/notes")"
+expect "  but the log says the server did not answer (#204)" \
+    "$(grep -qx "'ops-db' closed in cmux, but ops@two.example.com did not answer, so whether its tmux session still runs is unknown; left closed" <<<"$out" && echo y)" "$out"
 
 # repair closes a workspace and mirrors it again, under the lock.
 mkdir -p "$work/shown"; tree_of dev-web > "$work/shown/tree"
@@ -213,6 +218,8 @@ $(close dev-api)
 SLEEP 2")
 expect "a cmux whose windows cannot be read is no notice" \
     "$([[ "$(said "$out")" == 0 && ! -s "$d/notes" ]] && grep -qx tree "$d/calls" && echo y)" "$out"
+expect "  but the log says the close was not checked (#204)" \
+    "$(grep -qx "cmux closed dev-api, but its windows could not be read, so they were not checked" <<<"$out" && echo y)" "$out"
 
 d="$work/several"
 out=$(watch several <<<"$ack
