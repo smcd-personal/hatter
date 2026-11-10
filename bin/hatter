@@ -9745,6 +9745,11 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 
 # One cmux event in, at most one line out:
 #   full                    the stream (re)connected; anything may have happened
+#   full<TAB>after<TAB>gap<TAB>oldest<TAB>replayed<TAB>reason
+#                           the same, resuming from the cursor: cmux replays
+#                           what came after event `after`, and gap is true when
+#                           it no longer kept all of it (its log is in memory
+#                           and holds a few thousand events of every kind)
 #   heal<TAB>workspace<TAB>surface   a tab was dropped into that workspace
 #                           (drop events carry no window id)
 #   closed<TAB>title<TAB>user|lost   a workspace closed; the layout changed too.
@@ -9780,7 +9785,11 @@ WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try f
     ({sel: ([$seed[] | {(.): true}] | add // {}), kw: ([$keys | to_entries[] | select(.value == true) | .key][0] // null),
      known: (($keys | length) > 0), at: {}, out: null};
      .out = null
-     | if $e.type == "ack" then .out = "full"
+     | if $e.type == "ack" then
+         ($e.resume? // {}) as $r
+         | .out = ("full" + (if ($r | type) == "object" and $r.after_seq? != null
+             then "\t\($r.after_seq)\t\($r.gap == true)\t\($r.oldest_seq // "?")\t\($e.replay_count // 0)\t\(($r.gap_reason // "") | tostring | gsub("[\t\n\r]"; " "))"
+             else "" end))
        elif $e.type != "event" then .
        elif $e.name == "window.keyed" or $e.name == "window.unkeyed" then
          ($e.window_id // $e.payload.window_id? // null) as $win
@@ -9831,6 +9840,64 @@ watch_keys() {
 }
 
 watch_log() { echo "$(date '+%Y-%m-%d %H:%M:%S') watch: $*"; }
+
+# The event journal (#204). cmux keeps its event log in memory only, and agent
+# and notification traffic rolls it over in well under a day, so a workspace
+# lost overnight cannot be traced from it in the morning. The watcher keeps its
+# own copy of what it is sent: every frame but heartbeats, one JSON line each,
+# in autosave/events/<UTC day>.jsonl, by the day the event happened (a replay
+# after a wake goes to the night it belongs to). Days past WATCH_JOURNAL_DAYS
+# are dropped when a stream opens. The stream passes through unchanged, and a
+# journal that cannot be written never holds it up.
+WATCH_JOURNAL_DAYS=14
+watch_journal() {
+    local line day="" dir re='"occurred_at":"([0-9]{4}-[0-9]{2}-[0-9]{2})T'
+    dir="$AUTOSAVE_DIR/events"
+    mkdir -p "$dir" 2>/dev/null || dir=""
+    # The config directory is a git repo that `hatter backup` commits with
+    # add -A. The journal is a local record, never part of a backup.
+    if [[ -n "$dir" && ! -f "$dir/.gitignore" ]]; then printf '*\n' > "$dir/.gitignore" 2>/dev/null || true; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -n "$dir" && "$line" != *'"type":"heartbeat"'* ]]; then
+            if [[ "$line" =~ $re ]]; then
+                day=${BASH_REMATCH[1]}
+            else
+                day=$(date -u +%Y-%m-%d)
+            fi
+            printf '%s\n' "$line" >> "$dir/$day.jsonl" 2>/dev/null || true
+        fi
+        printf '%s\n' "$line" || return 0
+    done
+    return 0
+}
+
+watch_journal_prune() {
+    local cutoff f name re='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+    cutoff=$(date -u -v-"${WATCH_JOURNAL_DAYS}"d +%Y-%m-%d 2>/dev/null \
+        || date -u -d "$WATCH_JOURNAL_DAYS days ago" +%Y-%m-%d 2>/dev/null) || return 0
+    [[ "$cutoff" =~ $re ]] || return 0
+    for f in "$AUTOSAVE_DIR"/events/*.jsonl; do
+        [[ -f "$f" ]] || continue
+        name=${f##*/}; name=${name%.jsonl}
+        [[ "$name" =~ $re ]] || continue
+        if [[ "$name" < "$cutoff" ]]; then rm -f "$f"; fi
+    done
+    return 0
+}
+
+# watch_resumed <after TAB gap TAB oldest TAB replayed TAB reason>: say where
+# a resumed stream picked up, and whether cmux had already dropped some of
+# what happened while the watcher was not listening. Its event numbers count
+# every kind of event, not only those the watcher asks for.
+watch_resumed() {
+    local after gap oldest replay reason
+    IFS=$'\t' read -r after gap oldest replay reason <<<"$1"
+    if [[ "$gap" == true ]]; then
+        watch_log "the event stream resumed after event $after, but cmux had kept events only from $oldest on${reason:+ ($reason)}; whatever happened in between was not seen. Replaying $replay"
+    else
+        watch_log "the event stream resumed after event $after, replaying $replay"
+    fi
+}
 
 # HATTER_WATCH_DRY prints what the watcher would do instead of healing or
 # syncing; the tests drive the event handling with it. The close check below
@@ -10007,12 +10074,20 @@ watch_signin() {
 # watch_act calls this only once the config lock is free, so a hatter command
 # that closes a workspace has finished first: repair has re-opened it, rm and
 # rename have changed the record. Unknown is never "still running": a server
-# that does not answer, or a cmux whose windows cannot be read, says nothing.
+# that does not answer, or a cmux whose windows cannot be read, brings nothing
+# back and posts no notification, but the log says so, as it does for a
+# session that has ended.
 WATCH_REATTACH_GAP=1800
 watch_closed() {
-    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd="" back="" lives=""
-    tree=$(cmux_json tree --all 2>/dev/null) || return 0
-    [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" == array ]] || return 0
+    local s kind hat host tree shown pairs="" prev="" ok=0 live="" said="" n=0 cmd="" back="" lives="" titles
+    # What is not acted on is still said (#204): a close skipped in silence
+    # leaves nothing to trace it by later.
+    titles=$(printf '%s\n' "$1" | cut -f 1 | awk 'NF && !seen[$0]++' | paste -sd, - | sed 's/,/, /g')
+    tree=$(cmux_json tree --all 2>/dev/null) || tree=""
+    if [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" != array ]]; then
+        [[ -z "$titles" ]] || watch_log "cmux closed $titles, but its windows could not be read, so they were not checked"
+        return 0
+    fi
     shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
     while IFS=$'\t' read -r s kind; do
         [[ -n "$s" ]] || continue
@@ -10036,8 +10111,14 @@ watch_closed() {
             prev=$host; ok=1
             live=$(hat_live_sessions "$host" 2>/dev/null) || ok=0
         fi
-        [[ "$ok" == 1 ]] || continue
-        grep -qxF -- "$s" <<<"$live" || continue
+        if [[ "$ok" != 1 ]]; then
+            watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; left closed"
+            continue
+        fi
+        if ! grep -qxF -- "$s" <<<"$live"; then
+            watch_log "'$s' closed in cmux; its tmux session has ended too"
+            continue
+        fi
         if [[ "$kind" == lost ]] && ! watch_reattached_lately "$s"; then
             back+="$hat"$'\t'"$s"$'\n'
             lives+=$(printf '%s\n' "$live" | AWK_H="$host" awk '{ print ENVIRON["AWK_H"] "\t" $0 }')$'\n'
@@ -10192,8 +10273,10 @@ watch_stream() {
     WATCH_DIR=$dir
     fifo="$dir/events"
     mkfifo "$fifo" || { watch_cleanup; return 0; }
+    watch_journal_prune
     cmux events --category workspace --category surface --category window \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
+        | watch_journal \
         | jq -nR --unbuffered -r --argjson seed "$(watch_seed)" --argjson keys "$(watch_keys)" "$WATCH_JQ" > "$fifo" &
     exec 3<"$fifo"
     while :; do
@@ -10201,6 +10284,7 @@ watch_stream() {
             fails=0
             case "$line" in
                 full) heal_all=1; sync=1 ;;
+                full$'\t'*) heal_all=1; sync=1; watch_resumed "${line#full?}" ;;
                 heal$'\t'*)
                     IFS=$'\t' read -r kind w sf <<<"$line"
                     if [[ -n "$w" && -n "$sf" ]]; then heals+="$w"$'\t'"$sf"$'\n'; else heal_all=1; fi
@@ -11988,8 +12072,20 @@ runs" and posts a macOS notification naming `hatter new <session>`, which
 brings it back. A close from a script, or from the sidebar of a workspace
 that is not selected, looks like cmux's own. So a session is reattached at
 most once in 30 minutes: closing it again keeps it closed, with the notice.
-A server that does not answer gets nothing. The rack lists such sessions at
-the top.
+A server that does not answer gets no reattach and no notification, only a
+line in the log. The rack lists such sessions at the top.
+
+The log also says when the event stream resumes, from which event, and
+whether cmux had already dropped some of what happened while the watcher was
+not listening (cmux keeps a few thousand events, in memory). The watcher
+keeps its own copy of every event it is sent, one JSON line each, in
+~/.config/hatter/autosave/events/<UTC day>.jsonl, for 14 days. To trace one
+workspace:
+
+  jq -c 'select(.payload.title? == "dev-api")' ~/.config/hatter/autosave/events/*.jsonl
+
+The journal's directory carries its own .gitignore, so `hatter backup` never
+commits it.
 
 A notification about a tab that still exists is cmux's own, on that tab, so
 clicking it opens the tab. One with no tab left (a closed workspace) is posted
