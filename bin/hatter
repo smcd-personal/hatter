@@ -971,12 +971,12 @@ tell_server_sessions() {
 # window id is only for lining the tabs up with cmux, and never stored.
 # Every session on a server and every window in them, in one round trip:
 #   S<tab>session
-#   W<tab>session<tab>window id<tab>name<tab>cwd<tab>pinned<tab>was (WAS_OPT)
+#   W<tab>session<tab>window id<tab>name<tab>cwd<tab>pinned<tab>was (WAS_OPT)<tab>reopened (REOPENED_OPT)
 # Each S line also carries which tmux server it came from (its pid and start
 # time), so sync can tell a session that ended from one a restart lost.
 remote_tmux_state() {
     local sfmt=$'S\t#S\t#{pid}.#{start_time}'
-    local wfmt=$'W\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@hatter-pinned}\t#{@hatter-was}'
+    local wfmt=$'W\t#{session_name}\t#{window_id}\t#{window_name}\t#{pane_current_path}\t#{@hatter-pinned}\t#{@hatter-was}\t#{@hatter-reopened}'
     remote_sh "$1" "tmux list-sessions -F $(sq "$sfmt") 2>/dev/null || true
         tmux list-windows -a -F $(sq "$wfmt") 2>/dev/null || true"
 }
@@ -996,7 +996,8 @@ remote_windows_json() {
 # it, ties and strays in tmux order. A tab the config has pinned stays pinned;
 # a pinned tab that has been closed stays recorded, at the front, so restore
 # can bring it back. One renamed away from its recorded name (WAS_OPT) is that
-# live tab, not a closed one.
+# live tab, not a closed one. A pinned tab closed again after hatter reopened
+# it ("reopened") was closed on purpose: it is dropped, pin and all (#198).
 sync_windows_merge() {
     jq -c --argjson o "$1" --argjson rec "$2" '
         ([$rec[] | select(.pinned) | .name]) as $pins
@@ -1008,7 +1009,8 @@ sync_windows_merge() {
                 then .pinned = true else . end)
         | . as $live
         | ([$live[].name] + [$live[].was // [] | .[]]) as $known
-        | [$rec[] | select(.pinned and (.name as $n | $known | index($n) | not))]
+        | [$rec[] | select(.pinned and (.reopened | not)
+                           and (.name as $n | $known | index($n) | not))]
           + ($live | map(del(.was)))'
 }
 
@@ -1043,6 +1045,25 @@ PIN_OPT='@hatter-pinned'
 # does not bring it back; by then a sync has long since recorded the new name.
 WAS_OPT='@hatter-was'
 
+# A pinned tab hatter reopened carries this window option, and sync records it
+# as "reopened": true. Closing a pinned tab looks the same to hatter whether it
+# was lost or closed on purpose, so the first close gets the benefit of the
+# doubt: hatter reopens the tab and says so in it. A second close of the tab
+# it reopened is taken as meant, and the pin goes. `hatter tab pin` clears it.
+REOPENED_OPT='@hatter-reopened'
+
+# reopen_pinned_cmd <session> <name> <cwd>: a remote command that reopens a
+# closed pinned tab, marks it reopened, and tells whoever looks at it why it is
+# back and how to keep it closed: a line in the tab, and an OSC 9, which cmux
+# shows as a notification on that tab.
+reopen_pinned_cmd() {
+    local session="$1" name="$2" cwd="$3" msg
+    msg="hatter reopened pinned tab '$name'. Close it again to unpin it for good, or run: hatter tab unpin $session $name"
+    printf '%s && tmux set-option -w -t "$w" %s 1 && { t=$(tmux display-message -p -t "$w" %s) && [ -w "$t" ] && printf %s %s %s > "$t"; true; }' \
+        "$(pinned_create "tmux new-window -d -t $(sq "=$session") -n $(sq "$name") -c $(sq_dir "$cwd")" true)" \
+        "$REOPENED_OPT" "'#{pane_tty}'" "'\033]9;%s\007\r\n%s\r\n'" "$(sq "$msg")" "$(sq "$msg")"
+}
+
 # A remote command that creates a window and, when <pinned> is true, pins it.
 # <create> must be a tmux new-session/new-window call that takes -P -F.
 pinned_create() {
@@ -1057,13 +1078,15 @@ pinned_create() {
 
 # Bring back any pinned tab missing from a running session, and re-pin a live
 # tab of the same name that lost its option. Tabs are matched by name, which
-# is why only a named tab can be pinned.
+# is why only a named tab can be pinned. One hatter has reopened before and
+# that is missing again stays closed: sync drops its pin (REOPENED_OPT).
 ensure_pinned_tabs() {
     local host="$1" session="$2" dir="$3" windows="$4" live name cwd
     [[ "$(jq '[.[] | select(.pinned)] | length' <<<"$windows")" -gt 0 ]] || return 0
     live=$(remote_sh "$host" \
         "tmux list-windows -t $(sq "=$session") -F '#{window_id}	#{window_name}	#{$WAS_OPT}' 2>/dev/null || true")
-    while IFS=$'\x1f' read -r name cwd; do
+    local reopened
+    while IFS=$'\x1f' read -r name cwd reopened; do
         [[ -z "$name" ]] && continue
         local wid
         wid=$(AWK_N="$name" awk -F'\t' '($2 "") == (ENVIRON["AWK_N"] "") {print $1; exit}' <<<"$live")
@@ -1073,14 +1096,19 @@ ensure_pinned_tabs() {
                                   | ($w | type) == "array" and ($w | index([$n])) != null)
             | .[0]' <<<"$live" 2>/dev/null | head -1)
         if [[ -n "$wid" ]]; then
-            remote_sh "$host" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1" >/dev/null 2>&1 || true
+            local opts="tmux set-option -w -t $(sq "$wid") $PIN_OPT 1"
+            [[ "$reopened" == true ]] && opts+="; tmux set-option -w -t $(sq "$wid") $REOPENED_OPT 1"
+            remote_sh "$host" "$opts" >/dev/null 2>&1 || true
+            continue
+        fi
+        if [[ "$reopened" == true ]]; then
+            info "Leaving pinned tab '$name' in '$session' closed: it was closed again after hatter reopened it, so the next sync unpins it"
             continue
         fi
         [[ -z "$cwd" || "$cwd" == "null" ]] && cwd="$dir"
-        info "Reopening pinned tab '$name' in '$session' on $host"
-        remote_sh "$host" "$(pinned_create \
-            "tmux new-window -d -t $(sq "=$session") -n $(sq "$name") -c $(sq_dir "$cwd")" true)" >/dev/null
-    done < <(jq -r '.[] | select(.pinned) | [.name, (.cwd // "")] | join("\u001f")' <<<"$windows")
+        info "Reopening pinned tab '$name' in '$session' on $host (close it again to unpin it)"
+        remote_sh "$host" "$(reopen_pinned_cmd "$session" "$name" "$cwd")" >/dev/null
+    done < <(jq -r '.[] | select(.pinned) | [.name, (.cwd // ""), (.reopened // false | tostring)] | join("\u001f")' <<<"$windows")
 }
 
 ensure_remote_session() {
@@ -5794,9 +5822,9 @@ cmd_tab_pin() {
     if [[ "$action" == pin ]]; then
         [[ -n "$name" ]] || die "tab $idx has no name, and a pinned tab is matched by name when it is
   brought back. Name it first:  tmux rename-window -t '=$TAB_SESSION:$idx' <name>"
-        remote_sh "$TAB_HOST" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1"
+        remote_sh "$TAB_HOST" "tmux set-option -w -t $(sq "$wid") $PIN_OPT 1; tmux set-option -wu -t $(sq "$wid") $REOPENED_OPT"
     else
-        remote_sh "$TAB_HOST" "tmux set-option -wu -t $(sq "$wid") $PIN_OPT"
+        remote_sh "$TAB_HOST" "tmux set-option -wu -t $(sq "$wid") $PIN_OPT; tmux set-option -wu -t $(sq "$wid") $REOPENED_OPT"
     fi
 
     if [[ -z "$TAB_GROUP" ]]; then
@@ -5809,7 +5837,7 @@ cmd_tab_pin() {
                  --argjson p "$([[ "$action" == pin ]] && echo true || echo false)" '
             .groups[$g].sessions[$s].windows |= ((. // [])
                 | if any(.[]; .name == $n) then . else . + [{name: $n, cwd: null}] end
-                | map(if .name == $n then (if $p then .pinned = true else del(.pinned) end) else . end))'
+                | map(if .name == $n then (if $p then .pinned = true else del(.pinned) end) | del(.reopened) else . end))'
     fi
     if [[ "$action" == pin ]]; then info "Pinned tab '$name' in '$TAB_SESSION'"
     else info "Unpinned tab '${name:-$idx}' in '$TAB_SESSION'"; fi
@@ -8930,7 +8958,8 @@ sync_once() {
                                 + (if .[5] == "1" then {pinned: true} else {} end)
                                 + ((try (.[6] | fromjson) catch null) as $was
                                    | if ($was | type) == "array" and ($was | length) > 0
-                                     then {was: $was} else {} end))})
+                                     then {was: $was} else {} end)
+                                + (if .[7] == "1" then {reopened: true} else {} end))})
             | reduce .[] as $x ({}; .[$x.s] += [$x.w])' < "$tmp/ssh.$i")
 
         # A read that failed is unknown, not empty: no group is found there,
@@ -9181,7 +9210,7 @@ hat_missing() {
                 grep -qxF "$session"$'\t'"$pin" <<<"$tabs" \
                     || printf '%s\037pinned tab %s closed\n' "$session" "$pin"
             done < <(cfg --arg g "$group" --arg s "$session" \
-                        '.groups[$g].sessions[$s].windows[]? | select(.pinned) | .name')
+                        '.groups[$g].sessions[$s].windows[]? | select(.pinned and (.reopened | not)) | .name')
             if [[ -n "$win" ]] && ! grep -qxF "$session" <<<"$titles"; then
                 printf '%s\037not mirrored\n' "$session"
             fi
@@ -11779,7 +11808,7 @@ edit_tabs() {
         edit_header "$hat › $(group_display "$group") › $ws" "TABS" \
             "a tab is a tmux window inside the workspace. It survives losing the" \
             "client, and closing it here closes it everywhere." \
-            "A pinned tab 📌 comes back first on restore, even if it was closed."
+            "A pinned tab 📌 comes back first on restore; closed twice, it is unpinned."
 
         i=0
         while [[ $i -lt $n ]]; do
@@ -12154,8 +12183,10 @@ does the same thing.
   hatter tab dev-atlas notes
 
 Pin a tab, by index or name, and hatter keeps it: `restore` creates pinned
-tabs first and brings one back if it was closed. Only a named tab can be
-pinned. cmux cannot pin a mirrored tab itself, so this is hatter's pin.
+tabs first and brings one back if it was closed, with a note in the tab
+saying so. Close that reopened tab again and hatter takes it as meant: it
+stays closed and the next sync unpins it. Only a named tab can be pinned.
+cmux cannot pin a mirrored tab itself, so this is hatter's pin.
 
   hatter tab pin dev-atlas notes
   hatter tab unpin dev-atlas 0
