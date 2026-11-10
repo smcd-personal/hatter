@@ -7539,13 +7539,6 @@ $cfg[0] as $c
    (.prompt | if . == "" then "-" else . end), .sid, .wid, .idx]
 | map(tostring | gsub("[\u0000-\u001f\u007f]"; " ")) | join("\u001f")'
 
-# ps_cols: the terminal's width.
-ps_cols() {
-    local c="${COLUMNS:-}"
-    [[ "$c" =~ ^[0-9]+$ ]] || c=$(tput cols 2>/dev/null) || c=""
-    [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] || c=100
-    printf '%s' "$c"
-}
 
 # ps_render <rows file> <width> <wide 0|1> <hat column 0|1>: the table.
 # Columns, best first; each has a width cap (0: none) and a minimum. The
@@ -7813,7 +7806,7 @@ cmd_ps() {
         rm -rf "$tmp"
         return 0
     fi
-    ps_render "$tmp/rows" "$(ps_cols)" "$wide" "$all"
+    ps_render "$tmp/rows" "$(term_cols)" "$wide" "$all"
     rm -rf "$tmp"
 }
 
@@ -11157,6 +11150,21 @@ edit_windows() {
 
 # --- chrome -----------------------------------------------------------------
 
+# term_cols: the terminal's width, for anything laid out to fit it (#208).
+# Not `tput cols`: it reads the size off its own stdout, which inside $( ) is
+# a pipe, so it answers 80 however wide the terminal is. stty asks the tty
+# itself ("<rows> <cols>"), and is asked first because it follows a resize,
+# where an exported COLUMNS goes stale. With no tty (a test, a pipe from cron),
+# COLUMNS, then 100. HATTER_TTY is for the tests.
+term_cols() {
+    local c
+    c=$(stty size < "${HATTER_TTY:-/dev/tty}" 2>/dev/null) || c=""
+    c="${c##* }"
+    [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] || c="${COLUMNS:-}"
+    [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] || c=100
+    printf '%s' "$c"
+}
+
 edit_trunc() {
     local v="$1" w="$2"
     if [[ ${#v} -le $w ]]; then printf '%s' "$v"; else printf '%s…' "${v:0:$((w-1))}"; fi
@@ -11279,11 +11287,7 @@ edit_top() {
         # every hat row is several more jq reads on top. It happens only when
         # something has actually changed, so moving the highlight re-renders
         # from arrays already in hand - which is what makes the arrows instant.
-        # `tput cols` reads the size off its own stdout, which inside $( ) is a
-        # pipe - it answers 80 no matter how wide the terminal is. stty asks
-        # the tty itself. Output is "<rows> <cols>".
-        cols=$(stty size < /dev/tty 2>/dev/null); cols="${cols##* }"
-        [[ "$cols" =~ ^[0-9]+$ ]] || cols=100
+        cols=$(term_cols)
         [[ "$cols" != "$lastcols" ]] && { dirty=1; lastcols="$cols"; }
         if [[ "$dirty" == 1 ]]; then
             CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
