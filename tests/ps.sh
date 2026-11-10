@@ -117,11 +117,11 @@ jq -n '{session_id: "s7", hibernate: {from: "dev-a", name: "zz", index: 9, since
 # No cmux on the PATH: --go must attach, never drive a real cmux.
 nocmux=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v cmux | paste -sd: -)
 ps_() {
-    PATH="$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 COLUMNS="${COLS:-200}" \
+    PATH="$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 HATTER_TTY=/dev/null COLUMNS="${COLS:-200}" \
         "$root/bin/hatter" ps "$@" </dev/null 2>&1
 }
 ps_out() {  # stdout alone: the table, without warnings
-    PATH="$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 COLUMNS="${COLS:-200}" \
+    PATH="$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 HATTER_TTY=/dev/null COLUMNS="${COLS:-200}" \
         "$root/bin/hatter" ps "$@" </dev/null 2>/dev/null
 }
 row() {  # row <json> <tab> <field>
@@ -218,5 +218,36 @@ grep -q 'HAT' <<<"$out" || fail "--all has no HAT column:
 $out"
 grep -q 'refactor the ledger' <<<"$out" || fail "at 200 columns no prompt:
 $out"
+
+# --- the width comes from the tty, not tput (#208) ---------------------------
+# A stub stty stands in for the terminal: it answers "<rows> <cols>" for
+# `stty size`. HATTER_TTY=/dev/null only gives its stdin something to open.
+mkdir -p "$work/tty"
+cat > "$work/tty/stty" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = size ] && echo "40 ${STUB_COLS:-77}"
+EOF
+chmod +x "$work/tty/stty"
+widest() { while IFS= read -r l; do printf '%s\n' "${#l}"; done | sort -n | tail -n 1; }
+tty_ps() {  # tty_ps [COLUMNS value]: ps with the stub tty, COLUMNS as given or unset
+    env -u COLUMNS ${1:+COLUMNS=$1} PATH="$work/tty:$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" \
+        NO_COLOR=1 HATTER_TTY=/dev/null "$root/bin/hatter" ps --all </dev/null 2>/dev/null
+}
+# No COLUMNS: the table is laid out for the tty's width, the same as for
+# COLUMNS of that width, both narrower and wider than the old fallback of 80.
+for c in 60 150; do
+    got=$(STUB_COLS=$c tty_ps)
+    want=$(COLS=$c ps_out --all)
+    [ "$got" = "$want" ] || fail "no COLUMNS, tty $c wide: not laid out for $c:
+$got
+--- want:
+$want"
+done
+# The tty wins over a COLUMNS that may be stale.
+[ "$(STUB_COLS=60 tty_ps 200)" = "$(COLS=60 ps_out --all)" ] || fail "tty 60, COLUMNS 200: COLUMNS won"
+# No tty and no COLUMNS: 100.
+w=$(env -u COLUMNS PATH="$work/bin:$nocmux" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 HATTER_TTY=/nonexistent \
+    "$root/bin/hatter" ps --all </dev/null 2>/dev/null | widest)
+[ "$w" -le 100 ] && [ "$w" -gt 80 ] || fail "no tty, no COLUMNS: widest line is $w, want 81-100"
 
 echo "ok: ps"
