@@ -777,6 +777,36 @@ hat_session_name() {
     return 0
 }
 
+# hat_new_name <hat> <name>: the session a new name means on a hat, with no
+# lookup: the name as given if it already carries the hat's prefix, otherwise
+# "<hat>-<name>". For a name that must not exist yet, such as the target of a
+# rename, where reattaching is not on offer (#220).
+hat_new_name() {
+    if [[ "$2" == "$1"-* ]]; then printf '%s' "$2"; else printf '%s-%s' "$1" "$2"; fi
+}
+
+# hat_short_names <hat>: session names on stdin, one per line, out as the
+# labels to show inside that hat (#220). The "<hat>-" prefix only says which
+# hat a session belongs to, and a screen that already sits inside the hat
+# says that, so the label drops it. A session without the prefix keeps its
+# full name, and so does one whose short label would match another session
+# on the list: "dev-notes" stays in full beside a "notes".
+hat_short_names() {
+    awk -v p="$1-" '
+        { name[NR] = $0; full[$0] = 1 }
+        END {
+            for (i = 1; i <= NR; i++) {
+                n = name[i]; s = n
+                if (index(n, p) == 1 && length(n) > length(p)) s = substr(n, length(p) + 1)
+                if (s != n && (s in full)) s = n
+                print s
+            }
+        }'
+}
+
+# hat_short_name <hat> <session>: hat_short_names for one name.
+hat_short_name() { printf '%s\n' "$2" | hat_short_names "$1"; }
+
 # --------------------------------------------------------------- config writes
 
 register_hat() {
@@ -6679,7 +6709,9 @@ hat_workspaces() {
 
 # A numbered menu on stderr. Prints the choice; an empty answer, Esc or end of
 # input picks nothing and returns non-zero.
-pick_one() {
+# pick_index <prompt> <label>...: number the labels, ask for one, and print
+# the number picked. For a list whose labels are not the values (#220).
+pick_index() {
     local prompt="$1" a i=1
     shift
     local -a opts=("$@")
@@ -6689,11 +6721,20 @@ pick_one() {
         a="$EDIT_REPLY"
         [[ -n "$a" ]] || return 1
         if [[ "$a" =~ ^[1-9][0-9]*$ ]] && [[ "$a" -ge 1 && "$a" -le ${#opts[@]} ]]; then
-            printf '%s' "${opts[$((a-1))]}"
+            printf '%s' "$a"
             return 0
         fi
         echo "  pick a number from 1 to ${#opts[@]}" >&2
     done
+}
+
+# pick_one <prompt> <option>...: pick_index, printing the option itself.
+pick_one() {
+    local prompt="$1" a
+    shift
+    local -a opts=("$@")
+    a=$(pick_index "$prompt" "${opts[@]}") || return 1
+    printf '%s' "${opts[$((a-1))]}"
 }
 
 # With no argument: the hat first, then the workspace. On a phone, a number
@@ -6743,15 +6784,21 @@ $(printf '%s\n' "$list" | sed 's/^/    /')"
 
     # At a terminal, a new workspace is one more choice, so a hat with none
     # is a starting point rather than a dead end.
-    local -a choices=()
+    # The labels drop the hat prefix: the prompt already names the hat (#220).
+    local -a choices=() labels=()
+    local pick
     if [[ "$n" -gt 0 ]]; then
         while IFS= read -r session; do choices+=("$session"); done <<<"$list"
+        while IFS= read -r session; do labels+=("$session"); done \
+            < <(printf '%s\n' "$list" | hat_short_names "$hat")
     fi
-    choices+=("+ new workspace")
-    session=$(pick_one "workspace on '$hat': " "${choices[@]}") || exit 0
-    if [[ "$session" == "+ new workspace" ]]; then
+    choices+=("")
+    labels+=("+ new workspace")
+    pick=$(pick_index "workspace on '$hat': " "${labels[@]}") || exit 0
+    session="${choices[$((pick-1))]}"
+    if [[ -z "$session" ]]; then
         local name
-        ask_line "name (becomes $hat-<name>), Esc to cancel" || exit 0
+        ask_line "new workspace name, Esc to cancel" || exit 0
         name="$EDIT_REPLY"
         [[ -n "$name" ]] || exit 0
         session=$(hat_session_name "$hat" "$(tmux_session_name "$name")")
@@ -11717,7 +11764,7 @@ edit_groups() {
 
         edit_header "$hat" "GROUPS" \
             "a group is a project or area inside one hat. Group names are free" \
-            "text and take no prefix; the workspaces inside them do."
+            "text."
 
         i=0
         while [[ $i -lt $n ]]; do
@@ -11804,19 +11851,25 @@ edit_cmux_places() {
 }
 
 edit_workspaces() {
-    local hat="$1" group="$2" SEL=1 n ws i tabs att state place
+    local hat="$1" group="$2" SEL=1 n ws short i tabs att state place
     edit_cmux_places "$hat"
     while :; do
-        WSS=(); n=0
+        WSS=(); SHORTS=(); n=0
         while IFS= read -r ws; do
             [[ -z "$ws" ]] && continue
             WSS[$n]="$ws"; n=$((n+1))
         done < <(cfg --arg g "$group" '.groups[$g].sessions | keys_unsorted[]?')
+        # Shown without the hat prefix: the header already names the hat (#220).
+        i=0
+        while IFS= read -r ws; do
+            [[ $i -lt $n ]] || break
+            SHORTS[$i]="$ws"; i=$((i+1))
+        done < <([[ $n -gt 0 ]] && printf '%s\n' "${WSS[@]}" | hat_short_names "$hat")
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
         edit_header "$hat › $(group_display "$group")" "WORKSPACES" \
-            "a workspace is a tmux session named <hat>-<subproject>, shown as one" \
-            "entry in the cmux sidebar. Its tabs are the tmux windows inside it."
+            "a workspace is a tmux session, shown as one entry in the cmux" \
+            "sidebar. Its tabs are the tmux windows inside it."
 
         i=0
         while [[ $i -lt $n ]]; do
@@ -11838,7 +11891,7 @@ edit_workspaces() {
                         "$C_RD" "$C_R" "$C_DIM" "$C_R")
             fi
             ROW_LABEL=""; ROW_ICON="$ICON_WORKSPACE"
-            edit_row $((i+1)) "$SEL" "$ws" 26 "$state"
+            edit_row $((i+1)) "$SEL" "${SHORTS[$i]}" 26 "$state"
             i=$((i+1))
         done
         [[ $n -eq 0 ]] && printf '   %s(no workspaces in this group yet - press a)%s\n' "$C_DIM" "$C_R"
@@ -11847,15 +11900,16 @@ edit_workspaces() {
         edit_readkey
         edit_nav "$KEY" "$n" && continue
         ws="${WSS[$((SEL-1))]:-}"
+        short="${SHORTS[$((SEL-1))]:-}"
         case "$KEY" in
             q|Q|quit) return 1 ;;
             left|esc|back|h) return 0 ;;
             enter|right|l)
-                [[ $n -gt 0 ]] && { edit_tabs "$hat" "$group" "$ws" || return 1; }
+                [[ $n -gt 0 ]] && { edit_tabs "$hat" "$group" "$ws" "$short" || return 1; }
                 : ;;
             !) edit_fetch_hat "$hat"; edit_cmux_places "$hat" ;;
             a|A)
-                edit_ask "new workspace name (a bare name gets the '$hat-' prefix)" || continue
+                edit_ask "new workspace name" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
                     cmd_new "$EDIT_REPLY" --group "$group" --hat "$hat" || true
                     edit_fetch_hat "$hat"
@@ -11863,9 +11917,11 @@ edit_workspaces() {
                 edit_pause ;;
             r|R)
                 [[ $n -eq 0 ]] && continue
-                edit_ask "new name for workspace '$ws'" || continue
+                edit_ask "new name for workspace '$short'" || continue
                 if [[ -n "$EDIT_REPLY" ]]; then
-                    ( cmd_rename "$ws" "$EDIT_REPLY" --hat "$hat" ) || true; edit_fetch_hat "$hat"
+                    # The new name takes the prefix, as one typed for add does.
+                    ( cmd_rename "$ws" "$(hat_new_name "$hat" "$EDIT_REPLY")" --hat "$hat" ) || true
+                    edit_fetch_hat "$hat"
                 fi
                 edit_pause ;;
             f|F)
@@ -11878,7 +11934,7 @@ edit_workspaces() {
                 # Ending it is the usual case; forgetting only is for an entry
                 # whose server is gone, or a session to keep but stop tracking.
                 printf '  %sremove %s:%s [k]ill it and forget it / [f]orget only, leave it running / [N]o ' \
-                    "$C_YL" "$ws" "$C_R" >&2
+                    "$C_YL" "$short" "$C_R" >&2
                 edit_readkey
                 # A subshell: rm dies on whatever it could not do, and says what
                 # that was - including when it ended the session but could not
@@ -11899,7 +11955,7 @@ edit_workspaces() {
 # --- level 4: tabs ----------------------------------------------------------
 
 edit_tabs() {
-    local hat="$1" group="$2" ws="$3" SEL=1 n i
+    local hat="$1" group="$2" ws="$3" wslabel="${4:-$3}" SEL=1 n i
     local idx nm active panes cmd cwd dead pin mark short plural
     while :; do
         IDXS=(); NAMES=(); METAS=(); PINS=(); n=0
@@ -11922,7 +11978,7 @@ edit_tabs() {
         done < <(edit_windows "$hat" "$ws")
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$hat › $(group_display "$group") › $ws" "TABS" \
+        edit_header "$hat › $(group_display "$group") › $wslabel" "TABS" \
             "a tab is a tmux window inside the workspace. It survives losing the" \
             "client, and closing it here closes it everywhere." \
             "A pinned tab 📌 comes back first on restore; closed twice, it is unpinned."
@@ -12557,7 +12613,8 @@ Termux on Android included.
   hatter attach               pick the hat, then the workspace
 
 Given a hat, the choice is every workspace the config records for it plus any
-running on its server. Detach with the tmux prefix then d; the session keeps
+running on its server. The list shows them without the hat prefix (atlas for
+dev-atlas), and a name typed for a new one takes it. Detach with the tmux prefix then d; the session keeps
 running. On a machine without cmux, bare `hatter` does the same as
 `hatter attach`.
 
