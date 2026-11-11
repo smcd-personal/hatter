@@ -87,6 +87,16 @@ out=$(rack 'd k q' '') || fail "rack delete: $out"
 grep -q 'remove atlas:' <<<"$out" || fail "delete prompt: $out"
 grep -qx 'RM dev-atlas --hat dev' <<<"$out" || fail "delete: $out"
 
+# The tabs screen heads itself with the short name, not a tab's directory.
+out=$(run '
+    edit_readkey() { KEY=q; }
+    edit_header() { echo "HEADER $1"; }
+    edit_row() { :; }; edit_keys() { :; }
+    edit_windows() { printf "0\037shell\0371\0371\037bash\037/srv/proj\0370\0370\n"; }
+    SEL=1
+    edit_tabs dev Atlas dev-atlas atlas || true') || fail "tabs: $out"
+grep -qx 'HEADER dev › Atlas › atlas' <<<"$out" || fail "tabs header: $out"
+
 # --- attach picker ------------------------------------------------------------
 # pick <replies>: run cmd_attach dev at a "terminal", answering ask_line in turn.
 pick() {

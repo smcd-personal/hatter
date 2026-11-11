@@ -11955,7 +11955,7 @@ edit_workspaces() {
 # --- level 4: tabs ----------------------------------------------------------
 
 edit_tabs() {
-    local hat="$1" group="$2" ws="$3" short="${4:-$3}" SEL=1 n i
+    local hat="$1" group="$2" ws="$3" wslabel="${4:-$3}" SEL=1 n i
     local idx nm active panes cmd cwd dead pin mark short plural
     while :; do
         IDXS=(); NAMES=(); METAS=(); PINS=(); n=0
@@ -11978,7 +11978,7 @@ edit_tabs() {
         done < <(edit_windows "$hat" "$ws")
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$hat › $(group_display "$group") › $short" "TABS" \
+        edit_header "$hat › $(group_display "$group") › $wslabel" "TABS" \
             "a tab is a tmux window inside the workspace. It survives losing the" \
             "client, and closing it here closes it everywhere." \
             "A pinned tab 📌 comes back first on restore; closed twice, it is unpinned."
