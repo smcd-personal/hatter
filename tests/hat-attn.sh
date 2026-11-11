@@ -168,14 +168,38 @@ cmp -s "$ks" "$xs" || fail "the Claude and Codex skills differ"
 grep -q '^description: ' "$ks" || fail "SKILL.md has no description"
 grep -q 'hatter-managed' "$ks"  || fail "SKILL.md is not marked as hatter's"
 grep -q "hat-snooze snooze '<when>'" "$ks" || fail "the skill does not run hat-snooze"
+grep -q '/snooze <when>' "$ks" || fail "the hatter skill does not mention /snooze"
+# The snooze skill (#223): the short form, beside it, with the same steps.
+kz="$h/cfg/skills/snooze/SKILL.md"; xz="$h/.agents/skills/snooze/SKILL.md"
+[[ -f "$kz" ]] || fail "no snooze skill under CLAUDE_CONFIG_DIR"
+[[ -f "$xz" ]] || fail "no snooze skill in ~/.agents/skills for Codex"
+cmp -s "$kz" "$xz" || fail "the Claude and Codex snooze skills differ"
+[[ "$(sed -n 2p "$kz")" == "name: snooze" ]] || fail "snooze SKILL.md frontmatter: $(head -3 "$kz")"
+grep -q '^description: ' "$kz" || fail "snooze SKILL.md has no description"
+grep -q 'hatter-managed' "$kz"  || fail "snooze SKILL.md is not marked as hatter's"
+grep -q "hat-snooze snooze '<when>'" "$kz" || fail "the snooze skill does not run hat-snooze"
+grep -q "hat-snooze list --text" "$kz" || fail "the snooze skill has no list"
+# How to snooze is written once: the same lines in both skills.
+diff <(sed -n "/^Hide this tab/,/change nothing/p" "$ks") <(sed -n "/^Hide this tab/,/change nothing/p" "$kz") >/dev/null \
+    || fail "the two skills say how to snooze differently"
+[[ -n "$(sed -n "/^Hide this tab/,/change nothing/p" "$kz")" ]] || fail "the snooze skill has no steps"
+# A second run changes neither.
+cp "$ks" "$work/ks.1"; cp "$kz" "$work/kz.1"
+wire
+cmp -s "$ks" "$work/ks.1" && cmp -s "$kz" "$work/kz.1" || fail "a second provision changed a skill"
 [[ ! -e "$h/.claude/skills" ]] || fail "skill written to ~/.claude despite CLAUDE_CONFIG_DIR"
-# Someone's own hatter skill is left alone; hatter's own is rewritten.
+# Someone's own hatter or snooze skill is left alone; hatter's own is rewritten.
 printf 'mine\n' > "$xs"
+printf 'my snooze\n' > "$kz"
 echo stale >> "$ks"
+echo stale >> "$xz"
 wire
 [[ "$(cat "$xs")" == mine ]] || fail "provision overwrote a SKILL.md that is not hatter's"
-grep -q 'not hatter' "$work/wire.err" || fail "no warning about the skill left alone"
+[[ "$(cat "$kz")" == "my snooze" ]] || fail "provision overwrote a snooze SKILL.md that is not hatter's"
+grep -q "$xs is not hatter" "$work/wire.err" || fail "no warning about the hatter skill left alone"
+grep -q "$kz is not hatter" "$work/wire.err" || fail "no warning about the snooze skill left alone"
 grep -q '^stale$' "$ks" && fail "provision did not rewrite its own skill"
+grep -q '^stale$' "$xz" && fail "provision did not rewrite its own snooze skill"
 rm -rf "$h/.agents"
 
 c="$h/.codex/hooks.json"
@@ -198,9 +222,12 @@ rm -rf "$h/.codex" "$h/.agents" "$h/cfg/skills" "$work/bin/codex" "$work/bin/cla
 wire
 [[ ! -e "$h/.codex/hooks.json" ]] || fail "wrote Codex hooks where there is no codex"
 [[ ! -e "$h/.agents/skills/hatter" ]] || fail "wrote a Codex skill where there is no codex"
+[[ ! -e "$h/.agents/skills/snooze" ]] || fail "wrote a Codex snooze skill where there is no codex"
 [[ -f "$h/cfg/skills/hatter/SKILL.md" ]] || fail "no Claude skill though Claude has a config dir"
+[[ -f "$h/cfg/skills/snooze/SKILL.md" ]] || fail "no Claude snooze skill though Claude has a config dir"
 rm -rf "$h/cfg"
 wire
 [[ ! -e "$h/cfg/skills/hatter" ]] || fail "wrote a Claude skill where there is no claude and no config dir"
+[[ ! -e "$h/cfg/skills/snooze" ]] || fail "wrote a Claude snooze skill where there is no claude and no config dir"
 
 echo "ok: hat-attn"

@@ -4676,32 +4676,22 @@ if [ -n "$codex_home" ] && command -v jq >/dev/null 2>&1; then
     rm -f "$codex_hooks.hatter.new"
 fi
 
-# The hatter skill: /hatter in Claude Code, $hatter in Codex. Both read
-# skills/<name>/SKILL.md, so one file serves both. It is thin on purpose: the
-# agent runs hat-snooze on its own tab, which does the reading of times and
-# the moving, the same as `hatter snooze` from a client.
-#   Claude Code: <its config dir>/skills/hatter, where claude is installed
-#   Codex:       ~/.agents/skills/hatter (its user skills folder), where codex is
-# Rewritten on every provision, so a new hatter reaches it. A SKILL.md there
+# The agent skills: /hatter and /snooze in Claude Code, $hatter and $snooze in
+# Codex. Both read skills/<name>/SKILL.md, so one file per skill serves both.
+# They are thin on purpose: the agent runs hat-snooze on its own tab, which
+# does the reading of times and the moving, the same as `hatter snooze` from a
+# client. /snooze is the short form of /hatter snooze (#223); how to snooze is
+# written once, below, and goes into both files so they cannot drift apart.
+#   Claude Code: <its config dir>/skills/<name>, where claude is installed
+#   Codex:       ~/.agents/skills/<name> (its user skills folder), where codex is
+# Rewritten on every provision, so a new hatter reaches them. A SKILL.md there
 # without the hatter-managed line is someone's own, and is left alone.
-HATTER_SKILL_SRC="$HOME/.local/state/hatter/hatter-skill.md"
-mkdir -p "$(dirname "$HATTER_SKILL_SRC")"
-cat > "$HATTER_SKILL_SRC" <<'HATSKILL'
----
-name: hatter
-description: Snooze this tab with hatter, hiding it until a time and then bringing it back where it was. Use when the human types /hatter or $hatter, or asks to snooze this tab or session, hide it until later, or see it again at a time.
----
-
+HATTER_SKILLS_SRC="$HOME/.local/state/hatter/skills"
+mkdir -p "$HATTER_SKILLS_SRC"
+cat > "$HATTER_SKILLS_SRC/managed.md" <<'HATSKILL'
 <!-- hatter-managed: `hatter provision` writes this file and rewrites it on every run. To keep your own version, delete this line and provision will leave the file alone. -->
-
-# hatter
-
-This session runs in a tab that hatter manages: a tmux window on this server, mirrored to the human's terminal. `~/.local/bin/hat-snooze` acts on the tab it is run in.
-
-In Claude Code this skill is `/hatter`; in Codex it is `$hatter`. Use the form that fits when you mention it.
-
-## snooze <when>
-
+HATSKILL
+cat > "$HATTER_SKILLS_SRC/snooze-how.md" <<'HATSKILL'
 Hide this tab until <when>, then put it back where it was, flagged so the human sees it. This session keeps running while the tab is hidden. Nothing is sent to it when it wakes.
 
 1. Run this, with <when> exactly as the human gave it, in single quotes. If it holds a quote or a character other than letters, digits, spaces and `:` `-` `.`, ask the human for the time again instead.
@@ -4722,10 +4712,34 @@ Hide this tab until <when>, then put it back where it was, flagged so the human 
 Days and times are on the human's clock. If hat-snooze says no timezone is set, tell the human to run `hatter tz` on their computer. Never choose a timezone yourself.
 
 If no <when> was given, ask for one. If the command fails (not in tmux, the only tab in its workspace, a time it cannot read, no hat-snooze on this server), pass its message on and change nothing. If a sandbox stopped it reaching tmux, say so and ask the human to let it run outside the sandbox.
-
-## list
-
+HATSKILL
+cat > "$HATTER_SKILLS_SRC/snooze-list.md" <<'HATSKILL'
 `~/.local/bin/hat-snooze list --text` shows every snoozed tab on this server and when each wakes. Show its output as it is.
+HATSKILL
+{
+cat <<'HATSKILL'
+---
+name: hatter
+description: Snooze this tab with hatter, hiding it until a time and then bringing it back where it was. Use when the human types /hatter or $hatter, or asks to snooze this tab or session, hide it until later, or see it again at a time.
+---
+
+HATSKILL
+cat "$HATTER_SKILLS_SRC/managed.md"
+cat <<'HATSKILL'
+
+# hatter
+
+This session runs in a tab that hatter manages: a tmux window on this server, mirrored to the human's terminal. `~/.local/bin/hat-snooze` acts on the tab it is run in.
+
+In Claude Code this skill is `/hatter`; in Codex it is `$hatter`. Use the form that fits when you mention it. `/snooze <when>` (`$snooze` in Codex) is the short form of `/hatter snooze <when>`.
+
+## snooze <when>
+
+HATSKILL
+cat "$HATTER_SKILLS_SRC/snooze-how.md"
+printf '\n## list\n\n'
+cat "$HATTER_SKILLS_SRC/snooze-list.md"
+cat <<'HATSKILL'
 
 ## continue
 
@@ -4735,29 +4749,59 @@ Snoozing and having the session carry on with a prompt at the wake time is not a
 
 Say what this skill can do: `snooze <when>` and `list`.
 HATSKILL
+} > "$HATTER_SKILLS_SRC/hatter.md"
+{
+cat <<'HATSKILL'
+---
+name: snooze
+description: Snooze this tab with hatter, hiding it until a time and then bringing it back where it was. Use when the human types /snooze or $snooze, with a time such as 4h, tomorrow or fri 9am, or with list.
+---
 
-install_hatter_skill() {  # install_hatter_skill <skills dir> <for whom>
-    local d="$1/hatter" f="$1/hatter/SKILL.md"
+HATSKILL
+cat "$HATTER_SKILLS_SRC/managed.md"
+cat <<'HATSKILL'
+
+# snooze
+
+This session runs in a tab that hatter manages: a tmux window on this server, mirrored to the human's terminal. `~/.local/bin/hat-snooze` acts on the tab it is run in.
+
+In Claude Code this skill is `/snooze`; in Codex it is `$snooze`. It is the short form of `/hatter snooze` (`$hatter snooze`). Use the form that fits when you mention it.
+
+## /snooze list
+
+HATSKILL
+cat "$HATTER_SKILLS_SRC/snooze-list.md"
+printf '\n## /snooze <when>\n\nAnything else after /snooze is <when>.\n\n'
+cat "$HATTER_SKILLS_SRC/snooze-how.md"
+} > "$HATTER_SKILLS_SRC/snooze.md"
+rm -f "$HOME/.local/state/hatter/hatter-skill.md"  # where one skill was kept before #223
+
+install_hatter_skill() {  # install_hatter_skill <skills dir> <for whom> <name>
+    local d="$1/$3" f="$1/$3/SKILL.md"
     if [ -f "$f" ] && ! grep -q 'hatter-managed' "$f"; then
-        echo "WARNING: $f is not hatter's - left alone, so $2 has no hatter skill" >&2
+        echo "WARNING: $f is not hatter's - left alone, so $2 has no $3 skill from hatter" >&2
         return 0
     fi
-    if mkdir -p "$d" && cp "$HATTER_SKILL_SRC" "$f.new" && mv "$f.new" "$f"; then
-        echo "hatter skill installed for $2: $f"
+    if mkdir -p "$d" && cp "$HATTER_SKILLS_SRC/$3.md" "$f.new" && mv "$f.new" "$f"; then
+        echo "$3 skill installed for $2: $f"
     else
         rm -f "$f.new"
         echo "WARNING: could not write $f" >&2
     fi
     return 0
 }
+install_hatter_skills() {  # install_hatter_skills <skills dir> <for whom>
+    install_hatter_skill "$1" "$2" hatter
+    install_hatter_skill "$1" "$2" snooze
+}
 has_claude=$("${SHELL:-/bin/bash}" -lc 'command -v claude >/dev/null 2>&1 && printf HATCLAUDE' </dev/null 2>/dev/null) || has_claude=""
 # Where claude is on the login PATH, or Claude Code has a config dir: a
 # claude installed through nvm or the like may be on neither PATH we see.
 case "$has_claude" in
-    *HATCLAUDE*) install_hatter_skill "$claude_cfg/skills" "Claude Code" ;;
-    *) [ ! -d "$claude_cfg" ] || install_hatter_skill "$claude_cfg/skills" "Claude Code" ;;
+    *HATCLAUDE*) install_hatter_skills "$claude_cfg/skills" "Claude Code" ;;
+    *) [ ! -d "$claude_cfg" ] || install_hatter_skills "$claude_cfg/skills" "Claude Code" ;;
 esac
-[ -z "$codex_home" ] || install_hatter_skill "$HOME/.agents/skills" "Codex"
+[ -z "$codex_home" ] || install_hatter_skills "$HOME/.agents/skills" "Codex"
 
 # A systemd user unit only fires at boot with lingering on, which is also what
 # keeps the tmux server alive across logout. Say so rather than installing a
@@ -5183,8 +5227,9 @@ if "$HOME/.local/bin/hat-hibernate" auto >/dev/null 2>&1; then
 else
     echo "SELFTEST FAILED: 'hat-hibernate' did not run" >&2
 fi
-for f in "$HOME/.agents/skills/hatter/SKILL.md" "$claude_cfg/skills/hatter/SKILL.md"; do
-    if [ -f "$f" ] && grep -q hatter-managed "$f"; then echo "selftest ok: hatter skill in $f"; fi
+for f in "$HOME/.agents/skills/hatter/SKILL.md" "$claude_cfg/skills/hatter/SKILL.md" \
+         "$HOME/.agents/skills/snooze/SKILL.md" "$claude_cfg/skills/snooze/SKILL.md"; do
+    if [ -f "$f" ] && grep -q hatter-managed "$f"; then echo "selftest ok: skill in $f"; fi
 done
 if systemctl --user is-enabled hatter-restore.service >/dev/null 2>&1; then
     echo "selftest ok: boot restore is enabled"
@@ -12977,8 +13022,9 @@ the Mac being involved at all:
   - hat-hibernate  stops idle Claude sessions and wakes them again (see:
                  hatter help hibernate), with an hourly systemd timer that
                  does nothing until the hat sets an age
-  - the hatter skill, /hatter in Claude Code and $hatter in Codex, so an agent
-                 can snooze its own tab ("/hatter snooze fri 9am"). In Claude
+  - the hatter and snooze skills, /hatter and /snooze in Claude Code ($hatter
+                 and $snooze in Codex), so an agent can snooze its own tab
+                 ("/snooze fri 9am", or "/hatter snooze fri 9am"). In Claude
                  Code's skills folder where claude is installed, and in
                  ~/.agents/skills where codex is. Rewritten on each provision;
                  a SKILL.md there that hatter did not write is left alone.
