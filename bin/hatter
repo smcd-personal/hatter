@@ -7744,6 +7744,8 @@ def ps_agent: {status, model, ctx: .ctxs, idle: .idles, age: .ages,
 # answering: a server that takes the connection and then hangs must not hang
 # the command. The run is about a second; a minute of transcripts is a lot.
 PS_CAP="${HATTER_SERVER_TIMEOUT:-30}"
+# 0 or anything not a number would turn the cap off (alarm 0), so it is refused.
+case "$PS_CAP" in ''|0*|*[!0-9]*) PS_CAP=30 ;; esac
 
 # PS_JQ: the server's lines and the config in, ps's rows out, best first, one
 # JSON object per line. Reads $now, $idle, $busy, $want (the hats asked for,
@@ -7782,7 +7784,11 @@ def skey($k):
    | map(sort_by(where)) | add // [])
   + (map(select(.k == null)) | sort_by(where))
 | .[]
-| ({hat, group, workspace: .ws, tab: .tabs} | map_values(scrub)) + ps_agent + {window_id: .wid, index: .idx}'
+| ({hat, group, workspace: .ws, tab: .tabs} | map_values(scrub)) as $w | ps_agent as $a
+# The key order ps --json has always had.
+| {hat: $w.hat, status: $a.status, group: $w.group, workspace: $w.workspace, tab: $w.tab,
+   model: $a.model, ctx: $a.ctx, idle: $a.idle, age: $a.age, cwd: $a.cwd, last_prompt: $a.last_prompt,
+   session_id: $a.session_id, window_id: .wid, index: .idx}'
 
 
 # ps_render <rows file> <width> <wide 0|1> <hat column 0|1>: the table.
@@ -8134,8 +8140,7 @@ $cfg[0] as $c
 | ([inputs | split("\u001f")] | ps_rows($c; $now; $idle; $busy)) as $rows
 | [$sess | split("\n")[] | select(length > 0) | split("\u001f")
    | {hats: (.[0] | split(" ")), ws: .[1], clients: (.[2] | num // 0), control: (.[3] | num // 0)}
-   | .hat = ps_owner($where)
-   | select(.ws != "hatter-snooze" and (.ws | startswith("hatter-hop-") | not))] as $sessions
+   | .hat = ps_owner($where)] as $sessions
 | ([$dests[] | . as $d | .hats[] | {key: ., value: $d}] | from_entries) as $dest_of
 | {schema: $schema, generated: $gen,
    hats: [($c.hats // {}) | keys[] | select($only == "" or . == $only) | . as $h
@@ -8145,17 +8150,26 @@ $cfg[0] as $c
      | ([($c.groups // {}) | to_entries[] | select(.value.hat == $h)]
         | sort_by(if .value.managed then 0 else 1 end)) as $gs
      | [$gs[] | .value.sessions // {} | keys_unsorted[]] as $saved
+     # A workspace recorded in two of the hat'"'"'s groups is in the last one, as ps has it.
+     | ([($c.groups // {}) | to_entries[] | select(.value.hat == $h) | .key as $k
+         | .value.sessions // {} | keys_unsorted[] | {key: ., value: $k}] | from_entries) as $home
      | {name: $h, ssh: ($hc.ssh // null), color: ($hc.color // null),
         reachable: ($d != null and $d.ok),
-        why: (if $d == null then "no ssh destination" elif $d.ok then $d.err else $d.why end),
+        why: (if $d == null then
+                (if ($hc.ssh // "") | startswith("-") then "ssh destination starts with \"-\", so it is not used"
+                 else "no ssh destination" end)
+              elif $d.ok then $d.err else $d.why end),
         live: $live,
-        groups: [$gs[] | {key, name: (.value.name // .key), color: (.value.color // null),
+        groups: [$gs[] | .key as $gk
+                 | {key, name: (.value.name // .key), color: (.value.color // null),
                           icon: (.value.icon // null), unassigned: (.value.managed // false),
-                          workspaces: [(.value.sessions // {}) | to_entries[]
+                          workspaces: [(.value.sessions // {}) | to_entries[] | select($home[.key] == $gk)
                                        | if $live then live_ws(.key; $h; $rows; $sessions)
                                          else saved_ws(.key; .value) end]}],
         ungrouped: (if $live then
-                      [([$sessions[] | select(.hat == $h) | .ws] + [$rows[] | select(.hat == $h) | .ws])
+                      [([$sessions[] | select(.hat == $h) | .ws
+                         | select(. != "hatter-snooze" and (startswith("hatter-hop-") | not))]
+                        + [$rows[] | select(.hat == $h) | .ws])
                        | uniq[] | select(. as $n | $saved | index([$n]) | not)
                        | live_ws(.; $h; $rows; $sessions)]
                     else [] end)}]}'

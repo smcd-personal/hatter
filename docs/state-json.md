@@ -11,9 +11,11 @@ hatter state --json --hat dev    # one hat
 
 The command exits 0 whether or not each hat's server answers. A server that is
 down shows up as `reachable: false`. A server that takes the connection and
-then hangs is given 30 seconds (set `HATTER_SERVER_TIMEOUT` to change it), and
-then counts as down. Every server is asked at once, so the whole run takes
-about as long as the slowest server.
+then hangs is given 30 seconds, and then counts as down. To change that, set
+`HATTER_SERVER_TIMEOUT` to a whole number of seconds; anything else, 0
+included, means 30. The cap uses `perl`, which macOS and most Linux systems
+have. Without `perl` there is no cap. Every server is asked at once, so the
+whole run takes about as long as the slowest server.
 
 This page is the only description of the schema. `hatter ps --json` uses the
 same [agent fields](#agent).
@@ -48,7 +50,7 @@ ignore fields you don't know about.
 | `ssh` | string or null | Its ssh destination, `user@host` |
 | `color` | string or null | Its colour from the config |
 | `reachable` | boolean | The server answered over ssh |
-| `why` | string or null | Why the hat is not `live`: why ssh failed (`connection refused`, `timed out`, `no answer in 30s`, ...), or what the server reported (`tmux is not running`). Null when `live` |
+| `why` | string or null | Why the hat is not `live`: why ssh failed (`connection refused`, `timed out`, `no answer in 30s`, ...), what the server reported (`tmux is not running`), or that the hat has no usable ssh destination. Null when `live` |
 | `live` | boolean | The tree below comes from the server. When false, it is the **saved layout** from the config, and the live-only fields below are null |
 | `groups` | array | The hat's [groups](#group): its Unassigned group first, as cmux shows it, then the rest in the order the config keeps them |
 | `ungrouped` | array | [Workspaces](#workspace) running on the server that no group records. Always empty when `live` is false |
@@ -81,6 +83,11 @@ order, then the snoozed tabs that came from this workspace, then the
 hibernated ones. A saved tab that is not running is not listed. When the hat
 is not `live`, `tabs` lists the saved tabs.
 
+A workspace that the config records in more than one of a hat's groups is
+listed once, in the last of them, the group `hatter ps` shows. A snoozed tab
+with no record of its own workspace stays in the snooze box, which appears in
+`ungrouped` as a workspace named `hatter-snooze`.
+
 ## Tab
 
 A tab is a tmux window.
@@ -102,7 +109,8 @@ and in each row of `hatter ps --json`, with the same values. A `ps --json`
 row also has `hat`, `group`, `workspace`, `tab` (the title, with `* ` in
 front when pinned) and `window_id`.
 
-Every value is a string. A value that is not known is `-`.
+Every value is a string. A value that is not known is `-`, except
+`session_id`, which is empty.
 
 | Field | Meaning |
 |---|---|

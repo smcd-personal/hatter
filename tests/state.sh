@@ -2,8 +2,9 @@
 # hatter state --json (#210) against a stub ssh and tmux: a reachable hat's
 # live tree (groups in order, workspaces with their clients and mirroring,
 # tabs pinned, snoozed and hibernated), its agent fields equal to ps --json's,
-# and hats that cannot be read (refused, hung, no tmux) with their saved
-# layout and reachable or live false, without failing or hanging the command.
+# two hats on one server each getting their own workspaces, and hats that
+# cannot be read (refused, hung, no tmux, no ssh) with their saved layout and
+# reachable or live false, without failing or hanging the command.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -21,7 +22,9 @@ NOW=1767268800
 
 # dev's server: dev-a has two tabs and is mirrored (one control-mode client
 # and one plain one); dev-b is saved but has no clients; dev-c is in no group.
-# One tab of dev-a is snoozed, and a session of it is hibernated.
+# One tab of dev-a is snoozed, and a session of it is hibernated. Another
+# snoozed tab, "lost", has no record of where it came from. dev2 shares the
+# server and records dev-c.
 # NO_TMUX stands for a server where tmux is not running.
 cat > "$work/remote/tmux" <<'EOF'
 #!/usr/bin/env bash
@@ -32,7 +35,8 @@ list-windows)
     printf 'dev-a\t1\t@11\tmain\t9.1\t101\t/srv/a\tclaude\tdone\t1\t\n'
     printf 'dev-a\t2\t@12\tsh\t9.1\t104\t/srv/a\tbash\t\t\t\n'
     printf 'dev-c\t1\t@20\tscratch\t9.1\t104\t/srv/c\tbash\t\t\t\n'
-    printf 'hatter-snooze\t1\t@16\tnap\t9.1\t106\t/srv/a\tclaude\tdone\t\t1767300000\n' ;;
+    printf 'hatter-snooze\t1\t@16\tnap\t9.1\t106\t/srv/a\tclaude\tdone\t\t1767300000\n'
+    printf 'hatter-snooze\t2\t@17\tlost\t9.1\t104\t/srv/a\tbash\t\t\t1767400000\n' ;;
 list-sessions)
     printf 'S\tdev-a\nS\tdev-b\nS\tdev-c\nS\thatter-snooze\n' ;;
 list-clients)
@@ -64,11 +68,17 @@ chmod +x "$work/remote/tmux" "$work/remote/ps" "$work/bin/ssh"
 cat > "$work/cfg/hatter/config.json" <<'EOF'
 {"version":3,
  "hats":{"dev":{"ssh":"u@dev.example.com","color":"#336699"},
+         "dev2":{"ssh":"u@dev.example.com"},
+         "nossh":{},
+         "dash":{"ssh":"-oProxyCommand=false"},
          "ops":{"ssh":"u@ops.example.com"},
          "slow":{"ssh":"u@slow.example.com"},
          "idle":{"ssh":"u@idle.example.com"}},
  "groups":{"Atlas":{"hat":"dev","color":"#ff0000","icon":"star","sessions":{"dev-a":{"windows":[{"name":"main","pinned":true}]}}},
            "Unassigned@dev":{"hat":"dev","name":"Unassigned","managed":true,"sessions":{"dev-b":{}}},
+           "Spare":{"hat":"dev","sessions":{"dev-b":{}}},
+           "Dev2":{"hat":"dev2","sessions":{"dev-c":{}}},
+           "Kept":{"hat":"nossh","sessions":{"kept":{"windows":[{"name":"k"}]}}},
            "Ops":{"hat":"ops","sessions":{"ops-x":{"windows":[{"name":"build","cwd":"/srv/b","pinned":true},{"name":"logs","cwd":null}]}}},
            "Slow":{"hat":"slow","sessions":{"slow-x":{"windows":[{"name":"one"}]}}},
            "Idle":{"hat":"idle","sessions":{"idle-x":{"windows":[{"name":"two"}]}}}}}
@@ -118,14 +128,14 @@ took=$(( $(date +%s) - start ))
 
 want .schema 1
 want '.generated | type' number
-want '[.hats[].name] | join(" ")' "dev idle ops slow"
+want '[.hats[].name] | join(" ")' "dash dev dev2 idle nossh ops slow"
 
 # --- the reachable hat: the live tree ---
 dev='.hats[] | select(.name == "dev")'
 want "$dev | [.reachable, .live, .why] | map(tostring) | join(\" \")" "true true null"
 want "$dev | .color" "#336699"
 # Unassigned first, as cmux shows it.
-want "$dev | [.groups[].key] | join(\" \")" "Unassigned@dev Atlas"
+want "$dev | [.groups[].key] | join(\" \")" "Unassigned@dev Atlas Spare"
 want "$dev | .groups[0] | [.name, .unassigned] | map(tostring) | join(\" \")" "Unassigned true"
 want "$dev | .groups[1] | [.name, .color, .icon, .unassigned] | map(tostring) | join(\" \")" "Atlas #ff0000 star false"
 
@@ -140,11 +150,22 @@ want "$a | .tabs[2] | [.index, .window_id, .snoozed.until, .agent.status] | map(
 want "$a | .tabs[3] | [.index, .window_id, .hibernated.since, .agent.status, .agent.session_id] | map(tostring) | join(\" \")" \
     "null null 1767000000 asleep s7"
 
-b="$dev | .groups[0].workspaces[0]"
+# dev-b is recorded in Unassigned and in Spare: it is listed once, in the
+# last, as ps has it.
+want "$dev | [.groups[] | \"\(.key):\([.workspaces[].name] | join(\",\"))\"] | join(\" \")" \
+    "Unassigned@dev: Atlas:dev-a Spare:dev-b"
+b="$dev | .groups[2].workspaces[0]"
 want "$b | [.name, .running, .mirrored, .clients, (.tabs | length)] | map(tostring) | join(\" \")" "dev-b true false 0 0"
-# In no group: dev-c, and never the snooze box.
-want "$dev | [.ungrouped[].name] | join(\" \")" "dev-c"
-want "$dev | .ungrouped[0] | [.running, .mirrored, .clients, .tabs[0].title] | map(tostring) | join(\" \")" "true false 1 scratch"
+# dev-c is dev2's, though it runs on the same server. The snooze box is no
+# workspace, but a snoozed tab with no record of its home stays there, and
+# the box is running.
+want "$dev | [.ungrouped[].name] | join(\" \")" "hatter-snooze"
+want "$dev | .ungrouped[0] | [.running, .tabs[0].title, .tabs[0].snoozed.until] | map(tostring) | join(\" \")" \
+    "true lost 1767400000"
+dev2='.hats[] | select(.name == "dev2")'
+want "$dev2 | [.reachable, .live, (.ungrouped | length)] | map(tostring) | join(\" \")" "true true 0"
+want "$dev2 | .groups[0].workspaces[0] | [.name, .running, .mirrored, .clients, .tabs[0].title] | map(tostring) | join(\" \")" \
+    "dev-c true false 1 scratch"
 
 # --- the agent fields are ps --json's, value for value ---
 ps=$(hatter ps dev --json 2>/dev/null) || fail "ps dev --json failed"
@@ -173,6 +194,12 @@ want "$slow | .groups[0].workspaces[0].tabs[0].title" one
 idle='.hats[] | select(.name == "idle")'
 want "$idle | [.reachable, .live, .why] | map(tostring) | join(\" \")" "true false tmux is not running"
 want "$idle | .groups[0].workspaces[0] | [.running, .tabs[0].title] | map(tostring) | join(\" \")" "null two"
+
+# No ssh destination, and one ssh would read as an option: neither is asked.
+want '.hats[] | select(.name == "nossh") | [.reachable, .why, .groups[0].workspaces[0].tabs[0].title] | map(tostring) | join(" ")' \
+    "false no ssh destination k"
+want '.hats[] | select(.name == "dash") | [.reachable, .why] | map(tostring) | join(" ")' \
+    'false ssh destination starts with "-", so it is not used'
 
 # --- --hat limits it to one hat ---
 doc=$(hatter state --json --hat ops 2>/dev/null) || fail "state --json --hat ops failed"

@@ -157,6 +157,10 @@ want main group Atlas
 want main tab "* main"      # pinned
 want sh model -
 want main cwd /srv/a        # in --json, though not in the table
+# The keys, in the order ps --json has always printed them (#210 rebuilt it).
+keys=$(jq -r '.[0] | keys_unsorted | join(" ")' <<<"$out")
+[ "$keys" = "hat status group workspace tab model ctx idle age cwd last_prompt session_id window_id" ] \
+    || fail "--json keys: $keys"
 
 # --- a hat whose server is not reached: a warning, and nothing listed ---------
 out=$(ps_ ops) || fail "ps ops: $out"
