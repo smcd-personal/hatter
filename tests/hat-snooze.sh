@@ -140,10 +140,12 @@ for bad in "today 7am" "today" 2026-10-01 25:00 "fri 13pm" 2026-02-30 "next" "ne
 done
 [[ "$(at "today 7am" 2>&1)" == *"in the past"* ]] || fail "a time gone by today is not called past"
 for bad in 12/1 1/12 13/13 2/30 "feb 30" "dec 32" "Dec 1 2025" "Nov 1 2026" "nov 2 7am" "foo 1" \
-           "next year" "dec" "1/2/3/4" "12/25/1999"; do
+           "next year" "dec" "1/2/3/4" "12/25/1999" 0/5 5/0 "in 3"; do
     if at "$bad" >/dev/null 2>&1; then fail "'$bad' was read as a time"; fi
 done
 [[ "$(at 12/1 2>&1)" == *"could be"*"Dec 1"* ]] || fail "an ambiguous 12/1 does not say why: $(at 12/1 2>&1)"
+[[ "$(at 0/5 2>&1)" == *"no date 0/5"* ]] || fail "0/5 is not called no date: $(at 0/5 2>&1)"
+[[ "$(at "in 3" 2>&1)" == *"'in 3'"* ]] || fail "the refusal of 'in 3' does not quote it: $(at "in 3" 2>&1)"
 [[ "$(at "Dec 1 2025" 2>&1)" == *"in the past"* ]] || fail "a past date with a year is not called past"
 # next week on a Sunday is the next day, and never today on a Monday.
 [[ "$(wall "$(HAT_NOW=$(epoch $LA 2026 11 8 8 0) HAT_TZ=$LA "$SN" when 'next week')")" == "Mon 2026-11-09 09:00" ]] \
