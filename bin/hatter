@@ -3275,10 +3275,9 @@ cat > "$HOME/.local/bin/hat-snooze" <<'HATSNOOZE'
 #   hat-snooze when <when>                the wake time <when> means, in epoch seconds
 #   hat-snooze tz [zone]                  the human's timezone: print it, or set it
 #
-# <when> is a duration (30m, 4h, 2d, 1w, 1h30m), @<epoch seconds>, or a time
-# in the human's timezone: tomorrow, tomorrow 2pm, fri, fri 9am, 14:00, 9:30pm,
-# noon, 2026-11-03, 2026-11-03 14:00. A day with no time means 09:00; a time
-# with no day means the next time it comes round. The timezone is the one
+# <when> is a duration, @<epoch seconds>, or a day and time in the human's
+# timezone. The forms it reads are listed once, in `hatter help snooze`, and
+# tests/hat-snooze.sh has a row for each. The timezone is the one
 # `hatter tz` set on the client and provision copied here ($STATE/tz), or
 # HAT_TZ; with neither, an absolute time is refused rather than guessed.
 # <which> is a window id (@12), <origin session>:<tab name>, or a tab name.
@@ -3361,14 +3360,15 @@ when_rel() {
     printf '%s\n' "$(( $(now) + total ))"
 }
 
-# when_abs <spec> <zone>: a day and time on the human's clock. Python, for
+# when_abs <spec> <zone> [<as said>]: a day and time on the human's clock. Python, for
 # its timezone database: a day that loses or repeats an hour to daylight
 # saving is worked out, not guessed, and said when it matters.
 when_abs() {
     command -v python3 >/dev/null 2>&1 || { echo "hat-snooze: no python3 here for an absolute time" >&2; return 1; }
-    python3 - "$1" "$2" "$(now)" "$MAX" <<'PYWHEN'
+    python3 - "$1" "$2" "$(now)" "$MAX" "${3:-$1}" <<'PYWHEN'
 import datetime as dt, re, sys
 spec, zone, now_s, max_s = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+said = sys.argv[5]  # as the human wrote it, "in" and all, for messages
 def die(msg):
     sys.stderr.write("hat-snooze: %s\n" % msg); sys.exit(1)
 try:
@@ -3383,9 +3383,10 @@ except Exception:
         die("this server has no timezone database (install tzdata); durations like 4h still work")
     die("unknown timezone '%s': set it again with `hatter tz` on your client" % zone)
 HINT = ("cannot read '%s' as a time. Try 30m, 4h, 2d, tomorrow, tomorrow 2pm, "
-        "fri 9am, 14:00 or 2026-11-03 14:00" % spec)
+        "fri 9am, next week, Dec 1, 14:00 or 2026-11-03 14:00" % said)
 now = dt.datetime.fromtimestamp(now_s, tz)
 s = " ".join(spec.lower().replace(",", " ").split())
+s = re.sub(r"^(\d{4}-\d{2}-\d{2})t(?=\d)", r"\1 ", s)  # 2026-11-03T14:00
 DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 def weekday(w):
     for i, d in enumerate(DAYS):
@@ -3408,28 +3409,114 @@ def clock(t):
     return None
 
 # kind: what the day was given as, which decides what a time gone by means.
-kind, day, rest = "time", None, s
-m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})(?:[ t](.+))?", s)
-if m:
-    try: day = dt.date.fromisoformat(m.group(1))
-    except ValueError: die("there is no date %s" % m.group(1))
-    kind, rest = "date", m.group(2) or ""
-else:
-    words, nxt = s.split(" "), False
-    if words[0] == "next" and len(words) > 1 and weekday(words[1]) is not None:
-        words, nxt = words[1:], True
-    head, tail = words[0], " ".join(words[1:])
-    wd = weekday(head)
-    if head in ("today", "tomorrow"):
-        kind, rest = head, tail
-        day = now.date() + dt.timedelta(days=1 if head == "tomorrow" else 0)
-    elif wd is not None:
-        kind, rest = "weekday", tail
-        # "next mon" said on a Monday is a week away; "mon" may be today.
-        ahead = (wd - now.weekday()) % 7
-        day = now.date() + dt.timedelta(days=7 if nxt and ahead == 0 else ahead)
+#   date      a day named outright, with its year: gone by is a mistake to say
+#   monthday  a month and day with no year: the next time it comes round
+#   today, tomorrow, weekday, time (no day at all)
+MONTHS = ["january", "february", "march", "april", "may", "june", "july",
+          "august", "september", "october", "november", "december"]
+def month(w):
+    w = w.rstrip(".")
+    if w == "sept": return 9
+    for i, n in enumerate(MONTHS):
+        if len(w) >= 3 and n.startswith(w):
+            return i + 1
+    return None
+def mday(w):
+    m = re.fullmatch(r"(\d{1,2})(?:st|nd|rd|th)?", w)
+    return int(m.group(1)) if m and 1 <= int(m.group(1)) <= 31 else None
+def year(w):
+    return int(w) if re.fullmatch(r"\d{4}", w) else None
+def ymd(y, mo, d, said):
+    try: return dt.date(y, mo, d)
+    except ValueError: die("there is no date %s" % said)
+def monthday(mo, d, y, said):
+    # With no year, the next time the date comes round: a 29 February
+    # waits for a leap year (and is then likely past the limit, and said).
+    if y is not None:
+        return "date", ymd(y, mo, d, said)
+    for y in range(now.year, now.year + 9):
+        try: c = dt.date(y, mo, d)
+        except ValueError: continue
+        if c >= now.date(): return "monthday", c
+    die("there is no date %s" % said)
+def numeric(w):
+    # 2026/12/25, 12/25, 25/12, 12/25/2026, 25/12/26. Month and day are
+    # told apart only when one is over 12 or both are the same: 12/1 could
+    # be either, and guessing would be wrong for half the people asking.
+    m = re.fullmatch(r"(\d{4})/(\d{1,2})/(\d{1,2})", w)
+    if m:
+        return "date", ymd(int(m.group(1)), int(m.group(2)), int(m.group(3)), w)
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2}|\d{4}))?", w)
+    if not m: return None
+    a, b, y = int(m.group(1)), int(m.group(2)), m.group(3)
+    if a == 0 or b == 0: die("there is no date %s" % w)
+    if a > 12 and b <= 12:   mo, d = b, a
+    elif b > 12 and a <= 12: mo, d = a, b
+    elif a == b:             mo, d = a, b
+    elif a > 12:             die("there is no date %s" % w)
     else:
-        day = now.date()
+        x, y_ = "%s %d" % (MONTHS[a - 1][:3].title(), b), "%s %d" % (MONTHS[b - 1][:3].title(), a)
+        die("%s could be %s or %s: write the one you mean that way" % (w, x, y_))
+    if y is not None:
+        y = int(y) + (2000 if len(y) == 2 else 0)
+    return monthday(mo, d, y, w)
+def day_of(words):
+    # The day the words start with: (kind, date, words it took), or None.
+    w0 = words[0]
+    m = re.fullmatch(r"\d{4}-\d{2}-\d{2}", w0)
+    if m:
+        try: return "date", dt.date.fromisoformat(w0), 1
+        except ValueError: die("there is no date %s" % w0)
+    if "/" in w0:
+        k = numeric(w0)
+        if k is None: return None
+        return k[0], k[1], 1
+    if w0 in ("today", "tomorrow"):
+        return w0, now.date() + dt.timedelta(days=1 if w0 == "tomorrow" else 0), 1
+    if w0 == "next" and len(words) > 1:
+        w1 = words[1]
+        if w1 == "week":
+            # The Monday after today: on a Sunday that is tomorrow.
+            return "date", now.date() + dt.timedelta(days=7 - now.weekday()), 2
+        if w1 == "month":
+            y, mo = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
+            return "date", dt.date(y, mo, 1), 2
+        wd = weekday(w1)
+        if wd is not None:
+            # "next mon" said on a Monday is a week away.
+            ahead = (wd - now.weekday()) % 7
+            return "weekday", now.date() + dt.timedelta(days=ahead or 7), 2
+        return None
+    wd = weekday(w0)
+    if wd is not None:
+        # "mon" may be today; a time gone by today is next week's, below.
+        return "weekday", now.date() + dt.timedelta(days=(wd - now.weekday()) % 7), 1
+    # Dec 1, December 1st, Dec 1 2026; 1 Dec, 1st December 2026.
+    if len(words) > 1:
+        for mw, dw in ((w0, words[1]), (words[1], w0)):
+            mo, d = month(mw), mday(dw)
+            if mo is not None and d is not None:
+                y = year(words[2]) if len(words) > 2 else None
+                k = monthday(mo, d, y, " ".join(words[:3 if y is not None else 2]))
+                return k[0], k[1], 3 if y is not None else 2
+    return None
+
+words = [w for w in s.split(" ") if w not in ("at", "of", "on")]
+if not words: die(HINT)
+kind, day, rest = "time", now.date(), words
+got = day_of(words)
+if got:
+    kind, day, n = got
+    rest = words[n:]
+else:
+    # The time first, then the day: 2pm tomorrow, 9 am fri.
+    for k in (1, 2):
+        if len(words) > k and clock(" ".join(words[:k])) is not None:
+            got = day_of(words[k:])
+            if got and got[2] == len(words) - k:
+                kind, day, rest = got[0], got[1], words[:k]
+                break
+rest = " ".join(rest)
 if kind == "time" and rest == "": die(HINT)
 if kind == "today" and rest == "": die("today needs a time, like today 5pm")
 hm = clock(rest) if rest else (9, 0)
@@ -3444,6 +3531,8 @@ if when.timestamp() <= now_s:
     # A weekday or a bare time already gone by means the next one; a day
     # named outright that has gone by is a mistake to say, not to fix.
     if kind == "weekday":  wall, when, real = at(day + dt.timedelta(days=7))
+    elif kind == "monthday" and day == now.date():
+        die("%s is today, and %02d:%02d has gone by: give a time still to come" % (s, hm[0], hm[1]))
     elif kind == "time":   wall, when, real = at(day + dt.timedelta(days=1))
     else: die("%s is in the past" % s)
 if real.replace(tzinfo=None) != wall:
@@ -3460,8 +3549,10 @@ PYWHEN
 
 # when <spec>: the epoch second it names, or say why not and fail.
 when() {
-    local t rc=0 z
-    t=$(when_rel "$1") || rc=$?
+    local t rc=0 z spec="$1"
+    # "in 3 days" is 3 days.
+    case "$spec" in [Ii][Nn][[:space:]]*) spec=${spec:3} ;; esac
+    t=$(when_rel "$spec") || rc=$?
     if [ "$rc" = 0 ]; then printf '%s\n' "$t"; return 0; fi
     if [ "$rc" = 2 ]; then echo "hat-snooze: '$1' is more than 400 days" >&2; return 1; fi
     z=$(human_tz)
@@ -3469,7 +3560,7 @@ when() {
         echo "hat-snooze: cannot read '$1' as a duration (30m, 4h, 2d, 1w), and an absolute time needs the human's timezone, which is not set here: run \`hatter tz\` on the client" >&2
         return 1
     fi
-    when_abs "$1" "$z"
+    when_abs "$spec" "$z" "$1"
 }
 
 # One snooze change at a time: the timer and a person can both be at it. A
@@ -4694,7 +4785,7 @@ HATSKILL
 cat > "$HATTER_SKILLS_SRC/snooze-how.md" <<'HATSKILL'
 Hide this tab until <when>, then put it back where it was, flagged so the human sees it. This session keeps running while the tab is hidden. Nothing is sent to it when it wakes.
 
-1. Run this, with <when> exactly as the human gave it, in single quotes. If it holds a quote or a character other than letters, digits, spaces and `:` `-` `.`, ask the human for the time again instead.
+1. Run this, with <when> exactly as the human gave it, in single quotes. If it holds a quote or a character other than letters, digits, spaces and `:` `-` `.` `/` `,`, ask the human for the time again instead.
 
    ```
    ~/.local/bin/hat-snooze snooze '<when>'
@@ -4704,10 +4795,12 @@ Hide this tab until <when>, then put it back where it was, flagged so the human 
 
 <when> can be:
 
-- a duration: `30m`, `4h`, `2d`, `1w`, `1h30m`
-- a day: `tomorrow`, `fri`, `next mon`, `2026-11-03` (09:00 on that day)
+- a duration: `10m`, `5h`, `7d`, `1w`, `1h30m`, `in 3 days`
+- a day: `tomorrow`, `fri`, `next mon`, `next week`, `next month`, `Dec 1`, `12/25`, `2026-11-03` (09:00 on that day)
 - a time: `14:00`, `9:30pm`, `noon` (the next time it comes round)
-- both: `tomorrow 2pm`, `fri 9am`, `2026-11-03 14:00`
+- both: `tomorrow 2pm`, `fri at 9am`, `Dec 1 14:00`, `2pm tomorrow`
+
+These are examples, not the whole list. Pass the human's words on as they are; hat-snooze says when it cannot read them, and why (a date in numbers like `12/1` that could be either month first or day first is refused, with what to write instead).
 
 Days and times are on the human's clock. If hat-snooze says no timezone is set, tell the human to run `hatter tz` on their computer. Never choose a timezone yourself.
 
@@ -12316,10 +12409,16 @@ workspace, and at the wake time it comes back to the same place, flagged the
 way a tab with an agent waiting for you is.
 
 <tab> is a window index or name. <when> is one of:
-  a duration    30m, 4h, 2d, 1w, or a mix like 1h30m, up to 400d
-  a day         tomorrow, fri, next mon, 2026-11-03     (at 09:00)
+  a duration    10m, 5h, 7d, 1w, a mix like 1h30m, or "in 3 days"; up to 400d
+  a day         tomorrow, fri, next mon, next week (Monday), next month (the
+                1st), Dec 1, 1st December, Dec 1 2026, 2026-11-03,
+                12/25, 25/12, 12/25/2026, 2026/12/25         (at 09:00)
   a time        14:00, 9:30pm, noon      (the next time it comes round)
-  both          tomorrow 2pm, fri 9am, 2026-11-03 14:00
+  both          tomorrow 2pm, fri at 9am, Dec 1 14:00, 2pm tomorrow
+A date with no year is the next time it comes round. A date in numbers is
+read only when it cannot be misread: 12/25 and 25/12 are both 25 December,
+but 12/1 could be 1 December or 12 January, so it is refused. Write Dec 1 or
+2026-12-01 instead.
 Days and times are on your clock: see `hatter help tz`. A time the clocks skip
 or repeat for daylight saving is moved to the hour after, or taken the first
 time, and you are told. Wake times are shown in your timezone, named.

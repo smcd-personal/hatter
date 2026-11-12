@@ -64,6 +64,13 @@ near "$("$SN" when 1h30m)" 5400     || fail "1h30m is not 90 minutes from now"
 near "$("$SN" when 2D)" 172800      || fail "2D is not two days from now"
 near "$("$SN" when '1 week')" 604800 || fail "'1 week' is not a week from now"
 near "$("$SN" when 08h)" 28800      || fail "08h (leading zero) is not 8 hours"
+# The common ones by name (#224), and "in" in front of any of them.
+near "$("$SN" when 10m)" 600        || fail "10m is not ten minutes from now"
+near "$("$SN" when 5h)" 18000       || fail "5h is not five hours from now"
+near "$("$SN" when 7d)" 604800      || fail "7d is not seven days from now"
+near "$("$SN" when 'in 3 days')" 259200 || fail "'in 3 days' is not three days from now"
+near "$("$SN" when 'In 10m')" 600   || fail "'In 10m' is not ten minutes from now"
+near "$("$SN" when 'in 2 hours')" 7200 || fail "'in 2 hours' is not two hours from now"
 [[ "$("$SN" when @1700000000)" == 1700000000 ]] || fail "@epoch is not passed through"
 for bad in "" x 0m 4 4x 401d 1h-2m @ @12a; do
     if "$SN" when "$bad" >/dev/null 2>&1; then fail "'$bad' was read as a time"; fi
@@ -98,11 +105,54 @@ today 5pm|Mon 2026-11-02 17:00
 2026-11-03|Tue 2026-11-03 09:00
 2026-11-03 14:00|Tue 2026-11-03 14:00
 2026-11-03T14:00|Tue 2026-11-03 14:00
+next week|Mon 2026-11-09 09:00
+next week 10am|Mon 2026-11-09 10:00
+next month|Tue 2026-12-01 09:00
+Dec 1|Tue 2026-12-01 09:00
+dec 1st|Tue 2026-12-01 09:00
+December 1|Tue 2026-12-01 09:00
+Dec. 1|Tue 2026-12-01 09:00
+1 Dec|Tue 2026-12-01 09:00
+1st December|Tue 2026-12-01 09:00
+1st of December|Tue 2026-12-01 09:00
+sept 3|Fri 2027-09-03 09:00
+dec 1 2pm|Tue 2026-12-01 14:00
+Dec 1 at 14:00|Tue 2026-12-01 14:00
+Dec 1, 2026|Tue 2026-12-01 09:00
+1 Dec 2026 3pm|Tue 2026-12-01 15:00
+Nov 2|Mon 2026-11-02 09:00
+Nov 1|Mon 2027-11-01 09:00
+12/25|Fri 2026-12-25 09:00
+25/12|Fri 2026-12-25 09:00
+12/25/2026|Fri 2026-12-25 09:00
+25/12/26|Fri 2026-12-25 09:00
+2026/12/25|Fri 2026-12-25 09:00
+11/11|Wed 2026-11-11 09:00
+12/25 5pm|Fri 2026-12-25 17:00
+tomorrow at 2pm|Tue 2026-11-03 14:00
+on fri|Fri 2026-11-06 09:00
+2pm tomorrow|Tue 2026-11-03 14:00
+9 am fri|Fri 2026-11-06 09:00
+noon dec 1|Tue 2026-12-01 12:00
 TABLE
 for bad in "today 7am" "today" 2026-10-01 25:00 "fri 13pm" 2026-02-30 "next" "next 9am" 2027-12-31; do
     if at "$bad" >/dev/null 2>&1; then fail "'$bad' was read as a time"; fi
 done
 [[ "$(at "today 7am" 2>&1)" == *"in the past"* ]] || fail "a time gone by today is not called past"
+for bad in 12/1 1/12 13/13 2/30 "feb 30" "dec 32" "Dec 1 2025" "Nov 1 2026" "nov 2 7am" "foo 1" \
+           "next year" "dec" "1/2/3/4" "12/25/1999" 0/5 5/0 "in 3"; do
+    if at "$bad" >/dev/null 2>&1; then fail "'$bad' was read as a time"; fi
+done
+[[ "$(at 12/1 2>&1)" == *"could be"*"Dec 1"* ]] || fail "an ambiguous 12/1 does not say why: $(at 12/1 2>&1)"
+[[ "$(at 0/5 2>&1)" == *"no date 0/5"* ]] || fail "0/5 is not called no date: $(at 0/5 2>&1)"
+[[ "$(at "in 3" 2>&1)" == *"'in 3'"* ]] || fail "the refusal of 'in 3' does not quote it: $(at "in 3" 2>&1)"
+[[ "$(at "Dec 1 2025" 2>&1)" == *"in the past"* ]] || fail "a past date with a year is not called past"
+# next week on a Sunday is the next day, and never today on a Monday.
+[[ "$(wall "$(HAT_NOW=$(epoch $LA 2026 11 8 8 0) HAT_TZ=$LA "$SN" when 'next week')")" == "Mon 2026-11-09 09:00" ]] \
+    || fail "next week on a Sunday is not the Monday after"
+# next month in December is January.
+[[ "$(wall "$(HAT_NOW=$(epoch $LA 2026 12 15 8 0) HAT_TZ=$LA "$SN" when 'next month')")" == "Fri 2027-01-01 09:00" ]] \
+    || fail "next month in December is not 1 January"
 # In another zone the same words are another instant.
 [[ "$(Z=Europe/London at 'tomorrow 9am')" == "$(epoch Europe/London 2026 11 3 9 0)" ]] \
     || fail "tomorrow 9am is not read in the zone given"
