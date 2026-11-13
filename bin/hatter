@@ -10348,10 +10348,53 @@ watch_resumed() {
     local after gap oldest replay reason
     IFS=$'\t' read -r after gap oldest replay reason <<<"$1"
     if [[ "$gap" == true ]]; then
+        WATCH_GAP_CHECK=1
         watch_log "the event stream resumed after event $after, but cmux had kept events only from $oldest on${reason:+ ($reason)}; whatever happened in between was not seen. Replaying $replay"
     else
         watch_log "the event stream resumed after event $after, replaying $replay"
     fi
+}
+
+# After a gap (#203): cmux had dropped some of the events the watcher missed,
+# so a workspace it closed in that time is known to no one. List the recorded
+# sessions that still run but no cmux window shows. They are not reattached:
+# a workspace closed by hand looks the same (sync keeps its record, #74), and
+# with the events gone there is no telling the two apart. Said in the log and
+# one notification, naming the command that brings them back. A session
+# already on the retry list (#229) is left to its retry.
+WATCH_GAP_CHECK=0
+watch_gap_check() {
+    local tree shown hat host live s missing="" n=0 kept
+    kept=$(cut -f 3 "$(watch_retry_file)" 2>/dev/null || true)
+    tree=$(cmux_json tree --all 2>/dev/null) || tree=""
+    if [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" != array ]]; then
+        watch_log "after the gap, cmux's windows could not be read, so nothing was checked"
+        return 0
+    fi
+    shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        host=$(hat_ssh "$hat" 2>/dev/null) || continue
+        [[ -n "$host" ]] || continue
+        if ! live=$(hat_live_sessions "$host" 2>/dev/null); then
+            watch_log "after the gap, $host did not answer, so its workspaces were not checked"
+            continue
+        fi
+        while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
+            grep -qxF -- "$s" <<<"$live" || continue
+            grep -qxF -- "$s" <<<"$shown" && continue
+            grep -qxF -- "$s" <<<"$kept" && continue
+            missing+="${missing:+, }$s"; n=$((n + 1))
+        done < <(cfg --arg h "$hat" '.groups[]? | select(.hat == $h) | .sessions | keys_unsorted[]?' | awk '!seen[$0]++')
+    done < <(hat_names)
+    if [[ "$n" == 0 ]]; then
+        watch_log "after the gap, every recorded workspace that still runs is in cmux"
+        return 0
+    fi
+    watch_log "after the gap, $n recorded workspace(s) still run but are not in cmux: $missing. If cmux closed them while the watcher was not listening, hatter restore --missing brings them back"
+    watch_notify "hatter" "cmux's event log had a gap. Not in cmux, though their sessions still run: $missing. Bring them back: hatter restore --missing"
+    return 0
 }
 
 # HATTER_WATCH_DRY prints what the watcher would do instead of healing or
@@ -10924,6 +10967,10 @@ watch_act() {
     fi
     [[ -z "$closes" ]] || watch_closed "$closes"
     closes=""
+    if [[ "$WATCH_GAP_CHECK" == 1 ]]; then
+        WATCH_GAP_CHECK=0
+        watch_gap_check
+    fi
     watch_sync
     sync=0
     return 0
@@ -12774,7 +12821,12 @@ top.
 
 The log also says when the event stream resumes, from which event, and
 whether cmux had already dropped some of what happened while the watcher was
-not listening (cmux keeps a few thousand events, in memory). The watcher
+not listening (cmux keeps a few thousand events, in memory). When it had, a
+workspace cmux closed in that time would go unnoticed, so the watcher lists
+the recorded sessions that still run on their servers but that no cmux
+window shows, in the log and one notification naming `hatter restore
+--missing`. It does not bring them back itself: one closed by hand looks the
+same, and the events that would tell them apart are gone. The watcher
 keeps its own copy of every event it is sent, one JSON line each, in
 ~/.config/hatter/autosave/events/<UTC day>.jsonl, for 14 days. To trace one
 workspace:
