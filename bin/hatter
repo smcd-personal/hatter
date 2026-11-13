@@ -7455,9 +7455,12 @@ cmd_find() {
 #  13 context tokens    14 first said    15 last said
 #  16 oldest open tool call, 0 for none  17 agent started
 #  18 cwd               19 last prompt   20 the pane's command
+#  21 hibernated since (asleep lines only)
 #
-# Times are epoch seconds, empty when unknown. "@@hatter-err <why>" means the
-# server could not be read, and "@@hatter-ok" ends every run that got going.
+# Then one "@@hatter-sess <name>\037<clients>\037<control-mode clients>" per
+# tmux session. Times are epoch seconds, empty when unknown. "@@hatter-err
+# <why>" means the server could not be read, and "@@hatter-ok" ends every run
+# that got going.
 read -r -d '' PS_SH <<'HATPS' || true
 #!/usr/bin/env bash
 set -uo pipefail
@@ -7627,12 +7630,22 @@ WINS
 wait
 cat "$out"/[0-9]* 2>/dev/null
 
+# Each session, with how many clients it has and how many of them are in
+# control mode, which is how a client like cmux mirrors one (for hatter state):
+# "@@hatter-sess <name>\037<clients>\037<control-mode clients>".
+HT=$(printf '\t')
+{ tmux list-clients -F "C$HT#{client_session}$HT#{client_control_mode}" 2>/dev/null
+  tmux list-sessions -F "S$HT#{session_name}" 2>/dev/null; } | awk -F "$HT" '
+    $1 == "C" { n[$2]++; if ($3 == 1) m[$2]++; next }
+    $1 == "S" { s[++k] = $2 }
+    END { for (i = 1; i <= k; i++) printf "@@hatter-sess %s\037%d\037%d\n", s[i], n[s[i]], m[s[i]] }'
+
 # Hibernated sessions: no tab, but still the hat's.
 for f in "$PANES"/closed/*.json; do
     [ -e "$f" ] || continue
-    IFS="$US" read -r sid from name idx cwd <<EOF
+    IFS="$US" read -r sid from name idx cwd since <<EOF
 $(jq -r 'select((.hibernate // null) | type == "object")
-    | [.session_id, .hibernate.from, .hibernate.name, .hibernate.index, (.hibernate.cwd // .cwd)]
+    | [.session_id, .hibernate.from, .hibernate.name, .hibernate.index, (.hibernate.cwd // .cwd), .hibernate.since]
     | map(. // "" | tostring | gsub("[\u001f\t\r\n]"; " ")) | join("\u001f")' "$f" 2>/dev/null)
 EOF
     [ -n "${sid:-}" ] || continue
@@ -7641,9 +7654,9 @@ EOF
     IFS="$US" read -r m rm ctx last pend prompt <<EOF
 $facts
 EOF
-    printf 'asleep\037%s\037%s\037\037%s\037\037\037\037\037%s\037%s\037%s\037%s\037%s\037%s\0370\037\037%s\037%s\037\n' \
+    printf 'asleep\037%s\037%s\037\037%s\037\037\037\037\037%s\037%s\037%s\037%s\037%s\037%s\0370\037\037%s\037%s\037\037%s\n' \
         "$from" "$idx" "$name" "$sid" "${m:-}" "${rm:-}" "${ctx:-}" "$first" "${last:-}" "$cwd" \
-        "$(printf '%s' "${prompt:-}" | cut -c1-300)"
+        "$(printf '%s' "${prompt:-}" | cut -c1-300)" "${since:-}"
 done
 HATPS
 
@@ -7653,13 +7666,13 @@ HATPS
 PS_IDLE_AFTER=3600
 PS_BUSY_WITHIN=30
 
-# PS_JQ: the server's lines (with "<hat list>\037" in front, the hats on that
-# destination) and the config in, the table's rows out, best first. Reads
-# $now, $idle, $busy, $want (the hats asked for, [] for all) and $f, the
-# filters: {status: [...], model, min, max, match}, each empty or null for none;
-# $sort, the column to sort on, and $rev, true to reverse it.
+# PS_JQ_LIB: what ps and state share. ps_rows takes the server's tab lines,
+# each split on \037 with "<hat list>" in front (the hats on that
+# destination), and gives one object per tab with its hat, group and status
+# worked out. ps_agent picks the agent fields both commands print: their
+# names and values are documented in docs/state-json.md, and nowhere else.
 # shellcheck disable=SC2016
-PS_JQ='
+PS_JQ_LIB='
 def num: if type == "number" then . elif type == "string" and test("^[0-9]+$") then tonumber else null end;
 def dur: if . == null or . < 0 then "-"
          elif . < 60 then "\(.)s"
@@ -7674,6 +7687,73 @@ def tok: if . == null or . == 0 then "-"
 def short_model: if . == "" then "-" else
     sub("^claude-"; "") | sub("-[0-9]{8}$"; "") | sub("-(?<a>[0-9]+)-(?<b>[0-9]+)$"; "-\(.a).\(.b)") end;
 def rank: {approval: 0, question: 0, waiting: 1, working: 2, idle: 3, snoozed: 4, asleep: 5, shell: 6}[.] // 7;
+def scrub: if type == "string" then gsub("[\u0000-\u001f\u007f]"; " ") else . end;
+
+# Every saved session: {<name>: {hat, group (the name shown), gkey, order}}.
+def ps_where($c): [$c.groups // {} | to_entries[] as $g | ($g.value.sessions // {}) | keys_unsorted | to_entries[]
+    | {key: .value, value: {hat: $g.value.hat, group: ($g.value.name // $g.key), gkey: $g.key, order: .key}}]
+    | from_entries;
+# The hat a workspace (.ws) on a destination (.hats) belongs to: the one
+# recording it, if that hat is on this destination; else the one its name is
+# prefixed with; else the first.
+def ps_owner($where): ($where[.ws] // null) as $w | (.ws | split("-")[0]) as $pre
+    | if $w != null and (.hats | index($w.hat)) then $w.hat
+      elif (.hats | index($pre)) then $pre else .hats[0] end;
+
+def ps_rows($c; $now; $idle; $busy):
+  ps_where($c) as $where
+  | ([$c.groups // {} | to_entries | .[] | .value.name // .key] | to_entries | map({key: .value, value: .key}) | from_entries) as $gorder
+  | map(select(length >= 21)
+     | {hats: (.[0] | split(" ")), st: .[1], ws: .[2], idx: .[3], wid: .[4], tab: .[5], pin: .[6],
+        snz: .[7], wait: .[8], agent: .[9], sid: .[10], m: .[11], rm: .[12], ctx: (.[13] | num),
+        first: (.[14] | num), last: (.[15] | num), pend: (.[16] | num // 0), start: (.[17] | num),
+        cwd: .[18], prompt: .[19], cmd: .[20], since: (.[21] // "" | num)}
+     | ($where[.ws] // null) as $w
+     | .hat = ps_owner($where)
+     | .group = (if $w != null and $w.hat == .hat then $w.group else "-" end)
+     | .gkey = (if $w != null and $w.hat == .hat then $w.gkey else null end)
+     | .gord = (if .group == "-" then 1e9 else ($gorder[.group] // 1e9) end)
+     | .sord = (if $w != null then $w.order else 1e9 end)
+     | (if .last != null then $now - .last else null end) as $idle_s
+     | .status = (
+         if .st == "asleep" then "asleep"
+         elif .snz != "" or .ws == "hatter-snooze" then "snoozed"
+         elif .agent == "" then "shell"
+         elif .wait == "approval" or .wait == "question" then .wait
+         elif .pend > 0 and (.start == null or .pend >= .start) then "working"
+         elif .wait == "" and $idle_s != null and $idle_s < $busy then "working"
+         elif $idle_s != null and $idle_s >= $idle then "idle"
+         else "waiting" end)
+     | .model = (if .agent == "codex" and .m == "" then "codex" else (.m | short_model) end)
+     | .ctxs = (.ctx | tok)
+     | .idle_n = (if .status == "shell" then null else $idle_s end)
+     | .age_n = (if .first != null then $now - .first else null end)
+     | .idles = (.idle_n | dur)
+     | .ages = (.age_n | dur)
+     | .cwd = (.cwd | sub("^/(home|Users)/[^/]+(?=/|$)"; "~"))
+     | .tabs = ((if .pin != "" then "* " else "" end)
+                + (if .tab != "" then .tab elif .idx != "" then "tab \(.idx)" else "-" end)));
+
+def ps_agent: {status, model, ctx: .ctxs, idle: .idles, age: .ages,
+               cwd: (if .cwd == "" then "-" else .cwd end),
+               last_prompt: (if .prompt == "" then "-" else .prompt end),
+               session_id: .sid} | map_values(scrub);
+'
+
+# How long a server may take to answer ps or state before it counts as not
+# answering: a server that takes the connection and then hangs must not hang
+# the command. The run is about a second; a minute of transcripts is a lot.
+PS_CAP="${HATTER_SERVER_TIMEOUT:-30}"
+# 0 or anything not a number would turn the cap off (alarm 0), so it is refused.
+case "$PS_CAP" in ''|0*|*[!0-9]*) PS_CAP=30 ;; esac
+
+# PS_JQ: the server's lines and the config in, ps's rows out, best first, one
+# JSON object per line. Reads $now, $idle, $busy, $want (the hats asked for,
+# [] for all) and $f, the filters: {status: [...], model, min, max, match},
+# each empty or null for none; $sort, the column to sort on, and $rev, true
+# to reverse it.
+# shellcheck disable=SC2016
+PS_JQ="$PS_JQ_LIB"'
 # The key --sort <column> sorts on, in the natural direction of the column: idle
 # and age most recent first, ctx largest first, status needing you first,
 # group and workspace in cmux order, the rest alphabetical. null for a row
@@ -7689,53 +7769,14 @@ def skey($k):
     elif $k == "tab" then (.tabs | ltrimstr("* ") | ascii_downcase)
     elif $k == "model" then (if .model == "-" then null else .model end)
     else null end;
-
-$cfg[0] as $c
-| ([$c.groups | to_entries[] as $g | ($g.value.sessions // {}) | keys_unsorted | to_entries[]
-    | {key: .value, value: {hat: $g.value.hat, group: ($g.value.name // $g.key), order: .key}}]
-   | from_entries) as $where
-| ([$c.groups | to_entries | .[] | .value.name // .key] | to_entries | map({key: .value, value: .key}) | from_entries) as $gorder
-| [inputs | split("\u001f") | select(length >= 21)
-   | {hats: (.[0] | split(" ")), st: .[1], ws: .[2], idx: .[3], wid: .[4], tab: .[5], pin: .[6],
-      snz: .[7], wait: .[8], agent: .[9], sid: .[10], m: .[11], rm: .[12], ctx: (.[13] | num),
-      first: (.[14] | num), last: (.[15] | num), pend: (.[16] | num // 0), start: (.[17] | num),
-      cwd: .[18], prompt: .[19], cmd: .[20]}
-   # The hat it belongs to: the one recording its workspace, if that hat is on
-   # this destination; else the one its name is prefixed with; else the first.
-   | ($where[.ws] // null) as $w
-   | (.ws | split("-")[0]) as $pre
-   | .hat = (if $w != null and (.hats | index($w.hat)) then $w.hat
-             elif (.hats | index($pre)) then $pre else .hats[0] end)
-   | .group = (if $w != null and $w.hat == .hat then $w.group else "-" end)
-   | .gord = (if .group == "-" then 1e9 else ($gorder[.group] // 1e9) end)
-   | .sord = (if $w != null then $w.order else 1e9 end)
-   | select(.hat as $h | ($want | length) == 0 or ($want | index($h)))
-   | (if .last != null then $now - .last else null end) as $idle_s
-   | .status = (
-       if .st == "asleep" then "asleep"
-       elif .snz != "" or .ws == "hatter-snooze" then "snoozed"
-       elif .agent == "" then "shell"
-       elif .wait == "approval" or .wait == "question" then .wait
-       elif .pend > 0 and (.start == null or .pend >= .start) then "working"
-       elif .wait == "" and $idle_s != null and $idle_s < $busy then "working"
-       elif $idle_s != null and $idle_s >= $idle then "idle"
-       else "waiting" end)
-   | .model = (if .agent == "codex" and .m == "" then "codex" else (.m | short_model) end)
-   | .ctxs = (.ctx | tok)
-   | .idle_n = (if .status == "shell" then null else $idle_s end)
-   | .age_n = (if .first != null then $now - .first else null end)
-   | .idles = (.idle_n | dur)
-   | .ages = (.age_n | dur)
-   | .cwd = (.cwd | sub("^/(home|Users)/[^/]+(?=/|$)"; "~"))
-   | .tabs = ((if .pin != "" then "* " else "" end)
-              + (if .tab != "" then .tab elif .idx != "" then "tab \(.idx)" else "-" end))
+[inputs | split("\u001f")] | ps_rows($cfg[0]; $now; $idle; $busy)
+| map(select(.hat as $h | ($want | length) == 0 or ($want | index($h)))
    | select(.status as $s | ($f.status | length) == 0 or ($f.status | index($s)))
    | select($f.model == "" or (.model | ascii_downcase | contains($f.model | ascii_downcase)))
    | select($f.min == null or (.ctx // 0) >= $f.min)
    | select($f.max == null or (.ctx != null and .ctx <= $f.max))
    | select($f.match == "" or ([.group, .ws, .tabs, .cwd, .prompt] | join(" ") | ascii_downcase
-                              | contains($f.match | ascii_downcase)))
-  ]
+                              | contains($f.match | ascii_downcase))))
 | map(.k = skey($sort))
 | def where: [.hat, .gord, .sord, .ws, (.idx | num // 0)];
   # Reversing flips the order of the keys, not of the rows that tie on one.
@@ -7743,9 +7784,11 @@ $cfg[0] as $c
    | map(sort_by(where)) | add // [])
   + (map(select(.k == null)) | sort_by(where))
 | .[]
-| [.hat, .status, .group, .ws, .tabs, .model, .ctxs, .idles, .ages, (.cwd | if . == "" then "-" else . end),
-   (.prompt | if . == "" then "-" else . end), .sid, .wid, .idx]
-| map(tostring | gsub("[\u0000-\u001f\u007f]"; " ")) | join("\u001f")'
+| ({hat, group, workspace: .ws, tab: .tabs} | map_values(scrub)) as $w | ps_agent as $a
+# The key order ps --json has always had.
+| {hat: $w.hat, status: $a.status, group: $w.group, workspace: $w.workspace, tab: $w.tab,
+   model: $a.model, ctx: $a.ctx, idle: $a.idle, age: $a.age, cwd: $a.cwd, last_prompt: $a.last_prompt,
+   session_id: $a.session_id, window_id: .wid, index: .idx}'
 
 
 # ps_render <rows file> <width> <wide 0|1> <hat column 0|1>: the table.
@@ -7892,6 +7935,53 @@ ps_tokens() {
         sub(/[km]$/, "", v); printf "%d\n", v * m }'
 }
 
+# ps_dests [<hat>]: "<destination>\t<hat> <hat>...", one line per ssh
+# destination, in the order of its first hat: hats that share an account share
+# its tmux, so each is asked once. Given a hat, only its destination, but with
+# every hat on it, so a session goes to the right one of them. A hat with no
+# destination, or one ssh would read as an option, is left out.
+ps_dests() {
+    local only="${1:-}" want="" hat dest i found
+    local -a dests=() hats_of=()
+    [[ -z "$only" ]] || want=$(hat_ssh "$only" 2>/dev/null) || return 0
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        dest=$(hat_ssh "$hat" 2>/dev/null) || continue
+        [[ -n "$dest" && ( -z "$only" || "$dest" == "$want" ) ]] || continue
+        found=""
+        for ((i = 0; i < ${#dests[@]}; i++)); do
+            [[ "${dests[$i]}" == "$dest" ]] && { found=$i; break; }
+        done
+        if [[ -n "$found" ]]; then hats_of[$found]="${hats_of[$found]} $hat"
+        else dests+=("$dest"); hats_of+=("$hat"); fi
+    done < <(hat_names)
+    for ((i = 0; i < ${#dests[@]}; i++)); do printf '%s\t%s\n' "${dests[$i]}" "${hats_of[$i]}"; done
+    return 0
+}
+
+# ps_fetch <dir> <dest>...: PS_SH on every destination at once, each given
+# PS_CAP seconds (wall_cap). Leaves <dir>/<i>,
+# what destination i printed, and <dir>/<i>.why: empty when it answered, else
+# why it did not.
+ps_fetch() {
+    local dir="$1" dest i=0 rc
+    shift
+    for dest in "$@"; do
+        (
+            rc=0
+            printf '%s\n' "$PS_SH" | wall_cap "$PS_CAP" ssh "${SSH_OPTS[@]}" -o BatchMode=yes \
+                -o ConnectTimeout=8 "$dest" "$(posix_sh "exec bash -s")" > "$dir/$i" 2> "$dir/$i.err" || rc=$?
+            if grep -qx '@@hatter-ok' "$dir/$i"; then : > "$dir/$i.why"
+            elif [[ "$rc" == 142 ]]; then echo "no answer in ${PS_CAP}s" > "$dir/$i.why"
+            else ssh_why "$(cat "$dir/$i.err")" > "$dir/$i.why"; fi
+            exit 0
+        ) 2>/dev/null &   # bash's own "Alarm clock" report of a capped ssh
+        i=$((i + 1))
+    done
+    wait
+    return 0
+}
+
 cmd_ps() {
     local all=0 wide=0 json=0 only="" go=0 sort=idle rev=false
     local f_status="" f_model="" f_min=null f_max=null f_match="" st
@@ -7942,48 +8032,30 @@ cmd_ps() {
         if hat=$(current_hat 2>/dev/null) && [[ -n "$hat" ]]; then only="$hat"; else all=1; fi
     fi
 
-    # One run per ssh destination: hats that share an account share its tmux.
     local -a dests=() hats_of=()
-    local dest i found
-    while IFS= read -r hat; do
-        [[ -n "$hat" ]] || continue
-        if [[ -n "$only" ]]; then
-            # Every hat on the destination is passed along, so a session goes
-            # to the right one of them; only $only's rows are kept.
-            [[ "$(hat_ssh "$hat")" == "$(hat_ssh "$only")" ]] || continue
-        fi
-        dest=$(hat_ssh "$hat")
-        [[ -n "$dest" ]] || continue
-        found=""
-        for ((i = 0; i < ${#dests[@]}; i++)); do
-            [[ "${dests[$i]}" == "$dest" ]] && { found=$i; break; }
-        done
-        if [[ -n "$found" ]]; then hats_of[$found]="${hats_of[$found]} $hat"
-        else dests+=("$dest"); hats_of+=("$hat"); fi
-    done < <(hat_names)
+    local dest i hats
+    while IFS=$'\t' read -r dest hats; do
+        dests+=("$dest"); hats_of+=("$hats")
+    done < <(ps_dests "$only")
     [[ ${#dests[@]} -gt 0 ]] || die "no hats to list"
 
     local tmp
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-ps.XXXXXX")
-    for ((i = 0; i < ${#dests[@]}; i++)); do
-        printf '%s\n' "$PS_SH" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
-            "${dests[$i]}" "$(posix_sh "exec bash -s")" > "$tmp/$i" 2>"$tmp/$i.err" &
-    done
-    wait
+    ps_fetch "$tmp" "${dests[@]}"
 
     # Every line, behind the hats of its destination. Ages are measured by
     # the clock of the first server reached.
     local line now=""
     for ((i = 0; i < ${#dests[@]}; i++)); do
-        if ! grep -qx '@@hatter-ok' "$tmp/$i"; then
-            warn "could not reach ${hats_of[$i]# } (${dests[$i]}): $(ssh_why "$(cat "$tmp/$i.err")")"
+        if [[ -s "$tmp/$i.why" ]]; then
+            warn "could not reach ${hats_of[$i]# } (${dests[$i]}): $(cat "$tmp/$i.why")"
             continue
         fi
         while IFS= read -r line; do
             case "$line" in
                 "@@hatter-err "*) warn "${hats_of[$i]# }: ${line#@@hatter-err }" ;;
                 "@@hatter-now "*) [[ -n "$now" ]] || now="${line#@@hatter-now }" ;;
-                ""|@@hatter-ok) ;;
+                ""|@@hatter-ok|"@@hatter-sess "*) ;;
                 *) printf '%s\037%s\n' "${hats_of[$i]# }" "$line" ;;
             esac
         done < "$tmp/$i"
@@ -7997,18 +8069,18 @@ cmd_ps() {
     [[ "$go" == 0 || -n "$f_status" ]] || f_status=" approval question waiting working idle shell"
     filt=$(jq -nc --arg s "$f_status" --arg m "$f_model" --argjson min "$f_min" --argjson max "$f_max" \
         --arg x "$f_match" '{status: ($s | split(" ") | map(select(. != ""))), model: $m, min: $min, max: $max, match: $x}')
-    jq -n -R -r --slurpfile cfg "$CONFIG" --argjson now "$now" --argjson want "$want" --argjson f "$filt" \
+    jq -n -R -c --slurpfile cfg "$CONFIG" --argjson now "$now" --argjson want "$want" --argjson f "$filt" \
         --arg sort "$sort" --argjson rev "$rev" \
         --argjson idle "$PS_IDLE_AFTER" --argjson busy "$PS_BUSY_WITHIN" "$PS_JQ" \
-        < "$tmp/lines" > "$tmp/rows" || { rm -rf "$tmp"; die "could not build the table"; }
+        < "$tmp/lines" > "$tmp/objs" || { rm -rf "$tmp"; die "could not build the table"; }
 
     if [[ "$json" == 1 ]]; then
-        jq -R -s -c 'split("\n") | map(select(length > 0) | split("\u001f")
-            | {hat: .[0], status: .[1], group: .[2], workspace: .[3], tab: .[4], model: .[5],
-               ctx: .[6], idle: .[7], age: .[8], cwd: .[9], last_prompt: .[10],
-               session_id: .[11], window_id: .[12]})' < "$tmp/rows"
+        jq -s -c 'map(del(.index))' < "$tmp/objs"
         rm -rf "$tmp"; return 0
     fi
+    jq -r '[.hat, .status, .group, .workspace, .tab, .model, .ctx, .idle, .age, .cwd, .last_prompt,
+            .session_id, .window_id, .index] | map(tostring | gsub("[\u0000-\u001f\u007f]"; " "))
+           | join("\u001f")' < "$tmp/objs" > "$tmp/rows"
     if [[ ! -s "$tmp/rows" ]]; then
         rm -rf "$tmp"
         echo "  no tabs${only:+ on $only} match" >&2
@@ -8022,6 +8094,138 @@ cmd_ps() {
     fi
     ps_render "$tmp/rows" "$(term_cols)" "$wide" "$all"
     rm -rf "$tmp"
+}
+
+# ------------------------------------------------------------------- state
+#
+# hatter state --json [--hat <hat>] (#210): the whole tree, hats down to tabs,
+# with each tab's status, as one JSON document for anything that is not a
+# person (a GUI, a picker, a script). The schema is docs/state-json.md; a
+# change to the shape bumps STATE_SCHEMA there and here.
+#
+# It reads what ps reads, the same way (PS_SH on each destination at once,
+# capped at PS_CAP), so a server that is down or hangs costs at most the cap,
+# and its hats come back with their saved layout and reachable: false.
+STATE_SCHEMA=1
+
+# STATE_JQ: PS_JQ_LIB's rows, the sessions, the config and each destination's
+# outcome in, the document out. Reads $cfg, $dests ([{hats, ok, why, err}]),
+# $sess (the "@@hatter-sess" lines, "<hats>\037" in front), $now, $gen,
+# $only, $idle, $busy and $schema.
+# shellcheck disable=SC2016
+STATE_JQ='
+# A snoozed tab'"'"'s index is its place in the snooze box, which says nothing
+# about its own workspace, so it has none.
+def state_tab: {index: (if .status == "asleep" or .status == "snoozed" then null else (.idx | num) end),
+                window_id: (if .st == "asleep" or .wid == "" then null else .wid end),
+                title: (.tab | scrub), pinned: (.pin != ""),
+                snoozed: (if .status == "snoozed"
+                          then {until: (.snz | num | if . != null and . >= 1000000000 then . else null end)}
+                          else null end),
+                hibernated: (if .st == "asleep" then {since: .since} else null end),
+                agent: ps_agent};
+def saved_tab: {index: null, window_id: null, title: (.name // "" | scrub), pinned: (.pinned // false),
+                snoozed: null, hibernated: null, agent: null};
+def live_ws($name; $hat; $rows; $sessions):
+    (first($sessions[] | select(.hat == $hat and .ws == $name)) // null) as $s
+    | {name: $name, running: ($s != null), mirrored: (($s.control // 0) > 0), clients: ($s.clients // 0),
+       tabs: ([$rows[] | select(.hat == $hat and .ws == $name)]
+              | sort_by([({snoozed: 1, asleep: 2}[.status] // 0), (.idx | num // 0)]) | map(state_tab))};
+def saved_ws($name; $rec):
+    {name: $name, running: null, mirrored: null, clients: null, tabs: [($rec.windows // [])[] | saved_tab]};
+def uniq: reduce .[] as $x ([]; if any(.[]; . == $x) then . else . + [$x] end);
+
+$cfg[0] as $c
+| ps_where($c) as $where
+| ([inputs | split("\u001f")] | ps_rows($c; $now; $idle; $busy)) as $rows
+| [$sess | split("\n")[] | select(length > 0) | split("\u001f")
+   | {hats: (.[0] | split(" ")), ws: .[1], clients: (.[2] | num // 0), control: (.[3] | num // 0)}
+   | .hat = ps_owner($where)] as $sessions
+| ([$dests[] | . as $d | .hats[] | {key: ., value: $d}] | from_entries) as $dest_of
+| {schema: $schema, generated: $gen,
+   hats: [($c.hats // {}) | keys[] | select($only == "" or . == $only) | . as $h
+     | $c.hats[$h] as $hc
+     | ($dest_of[$h] // null) as $d
+     | ($d != null and $d.ok and $d.err == null) as $live
+     | ([($c.groups // {}) | to_entries[] | select(.value.hat == $h)]
+        | sort_by(if .value.managed then 0 else 1 end)) as $gs
+     | [$gs[] | .value.sessions // {} | keys_unsorted[]] as $saved
+     # A workspace recorded in two of the hat'"'"'s groups is in the last one, as ps has it.
+     | ([($c.groups // {}) | to_entries[] | select(.value.hat == $h) | .key as $k
+         | .value.sessions // {} | keys_unsorted[] | {key: ., value: $k}] | from_entries) as $home
+     | {name: $h, ssh: ($hc.ssh // null), color: ($hc.color // null),
+        reachable: ($d != null and $d.ok),
+        why: (if $d == null then
+                (if ($hc.ssh // "") | startswith("-") then "ssh destination starts with \"-\", so it is not used"
+                 else "no ssh destination" end)
+              elif $d.ok then $d.err else $d.why end),
+        live: $live,
+        groups: [$gs[] | .key as $gk
+                 | {key, name: (.value.name // .key), color: (.value.color // null),
+                          icon: (.value.icon // null), unassigned: (.value.managed // false),
+                          workspaces: [(.value.sessions // {}) | to_entries[] | select($home[.key] == $gk)
+                                       | if $live then live_ws(.key; $h; $rows; $sessions)
+                                         else saved_ws(.key; .value) end]}],
+        ungrouped: (if $live then
+                      [([$sessions[] | select(.hat == $h) | .ws
+                         | select(. != "hatter-snooze" and (startswith("hatter-hop-") | not))]
+                        + [$rows[] | select(.hat == $h) | .ws])
+                       | uniq[] | select(. as $n | $saved | index([$n]) | not)
+                       | live_ws(.; $h; $rows; $sessions)]
+                    else [] end)}]}'
+
+cmd_state() {
+    local json=0 only=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            --hat)  [[ -n "${2:-}" ]] || die "--hat needs a hat"
+                    hat_exists "$2" || die "no hat named '$2'"
+                    only="$2"; shift 2 ;;
+            -h|--help) usage_cmd state; return 0 ;;
+            *) die "unknown argument: $1  (try: hatter help state)" ;;
+        esac
+    done
+    [[ "$json" == 1 ]] || die "state is for programs and prints JSON only: hatter state --json
+  For people: hatter list, hatter ps, or the rack"
+
+    local -a dests=() hats_of=()
+    local dest hats i line now="" err tmp
+    while IFS=$'\t' read -r dest hats; do
+        dests+=("$dest"); hats_of+=("$hats")
+    done < <(ps_dests "$only")
+
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-state.XXXXXX")
+    : > "$tmp/lines"; : > "$tmp/sess"; : > "$tmp/dests"
+    [[ ${#dests[@]} -eq 0 ]] || ps_fetch "$tmp" "${dests[@]}"
+
+    # Each destination's outcome; its tab lines and session lines, behind its
+    # hats. Ages are measured by the clock of the first server reached.
+    for ((i = 0; i < ${#dests[@]}; i++)); do
+        err=""
+        if [[ ! -s "$tmp/$i.why" ]]; then
+            while IFS= read -r line; do
+                case "$line" in
+                    "@@hatter-err "*) [[ -n "$err" ]] || err="${line#@@hatter-err }" ;;
+                    "@@hatter-now "*) [[ -n "$now" ]] || now="${line#@@hatter-now }" ;;
+                    "@@hatter-sess "*) printf '%s\037%s\n' "${hats_of[$i]}" "${line#@@hatter-sess }" >> "$tmp/sess" ;;
+                    ""|@@hatter-ok) ;;
+                    *) printf '%s\037%s\n' "${hats_of[$i]}" "$line" >> "$tmp/lines" ;;
+                esac
+            done < "$tmp/$i"
+        fi
+        jq -n -c --arg h "${hats_of[$i]}" --rawfile why "$tmp/$i.why" --arg err "$err" \
+            '{hats: ($h | split(" ")), ok: ($why == ""), why: ($why | rtrimstr("\n") | if . == "" then null else . end),
+              err: (if $err == "" then null else $err end)}' >> "$tmp/dests"
+    done
+    [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+
+    jq -n -R --slurpfile cfg "$CONFIG" --slurpfile dests "$tmp/dests" --rawfile sess "$tmp/sess" \
+        --argjson now "$now" --argjson gen "$(date +%s)" --arg only "$only" --argjson schema "$STATE_SCHEMA" \
+        --argjson idle "$PS_IDLE_AFTER" --argjson busy "$PS_BUSY_WITHIN" "$PS_JQ_LIB$STATE_JQ" \
+        < "$tmp/lines" || { rm -rf "$tmp"; die "could not build the state document"; }
+    rm -rf "$tmp"
+    return 0
 }
 
 # The Termux widget lists the scripts under ~/.shortcuts as home-screen buttons.
@@ -12201,6 +12405,7 @@ Commands:
   attach [hat|session]   Open a workspace in this terminal, over plain ssh
   find <terms>...        Find the Claude session working on something, and go to it
   ps [<hat>|--all]       Every tab on a hat: agent status, model, context, idle, age
+  state --json           Every hat, group, workspace and tab with its status, as JSON
   login [hat]            Log in to Cloudflare Access for hats whose ssh goes through it
   key add <key> <hat>... Authorise another machine's ssh key on hats
   rename <old> <new>     Rename a session on its server, in cmux and in config
@@ -12658,7 +12863,9 @@ lists every hat, with a HAT column.
 
 Rows are sorted by idle time, most recently active first. When the table is
 too wide, the last columns above go first; --wide shows every column in full and
---json prints the rows, with each tab's cwd too. Codex tabs show what tmux knows, with "-" for the rest.
+--json prints the rows, with each tab's cwd too. Their fields are described in
+docs/state-json.md (https://github.com/smcd-personal/hatter/blob/main/docs/state-json.md).
+Codex tabs show what tmux knows, with "-" for the rest.
 
 Filters, all of which a row must pass:
   --status <s,...>  one or more of the statuses above; "needs" is approval,
@@ -12681,6 +12888,25 @@ Sorting:
                     or attached over ssh. Snoozed and hibernated rows are
                     skipped unless --status names them.
                     e.g. hatter ps --status needs --go
+USAGE
+    ;;
+    state) cat <<'USAGE'
+hatter state --json [--hat <hat>]
+
+The whole tree as one JSON document, for programs rather than people: every
+hat (reachable or not, and why), its groups, their workspaces (running,
+mirrored, attached clients) and their tabs (pinned, snoozed, hibernated, and
+the agent status that hatter ps shows).
+
+Every server is asked at once. A hat whose server does not answer within 30
+seconds (HATTER_SERVER_TIMEOUT) is listed with its saved layout and
+"reachable": false, and the command still succeeds.
+
+  --hat <hat>  only this hat
+
+The schema, which is versioned, is in docs/state-json.md:
+https://github.com/smcd-personal/hatter/blob/main/docs/state-json.md
+For people: hatter list, hatter ps, or the rack.
 USAGE
     ;;
     find) cat <<'USAGE'
@@ -13210,7 +13436,7 @@ seed_config
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|state|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -13223,7 +13449,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|state|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -13260,6 +13486,7 @@ case "$cmd" in
                if [[ $# -eq 1 ]]; then cmd_attach "$1"; else cmd_attach_pick; fi ;;
     find)      cmd_find "$@" ;;
     ps)        cmd_ps "$@" ;;
+    state)     cmd_state "$@" ;;
     login)     cmd_login "$@" ;;
     key)       cmd_key "$@" ;;
     rename)    [[ $# -gt 0 ]] || { usage_cmd rename; exit 1; };    cmd_rename "$@" ;;
