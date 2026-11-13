@@ -155,6 +155,70 @@ grep -q 'and 1 more' <<<"$out" || fail "find --limit 2: no count of the rest:
 $out"
 grep -q 'more:' <<<"$(find_ --all parser)" && fail "find --all parser: under the limit, still says there are more"
 
+# --- one live match jumps by itself after 2s; any key aborts (#231) ---------
+# At a terminal (a pty), with no cmux so the jump is an attach. "billing" is one
+# running session. No key: the countdown runs out and it goes (the stub tmux
+# cannot attach, which is enough to show it tried). A key: it says it aborted
+# and does not go. Several matches never auto-jump.
+pty_find() {   # pty_find <keys or ""> <term>...: print the whole terminal output
+    local keys="$1"; shift
+    PATH="${PTY_PATH:-$work/bin:$nocmux}" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 HATTER_BIN="$root/bin/hatter" \
+        python3 -I - "$keys" "$@" <<'PY'
+import os, pty, select, sys, time
+keys, terms = sys.argv[1].encode(), sys.argv[2:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(os.environ['HATTER_BIN'], [os.environ['HATTER_BIN'], 'find'] + terms)
+out, sent, start = b'', not keys, time.time()
+while time.time() - start < 15:
+    if select.select([fd], [], [], 0.1)[0]:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+    if not sent and b'jumping to' in out:
+        time.sleep(0.5); os.write(fd, keys); sent = True
+sys.stdout.write(out.decode(errors='replace'))
+PY
+}
+nocmux=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v cmux | paste -sd: -)
+out=$(pty_find "" billing)
+grep -q 'jumping to dev-a:1 (main)' <<<"$out" || fail "one live match: no countdown:
+$out"
+grep -q 'aborted' <<<"$out" && fail "one live match: aborted with no key:
+$out"
+grep -q "open which" <<<"$out" && fail "one live match: asked instead of jumping:
+$out"
+grep -q 'new-session' <<<"$out" || fail "one live match: did not go after the countdown:
+$out"
+out=$(pty_find "x" billing)
+grep -q 'Auto-jump to dev-a:1 (main) aborted' <<<"$out" || fail "a key did not abort the jump:
+$out"
+grep -q 'new-session' <<<"$out" && fail "aborted jump went anyway:
+$out"
+out=$(pty_find "" parser </dev/null)
+grep -q 'jumping to' <<<"$out" && fail "two matches auto-jumped:
+$out"
+
+# Under cmux, switching to another tab during the countdown aborts it. A stub
+# cmux reports a different focused surface on every identify call.
+mkdir -p "$work/cmuxbin"
+cat > "$work/cmuxbin/cmux" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+    *identify*) n=$(cat "$CMUX_N" 2>/dev/null || echo 0); echo $((n + 1)) > "$CMUX_N"
+        printf '{"focused":{"window_id":"w","workspace_id":"x","pane_id":"p","surface_id":"s%s"}}\n' "$n" ;;
+    *) exit 1 ;;
+esac
+STUB
+chmod +x "$work/cmuxbin/cmux"
+out=$(CMUX_N="$work/cmux-n" PTY_PATH="$work/cmuxbin:$work/bin:$PATH" pty_find "" billing)
+grep -q 'aborted (switched to another tab)' <<<"$out" || fail "a tab switch did not abort the jump:
+$out"
+
 # --- --go takes the best match without asking: s2 (title match), attached ----
 # No cmux on the PATH, so it attaches (and, with no terminal, says so).
 nocmux=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v cmux | paste -sd: -)
