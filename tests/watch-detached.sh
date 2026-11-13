@@ -425,6 +425,49 @@ seed_retry() {
     printf '%s\t%s\t%s\n' "$(( $(date +%s) + $2 ))" "$3" "$4" >> "$work/$1/config/hatter/autosave/reattach-retry"
 }
 
+# #203: when cmux had already dropped events the watcher missed, the recorded
+# sessions that run but are not in cmux are listed, not reattached.
+gapack='{"type":"ack","replay_count":0,"resume":{"after_seq":5,"gap":true,"oldest_seq":90}}'
+mkdir -p "$work/gap"; tree_of dev-web > "$work/gap/tree"
+d="$work/gap"
+out=$(watch gap <<<"$gapack
+SLEEP 2")
+expect "after a gap, the sessions that run but are not in cmux are listed (#203)" \
+    "$(grep -q '^after the gap, 3 recorded workspace(s) still run but are not in cmux: dev-api, dev two, ops-db\. ' <<<"$out" \
+       && [[ "$(reattached "$out")" == 0 ]] && grep -q 'hatter restore --missing' "$d/notes" && echo y)" "$out
+notes: $(cat "$d/notes")"
+expect "  and none is put on the retry list" "$([[ -z "$(retries "$d")" ]] && echo y)" "$(retries "$d")"
+# One already on the retry list is left to its retry.
+seed_retry gap-kept 600 0 ops-db
+tree_of dev-web > "$work/gap-kept/tree"
+out=$(watch gap-kept <<<"$gapack
+SLEEP 2")
+expect "  but not one already on the retry list" \
+    "$(grep -q '^after the gap, 2 recorded workspace(s) still run but are not in cmux: dev-api, dev two\. ' <<<"$out" && echo y)" "$out"
+# A server that does not answer is said, and its sessions are not listed.
+mkdir -p "$work/gap-down"; tree_of dev-web > "$work/gap-down/tree"
+echo ops@two.example.com > "$work/gap-down/down"
+out=$(watch gap-down <<<"$gapack
+SLEEP 2")
+expect "  a server that does not answer is said, not guessed at" \
+    "$(grep -qx 'after the gap, ops@two.example.com did not answer, so its workspaces were not checked' <<<"$out" \
+       && grep -q '^after the gap, 2 recorded workspace(s) still run but are not in cmux: dev-api, dev two\. ' <<<"$out" && echo y)" "$out"
+# Everything shown: said, and no notification.
+mkdir -p "$work/gap-all"; tree_of dev-api dev-web 'dev two' ops-db > "$work/gap-all/tree"
+d="$work/gap-all"
+out=$(watch gap-all <<<"$gapack
+SLEEP 2")
+expect "  with every running workspace in cmux, that is said and nothing is notified" \
+    "$(grep -qx 'after the gap, every recorded workspace that still runs is in cmux' <<<"$out" && [[ ! -s "$d/notes" ]] && echo y)" "$out
+notes: $(cat "$d/notes")"
+# No gap: nothing is checked.
+mkdir -p "$work/nogap"; tree_of dev-web > "$work/nogap/tree"
+d="$work/nogap"
+out=$(watch nogap <<<'{"type":"ack","replay_count":2,"resume":{"after_seq":5,"gap":false,"oldest_seq":1}}
+SLEEP 2')
+expect "a resume with nothing lost checks nothing" \
+    "$(! grep -q 'after the gap' <<<"$out" && [[ ! -s "$d/notes" ]] && echo y)" "$out"
+
 # A retry that is due is reattached; one not yet due waits.
 seed_retry retry-due -10 0 dev-api
 seed_retry retry-due 3600 0 dev-web
