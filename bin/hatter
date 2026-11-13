@@ -10578,8 +10578,12 @@ watch_closed() {
         fi
         if [[ "$ok" != 1 ]]; then
             # On a wake the network is often not up yet (#203, #229): a lost
-            # close is looked at again later rather than dropped.
-            if [[ "$kind" == lost ]] && watch_retry_note "$s"; then
+            # close is looked at again later rather than dropped. A server
+            # that does not answer says nothing about the session, so it
+            # costs no try: a lid closed for hours, then a network that is
+            # slow to come back, never runs the tries out.
+            if [[ "$kind" == lost ]]; then
+                watch_retry_wait "$s"
                 watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; looking again at $(watch_retry_when "$s")"
             else
                 watch_log "'$s' closed in cmux, but $host did not answer, so whether its tmux session still runs is unknown; left closed"
@@ -10718,6 +10722,26 @@ watch_retry_defer() {
     tries=${tries:-0}
     [[ "$tries" -le 0 ]] || tries=$((tries - 1))
     watch_retry_set "$1" "$(date +%s)" "$tries" || true
+}
+
+# watch_retry_wait <session>: its server did not answer, so look again
+# later at no cost in tries (#203). Unlike watch_retry_defer it waits, by
+# the delay of the try it is on, which does not grow while the server stays
+# silent. A try taken from the
+# list was counted when it was taken, so it is handed back. It never gives
+# up: the session leaves the list once the server answers, or when cmux
+# shows the workspace again.
+watch_retry_wait() {
+    local got due tries d i
+    got=$(watch_retry_get "$1")
+    IFS=$'\t' read -r due tries <<<"$got"
+    tries=${tries:-0}
+    [[ -z "$got" || "$tries" -le 0 ]] || tries=$((tries - 1))
+    # shellcheck disable=SC2206  # the delays are plain numbers
+    d=($WATCH_RETRY_DELAYS)
+    i=$tries
+    [[ "$i" -lt "${#d[@]}" ]] || i=$(( ${#d[@]} - 1 ))
+    watch_retry_set "$1" "$(( $(date +%s) + ${d[$i]} ))" "$tries" || true
 }
 
 # watch_retry_when <session>: the local time its next try is due.
@@ -12733,9 +12757,11 @@ brings it back. A close from a script, or from the sidebar of a workspace
 that is not selected, looks like cmux's own. So a session is reattached at
 most once in 30 minutes: closing it again keeps it closed, with the notice.
 
-A reattach that fails, or a server that does not answer, is tried again
-after 1, 2, 5, 10, 20 and 30 minutes, with a line in the log each time. Only
-when the last try fails does the notification come. While the Mac is in a
+A reattach that fails is tried again after 1, 2, 5, 10, 20 and 30 minutes,
+with a line in the log each time. Only when the last try fails does the
+notification come. A server that does not answer uses up no try: the
+session waits the same delay again, and is never given up for a server
+that is down, however long the network stays away. While the Mac is in a
 dark wake (awake for maintenance, display off) nothing is tried: it would
 fall asleep again half-way. The tries start once the Mac wakes. A close from a script while its server
 is down looks like cmux's own, so it too is reattached once the server
