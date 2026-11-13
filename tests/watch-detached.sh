@@ -542,6 +542,32 @@ expect "a lost close whose server does not answer is looked at again later (#229
     "$(grep -q "^'ops-db' closed in cmux, but ops@two.example.com did not answer.*; looking again at [0-9][0-9]:[0-9][0-9]$" <<<"$out" \
        && retries "$d" | grep -qE $'\t0\tops-db$' && ! grep -q ops-db "$d/notes" && echo y)" "$out"
 
+# A server that does not answer costs no try (#203): one taken from the list
+# on its fifth try is handed back and waits, where before its sixth was
+# counted and it was given up. Even on its last try it is never dropped for
+# a server that is down.
+seed_retry unreachable-spent -10 5 ops-db
+mkdir -p "$work/unreachable-spent"; echo ops@two.example.com > "$work/unreachable-spent/down"
+d="$work/unreachable-spent"
+out=$(watch unreachable-spent <<<"$ack
+SLEEP 2")
+due=$(retries "$d" | awk -F '\t' '$3 == "ops-db" { print $1 }')
+expect "a retry whose server does not answer keeps its tries and waits (#203)" \
+    "$(grep -q "^'ops-db' closed in cmux, but ops@two.example.com did not answer.*; looking again at [0-9][0-9]:[0-9][0-9]$" <<<"$out" \
+       && retries "$d" | grep -qE $'\t5\tops-db$' && [[ -n "$due" && "$due" -gt $(date +%s) ]] \
+       && ! grep -q 'gave up\|left closed' <<<"$out" && echo y)" "$out
+list: $(retries "$d")"
+
+# The same retry with the server answering: looked at and reattached, so the
+# try is spent and it leaves the list.
+seed_retry reachable-spent -10 5 ops-db
+d="$work/reachable-spent"
+out=$(watch reachable-spent <<<"$ack
+SLEEP 2")
+expect "  with the server answering, the same retry is reattached and leaves the list" \
+    "$(grep -qx 'reattach ops-db into Ops' <<<"$out" && [[ -z "$(retries "$d")" ]] && echo y)" "$out
+list: $(retries "$d")"
+
 # --- the reattach itself, outside the dry run ------------------------------------
 # hatter's functions, sourced without main, with hatter new, cmux and the lock
 # stubbed. $d/names is what it hands back to report (stdout), $d/log what it
