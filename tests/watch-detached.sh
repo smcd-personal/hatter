@@ -80,7 +80,17 @@ cat > "$work/bin/terminal-notifier" <<'STUB'
 #!/usr/bin/env bash
 while [[ $# -gt 0 ]]; do [[ "$1" == -message ]] && printf '%s\n' "$2" >> "$STUB_DIR/notes"; shift; done
 STUB
-chmod +x "$work/bin/cmux" "$work/bin/ssh" "$work/bin/terminal-notifier"
+# pmset: the Mac is in a dark wake (no Graphics) when $STUB_DIR/dark exists.
+cat > "$work/bin/pmset" <<'STUB'
+#!/usr/bin/env bash
+if [[ -f "$STUB_DIR/dark" ]]; then
+  echo "Current System Capabilities are: CPU Network "
+else
+  echo "Current System Capabilities are: CPU Graphics Audio Network "
+fi
+echo "Current Power State: 4"
+STUB
+chmod +x "$work/bin/cmux" "$work/bin/ssh" "$work/bin/terminal-notifier" "$work/bin/pmset"
 
 ack='{"type":"ack","resume":{"gap":false}}'
 # selected <session> [previous] [time]: a workspace selected in the sidebar.
@@ -399,9 +409,100 @@ out=$(watch reattach-fails HATTER_WATCH_REATTACH_RC=1 <<<"$ack
 SLEEP 2
 $(lost dev-api)
 SLEEP 2")
-expect "a reattach that fails is reported as before" \
-    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && logged "$out" dev-api dev-api \
-       && grep -q "'dev-api' closed in cmux" "$d/notes" && echo y)" "$out"
+retries() { cat "$1/config/hatter/autosave/reattach-retry" 2>/dev/null || true; }
+expect "a reattach that fails is tried again later, not reported yet (#229)" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" \
+       && grep -q "^'dev-api' was closed by cmux.*reattaching it failed: (dry run); trying again at [0-9][0-9]:[0-9][0-9]$" <<<"$out" \
+       && [[ "$(said "$out")" == 0 && ! -s "$d/notes" ]] && echo y)" "$out
+notes: $(cat "$d/notes")"
+expect "  and it is on the retry list, its reattach record dropped" \
+    "$(retries "$d" | grep -qE $'^[0-9]+\t0\tdev-api$' \
+       && ! grep -q dev-api "$d/config/hatter/autosave/reattached" 2>/dev/null && echo y)" "$(retries "$d")"
+
+# seed_retry <case> <due offset> <tries> <session>: a retry list before the run.
+seed_retry() {
+    mkdir -p "$work/$1/config/hatter/autosave"
+    printf '%s\t%s\t%s\n' "$(( $(date +%s) + $2 ))" "$3" "$4" >> "$work/$1/config/hatter/autosave/reattach-retry"
+}
+
+# A retry that is due is reattached; one not yet due waits.
+seed_retry retry-due -10 0 dev-api
+seed_retry retry-due 3600 0 dev-web
+d="$work/retry-due"
+out=$(watch retry-due <<<"$ack
+SLEEP 2")
+expect "a retry that is due is reattached, with no new close" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && [[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
+expect "  and leaves the list once back, while the one not due stays" \
+    "$(! retries "$d" | grep -q dev-api && retries "$d" | grep -qE $'\t0\tdev-web$' && echo y)" "$(retries "$d")"
+
+# A retry for a session cmux shows again, or that has ended, is dropped.
+mkdir -p "$work/retry-moot"; tree_of dev-web > "$work/retry-moot/tree"
+seed_retry retry-moot -10 1 dev-web
+seed_retry retry-moot -10 1 dev-old
+seed_retry retry-moot -10 1 dev-api
+d="$work/retry-moot"
+out=$(watch retry-moot <<<"$ack
+SLEEP 2")
+expect "a retry for a session shown again or ended is dropped, not reattached" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && [[ "$(reattached "$out")" == 1 ]] \
+       && [[ -z "$(retries "$d")" ]] && echo y)" "$out
+list: $(retries "$d")"
+
+# The last try fails: given up and reported as before.
+seed_retry retry-last -10 5 dev-api
+seed_retry retry-last -10 0 dev-web
+d="$work/retry-last"
+out=$(watch retry-last HATTER_WATCH_REATTACH_RC=1 <<<"$ack
+SLEEP 2")
+expect "the last retry failing is given up and reported" \
+    "$(grep -q "^'dev-api' was closed by cmux.*failed: (dry run); gave up after 6 tries$" <<<"$out" \
+       && logged "$out" dev-api dev-api && grep -q "'dev-api' closed in cmux" "$d/notes" && echo y)" "$out
+notes: $(cat "$d/notes")"
+expect "  while an earlier one failing stays on the list, its try counted" \
+    "$(grep -q "^'dev-web' was closed by cmux.*trying again at" <<<"$out" && ! grep -q dev-web "$d/notes" \
+       && retries "$d" | grep -qE $'\t1\tdev-web$' && ! retries "$d" | grep -q dev-api && echo y)" "$out
+list: $(retries "$d")"
+
+# In a dark wake a lost close waits for the Mac to wake: no look at the server,
+# no reattach, no try spent. A person's close is still reported. A retry that
+# is due is not taken.
+mkdir -p "$work/dark"; : > "$work/dark/dark"
+seed_retry dark -10 2 dev-web
+d="$work/dark"
+out=$(watch dark <<<"$ack
+SLEEP 2
+$(lost dev-api)
+$(close 'dev two')
+SLEEP 2")
+expect "a lost close in a dark wake waits for the wake (#229)" \
+    "$(grep -qx "'dev-api' closed in cmux while the Mac was in a dark wake; looking at it again once the Mac wakes" <<<"$out" \
+       && [[ "$(reattached "$out")" == 0 ]] && retries "$d" | grep -qE $'\t0\tdev-api$' && echo y)" "$out
+list: $(retries "$d")"
+expect "  a due retry is not taken, and a person's close is still reported" \
+    "$(retries "$d" | grep -qE $'\t2\tdev-web$' && logged "$out" 'dev two' "'dev two'" && [[ "$(said "$out")" == 1 ]] && echo y)" "$out
+list: $(retries "$d")"
+
+# The same, awake: reattached at once, nothing left on the list.
+d="$work/awake"
+out=$(watch awake <<<"$ack
+SLEEP 2
+$(lost dev-api)
+SLEEP 2")
+expect "  awake, the same close is reattached at once" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && [[ -z "$(retries "$d")" ]] && echo y)" "$out"
+
+# A server that does not answer a lost close: looked at again later. A
+# person's close on it is left closed, as before.
+mkdir -p "$work/unreachable-lost"; echo ops@two.example.com > "$work/unreachable-lost/down"
+d="$work/unreachable-lost"
+out=$(watch unreachable-lost <<<"$ack
+SLEEP 2
+$(lost ops-db)
+SLEEP 2")
+expect "a lost close whose server does not answer is looked at again later (#229)" \
+    "$(grep -q "^'ops-db' closed in cmux, but ops@two.example.com did not answer.*; looking again at [0-9][0-9]:[0-9][0-9]$" <<<"$out" \
+       && retries "$d" | grep -qE $'\t0\tops-db$' && ! grep -q ops-db "$d/notes" && echo y)" "$out"
 
 # --- the reattach itself, outside the dry run ------------------------------------
 # hatter's functions, sourced without main, with hatter new, cmux and the lock
@@ -470,15 +571,32 @@ expect "a workspace already open when the lock was taken is not detached" \
     "$(! grep -q 'close-workspace' "$work/re-opened/calls" && echo y)" "$(cat "$work/re-opened/calls")"
 
 reattach re-fail STUB_NEW_FAILS=1
-expect "a reattach that fails says why, and hands back just the session to report" \
-    "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api" "$work/re-fail/log" \
-       && [[ "$(names re-fail)" == dev-api ]] && echo y)" "names: $(cat "$work/re-fail/names")
+expect "a reattach that fails says why, and keeps the session for a retry rather than reporting it (#229)" \
+    "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api; trying again at" "$work/re-fail/log" \
+       && [[ -z "$(names re-fail)" ]] && retries "$work/re-fail" | grep -qE $'\t0\tdev-api$' && echo y)" \
+    "names: $(cat "$work/re-fail/names")
 log: $(cat "$work/re-fail/log")"
 
+# Its last try, taken from the list (which counted it): given up and handed back.
+seed_retry re-fail-last 3600 6 dev-api
+reattach re-fail-last STUB_NEW_FAILS=1
+expect "  and once its tries are used up, it is handed back to report" \
+    "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api; gave up after 6 tries" "$work/re-fail-last/log" \
+       && [[ "$(names re-fail-last)" == dev-api ]] && [[ -z "$(retries "$work/re-fail-last")" ]] && echo y)" \
+    "names: $(cat "$work/re-fail-last/names")
+log: $(cat "$work/re-fail-last/log")"
+
 reattach re-locked STUB_LOCKED=1
-expect "with another hatter command running, nothing is reattached and the session is handed back" \
-    "$(! grep -q '^new' "$work/re-locked/calls" && [[ "$(names re-locked)" == dev-api ]] && echo y)" \
+expect "with another hatter command running, nothing is reattached and the session waits for a retry" \
+    "$(! grep -q '^new' "$work/re-locked/calls" && [[ -z "$(names re-locked)" ]] \
+       && retries "$work/re-locked" | grep -qE $'\t0\tdev-api$' && echo y)" \
     "names: $(cat "$work/re-locked/names")"
+
+seed_retry re-locked-last 3600 6 dev-api
+reattach re-locked-last STUB_LOCKED=1
+expect "  and with its tries used up, it is handed back" \
+    "$(! grep -q '^new' "$work/re-locked-last/calls" && [[ "$(names re-locked-last)" == dev-api ]] && echo y)" \
+    "names: $(cat "$work/re-locked-last/names")"
 
 mkdir -p "$work/re-norecord/config/hatter/autosave"; chmod 555 "$work/re-norecord/config/hatter/autosave"
 reattach re-norecord
