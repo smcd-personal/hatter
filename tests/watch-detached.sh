@@ -483,6 +483,44 @@ expect "  a due retry is not taken, and a person's close is still reported" \
     "$(retries "$d" | grep -qE $'\t2\tdev-web$' && logged "$out" 'dev two' "'dev two'" && [[ "$(said "$out")" == 1 ]] && echo y)" "$out
 list: $(retries "$d")"
 
+# A try taken and then put off by a dark wake is handed back: the entry was
+# at 3 when taken (now 4), and the dark wake's close of it leaves it at 3.
+mkdir -p "$work/dark-taken"; : > "$work/dark-taken/dark"
+seed_retry dark-taken 3600 4 dev-api
+d="$work/dark-taken"
+out=$(watch dark-taken <<<"$ack
+SLEEP 2
+$(lost dev-api)
+SLEEP 2")
+expect "  a taken try put off by a dark wake is handed back" \
+    "$(retries "$d" | grep -qE $'\t3\tdev-api$' && echo y)" "$out
+list: $(retries "$d")"
+
+# A retry inside the reattach gap is reported once and leaves the list (review
+# of #229): otherwise each later try would report it again.
+mkdir -p "$work/retry-gap/config/hatter/autosave"
+printf '%s\tdev-api\n' "$(date +%s)" > "$work/retry-gap/config/hatter/autosave/reattached"
+seed_retry retry-gap -10 1 dev-api
+seed_retry retry-gap -10 1 dev-web
+d="$work/retry-gap"
+out=$(watch retry-gap <<<"$ack
+SLEEP 2")
+expect "a retry inside the reattach gap is reported once and leaves the list" \
+    "$(logged "$out" dev-api dev-api && grep -qx 'reattach dev-web into Work' <<<"$out" \
+       && [[ "$(reattached "$out")" == 1 && -z "$(retries "$d")" ]] && echo y)" "$out
+list: $(retries "$d")"
+
+# One whose tries are used up and was never settled is dropped with a log line.
+seed_retry retry-spent -10 6 dev-api
+seed_retry retry-spent -10 0 dev-web
+d="$work/retry-spent"
+out=$(watch retry-spent <<<"$ack
+SLEEP 2")
+expect "a retry with its tries used up is dropped, and the log says so" \
+    "$(grep -qx "'dev-api': gave up reattaching it after 6 tries" <<<"$out" \
+       && grep -qx 'reattach dev-web into Work' <<<"$out" && [[ "$(reattached "$out")" == 1 && -z "$(retries "$d")" ]] && echo y)" "$out
+list: $(retries "$d")"
+
 # The same, awake: reattached at once, nothing left on the list.
 d="$work/awake"
 out=$(watch awake <<<"$ack

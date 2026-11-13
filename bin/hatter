@@ -10505,9 +10505,9 @@ watch_closed() {
         [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || { watch_retry_clear "$s"; continue; }
         if grep -qxF -- "$s" <<<"$shown"; then watch_retry_clear "$s"; continue; fi
         hat=$(session_hat "$s")
-        [[ -n "$hat" ]] || continue
-        host=$(hat_ssh "$hat" 2>/dev/null) || continue
-        [[ -n "$host" ]] || continue
+        [[ -n "$hat" ]] || { watch_retry_clear "$s"; continue; }
+        host=$(hat_ssh "$hat" 2>/dev/null) || host=""
+        [[ -n "$host" ]] || { watch_retry_clear "$s"; continue; }
         # A person's close is theirs: no retry is owed any more.
         [[ "${kind:-user}" == lost ]] || watch_retry_clear "$s"
         # In a dark wake the Mac is back asleep within seconds, and the
@@ -10552,6 +10552,9 @@ watch_closed() {
             lives+=$(printf '%s\n' "$live" | AWK_H="$host" awk '{ print ENVIRON["AWK_H"] "\t" $0 }')$'\n'
             continue
         fi
+        # Reported, so no retry is owed: one inside the reattach gap would
+        # otherwise be reported again at each try.
+        watch_retry_clear "$s"
         cmd="hatter new $(watch_word "$s")"
         watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
         said+="${said:+, }$s"; n=$((n + 1))
@@ -10662,12 +10665,15 @@ watch_retry_note() {
 }
 
 # watch_retry_defer <session>: look at it again as soon as the Mac is awake,
-# at no cost in tries.
+# at no cost in tries. A try taken from the list and then put off was counted
+# when it was taken, so it is handed back.
 watch_retry_defer() {
     local got due tries
     got=$(watch_retry_get "$1")
     IFS=$'\t' read -r due tries <<<"$got"
-    watch_retry_set "$1" "$(date +%s)" "${tries:-0}" || true
+    tries=${tries:-0}
+    [[ "$tries" -le 0 ]] || tries=$((tries - 1))
+    watch_retry_set "$1" "$(date +%s)" "$tries" || true
 }
 
 # watch_retry_when <session>: the local time its next try is due.
@@ -10690,21 +10696,30 @@ watch_retry_due() {
 
 # watch_retry_take: prints "<session> TAB lost" for each one due, counting the
 # try and setting when the next is due. One whose tries are used up and was
-# never noted again (it left the config, say) is dropped.
+# never noted again is dropped, and the log says so: watch_closed clears every
+# entry it settles, so this is a session it could not place.
 watch_retry_take() {
-    local f
+    local f got s k
     f=$(watch_retry_file)
     [[ -s "$f" ]] || return 0
     rm -f "$f.tmp"
-    AWK_T=$(date +%s) AWK_D="$WATCH_RETRY_DELAYS" AWK_M="$WATCH_RETRY_MAX" awk -F '\t' -v OFS='\t' -v out="$f.tmp" '
+    got=$(AWK_T=$(date +%s) AWK_D="$WATCH_RETRY_DELAYS" AWK_M="$WATCH_RETRY_MAX" awk -F '\t' -v OFS='\t' -v out="$f.tmp" '
         BEGIN { n = split(ENVIRON["AWK_D"], d, " "); now = ENVIRON["AWK_T"] + 0; max = ENVIRON["AWK_M"] + 0 }
         $3 == "" { next }
         $1 + 0 > now { print > out; next }
-        $2 + 0 >= max { next }
+        $2 + 0 >= max { print $3 "\tdrop"; next }
         { t = $2 + 1; i = (t + 1 <= n) ? t + 1 : n
           print now + d[i], t, $3 > out
-          print $3 "\tlost" }' "$f" 2>/dev/null || { rm -f "$f.tmp"; return 0; }
+          print $3 "\tlost" }' "$f" 2>/dev/null) || { rm -f "$f.tmp"; return 0; }
     if [[ -s "$f.tmp" ]]; then mv "$f.tmp" "$f"; else rm -f "$f" "$f.tmp"; fi
+    while IFS=$'\t' read -r s k; do
+        [[ -n "$s" ]] || continue
+        if [[ "$k" == drop ]]; then
+            watch_log "'$s': gave up reattaching it after $WATCH_RETRY_MAX tries" >&2
+        else
+            printf '%s\tlost\n' "$s"
+        fi
+    done <<<"$got"
     return 0
 }
 
@@ -10833,7 +10848,11 @@ watch_act() {
         mtime=$(lock_mtime "$LOCK_DIR")
         [[ "$mtime" -gt 0 && $(( $(date +%s) - mtime )) -gt "$LOCK_STALE_SECONDS" ]] || return 0
     fi
-    [[ "$retry" == 0 ]] || closes+=$(watch_retry_take)$'\n'
+    if [[ "$retry" == 1 ]]; then
+        local due_now
+        due_now=$(watch_retry_take)
+        [[ -z "$due_now" ]] || closes+="$due_now"$'\n'
+    fi
     [[ -z "$closes" ]] || watch_closed "$closes"
     closes=""
     watch_sync
@@ -12674,7 +12693,9 @@ A reattach that fails, or a server that does not answer, is tried again
 after 1, 2, 5, 10, 20 and 30 minutes, with a line in the log each time. Only
 when the last try fails does the notification come. While the Mac is in a
 dark wake (awake for maintenance, display off) nothing is tried: it would
-fall asleep again half-way. The tries start once the Mac wakes. The list
+fall asleep again half-way. The tries start once the Mac wakes. A close from a script while its server
+is down looks like cmux's own, so it too is reattached once the server
+answers; close it again to keep it closed. The list
 of pending tries is ~/.config/hatter/autosave/reattach-retry. A workspace
 someone closed, and whose server does not answer, gets no reattach and no
 notification, only a line in the log. The rack lists such sessions at the
