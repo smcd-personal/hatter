@@ -251,6 +251,15 @@ printf 'dev-a\n' > "$d/server"
 STUB_GROUPS_FAIL=1 hatter_in sync || true
 expect "sync: with cmux's groups unreadable, an empty group is kept" \
     "$(yes_if all_of group_in E -- lacks forgotten)"
+# A window that shows no group at all (cmux just restarted) says nothing
+# about which were deleted.
+setup deleted-group-bare
+add_empty_groups
+echo '{"groups": []}' > "$d/groups.json"
+printf 'dev-a\ndev-b\ndev-d\ndev-l\n%s\n' "$Q" > "$d/server"
+hatter_in sync || true
+expect "sync: with no group shown in the window, an empty group is kept" \
+    "$(yes_if all_of group_in E -- lacks forgotten)"
 # An unreachable server leaves its hat's config alone, empty groups included.
 setup deleted-group-down
 add_empty_groups

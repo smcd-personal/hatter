@@ -9567,9 +9567,10 @@ sync_once() {
         # deleted in cmux (#235). Kept, it would be made again by the next
         # restore. One that still records a session stays: cmux also drops a
         # group when its last workspace closes, and the session may run on.
-        # Unassigned is left to PRUNE_UNASSIGNED, and a window whose groups
-        # could not be read says nothing about what is gone.
-        if [[ "$gread" == 1 ]]; then
+        # Unassigned is left to PRUNE_UNASSIGNED. A window whose groups could
+        # not be read says nothing about what is gone, and nor does one that
+        # shows no group at all: cmux just restarted, or the window is new.
+        if [[ "$gread" == 1 ]] && jq -e '(.groups // []) | length > 0' <<<"$groups_json" >/dev/null; then
             while IFS= read -r rg; do
                 [[ -z "$rg" ]] && continue
                 forget+="$rg"$'\n'
