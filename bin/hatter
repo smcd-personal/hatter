@@ -9379,7 +9379,7 @@ sync_once() {
     wait
 
     # Work out the new config, all in memory, saying what was found.
-    local patch='{}' adopt="" w host gname gkey order recorded owner wjson seen ukey
+    local patch='{}' adopt="" forget="" w host gname gkey order recorded owner wjson seen ukey
     local lives=() wjsons=() gjsons=() wsjsons=() insts=() inst
     for ((i = 0; i < n; i++)); do
         hat="${hats[$i]}" w="${wins[$i]}" host="${hosts[$i]}"
@@ -9563,6 +9563,26 @@ sync_once() {
                           '.[$g].sessions[$s] = $e' <<<"$patch")
         done <<<"$unseen"
 
+        # A group the window no longer shows, and that records no session, was
+        # deleted in cmux (#235). Kept, it would be made again by the next
+        # restore. One that still records a session stays: cmux also drops a
+        # group when its last workspace closes, and the session may run on.
+        # Unassigned is left to PRUNE_UNASSIGNED, and a window whose groups
+        # could not be read says nothing about what is gone.
+        if [[ "$gread" == 1 ]]; then
+            while IFS= read -r rg; do
+                [[ -z "$rg" ]] && continue
+                forget+="$rg"$'\n'
+                echo "  $hat / $(group_display "$rg")  forgotten (empty, and no longer in cmux)"
+            done < <(cfg --arg l "$hat" --argjson cm "$groups_json" --argjson p "$patch" '
+                [$cm.groups[]?.name] as $shown
+                | .groups | to_entries[]
+                | select(.value.hat == $l and (.value.managed | not))
+                | select((.value.sessions // {}) | length == 0)
+                | select((.value.name // .key) as $n | $shown | index($n) | not)
+                | select(.key as $k | $p | has($k) | not)
+                | .key')
+        fi
     done
     rm -rf "$tmp"
     cmux_snapshot_drop
@@ -9585,8 +9605,9 @@ sync_once() {
     while IFS=$'\x1f' read -r gname hat; do
         [[ -n "$gname" ]] && register_group "$gname" "$hat"
     done <<<"$adopt"
-    jq_write --argjson p "$patch" '
-        reduce ($p | to_entries[]) as $e (.;
+    jq_write --argjson p "$patch" --argjson f "$(printf '%s' "$forget" | jq -R . | jq -sc .)" '
+        reduce $f[] as $k (.; del(.groups[$k]))
+        | reduce ($p | to_entries[]) as $e (.;
             .groups[$e.key].color       = $e.value.color
             | .groups[$e.key].icon      = $e.value.icon
             | .groups[$e.key].pinned    = $e.value.pinned
@@ -13451,6 +13472,9 @@ Subcommands:
   rename <old> <new>            Rename it in cmux and in the config together
   rm <name>                     Forget a group (cmux group left alone)
 
+An empty group deleted in cmux needs no `group rm`: the next sync forgets it
+(see: hatter help sync).
+
   hatter group add "Atlas" --hat dev
 USAGE
     ;;
@@ -13526,6 +13550,12 @@ restore --missing` mirrors again, or "kept (running, in no cmux group)", which
 sync then puts back in its group in cmux. An entry is dropped only when its
 session is no longer running on the server: "dropped (not running)". To close
 a workspace for good, use `hatter rm`.
+
+A group is forgotten once cmux no longer shows it and it records no session:
+"forgotten (empty, and no longer in cmux)". So deleting an empty group in cmux
+is enough, and restore does not make it again. A group cmux no longer shows
+that still records a session is kept, since cmux also drops a group when its
+last workspace closes.
 
 A session that is not running is dropped only if sync saw it running on the
 tmux server running now: then it ended, rather than being lost when the server

@@ -221,6 +221,43 @@ expect "sync: every ssh call has keepalives" \
     "$(yes_if bash -c '! grep -v "ServerAliveInterval=10 -o ServerAliveCountMax=3" "$1"' _ "$d/sshargs")"
 [[ "$fails" == 0 ]] || cat "$d/out"
 
+# --- sync: a group deleted in cmux is forgotten (#235) -------------------------
+# E records nothing and cmux no longer shows it: deleted there, so forgotten,
+# or the next restore would make it again. F records nothing but cmux still
+# shows it, so it stays. H records a running session cmux does not show: cmux
+# drops a group when its last workspace closes, so H stays as well.
+add_empty_groups() {
+    jq '.groups.E = {"hat": "dev", "sessions": {}} | .groups.F = {"hat": "dev", "sessions": {}}' \
+        "$d/home/.config/hatter/config.json" > "$d/c" && mv "$d/c" "$d/home/.config/hatter/config.json"
+    jq '.groups += [{"id": "g-2", "name": "F", "member_workspace_ids": []}]' \
+        "$d/groups.json" > "$d/g" && mv "$d/g" "$d/groups.json"
+}
+group_in() { [ "$(jq -r --arg g "$1" '.groups | has($g)' < "$d/home/.config/hatter/config.json")" = true ]; }
+group_gone() { ! group_in "$1"; }
+setup deleted-group
+add_empty_groups
+printf 'dev-a\ndev-b\ndev-d\ndev-l\n%s\ndev-h\n' "$Q" > "$d/server"
+hatter_in sync || true
+expect "sync: an empty group cmux no longer shows is forgotten" \
+    "$(yes_if all_of group_gone E -- says "dev / E  forgotten (empty, and no longer in cmux)")"
+expect "sync: an empty group cmux still shows is kept" "$(yes_if all_of group_in F -- lacks "dev / F  forgotten")"
+expect "sync: a group cmux does not show that records a session is kept" \
+    "$(yes_if all_of has H dev-h -- lacks "dev / H  forgotten")"
+expect "sync: ...and the rest of the config is still written" "$(yes_if hasnt G dev-c)"
+# Groups that cmux could not read say nothing about what was deleted.
+setup deleted-group-unread
+add_empty_groups
+printf 'dev-a\n' > "$d/server"
+STUB_GROUPS_FAIL=1 hatter_in sync || true
+expect "sync: with cmux's groups unreadable, an empty group is kept" \
+    "$(yes_if all_of group_in E -- lacks forgotten)"
+# An unreachable server leaves its hat's config alone, empty groups included.
+setup deleted-group-down
+add_empty_groups
+touch "$d/down"
+hatter_in sync || true
+expect "sync: with the server unreachable, an empty group is kept" "$(yes_if group_in E)"
+
 # --- sync: a server only part way back drops nothing ---------------------------
 # Only dev-a runs: five of the seven recorded sessions would go at once.
 setup partial
