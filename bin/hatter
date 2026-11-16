@@ -10575,6 +10575,228 @@ watch_signin() {
     return 0
 }
 
+# Ready after a wake (#237). After the Mac sleeps or restarts, cmux reconnects
+# its mirrors and the watcher reattaches what cmux dropped (watch_closed) and
+# restores hats cmux gave up on (watch_signin). This says when that is over,
+# in one notification per wake:
+#   - "ready": every workspace that was there before is back and connected;
+#   - "sign in to <dest>": everything else is back, but cmux is waiting on a
+#     "Sign in to <dest>" workspace the watcher could not clear. It is posted
+#     on that workspace's tab, so a click opens it;
+#   - "not all back": WATCH_READY_CAP passed first. It names what is missing,
+#     and a host that did not answer.
+#
+# What "before" means is $AUTOSAVE_DIR/mirrored: "<hat> TAB <session>" for
+# each recorded session that cmux showed, attached, at the last look while
+# awake (every WATCH_MIRRORED_EVERY seconds). A file, so a restart of the Mac
+# keeps it. A workspace closed on purpose, or one that never connected, is
+# not in it and is not waited for. With no file yet, every recorded session
+# that still runs is.
+#
+# A wake is the clock jumping WATCH_WAKE_JUMP seconds or more between two
+# rounds of the watcher (the process was asleep with the Mac), or a watcher
+# that starts within WATCH_WAKE_BOOT seconds of boot. A dark wake does not
+# count until the Mac wakes for real. Ready has to be seen on two looks in a
+# row, WATCH_READY_EVERY apart, so a heal or a reattach still under way is
+# not cut off. "prefs": {"wake_notify": "off"} turns it off.
+WATCH_WAKE_JUMP=90
+WATCH_WAKE_BOOT=600
+WATCH_READY_MIN=10          # first look this long after the wake
+WATCH_READY_EVERY=10
+WATCH_READY_SIGNIN_WAIT=45  # watch_signin gets this long to clear a sign-in
+WATCH_READY_CAP=180
+WATCH_MIRRORED_EVERY=300
+WATCH_TICK=0
+WATCH_WAKE_PENDING=0
+WATCH_WAKE_AT=0
+WATCH_READY_LAST=0
+WATCH_READY_PREV=""
+WATCH_MIRRORED_AT=0
+
+# mac_boot_time: when the Mac booted, in epoch seconds. False off a Mac.
+mac_boot_time() {
+    local s
+    s=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ *sec *= *\([0-9][0-9]*\).*/\1/p') || return 1
+    [[ -n "$s" ]] || return 1
+    printf '%s\n' "$s"
+}
+
+# cmux_attached <host> <session>: cmux's mirror of it is connected.
+cmux_attached() {
+    cmux rpc remote.tmux.state "$(jq -nc --arg h "$1" --arg s "$2" '{host: $h, session: $s}')" 2>/dev/null \
+        | jq -e '.attached == true' >/dev/null 2>&1
+}
+
+watch_mirrored_file() { printf '%s/mirrored' "$AUTOSAVE_DIR"; }
+
+# "<hat> TAB <session>" for every recorded session, once each.
+watch_recorded() {
+    cfg '.groups[]? | .hat as $h | .sessions | keys_unsorted[]? | "\($h)\t\(.)"' 2>/dev/null | awk '!seen[$0]++'
+}
+
+# watch_wake_tick: start of a watcher round. Notices a wake and arms the look.
+watch_wake_tick() {
+    local now boot
+    now=$(date +%s)
+    if [[ "$WATCH_TICK" == 0 ]]; then
+        if boot=$(mac_boot_time) && (( now - boot < WATCH_WAKE_BOOT )); then WATCH_WAKE_PENDING=1; fi
+    elif (( now - WATCH_TICK >= WATCH_WAKE_JUMP )); then
+        WATCH_WAKE_PENDING=1
+    fi
+    WATCH_TICK=$now
+    [[ "$WATCH_WAKE_PENDING" == 1 ]] || return 0
+    mac_dark_wake && return 0
+    WATCH_WAKE_PENDING=0
+    [[ "$(cfg '.prefs.wake_notify // "on"' 2>/dev/null)" != off ]] || return 0
+    WATCH_WAKE_AT=$now; WATCH_READY_LAST=0; WATCH_READY_PREV=""
+    watch_log "the Mac woke; watching for everything to come back"
+    return 0
+}
+
+# watch_mirrored_snap: while awake and settled, record what is connected now.
+watch_mirrored_snap() {
+    local now tree shown hat s host f out=""
+    now=$(date +%s)
+    (( now - WATCH_MIRRORED_AT >= WATCH_MIRRORED_EVERY )) || return 0
+    [[ "$WATCH_WAKE_PENDING" == 0 && ! -d "$LOCK_DIR" ]] || return 0
+    mac_dark_wake && return 0
+    WATCH_MIRRORED_AT=$now
+    tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" == array ]] || return 0
+    shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
+    while IFS=$'\t' read -r hat s; do
+        [[ -n "$s" ]] || continue
+        grep -qxF -- "$s" <<<"$shown" || continue
+        host=$(hat_ssh "$hat" 2>/dev/null) || continue
+        [[ -n "$host" ]] || continue
+        cmux_attached "$host" "$s" || continue
+        out+="$hat"$'\t'"$s"$'\n'
+    done < <(watch_recorded)
+    f=$(watch_mirrored_file)
+    [[ "$(cat "$f" 2>/dev/null)"$'\n' != "$out" ]] || return 0
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+    { printf '%s' "$out" > "$f.tmp" && mv "$f.tmp" "$f"; } 2>/dev/null || rm -f "$f.tmp"
+    return 0
+}
+
+# watch_ready_look: one look at how far the recovery is. Prints
+#   back TAB <n>                      sessions that are back and connected
+#   signin TAB <dest> TAB <surface>   a hat's sign-in workspace is open
+#   wait TAB <session> TAB <why>      expected, not back yet
+#   down TAB <host> TAB <why>         did not answer, so its missing are unknown
+# False when cmux's windows cannot be read.
+watch_ready_look() {
+    local tree shown signins hat s host n=0 lives="" live why expect
+    tree=$(cmux_json tree --all 2>/dev/null) || return 1
+    [[ "$(jq -r '.windows | type' <<<"$tree" 2>/dev/null)" == array ]] || return 1
+    shown=$(jq -r '.windows[].workspaces[]?.title // empty' <<<"$tree")
+    signins=""
+    while IFS=$'\t' read -r s host; do
+        [[ -n "$s" ]] || continue
+        [[ -n "$(cfg --arg d "$s" '.hats | to_entries[] | select(.value.ssh == $d) | .key' 2>/dev/null)" ]] || continue
+        signins+="$s"$'\n'
+        printf 'signin\t%s\t%s\n' "$s" "$host"
+    done < <(jq -r '[.windows[]?.workspaces[]? | select((.title // "") | startswith("Sign in to "))
+            | {d: (.title | ltrimstr("Sign in to ")), s: ([.panes[]?.surfaces[]?.id // empty][0] // "")}]
+            | unique_by(.d)[] | [.d, .s] | @tsv' <<<"$tree" 2>/dev/null)
+    if [[ -s "$(watch_mirrored_file)" ]]; then expect=$(cat "$(watch_mirrored_file)"); else expect=$(watch_recorded); fi
+    while IFS=$'\t' read -r hat s; do
+        [[ -n "$s" ]] || continue
+        host=$(hat_ssh "$hat" 2>/dev/null) || continue
+        [[ -n "$host" ]] || continue
+        # Its host is waiting on a sign-in: that is the one thing to do.
+        grep -qxF -- "$host" <<<"$signins" && continue
+        if grep -qxF -- "$s" <<<"$shown"; then
+            if cmux_attached "$host" "$s"; then n=$((n + 1)); else printf 'wait\t%s\tnot connected\n' "$s"; fi
+            continue
+        fi
+        # Not shown: still running (missing) or ended? One look per host.
+        if [[ $'\n'"$lives" != *$'\n'"$host"$'\t'* ]]; then
+            if live=$(hat_live_sessions "$host" 2>"$AUTOSAVE_DIR/.ready-err"); then
+                lives+="$host"$'\t'"ok"$'\n'
+                lives+=$(printf '%s\n' "$live" | AWK_H="$host" awk 'NF { print ENVIRON["AWK_H"] "\t=" $0 }')$'\n'
+            else
+                why=$(head -n 1 "$AUTOSAVE_DIR/.ready-err" 2>/dev/null)
+                lives+="$host"$'\t'"down"$'\n'
+                printf 'down\t%s\t%s\n' "$host" "${why:-no answer}"
+            fi
+            rm -f "$AUTOSAVE_DIR/.ready-err"
+        fi
+        [[ $'\n'"$lives" == *$'\n'"$host"$'\t'"ok"$'\n'* ]] || continue
+        [[ $'\n'"$lives" == *$'\n'"$host"$'\t'"=$s"$'\n'* ]] || continue
+        printf 'wait\t%s\tnot in cmux\n' "$s"
+    done < <(printf '%s\n' "$expect" | sort -t $'\t' -k1,1 -s)
+    printf 'back\t%s\n' "$n"
+    return 0
+}
+
+# "38s", "2m05s"
+watch_took() {
+    local t="$1"
+    if (( t < 60 )); then printf '%ss' "$t"; else printf '%dm%02ds' $((t / 60)) $((t % 60)); fi
+}
+
+# watch_ready: while a wake is armed, look every WATCH_READY_EVERY seconds and
+# post the one notification when it is over. Otherwise keep the record of
+# what is connected up to date.
+watch_ready() {
+    [[ "$WATCH_WAKE_AT" != 0 ]] || { watch_mirrored_snap; return 0; }
+    local now took look n waits downs signins first fsurf others state capped body
+    now=$(date +%s)
+    took=$((now - WATCH_WAKE_AT))
+    (( took >= WATCH_READY_MIN )) || return 0
+    (( now - WATCH_READY_LAST >= WATCH_READY_EVERY )) || return 0
+    # A hatter command is changing cmux; look once it is done.
+    [[ ! -d "$LOCK_DIR" ]] || return 0
+    mac_dark_wake && return 0
+    WATCH_READY_LAST=$now
+    look=$(watch_ready_look) || return 0
+    n=$(awk -F '\t' '$1 == "back" { print $2 }' <<<"$look")
+    waits=$(awk -F '\t' '$1 == "wait" { printf "%s%s (%s)", (k++ ? ", " : ""), $2, $3 }' <<<"$look")
+    downs=$(awk -F '\t' '$1 == "down" { printf "%s%s (%s)", (k++ ? ", " : ""), $2, $3 }' <<<"$look")
+    signins=$(awk -F '\t' '$1 == "signin" { print $2 }' <<<"$look")
+    first=$(head -n 1 <<<"$signins")
+    fsurf=$(awk -F '\t' '$1 == "signin" { print $3; exit }' <<<"$look")
+    others=$(tail -n +2 <<<"$signins" | paste -sd, - | sed 's/,/, /g')
+    capped=0; (( took < WATCH_READY_CAP )) || capped=1
+    state=""
+    if [[ -z "$waits" && -z "$downs" ]]; then
+        if [[ -z "$signins" ]]; then state=ready
+        elif (( took >= WATCH_READY_SIGNIN_WAIT )); then state="signin $signins"
+        fi
+    fi
+    if [[ -n "$state" && "$state" != "$WATCH_READY_PREV" ]]; then
+        # Seen once: it has to hold until the next look.
+        WATCH_READY_PREV=$state
+        return 0
+    fi
+    if [[ -z "$state" && "$capped" == 0 ]]; then
+        WATCH_READY_PREV=""
+        return 0
+    fi
+    WATCH_WAKE_AT=0; WATCH_READY_PREV=""
+    # What is connected now is the new "before".
+    WATCH_MIRRORED_AT=0
+    if [[ "$state" == ready ]]; then
+        watch_log "after the wake, everything is back: $n workspace(s) in $(watch_took "$took")"
+        watch_notify "hatter: ready" "All $n workspaces are back ($(watch_took "$took") after waking)."
+    elif [[ -n "$state" ]]; then
+        body="Everything else is back. Click to open the sign-in tab."
+        [[ -z "$others" ]] || body+=" Also waiting to sign in: $others."
+        watch_log "after the wake, everything else is back, but cmux waits to sign in to $first${others:+ and $others}"
+        watch_notify "hatter: sign in to $first" "$body" "$fsurf"
+    else
+        body="$n back after $(watch_took "$took")."
+        [[ -z "$signins" ]] || body="Sign in to $first${others:+, $others} (click). $body"
+        [[ -z "$waits" ]] || body+=" Still missing: $waits."
+        [[ -z "$downs" ]] || body+=" Did not answer: $downs."
+        [[ -z "$waits" ]] || body+=" Bring them back: hatter restore --missing"
+        watch_log "after the wake, not everything came back in $(watch_took "$took"):${signins:+ waiting to sign in to $(paste -sd, - <<<"$signins");}${waits:+ missing $waits;}${downs:+ no answer from $downs}"
+        watch_notify "hatter: not all back" "$body" "$fsurf"
+    fi
+    return 0
+}
+
 # watch_closed <title TAB user|lost lines>: the workspaces cmux closed while
 # their tmux sessions still run. cmux can close a mirrored workspace by itself:
 # when the ssh connection under its tmux mirror drops (after the Mac sleeps,
@@ -10964,6 +11186,7 @@ watch_reattach() {
 # after the lock goes. A lock old enough to be stale does not hold it up.
 watch_act() {
     local w sf mtime
+    watch_wake_tick
     if [[ "$heal_all" == 1 ]]; then
         watch_heal
     elif [[ -n "$heals" ]]; then
@@ -10973,6 +11196,7 @@ watch_act() {
     fi
     heals=""; heal_all=0
     watch_signin
+    watch_ready
     # A reattach that is due again (#229) is a close to look at, like one
     # that just came in.
     local retry=0
@@ -11044,6 +11268,8 @@ watch_stream() {
         # A quiet moment: act on what came in. The fifo stays out of the
         # commands it runs (an ssh master left running would hold it open).
         watch_act 3<&-
+        # A long round (a restore) is not a wake: time it from its end.
+        WATCH_TICK=$(date +%s)
         since=0
         if watch_updated; then rc=3; break; fi
     done
@@ -12840,6 +13066,19 @@ of pending tries is ~/.config/hatter/autosave/reattach-retry. A workspace
 someone closed, and whose server does not answer, gets no reattach and no
 notification, only a line in the log. The rack lists such sessions at the
 top.
+
+After the Mac wakes, or starts up, the watcher posts one notification once
+everything is back, so you know when to start: "hatter: ready" when every
+workspace that was connected before the sleep is back in cmux and connected
+again. If cmux is still waiting on a "Sign in to <host>" workspace that the
+watcher could not clear by itself, the notification is "hatter: sign in to
+<host>" instead, and clicking it opens that sign-in tab. If not everything is
+back within 3 minutes, "hatter: not all back" names what is missing and any
+server that did not answer. A workspace you closed before the sleep is not
+waited for: the watcher keeps a list of what is connected, refreshed every 5
+minutes while the Mac is awake, in ~/.config/hatter/autosave/mirrored. A dark
+wake does not count. Turn it off with "prefs": {"wake_notify": "off"} in the
+config.
 
 The log also says when the event stream resumes, from which event, and
 whether cmux had already dropped some of what happened while the watcher was
