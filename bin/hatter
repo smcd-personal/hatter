@@ -3228,14 +3228,15 @@ case "${ev:-}" in
         msg=$(printf '%s' "$payload" | jq -r '.last_assistant_message // empty | tostring' 2>/dev/null) || msg=""
         if [ -z "$msg" ]; then
             tp=$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null) || tp=""
-            if [ -n "$tp" ] && [ -r "$tp" ]; then
-                msg=$(tail -n 400 "$tp" 2>/dev/null | jq -Rnr '[inputs | fromjson?
+            if [ -n "$tp" ] && [ -f "$tp" ] && [ -r "$tp" ]; then
+                # A line of an unexpected shape is skipped, not fatal.
+                msg=$(tail -n 400 "$tp" 2>/dev/null | jq -Rnr '[inputs | try (fromjson
                     | select(type == "object" and .type == "assistant")
                     | .message.content
                     | if type == "string" then .
-                      elif type == "array" then map(select(.type == "text") | .text) | join("\n")
+                      elif type == "array" then map(select(.type == "text") | .text | tostring) | join("\n")
                       else "" end
-                    | select(length > 0)] | last // empty' 2>/dev/null) || msg=""
+                    | select(length > 0)) catch empty] | last // empty' 2>/dev/null) || msg=""
             fi
         fi
         if [ -n "$msg" ] && printf '%s' "$msg" | jq -Rse \

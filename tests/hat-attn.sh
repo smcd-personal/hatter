@@ -127,6 +127,7 @@ RUN
         echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Earlier, ok?"}]}}'
         echo '{"type":"user","message":{"content":"yes"}}'
         echo 'not json'
+        echo '{"type":"assistant","message":"a string, not an object"}'
         echo '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"Want me to open the PR?"}]}}'
         echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}'
     } > "$work/t-question.jsonl"
