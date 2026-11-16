@@ -51,7 +51,7 @@ watch() {
     : > "$d/calls"
     env XDG_CONFIG_HOME="$d/config" PATH="$work/bin:$PATH" STUB_EVENTS="$d/events" \
         STUB_SELF="$work/self/hatter" STUB_LOCK="$d/config/hatter/.lock" STUB_CALLS="$d/calls" \
-        HATTER_WATCH_DRY=1 HATTER_WATCH_ONCE=1 "$@" \
+        HATTER_WATCH_DRY=1 HATTER_WATCH_ONCE=1 HATTER_BOOT_TIME=1 "$@" \
         /bin/bash "$work/self/hatter" autosave watch 2>&1 </dev/null \
         | sed -E 's/^[0-9-]+ [0-9:]+ watch: //' || true
 }

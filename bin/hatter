@@ -10614,8 +10614,11 @@ WATCH_READY_PREV=""
 WATCH_MIRRORED_AT=0
 
 # mac_boot_time: when the Mac booted, in epoch seconds. False off a Mac.
+# HATTER_BOOT_TIME stands in for it: the tests set it, so a machine that just
+# booted (a CI runner) does not take the watcher's start for a wake.
 mac_boot_time() {
     local s
+    if [[ -n "${HATTER_BOOT_TIME:-}" ]]; then printf '%s\n' "$HATTER_BOOT_TIME"; return 0; fi
     s=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ *sec *= *\([0-9][0-9]*\).*/\1/p') || return 1
     [[ -n "$s" ]] || return 1
     printf '%s\n' "$s"
