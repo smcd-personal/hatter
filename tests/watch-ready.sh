@@ -16,6 +16,9 @@ expect() {
 
 lib="$work/hatter-lib.sh"
 sed '/^# -* main$/,$d' "$root/bin/hatter" > "$lib"
+# hatter derives every path it writes from these: keep them in $work (#239).
+export HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config"
+mkdir -p "$XDG_CONFIG_HOME/hatter"
 # shellcheck source=/dev/null
 source "$lib"
 set +e
