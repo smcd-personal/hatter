@@ -53,6 +53,9 @@ hat_live_sessions() {
 mac_dark_wake() { [[ -e "$work/dark" ]]; }
 BOOT=1
 mac_boot_time() { printf '%s\n' "$BOOT"; }
+# The Mac's last wake time; empty is a machine that has none to read.
+WAKE=1
+mac_wake_time() { [[ -n "$WAKE" ]] || return 1; printf '%s\n' "$WAKE"; }
 watch_notify() { printf '%s|%s|%s\n' "$1" "$2" "${3:-}" >> "$work/notes"; }
 
 D=me@dev.example.com; O=me@ops.example.com
@@ -67,7 +70,7 @@ healthy() {
 }
 reset() {
     healthy; rm -f "$work/notes" "$work/dark" "$work/log"; rmdir "$LOCK_DIR" 2>/dev/null
-    WATCH_TICK=0; WATCH_WAKE_PENDING=0; WATCH_WAKE_AT=0; WATCH_READY_LAST=0; WATCH_READY_PREV=""
+    WATCH_TICK=0; WATCH_WAKE_SEEN=""; WATCH_WAKE_PENDING=0; BOOT=1; WAKE=1; WATCH_WAKE_AT=0; WATCH_READY_LAST=0; WATCH_READY_PREV=""
     WATCH_MIRRORED_AT=$(date +%s)
 }
 # arm <seconds since the wake>
@@ -77,25 +80,32 @@ notes() { cat "$work/notes" 2>/dev/null; }
 nnotes() { grep -c . "$work/notes" 2>/dev/null || echo 0; }
 
 # --- noticing a wake ---------------------------------------------------------
-reset
-WATCH_TICK=$(( $(date +%s) - 10 )); watch_wake_tick > /dev/null
-expect "a short gap between rounds is not a wake" "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
+reset; watch_wake_tick > /dev/null
+expect "a first round long after boot and wake is not a wake" "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
 WATCH_TICK=$(( $(date +%s) - 400 )); watch_wake_tick > /dev/null
-expect "a clock jump is a wake" "$([[ "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
+expect "the clock jumping with no new wake time (cmux was down) is not a wake" \
+    "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
+WAKE=$(date +%s); watch_wake_tick > /dev/null
+expect "a new wake time is a wake, with no jump" "$([[ "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
 
-reset; touch "$work/dark"
-WATCH_TICK=$(( $(date +%s) - 400 )); watch_wake_tick > /dev/null
+reset; watch_wake_tick > /dev/null; touch "$work/dark"; WAKE=$(date +%s); watch_wake_tick > /dev/null
 expect "a dark wake does not arm it" "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
 rm -f "$work/dark"; watch_wake_tick > /dev/null
 expect "...but the real wake after it does" "$([[ "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
 
+reset; WAKE=""; watch_wake_tick > /dev/null
+WATCH_TICK=$(( $(date +%s) - 10 )); watch_wake_tick > /dev/null
+expect "no wake time: a short gap is not a wake" "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
+WATCH_TICK=$(( $(date +%s) - 400 )); watch_wake_tick > /dev/null
+expect "no wake time: a clock jump is" "$([[ "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
+
 reset; BOOT=$(( $(date +%s) - 60 )); watch_wake_tick > /dev/null
 expect "a watcher started just after boot counts a wake" "$([[ "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
-reset; BOOT=$(( $(date +%s) - 50000 )); watch_wake_tick > /dev/null
-expect "a watcher restarted long after boot does not" "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
+reset; WAKE=$(( $(date +%s) - 60 )); watch_wake_tick > /dev/null
+expect "a watcher started just after a wake counts one" "$([[ "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
 
 reset; write_config '"prefs": {"wake_notify": "off"}, '
-WATCH_TICK=$(( $(date +%s) - 400 )); watch_wake_tick > /dev/null
+watch_wake_tick > /dev/null; WAKE=$(date +%s); watch_wake_tick > /dev/null
 expect "prefs.wake_notify off: no wake is watched" "$([[ "$WATCH_WAKE_AT" == 0 ]] && echo y || echo n)"
 write_config
 
@@ -131,6 +141,11 @@ expect "a session not in the mirrored record is not waited for" "$(notes | grep 
 reset; arm 20; printf '%s\n' dev-old >> "$work/live-$D"; rm -f "$AUTOSAVE_DIR/mirrored"
 look; look
 expect "with no record, every recorded running session is" "$([[ $(nnotes) == 0 ]] && echo y || echo n)"
+
+reset; arm 20; : > "$AUTOSAVE_DIR/mirrored"; printf '%s\n' dev-api > "$work/titles"
+look; look
+expect "an empty record: nothing waited for, and no \"All 0\" notice" \
+    "$([[ $(nnotes) == 0 && "$WATCH_WAKE_AT" == 0 ]] && grep -q 'nothing to wait for' "$work/log" && echo y || echo n)"
 
 reset; arm 20; mkdir "$LOCK_DIR"; look; look
 expect "a held config lock: no look" "$([[ $(nnotes) == 0 && -z "$WATCH_READY_PREV" ]] && echo y || echo n)"
@@ -168,6 +183,18 @@ arm $((WATCH_READY_CAP + 1)); look
 expect "at the cap with a sign-in too, it is on the sign-in tab" \
     "$(notes | grep -q "^hatter: not all back|Sign in to $O (click).*|SF-Sign in to $O\$" && echo y || echo n)"
 
+reset; arm $((WATCH_READY_CAP + 1))
+cmux_json() { return 1; }
+look
+expect "cmux unreadable at the cap: no notice yet" "$([[ $(nnotes) == 0 && "$WATCH_WAKE_AT" != 0 ]] && echo y || echo n)"
+arm $((2 * WATCH_READY_CAP)); look
+expect "...and the watch is dropped at twice the cap, without one" \
+    "$([[ $(nnotes) == 0 && "$WATCH_WAKE_AT" == 0 ]] && grep -q 'stopped watching' "$work/log" && echo y || echo n)"
+cmux_json() {
+    jq -R . < "$work/titles" \
+        | jq -s '{windows: [{workspaces: map({title: ., panes: [{surfaces: [{id: ("SF-" + .)}]}]})}]}'
+}
+
 # --- the record of what is connected -----------------------------------------
 reset; rm -f "$AUTOSAVE_DIR/mirrored"; WATCH_MIRRORED_AT=0
 printf '%s\n' dev-api dev-web dev-old ops-main > "$work/titles"
@@ -184,7 +211,7 @@ reset
 watch_signin() { return 0; }
 out=$( set -euo pipefail
        heals=""; heal_all=0; sync=0
-       WATCH_TICK=$(( $(date +%s) - 400 )); watch_act
+       WATCH_TICK=$(( $(date +%s) - 400 )); watch_act; WAKE=$(date +%s); watch_act
        WATCH_WAKE_AT=$(( $(date +%s) - 20 )); WATCH_READY_LAST=0; watch_act
        WATCH_READY_LAST=0; WATCH_TICK=$(date +%s); watch_act; echo "survived" )
 expect "watch_act notices the wake and posts ready" "$(notes | grep -q '^hatter: ready' && echo y || echo n)"
