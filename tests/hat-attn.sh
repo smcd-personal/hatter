@@ -5,7 +5,8 @@
 #     clears @hatter-waiting and writes an OSC 9 notification into the pane
 #     (caught with pipe-pane), or stays quiet - for idle_prompt, any tool but
 #     AskUserQuestion, a snoozed tab, and an agent run by another agent. A
-#     Stop sets the flag but never rings (#246).
+#     Stop sets the flag but rings only when its last message ends in a
+#     question (#246, #249).
 #   - the hatter skill (#137): written for Claude Code and Codex where each is,
 #     rewritten each run, and someone's own SKILL.md left alone
 #   - the settings wiring: provision adds hat-attn to Claude's settings.json and
@@ -107,16 +108,53 @@ RUN
     hook '{"hook_event_name":"Stop"}'; settle
     [[ "$(waiting)" == done && "$(osc_count)" == 3 ]] || fail "Stop after a question: waiting='$(waiting)', $(osc_count) notifications"
 
+    # A Stop whose last message ends in a question rings (#249): from the
+    # payload, past markdown and quotes, and from the transcript when the
+    # payload has no last message. A question mid-message does not count.
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook '{"hook_event_name":"Stop","last_assistant_message":"Done. Is that what you wanted?\n"}'; settle
+    [[ "$(waiting)" == question && "$(osc_count)" == 4 ]] || fail "Stop with a question: waiting='$(waiting)', $(osc_count) notifications"
+    [[ "$(last_osc)" == "Has a question in my tab" ]] || fail "Stop with a question: text is '$(last_osc)'"
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook '{"hook_event_name":"Stop","last_assistant_message":"Ready.\n\n**Should I merge it?**  "}'; settle
+    [[ "$(waiting)" == question && "$(osc_count)" == 5 ]] || fail "Stop with a bold question: waiting='$(waiting)', $(osc_count) notifications"
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook '{"hook_event_name":"Stop","last_assistant_message":"Why did it fail? A stale lock. Fixed."}'; settle
+    [[ "$(waiting)" == done && "$(osc_count)" == 5 ]] || fail "Stop with a mid-message question: waiting='$(waiting)', $(osc_count) notifications"
+    # Transcript fallback: the last assistant text wins over earlier ones and
+    # over a later tool-only entry; a broken line is skipped.
+    {
+        echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Earlier, ok?"}]}}'
+        echo '{"type":"user","message":{"content":"yes"}}'
+        echo 'not json'
+        echo '{"type":"assistant","message":"a string, not an object"}'
+        echo '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"x"},{"type":"text","text":"Want me to open the PR?"}]}}'
+        echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}'
+    } > "$work/t-question.jsonl"
+    {
+        echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Should I?"}]}}'
+        echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Merged."}]}}'
+    } > "$work/t-done.jsonl"
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook "{\"hook_event_name\":\"Stop\",\"transcript_path\":\"$work/t-question.jsonl\"}"; settle
+    [[ "$(waiting)" == question && "$(osc_count)" == 6 ]] || fail "Stop, transcript question: waiting='$(waiting)', $(osc_count) notifications"
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook "{\"hook_event_name\":\"Stop\",\"transcript_path\":\"$work/t-done.jsonl\"}"; settle
+    [[ "$(waiting)" == done && "$(osc_count)" == 6 ]] || fail "Stop, transcript statement: waiting='$(waiting)', $(osc_count) notifications"
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook '{"hook_event_name":"Stop","transcript_path":"/nonexistent/t.jsonl"}'; settle
+    [[ "$(waiting)" == done && "$(osc_count)" == 6 ]] || fail "Stop, missing transcript: waiting='$(waiting)', $(osc_count) notifications"
+
     # An agent run by an agent stays quiet, flag and all.
     hook '{"hook_event_name":"UserPromptSubmit"}'
     nested_hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
-    [[ -z "$(waiting)" && "$(osc_count)" == 3 ]] || fail "a nested agent's prompt notified (waiting='$(waiting)')"
+    [[ -z "$(waiting)" && "$(osc_count)" == 6 ]] || fail "a nested agent's prompt notified (waiting='$(waiting)')"
 
     # A snoozed tab keeps the flag but is not announced.
     tmux -L "$k" set-option -w -t "$pane" @hatter-snooze-until 9999999999
     hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
     [[ "$(waiting)" == approval ]] || fail "snoozed: @hatter-waiting is '$(waiting)'"
-    [[ "$(osc_count)" == 3 ]] || fail "a snoozed tab was announced"
+    [[ "$(osc_count)" == 6 ]] || fail "a snoozed tab was announced"
     tmux -L "$k" set-option -wu -t "$pane" @hatter-snooze-until
 
     # Control bytes in a tab name cannot end the notification early.
