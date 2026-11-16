@@ -3168,7 +3168,7 @@ chmod +x "$HOME/.local/bin/hat-record"
 
 cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #!/usr/bin/env bash
-# hat-attn - Claude Code / Codex hook: flag a tab whose agent is waiting for
+# hat-attn - Claude Code / Codex hook: flag a tab whose agent is blocked on
 # its human.
 #
 # The agent runs here, in tmux; the client only sees what the pane prints. So
@@ -3180,8 +3180,12 @@ cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #
 #   needs approval   Claude Notification permission_prompt, Codex PermissionRequest
 #   has a question   Claude Notification elicitation_dialog, PreToolUse AskUserQuestion
-#   waiting for you  Stop (the turn ended)
+#   done             Stop (the turn ended): @hatter-waiting only, no ring
 #   (cleared)        UserPromptSubmit
+#
+# A Stop sets the option but does not ring (#246): every turn ends in one, so
+# ringing on it would ring every agent tab after every turn and bury the
+# rings that mean the agent cannot go on without you.
 #
 # Same two rules as hat-record:
 #   - never write stdout: it is the hook JSON channel
@@ -3235,13 +3239,14 @@ done
 
 tmux set-option -w -t "$TMUX_PANE" @hatter-waiting "$kind" 2>/dev/null
 
+# A finished turn is not blocked on anyone: flagged above, not rung.
+[ "$kind" != done ] || exit 0
 # A snoozed tab waits quietly; waking it is what brings it to the human.
 [ -z "$(tmux show-options -wqv -t "$TMUX_PANE" @hatter-snooze-until 2>/dev/null)" ] || exit 0
 
 case "$kind" in
     approval) what="Needs approval" ;;
-    question) what="Has a question" ;;
-    *)        what="Waiting for you" ;;
+    *)        what="Has a question" ;;
 esac
 tab=$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null) || tab=""
 # The text starts with a letter on purpose: OSC 9 text that starts "4;" is a
@@ -13221,7 +13226,7 @@ hatter snoozed [hat]
 
 Snooze a tab to get it out of sight until you need it. It disappears from its
 workspace, and at the wake time it comes back to the same place, flagged the
-way a tab with an agent waiting for you is.
+way a tab whose agent needs your approval is.
 
 <tab> is a window index or name. <when> is one of:
   a duration    10m, 5h, 7d, 1w, a mix like 1h30m, or "in 3 days"; up to 400d
@@ -13958,11 +13963,12 @@ the Mac being involved at all:
                  existing hooks are untouched. This is what catches a session
                  started by hand, which is most of them.
   - hat-attn     a Claude Code and Codex hook that flags a tab whose agent is
-                 waiting for you: a permission prompt, a question, or a turn
-                 that ended. It writes an OSC 9 notification into the pane, so
-                 cmux rings that tab and badges its workspace until you look,
-                 and sets the tmux window option @hatter-waiting until the next
-                 prompt. Quiet for an agent started by another agent, and for a
+                 blocked on you: a permission prompt or a question. It writes
+                 an OSC 9 notification into the pane, so cmux rings that tab
+                 and badges its workspace until you look. It also sets the tmux
+                 window option @hatter-waiting until the next prompt, for a
+                 turn that ended too, but a finished turn does not ring.
+                 Quiet for an agent started by another agent, and for a
                  snoozed tab. Goes in Codex's hooks.json where codex is
                  installed.
   - hat-snooze   hides a tab until a time and brings it back (see: hatter help
