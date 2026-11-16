@@ -3180,12 +3180,13 @@ cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #
 #   needs approval   Claude Notification permission_prompt, Codex PermissionRequest
 #   has a question   Claude Notification elicitation_dialog, PreToolUse AskUserQuestion
-#   done             Stop (the turn ended): @hatter-waiting only, no ring
+#                    Stop whose last message ends in a question (#249)
+#   done             any other Stop (the turn ended): @hatter-waiting only, no ring
 #   (cleared)        UserPromptSubmit
 #
-# A Stop sets the option but does not ring (#246): every turn ends in one, so
-# ringing on it would ring every agent tab after every turn and bury the
-# rings that mean the agent cannot go on without you.
+# A plain Stop sets the option but does not ring (#246): every turn ends in
+# one, so ringing on it would ring every agent tab after every turn and bury
+# the rings that mean the agent cannot go on without you.
 #
 # Same two rules as hat-record:
 #   - never write stdout: it is the hook JSON channel
@@ -3217,7 +3218,30 @@ case "${ev:-}" in
         esac ;;
     PermissionRequest) kind=approval ;;
     PreToolUse) [ "${tool:-}" = AskUserQuestion ] && kind=question || exit 0 ;;
-    Stop) kind=done ;;
+    Stop)
+        # A turn that ends by asking something is blocked on the human as
+        # much as AskUserQuestion is (#249). Read the last message: the
+        # payload's last_assistant_message, else the transcript's last
+        # assistant text. A last sentence ending in "?" (past any trailing
+        # markdown, quotes or brackets) rings; anything else is just done.
+        kind=done
+        msg=$(printf '%s' "$payload" | jq -r '.last_assistant_message // empty | tostring' 2>/dev/null) || msg=""
+        if [ -z "$msg" ]; then
+            tp=$(printf '%s' "$payload" | jq -r '.transcript_path // empty' 2>/dev/null) || tp=""
+            if [ -n "$tp" ] && [ -r "$tp" ]; then
+                msg=$(tail -n 400 "$tp" 2>/dev/null | jq -Rnr '[inputs | fromjson?
+                    | select(type == "object" and .type == "assistant")
+                    | .message.content
+                    | if type == "string" then .
+                      elif type == "array" then map(select(.type == "text") | .text) | join("\n")
+                      else "" end
+                    | select(length > 0)] | last // empty' 2>/dev/null) || msg=""
+            fi
+        fi
+        if [ -n "$msg" ] && printf '%s' "$msg" | jq -Rse \
+            'sub("[\\s*_`~\"\u0027)\\]\u00bb\u201d\u2019]+$"; "") | test("[?\uff1f]$")' >/dev/null 2>&1; then
+            kind=question
+        fi ;;
     UserPromptSubmit)
         tmux set-option -wu -t "$TMUX_PANE" @hatter-waiting 2>/dev/null
         exit 0 ;;
@@ -13963,11 +13987,12 @@ the Mac being involved at all:
                  existing hooks are untouched. This is what catches a session
                  started by hand, which is most of them.
   - hat-attn     a Claude Code and Codex hook that flags a tab whose agent is
-                 blocked on you: a permission prompt or a question. It writes
+                 blocked on you: a permission prompt, a question, or a turn
+                 whose last message ends in a question mark. It writes
                  an OSC 9 notification into the pane, so cmux rings that tab
                  and badges its workspace until you look. It also sets the tmux
                  window option @hatter-waiting until the next prompt, for a
-                 turn that ended too, but a finished turn does not ring.
+                 turn that ended too, but any other finished turn does not ring.
                  Quiet for an agent started by another agent, and for a
                  snoozed tab. Goes in Codex's hooks.json where codex is
                  installed.
