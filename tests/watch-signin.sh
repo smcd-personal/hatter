@@ -25,6 +25,7 @@ CONFIG="$work/config.json"
 LOCK_DIR="$work/lock"
 HATTER_CF_DIR="$work/cf"
 export HATTER_WATCH_DRY=1
+export HATTER_BOOT_TIME=1 HATTER_WAKE_TIME=1   # never "just booted" or "just woke" (#237)
 cat > "$CONFIG" <<'EOF'
 { "hats": {
     "dev":  { "ssh": "me@dev.example.com" },
