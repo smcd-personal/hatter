@@ -1977,11 +1977,12 @@ apply_group_style() {
 # clears it. The third is the human's timezone (hatter tz); empty leaves the
 # server's as it is. The fourth is the idle age past which the server
 # hibernates Claude sessions (hatter hibernate --auto); empty turns that off,
-# and "@@keep" leaves it as it is.
+# and "@@keep" leaves it as it is. The fifth is the attention markers
+# (prefs.attn_markers, one per line) hat-attn rings on; empty removes them.
 provision_host() {
-    local host="$1" launch="${2:-}" tz="${3:-}" hib="${4:-@@keep}"
+    local host="$1" launch="${2:-}" tz="${3:-}" hib="${4:-@@keep}" marks="${5:-}"
     info "Provisioning tmux persistence on $host"
-    remote_sh_stdin "$host" "bash -s -- $(sq "$launch") $(sq "$tz") $(sq "$hib")" <<'REMOTE_EOF'
+    remote_sh_stdin "$host" "bash -s -- $(sq "$launch") $(sq "$tz") $(sq "$hib") $(sq "$marks")" <<'REMOTE_EOF'
 set -euo pipefail
 
 CONF="$HOME/.tmux.conf"
@@ -2010,6 +2011,16 @@ case "$HAT_TZ_NAME" in
            && mv "$(dirname "$LAUNCH_CONF")/tz.new" "$(dirname "$LAUNCH_CONF")/tz"
        echo "timezone: $HAT_TZ_NAME" ;;
 esac
+
+# The markers hat-attn rings on when a turn's last line holds one (#251), from
+# prefs.attn_markers, one per line. Written whole; none removes the file.
+if [ -n "${4:-}" ]; then
+    printf '%s\n' "$4" > "$(dirname "$LAUNCH_CONF")/attn-markers.new" \
+        && mv "$(dirname "$LAUNCH_CONF")/attn-markers.new" "$(dirname "$LAUNCH_CONF")/attn-markers"
+    echo "attention markers: $(printf '%s\n' "$4" | grep -c .)"
+else
+    rm -f "$HOME/.local/state/hatter/attn-markers"
+fi
 
 if [ ! -d "$HOME/.tmux/plugins/tpm" ]; then
     echo "installing tpm"
@@ -3180,7 +3191,8 @@ cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #
 #   needs approval   Claude Notification permission_prompt, Codex PermissionRequest
 #   has a question   Claude Notification elicitation_dialog, PreToolUse AskUserQuestion
-#                    Stop whose last message ends in a question (#249)
+#                    Stop whose last message ends in a question (#249), or
+#                    whose last line holds a configured marker (#251)
 #   done             any other Stop (the turn ended): @hatter-waiting only, no ring
 #   (cleared)        UserPromptSubmit
 #
@@ -3241,6 +3253,18 @@ case "${ev:-}" in
         fi
         if [ -n "$msg" ] && printf '%s' "$msg" | jq -Rse \
             'sub("[\\s*_`~\"\u0027)\\]\u00bb\u201d\u2019]+$"; "") | test("[?\uff1f]$")' >/dev/null 2>&1; then
+            kind=question
+        fi
+        # Some setups hand the turn back on a line with a fixed marker, and that
+        # line may end in a period (#251). provision writes the markers from
+        # prefs.attn_markers, one per line; a last non-empty line holding any
+        # of them rings too.
+        mf="$HOME/.local/state/hatter/attn-markers"
+        if [ "$kind" = done ] && [ -n "$msg" ] && [ -s "$mf" ] \
+            && printf '%s' "$msg" | jq -Rse --arg m "$(cat "$mf" 2>/dev/null)" '
+                ($m | split("\n") | map(select(length > 0))) as $ms
+                | (split("\n") | map(select(test("\\S"))) | last // "") as $l
+                | any($ms[]; . as $x | $l | contains($x))' >/dev/null 2>&1; then
             kind=question
         fi ;;
     UserPromptSubmit)
@@ -5600,6 +5624,9 @@ tab_find() {
 
 # The human's timezone, as `hatter tz` set it; empty until then.
 human_tz() { cfg '.prefs.timezone // empty'; }
+# The strings a turn's last line can carry to say it hands back to the human
+# (#251), one per line; hat-attn rings on them. Set in config as an array.
+attn_markers() { cfg '[.prefs.attn_markers // [] | .[]? | strings | gsub("[\r\n]"; "") | select(length > 0)] | .[]'; }
 
 # local_stamp <epoch>: a time in the human's timezone, named; in this
 # machine's own until one is set.
@@ -10039,7 +10066,7 @@ cmd_provision() {
     fi
     local hib="@@keep"
     [[ "$launch" == "@@keep" ]] || hib=$(hat_hibernate_after "$host") || exit 1
-    provision_host "$host" "$launch" "$(human_tz)" "$hib"
+    provision_host "$host" "$launch" "$(human_tz)" "$hib" "$(attn_markers)"
     check_max_sessions "$host"
 }
 
@@ -13989,7 +14016,10 @@ the Mac being involved at all:
                  started by hand, which is most of them.
   - hat-attn     a Claude Code and Codex hook that flags a tab whose agent is
                  blocked on you: a permission prompt, a question, or a turn
-                 whose last message ends in a question mark. It writes
+                 whose last message ends in a question mark, or whose last
+                 line holds one of the strings in prefs.attn_markers (an
+                 array in config.json, for a setup that marks the line where
+                 it hands back to you; provision copies it). It writes
                  an OSC 9 notification into the pane, so cmux rings that tab
                  and badges its workspace until you look. It also sets the tmux
                  window option @hatter-waiting until the next prompt, for a
