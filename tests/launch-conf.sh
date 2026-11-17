@@ -103,7 +103,10 @@ config '{"version":3,"groups":{},"hats":{
 mkdir -p "$work/rhome"
 step=$(extract REMOTE_EOF | sed -n '/^LAUNCH_CONF=/,/^mv "\$LAUNCH_CONF.new"/p')
 [[ -n "$step" ]] || { echo "FAIL could not extract the launch-file step"; exit 1; }
-printf '%s\n' "$step" > "$work/step.sh"
+# And the attention markers (#251), from later in the same script.
+marks=$(extract REMOTE_EOF | sed -n '/^# The markers hat-attn rings on/,/^fi$/p')
+[[ -n "$marks" ]] || { echo "FAIL could not extract the attention-marker step"; exit 1; }
+printf '%s\n%s\n' "$step" "$marks" > "$work/step.sh"
 cat > "$work/bin/ssh" <<EOF
 #!/usr/bin/env bash
 # `ssh -G` only reads the ssh config (the Cloudflare Access check); no connect.
@@ -115,7 +118,7 @@ eval "set -- \$cmd"     # sh -c '<script>'
 # bash -s -- '<launch conf>', after the tmux -u wrapper posix_sh puts first
 eval "set -- bash -s -- \${3#*bash -s -- }"
 cat > /dev/null
-HOME="$work/rhome" bash "$work/step.sh" "\$4"
+HOME="$work/rhome" bash "$work/step.sh" "\$4" "\$5" "\$6" "\$7"
 EOF
 chmod +x "$work/bin/ssh"
 hatter provision dev >/dev/null 2>&1 || true
@@ -125,6 +128,17 @@ config '{"version":3,"groups":{},"hats":{"dev":{"ssh":"u@dev.example.com"}}}'
 hatter provision dev >/dev/null 2>&1 || true
 got=$(cat "$work/rhome/.local/state/hatter/launch.tmux.conf" 2>/dev/null) || got="(none)"
 expect "a setting taken out of the config goes from the server too" "$([[ -z "$got" ]] && echo y || echo n)"
+
+# prefs.attn_markers goes to the server one per line, and goes from it when
+# the pref does (#251).
+mk="$work/rhome/.local/state/hatter/attn-markers"
+config '{"version":3,"groups":{},"prefs":{"attn_markers":["Your turn:","","x\ny"]},"hats":{"dev":{"ssh":"u@dev.example.com"}}}'
+hatter provision dev >/dev/null 2>&1 || true
+got=$(cat "$mk" 2>/dev/null) || got="(none)"
+expect "provision writes the attention markers" "$([[ "$got" == $'Your turn:\nxy' ]] && echo y || echo n)"
+config '{"version":3,"groups":{},"hats":{"dev":{"ssh":"u@dev.example.com"}}}'
+hatter provision dev >/dev/null 2>&1 || true
+expect "no attn_markers removes the server's list" "$([[ ! -e "$mk" ]] && echo y || echo n)"
 
 # By user@host, with no hat in the config for it: the server keeps its file.
 printf "set -g @hat_claude_args 'kept'\n" > "$work/rhome/.local/state/hatter/launch.tmux.conf"
