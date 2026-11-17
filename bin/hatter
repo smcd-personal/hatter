@@ -10574,6 +10574,60 @@ wall_cap() {
     fi
 }
 
+# watch_signin_place <tree>: put each "Sign in to <dest>" workspace whose <dest>
+# is a hat's at the top of that hat's window (#253). cmux opens it in whichever
+# window is in front, so a hat's sign-in could sit in another hat's window and
+# look like one of its tabs. When several hats share <dest>, any of their
+# windows will do. Each workspace is placed once, so one that someone moves
+# afterwards stays where they put it; one for a hat with no window is left
+# where cmux put it. The windows are read from one snapshot, dropped again
+# before anything changes.
+WATCH_SIGNIN_PLACED=""
+watch_signin_place() {
+    local tree="$1" win id dest hats hat w target plan="" moved=0
+    while IFS=$'\t' read -r win id dest; do
+        [[ -n "$id" ]] || continue
+        [[ $'\n'"$WATCH_SIGNIN_PLACED" != *$'\n'"$id"$'\n'* ]] || continue
+        WATCH_SIGNIN_PLACED+="$id"$'\n'
+        hats=$(cfg --arg d "$dest" '.hats | to_entries[] | select(.value.ssh == $d) | .key' 2>/dev/null) || continue
+        [[ -n "$hats" ]] || continue
+        [[ "$CMUX_SNAP" == 1 ]] || cmux_snapshot
+        target=""
+        while IFS= read -r hat; do
+            [[ -n "$hat" ]] || continue
+            w=$(find_hat_window "$hat" 2>/dev/null) || w=""
+            [[ -n "$w" ]] || continue
+            [[ -n "$target" ]] || target="$w"
+            [[ "$w" != "$win" ]] || { target="$w"; break; }
+        done <<<"$hats"
+        [[ -z "$target" ]] || plan+="$win"$'\t'"$id"$'\t'"$dest"$'\t'"$target"$'\n'
+    done < <(jq -r '.windows[]? | .id as $w | .workspaces[]?
+        | select((.title // "") | startswith("Sign in to "))
+        | [$w, .id, (.title | ltrimstr("Sign in to "))] | @tsv' <<<"$tree" 2>/dev/null || true)
+    cmux_snapshot_drop
+    while IFS=$'\t' read -r win id dest target; do
+        [[ -n "$id" ]] || continue
+        if [[ "$win" != "$target" ]]; then
+            if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then
+                echo "move $id $target"
+            elif cmux_change move-workspace-to-window --workspace "$id" --window "$target" >/dev/null 2>&1 </dev/null; then
+                moved=1
+                watch_log "moved the sign-in for $dest into its hat's window"
+            else
+                watch_log "could not move the sign-in for $dest into its hat's window"
+                continue
+            fi
+        fi
+        if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then
+            echo "top $id $target"
+        else
+            cmux_change reorder-workspace --workspace "$id" --index 0 --window "$target" >/dev/null 2>&1 </dev/null || true
+        fi
+    done <<<"$plan"
+    (( moved == 0 )) || focus_restore
+    return 0
+}
+
 watch_signin() {
     local now tree dests dest hats hat err why done_at line
     now=$(date +%s)
@@ -10584,7 +10638,8 @@ watch_signin() {
     tree=$(cmux_json tree --all 2>/dev/null) || return 0
     dests=$(jq -r '.windows[]?.workspaces[]?.title // empty
         | select(startswith("Sign in to ")) | ltrimstr("Sign in to ")' <<<"$tree" 2>/dev/null | sort -u) || return 0
-    [[ -n "$dests" ]] || { WATCH_SIGNIN_SAID=""; return 0; }
+    [[ -n "$dests" ]] || { WATCH_SIGNIN_SAID=""; WATCH_SIGNIN_PLACED=""; return 0; }
+    watch_signin_place "$tree"
     while IFS= read -r dest; do
         [[ -n "$dest" ]] || continue
         hats=$(cfg --arg d "$dest" '.hats | to_entries[] | select(.value.ssh == $d) | .key' 2>/dev/null) || continue
@@ -13160,8 +13215,9 @@ everything is back, so you know when to start: "hatter: ready" when every
 workspace that was connected before the sleep is back in cmux and connected
 again. If cmux is still waiting on a "Sign in to <host>" workspace that the
 watcher could not clear by itself, the notification is "hatter: sign in to
-<host>" instead, and clicking it opens that sign-in tab. If not everything is
-back within 3 minutes, "hatter: not all back" names what is missing and any
+<host>" instead, and clicking it opens that sign-in tab. cmux opens a sign-in
+workspace in whichever window is in front; the watcher moves it, once, to the
+top of its own hat's window. If not everything is back within 3 minutes, "hatter: not all back" names what is missing and any
 server that did not answer. A workspace you closed before the sleep is not
 waited for: the watcher keeps a list of what is connected, refreshed every 5
 minutes while the Mac is awake, in ~/.config/hatter/autosave/mirrored, so a

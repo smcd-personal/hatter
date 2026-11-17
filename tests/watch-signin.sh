@@ -51,11 +51,14 @@ chmod +x "$work/bin/ssh"
 PATH="$work/bin:$PATH"
 : > "$work/down"
 
-# Stub cmux tree: one window holding the titles in $work/titles, each with
-# one tab whose id is "SF-<title>".
+# Stub cmux tree: the workspaces in $work/titles, one per line, each "<window>
+# TAB <title>" or just "<title>" for window W1. Each has one tab whose id is
+# "SF-<title>"; the workspace's id is "WS-<title>".
 cmux_json() {
-    jq -R . < "$work/titles" \
-        | jq -s '{windows: [{workspaces: map({title: ., panes: [{surfaces: [{id: ("SF-" + .)}]}]})}]}'
+    awk -F '\t' 'NF == 1 { print "W1\t" $1; next } { print }' "$work/titles" \
+        | jq -R 'split("\t")' \
+        | jq -s 'group_by(.[0]) | {windows: map({id: .[0][0], workspaces: map({id: ("WS-" + .[1]),
+            title: .[1], panes: [{surfaces: [{id: ("SF-" + .[1])}]}]})})}'
 }
 # A notification is recorded, not posted.
 watch_notify() { printf '%s\n' "$*" >> "$work/notes"; }
@@ -70,7 +73,7 @@ run() {
     cat "$work/round" >> "$work/log"
     out=$(grep '^restore ' "$work/round" || true)
 }
-reset() { WATCH_SIGNIN_SAID=""; WATCH_SIGNIN_DONE=""; rm -f "$work/connects" "$work/log" "$work/notes"; : > "$work/down"; }
+reset() { WATCH_SIGNIN_SAID=""; WATCH_SIGNIN_DONE=""; WATCH_SIGNIN_PLACED=""; rm -f "$work/connects" "$work/log" "$work/notes"; : > "$work/down"; }
 
 # --- nothing to do -----------------------------------------------------------
 printf '%s\n' "dev-main" "ops-main" > "$work/titles"
@@ -132,6 +135,63 @@ expect "...on the sign-in workspace's tab (#188)" \
     "$(grep -q "SF-Sign in to me@dev.example.com$" "$work/notes" 2>/dev/null && echo y || echo n)"
 run
 expect "...once" "$([[ $(grep -c . "$work/notes") == 1 ]] && echo y || echo n)"
+
+# --- a sign-in goes to the top of its own hat's window (#253) ----------------
+reset
+unset -f access_gate
+access_gate() { return 0; }
+placed() { grep -E '^(move|top) ' "$work/round" || true; }
+T=$'\t'
+printf '%s\n' "W1${T}ops-main" "W1${T}Sign in to me@dev.example.com" "W2${T}dev-main" > "$work/titles"
+run
+expect "a sign-in in another hat's window is moved to its hat's window" \
+    "$(placed | grep -qx 'move WS-Sign in to me@dev.example.com W2' && echo y || echo n)"
+expect "...and to the top of it" \
+    "$(placed | grep -qx 'top WS-Sign in to me@dev.example.com W2' && echo y || echo n)"
+run
+expect "...once: a sign-in someone moved again is left alone" "$([[ -z "$(placed)" ]] && echo y || echo n)"
+
+reset
+printf '%s\n' "W1${T}dev-main" "W1${T}Sign in to me@dev.example.com" "W2${T}ops-main" > "$work/titles"
+run
+expect "a sign-in already in its hat's window is not moved" \
+    "$(! placed | grep -q '^move ' && echo y || echo n)"
+expect "...but is put at the top" \
+    "$(placed | grep -qx 'top WS-Sign in to me@dev.example.com W1' && echo y || echo n)"
+
+reset
+printf '%s\n' "W1${T}dev-main" "W2${T}dev2-main" "W2${T}Sign in to me@dev.example.com" > "$work/titles"
+run
+expect "a sign-in in any window of the hats sharing its host stays there" \
+    "$(! placed | grep -q '^move ' && placed | grep -qx 'top WS-Sign in to me@dev.example.com W2' && echo y || echo n)"
+
+reset
+printf '%s\n' "W1${T}dev-main" "W2${T}Sign in to someone@else.example.com" > "$work/titles"
+run
+expect "a sign-in for a host that is no hat's is not placed" "$([[ -z "$(placed)" ]] && echo y || echo n)"
+
+reset
+printf '%s\n' "W1${T}Sign in to me@ops.example.com" "W1${T}dev-main" > "$work/titles"
+run
+expect "a sign-in for a hat with no window of its own stays where it is" "$([[ -z "$(placed)" ]] && echo y || echo n)"
+
+# Not dry: the moves really reach cmux, and focus goes back after a move.
+reset
+printf '%s\n' "W1${T}ops-main" "W1${T}Sign in to me@dev.example.com" "W2${T}dev-main" > "$work/titles"
+cmux() { printf '%s\n' "$*" >> "$work/cmux"; }
+focus_restore() { echo restored >> "$work/cmux"; }
+rm -f "$work/cmux"
+( unset HATTER_WATCH_DRY; WATCH_SIGNIN_LAST=0; watch_signin >/dev/null 2>&1 )
+expect "the move reaches cmux" \
+    "$(grep -qx 'move-workspace-to-window --workspace WS-Sign in to me@dev.example.com --window W2' "$work/cmux" && echo y || echo n)"
+expect "...then the reorder to the top" \
+    "$(grep -qx 'reorder-workspace --workspace WS-Sign in to me@dev.example.com --index 0 --window W2' "$work/cmux" && echo y || echo n)"
+expect "...then focus goes back" "$([[ "$(tail -n 1 "$work/cmux")" == restored ]] && echo y || echo n)"
+rm -f "$work/cmux"
+printf '%s\n' "W1${T}dev-main" "W1${T}Sign in to me@dev.example.com" > "$work/titles"
+( unset HATTER_WATCH_DRY; WATCH_SIGNIN_LAST=0; WATCH_SIGNIN_PLACED=""; watch_signin >/dev/null 2>&1 )
+expect "no move, no focus restore" "$(! grep -q 'move-workspace\|restored' "$work/cmux" && echo y || echo n)"
+unset -f cmux focus_restore
 
 # --- the watcher really calls it, and survives set -euo pipefail -------------
 reset
