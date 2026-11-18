@@ -10579,18 +10579,30 @@ wall_cap() {
 # window is in front, so a hat's sign-in could sit in another hat's window and
 # look like one of its tabs. When several hats share <dest>, any of their
 # windows will do. Each workspace is placed once, so one that someone moves
-# afterwards stays where they put it; one for a hat with no window is left
-# where cmux put it. The windows are read from one snapshot, dropped again
-# before anything changes.
+# afterwards stays where they put it. Until it is placed it is tried every
+# round: one for a hat whose window cmux has not listed yet, or whose move
+# failed, gets another go (a failed move is logged once). The records keep only
+# sign-ins that are still open. The windows are read from one snapshot, dropped
+# again before anything changes.
 WATCH_SIGNIN_PLACED=""
+WATCH_SIGNIN_PLACE_FAILED=""
 watch_signin_place() {
-    local tree="$1" win id dest hats hat w target plan="" moved=0
+    local tree="$1" signins open win id dest hats hat w target plan="" moved=0
+    signins=$(jq -r '.windows[]? | .id as $w | .workspaces[]?
+        | select((.title // "") | startswith("Sign in to "))
+        | [$w, .id, (.title | ltrimstr("Sign in to "))] | @tsv' <<<"$tree" 2>/dev/null) || signins=""
+    open=$(printf '%s\n' "$signins" | awk -F '\t' 'NF { print $2 }')
+    # $( ) drops the last newline, which every record line ends with.
+    WATCH_SIGNIN_PLACED=$(watch_signin_keep "$WATCH_SIGNIN_PLACED" "$open")
+    [[ -z "$WATCH_SIGNIN_PLACED" ]] || WATCH_SIGNIN_PLACED+=$'\n'
+    WATCH_SIGNIN_PLACE_FAILED=$(watch_signin_keep "$WATCH_SIGNIN_PLACE_FAILED" "$open")
+    [[ -z "$WATCH_SIGNIN_PLACE_FAILED" ]] || WATCH_SIGNIN_PLACE_FAILED+=$'\n'
     while IFS=$'\t' read -r win id dest; do
         [[ -n "$id" ]] || continue
         [[ $'\n'"$WATCH_SIGNIN_PLACED" != *$'\n'"$id"$'\n'* ]] || continue
-        WATCH_SIGNIN_PLACED+="$id"$'\n'
         hats=$(cfg --arg d "$dest" '.hats | to_entries[] | select(.value.ssh == $d) | .key' 2>/dev/null) || continue
-        [[ -n "$hats" ]] || continue
+        # No hat's host: nothing to do, now or later.
+        [[ -n "$hats" ]] || { WATCH_SIGNIN_PLACED+="$id"$'\n'; continue; }
         [[ "$CMUX_SNAP" == 1 ]] || cmux_snapshot
         target=""
         while IFS= read -r hat; do
@@ -10601,9 +10613,7 @@ watch_signin_place() {
             [[ "$w" != "$win" ]] || { target="$w"; break; }
         done <<<"$hats"
         [[ -z "$target" ]] || plan+="$win"$'\t'"$id"$'\t'"$dest"$'\t'"$target"$'\n'
-    done < <(jq -r '.windows[]? | .id as $w | .workspaces[]?
-        | select((.title // "") | startswith("Sign in to "))
-        | [$w, .id, (.title | ltrimstr("Sign in to "))] | @tsv' <<<"$tree" 2>/dev/null || true)
+    done <<<"$signins"
     cmux_snapshot_drop
     while IFS=$'\t' read -r win id dest target; do
         [[ -n "$id" ]] || continue
@@ -10614,7 +10624,10 @@ watch_signin_place() {
                 moved=1
                 watch_log "moved the sign-in for $dest into its hat's window"
             else
-                watch_log "could not move the sign-in for $dest into its hat's window"
+                if [[ $'\n'"$WATCH_SIGNIN_PLACE_FAILED" != *$'\n'"$id"$'\n'* ]]; then
+                    watch_log "could not move the sign-in for $dest into its hat's window; trying again each round"
+                    WATCH_SIGNIN_PLACE_FAILED+="$id"$'\n'
+                fi
                 continue
             fi
         fi
@@ -10623,9 +10636,16 @@ watch_signin_place() {
         else
             cmux_change reorder-workspace --workspace "$id" --index 0 --window "$target" >/dev/null 2>&1 </dev/null || true
         fi
+        WATCH_SIGNIN_PLACED+="$id"$'\n'
     done <<<"$plan"
     (( moved == 0 )) || focus_restore
     return 0
+}
+
+# watch_signin_keep <record> <ids>: the record's lines that are among <ids>.
+watch_signin_keep() {
+    printf '%s\n' "$1" | AWK_IDS="$2" awk 'BEGIN { n = split(ENVIRON["AWK_IDS"], a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") keep[a[i]] = 1 }
+        NF && ($0 in keep) { printf "%s\n", $0 }'
 }
 
 watch_signin() {
@@ -10638,7 +10658,7 @@ watch_signin() {
     tree=$(cmux_json tree --all 2>/dev/null) || return 0
     dests=$(jq -r '.windows[]?.workspaces[]?.title // empty
         | select(startswith("Sign in to ")) | ltrimstr("Sign in to ")' <<<"$tree" 2>/dev/null | sort -u) || return 0
-    [[ -n "$dests" ]] || { WATCH_SIGNIN_SAID=""; WATCH_SIGNIN_PLACED=""; return 0; }
+    [[ -n "$dests" ]] || { WATCH_SIGNIN_SAID=""; WATCH_SIGNIN_PLACED=""; WATCH_SIGNIN_PLACE_FAILED=""; return 0; }
     watch_signin_place "$tree"
     while IFS= read -r dest; do
         [[ -n "$dest" ]] || continue

@@ -175,6 +175,28 @@ printf '%s\n' "W1${T}Sign in to me@ops.example.com" "W1${T}dev-main" > "$work/ti
 run
 expect "a sign-in for a hat with no window of its own stays where it is" "$([[ -z "$(placed)" ]] && echo y || echo n)"
 
+# A hat whose window cmux has not listed yet: tried again next round.
+reset
+printf '%s\n' "W1${T}Sign in to me@dev.example.com" "W1${T}ops-main" > "$work/titles"
+run
+expect "no window yet: nothing placed" "$([[ -z "$(placed)" ]] && echo y || echo n)"
+printf '%s\n' "W1${T}Sign in to me@dev.example.com" "W1${T}ops-main" "W2${T}dev-main" > "$work/titles"
+run
+expect "...and once its window is there, the sign-in moves into it" \
+    "$(placed | grep -qx 'move WS-Sign in to me@dev.example.com W2' && echo y || echo n)"
+
+# The record keeps only sign-ins still open, and still matches after pruning.
+reset
+printf '%s\n' "W1${T}dev-main" "W2${T}ops-main" "W2${T}Sign in to me@dev.example.com" "W1${T}Sign in to me@ops.example.com" > "$work/titles"
+run
+expect "two sign-ins in the wrong windows: both move" \
+    "$([[ $(placed | grep -c '^move ') == 2 ]] && echo y || echo n)"
+printf '%s\n' "W1${T}dev-main" "W2${T}ops-main" "W2${T}Sign in to me@dev.example.com" > "$work/titles"
+run
+expect "one closes, the other is still left alone" "$([[ -z "$(placed)" ]] && echo y || echo n)"
+expect "...and the closed one is out of the record" \
+    "$([[ "$WATCH_SIGNIN_PLACED" == $'WS-Sign in to me@dev.example.com\n' ]] && echo y || echo n)"
+
 # Not dry: the moves really reach cmux, and focus goes back after a move.
 reset
 printf '%s\n' "W1${T}ops-main" "W1${T}Sign in to me@dev.example.com" "W2${T}dev-main" > "$work/titles"
@@ -191,6 +213,20 @@ rm -f "$work/cmux"
 printf '%s\n' "W1${T}dev-main" "W1${T}Sign in to me@dev.example.com" > "$work/titles"
 ( unset HATTER_WATCH_DRY; WATCH_SIGNIN_LAST=0; WATCH_SIGNIN_PLACED=""; watch_signin >/dev/null 2>&1 )
 expect "no move, no focus restore" "$(! grep -q 'move-workspace\|restored' "$work/cmux" && echo y || echo n)"
+# A move cmux refuses is tried again next round, and logged once.
+cmux() { printf '%s\n' "$*" >> "$work/cmux"; [[ "$1" != move-workspace-to-window ]]; }
+rm -f "$work/cmux"
+printf '%s\n' "W1${T}ops-main" "W1${T}Sign in to me@dev.example.com" "W2${T}dev-main" > "$work/titles"
+WATCH_SIGNIN_PLACED=""; WATCH_SIGNIN_PLACE_FAILED=""
+unset HATTER_WATCH_DRY
+for _ in 1 2; do
+    WATCH_SIGNIN_LAST=0; watch_signin >> "$work/fail.log" 2>&1
+done
+export HATTER_WATCH_DRY=1
+expect "a refused move is tried again next round" \
+    "$([[ $(grep -c '^move-workspace-to-window' "$work/cmux") == 2 ]] && echo y || echo n)"
+expect "...without a reorder or a focus restore" "$(! grep -q 'reorder\|restored' "$work/cmux" && echo y || echo n)"
+expect "...and is logged once" "$([[ $(grep -c 'could not move the sign-in' "$work/fail.log") == 1 ]] && echo y || echo n)"
 unset -f cmux focus_restore
 
 # --- the watcher really calls it, and survives set -euo pipefail -------------
