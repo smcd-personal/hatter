@@ -2012,7 +2012,8 @@ case "$HAT_TZ_NAME" in
        echo "timezone: $HAT_TZ_NAME" ;;
 esac
 
-# The markers hat-attn rings on when a turn's last line holds one (#251), from
+# The markers hat-attn rings on when a line of a turn's last message starts
+# with one (#251, #257), from
 # prefs.attn_markers, one per line. Written whole; none removes the file.
 if [ -n "${4:-}" ]; then
     printf '%s\n' "$4" > "$(dirname "$LAUNCH_CONF")/attn-markers.new" \
@@ -3192,7 +3193,7 @@ cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #   needs approval   Claude Notification permission_prompt, Codex PermissionRequest
 #   has a question   Claude Notification elicitation_dialog, PreToolUse AskUserQuestion
 #                    Stop whose last message ends in a question (#249), or
-#                    whose last line holds a configured marker (#251)
+#                    that has a line starting with a configured marker (#251, #257)
 #   done             any other Stop (the turn ended): @hatter-waiting only, no ring
 #   (cleared)        UserPromptSubmit
 #
@@ -3257,14 +3258,18 @@ case "${ev:-}" in
         fi
         # Some setups hand the turn back on a line with a fixed marker, and that
         # line may end in a period (#251). provision writes the markers from
-        # prefs.attn_markers, one per line; a last non-empty line holding any
-        # of them rings too.
+        # prefs.attn_markers, one per line; any line that starts with one rings
+        # too. Any line, not only the last: an agent often adds a note or an
+        # offer after the hand-off (#257). It has to start the line (after
+        # indent and markdown such as > - * # **), so a mention mid-sentence
+        # stays quiet. A marker that is itself markdown matches the raw line.
         mf="$HOME/.local/state/hatter/attn-markers"
         if [ "$kind" = done ] && [ -n "$msg" ] && [ -s "$mf" ] \
             && printf '%s' "$msg" | jq -Rse --arg m "$(cat "$mf" 2>/dev/null)" '
                 ($m | split("\n") | map(select(length > 0))) as $ms
-                | (split("\n") | map(select(test("\\S"))) | last // "") as $l
-                | any($ms[]; . as $x | $l | contains($x))' >/dev/null 2>&1; then
+                | [split("\n")[] | sub("^\\s+"; "") | select(length > 0)
+                   | ., sub("^[\\s>*#_`~+-]+"; "")] as $ls
+                | any($ms[]; . as $x | any($ls[]; startswith($x)))' >/dev/null 2>&1; then
             kind=question
         fi ;;
     UserPromptSubmit)
@@ -14092,8 +14097,8 @@ the Mac being involved at all:
                  started by hand, which is most of them.
   - hat-attn     a Claude Code and Codex hook that flags a tab whose agent is
                  blocked on you: a permission prompt, a question, or a turn
-                 whose last message ends in a question mark, or whose last
-                 line holds one of the strings in prefs.attn_markers (an
+                 whose last message ends in a question mark, or has a line
+                 starting with one of the strings in prefs.attn_markers (an
                  array in config.json, for a setup that marks the line where
                  it hands back to you; provision copies it). It writes
                  an OSC 9 notification into the pane, so cmux rings that tab
