@@ -146,9 +146,9 @@ RUN
     hook '{"hook_event_name":"Stop","transcript_path":"/nonexistent/t.jsonl"}'; settle
     [[ "$(waiting)" == done && "$(osc_count)" == 6 ]] || fail "Stop, missing transcript: waiting='$(waiting)', $(osc_count) notifications"
 
-    # A Stop whose last line carries a configured marker rings even with no
-    # "?" (#251); the marker elsewhere in the message, or no markers file,
-    # does not. Each case is also run the other way, so the test takes both
+    # A Stop with a line that starts with a configured marker rings even with
+    # no "?" (#251), also when more text follows that line (#257); the marker
+    # in the middle of a line, or no markers file, does not. Each case is also run the other way, so the test takes both
     # sides of the new branch.
     mkdir -p "$work/hh/.local/state/hatter"; mf="$work/hh/.local/state/hatter/attn-markers"
     marked='{"hook_event_name":"Stop","last_assistant_message":"Done.\n\n  > \u25a0 Over to you: pick a palette.\n\n"}'
@@ -161,23 +161,26 @@ RUN
     [[ "$(waiting)" == question && "$(osc_count)" == 7 ]] || fail "marker on the last line: waiting='$(waiting)', $(osc_count) notifications"
     [[ "$(last_osc)" == "Has a question in my tab" ]] || fail "marker on the last line: text is '$(last_osc)'"
     hook '{"hook_event_name":"UserPromptSubmit"}'
-    hook '{"hook_event_name":"Stop","last_assistant_message":"Your turn: was earlier.\nNow merged."}'; settle
-    [[ "$(waiting)" == done && "$(osc_count)" == 7 ]] || fail "marker before the last line: waiting='$(waiting)', $(osc_count) notifications"
+    hook '{"hook_event_name":"Stop","last_assistant_message":"Summary.\n\n- **Your turn:** keep it or drop it.\n\nSide note: issue 9 looks done. I can close it, or start the next plan."}'; settle
+    [[ "$(waiting)" == question && "$(osc_count)" == 8 ]] || fail "marker line with text after it: waiting='$(waiting)', $(osc_count) notifications"
+    hook '{"hook_event_name":"UserPromptSubmit"}'
+    hook '{"hook_event_name":"Stop","last_assistant_message":"The docs now say Your turn: in the footer.\nNow merged."}'; settle
+    [[ "$(waiting)" == done && "$(osc_count)" == 8 ]] || fail "marker mid-line: waiting='$(waiting)', $(osc_count) notifications"
     hook '{"hook_event_name":"UserPromptSubmit"}'
     hook "{\"hook_event_name\":\"Stop\",\"transcript_path\":\"$work/t-done.jsonl\"}"; settle
-    [[ "$(waiting)" == done && "$(osc_count)" == 7 ]] || fail "markers set, plain statement: waiting='$(waiting)', $(osc_count) notifications"
+    [[ "$(waiting)" == done && "$(osc_count)" == 8 ]] || fail "markers set, plain statement: waiting='$(waiting)', $(osc_count) notifications"
     rm -f "$mf"
 
     # An agent run by an agent stays quiet, flag and all.
     hook '{"hook_event_name":"UserPromptSubmit"}'
     nested_hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
-    [[ -z "$(waiting)" && "$(osc_count)" == 7 ]] || fail "a nested agent's prompt notified (waiting='$(waiting)')"
+    [[ -z "$(waiting)" && "$(osc_count)" == 8 ]] || fail "a nested agent's prompt notified (waiting='$(waiting)')"
 
     # A snoozed tab keeps the flag but is not announced.
     tmux -L "$k" set-option -w -t "$pane" @hatter-snooze-until 9999999999
     hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
     [[ "$(waiting)" == approval ]] || fail "snoozed: @hatter-waiting is '$(waiting)'"
-    [[ "$(osc_count)" == 7 ]] || fail "a snoozed tab was announced"
+    [[ "$(osc_count)" == 8 ]] || fail "a snoozed tab was announced"
     tmux -L "$k" set-option -wu -t "$pane" @hatter-snooze-until
 
     # Control bytes in a tab name cannot end the notification early.
