@@ -338,7 +338,20 @@ hat_ssh() {
 }
 hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
 hat_mosh()   { cfg --arg l "$1" '.hats[$l].mosh // false'; }
-hat_names()  { cfg '.hats | keys[]?'; }
+# hat_names lists the hats hatter works on: every loop over hats (sync,
+# restore, autosave, the rack, list) goes through it, so a disabled hat is
+# left alone by all of them, its groups kept as they were (#255).
+# all_hat_names lists every hat, disabled ones too, for the commands that
+# show or manage hats as such.
+hat_names()  { cfg '.hats | to_entries[] | select(.value.disabled | not) | .key'; }
+all_hat_names() { cfg '.hats | keys[]?'; }
+hat_disabled() { [[ "$(cfg --arg l "$1" '.hats[$l].disabled // false')" == true ]]; }
+# hat_require_enabled <hat>: stop, saying how to turn it back on, before
+# anything opens a window or a session for a disabled hat.
+hat_require_enabled() {
+    hat_disabled "$1" || return 0
+    die "hat '$1' is disabled. Turn it back on with: hatter hat enable $1"
+}
 
 # ------------------------------------------------------------ Cloudflare Access
 # A server can sit behind Cloudflare Access, reached with an ssh config entry
@@ -899,9 +912,10 @@ remote_sessions() {
 
 # Every session the config records on a server, across all the hats that share
 # its ssh destination: the server keeps one list per account, not per hat.
+# A disabled hat's are left out, so a reboot does not bring them back.
 host_recorded_sessions() {
     cfg --arg h "$1" '
-        [.hats | to_entries[] | select(.value.ssh == $h) | .key] as $hats
+        [.hats | to_entries[] | select(.value.ssh == $h and (.value.disabled | not)) | .key] as $hats
         | .groups[] | select(.hat as $x | $hats | index($x))
         | .sessions | keys_unsorted[]?'
 }
@@ -963,20 +977,22 @@ session_place() {
 # hat_unrecorded <hat> <live sessions>: the running sessions that no hat on
 # this hat's server records, and that belong to this hat. Several hats can share
 # one server; a session goes to the hat its name is prefixed with, and one with
-# no such prefix goes to the first of them by name, so each is shown once.
+# no such prefix goes to the first of them by name that is not disabled, so
+# each is shown once. One prefixed with a disabled hat's name is no one's.
 # The drag healer's own short-lived hop sessions (heal_hop_window) and the
 # session that holds snoozed tabs (hat-snooze) are no one's.
 hat_unrecorded() {
     cfg --arg l "$1" --arg live "$2" '
         .hats[$l].ssh as $h
         | ([.hats | to_entries[] | select(.value.ssh == $h) | .key] | sort) as $hats
+        | ([.hats | to_entries[] | select(.value.ssh == $h and (.value.disabled | not)) | .key] | sort) as $on
         | ([.groups[] | select(.hat as $x | $hats | index($x)) | .sessions | keys_unsorted[]?]) as $rec
         | $live | split("\n")[]
         | select(. != "" and (. as $s | $rec | index($s) | not))
         | select(startswith("hatter-hop-") | not)
         | select(. != "hatter-snooze")
         | select((split("-")[0]) as $p
-                 | if ($hats | index($p)) then $p == $l else $hats[0] == $l end)'
+                 | if ($hats | index($p)) then $p == $l else $on[0] == $l end)'
 }
 
 # Tell a server what the config records, and drop its registry entries for tabs
@@ -1757,6 +1773,7 @@ NEW_WINDOW_STRAY=""
 ensure_hat_window() {
     # ensure_hat_window <hat> -> prints window id, and focuses it
     local hat="$1" w
+    hat_require_enabled "$hat"
     w=$(find_hat_window "$hat")
 
     if [[ -z "$w" ]]; then
@@ -2468,6 +2485,8 @@ cat > "$HOME/.local/bin/hat-registry" <<'HATREGISTRY'
 #   hat-registry snooze <window id> <json>     set a window's .snooze
 #   hat-registry hibernate <window id> <json>  set a window's .hibernate
 #   hat-registry hibernate-done <session id>   take .hibernate off its history
+#   hat-registry forget <session>...  drop those sessions' entries, and end
+#                                   their snoozed tabs (a disabled hat's)
 #
 # An entry is filed under its window's tmux id and the server's (pid and start
 # time), and follows the window when windows close, move or renumber. Keyed by
@@ -2481,7 +2500,7 @@ cat > "$HOME/.local/bin/hat-registry" <<'HATREGISTRY'
 # session id. That is history for `hatter find`, never restored, and goes
 # after HISTORY_DAYS.
 #
-# Never fails, and only prune writes to stdout: hat-record runs this from a
+# Never fails, and only prune and forget write to stdout: hat-record runs this from a
 # Claude Code hook, and tmux from its own hooks.
 set -uo pipefail
 
@@ -2871,6 +2890,30 @@ EOF
     echo "hat-registry: forgot $gone entry(ies), recorded $added window(s) as shells"
 }
 
+# forget <session>...: the sessions of a hat being disabled (#255), already
+# ended or about to be. Their entries go, an agent's conversation kept as
+# history as when its tab closes; without this, a session made again under
+# the same name would be matched to its old entries by name and index, and a
+# reboot would resume their agents in it. Their snoozed tabs end too, or one
+# waking would start its session again.
+cmd_forget() {
+    local list all snoozed plan n w sel
+    [ $# -gt 0 ] || { echo "hat-registry: forgot 0 entry(ies)"; return 0; }
+    list=$(printf '%s\n' "$@" | jq -R . | jq -cs .) || return 0
+    lock || { echo "hat-registry: another writer holds the registry - nothing forgotten"; return 0; }
+    all=$(entries) || { echo "hat-registry: could not read the registry - nothing forgotten"; return 0; }
+    sel='select((.session as $x | $s | index([$x]))
+                or (.session == "hatter-snooze" and ((.snooze.from // "") as $f | $s | index([$f]))))'
+    snoozed=$(printf '%s' "$all" | jq -r --argjson s "$list" \
+        '.[] | select(.session == "hatter-snooze") | '"$sel"' | .window_id // empty' 2>/dev/null) || snoozed=""
+    for w in $snoozed; do tmux kill-window -t "$w" 2>/dev/null; done
+    plan=$(printf '%s' "$all" | jq -r --argjson s "$list" \
+        '.[] | '"$sel"' | "rm\u001f\(._file)\u001f1"' 2>/dev/null) || plan=""
+    n=$(printf '%s' "$plan" | grep -c . || true)
+    [ -z "$plan" ] || printf '%s\n' "$plan" | apply
+    echo "hat-registry: forgot $n entry(ies)"
+}
+
 case "${1:-}" in
     put)     shift; cmd_put "$@" ;;
     adopt)   shift; cmd_adopt "$@" ;;
@@ -2879,7 +2922,8 @@ case "${1:-}" in
     snooze)  shift; cmd_mark snooze "$@"; exit $? ;;
     hibernate) shift; cmd_mark hibernate "$@"; exit $? ;;
     hibernate-done) shift; cmd_hibernate_done "$@" ;;
-    *)       echo "usage: hat-registry put|adopt|refresh|prune|snooze|hibernate|hibernate-done" >&2 ;;
+    forget)  shift; cmd_forget "$@" ;;
+    *)       echo "usage: hat-registry put|adopt|refresh|prune|snooze|hibernate|hibernate-done|forget" >&2 ;;
 esac
 exit 0
 HATREGISTRY
@@ -5459,6 +5503,7 @@ cmd_new() {
     elif [[ -n "$ssh_dest" ]]; then
         register_hat "$hat" "$ssh_dest" "$dir"
     fi
+    hat_require_enabled "$hat"
 
     # Now that the hat is known, a bare name can take its prefix - unless it
     # names a session the hat already has, which is then reattached.
@@ -6861,6 +6906,7 @@ cmd_repair() {
 # attach_session <hat> <session> [window]: a window index selects that tab first.
 attach_session() {
     local hat="$1" session="$2" window="${3:-}" dest dir cmd
+    hat_require_enabled "$hat"
     [[ -t 0 && -t 1 ]] || die "attach needs a terminal - '$session' is on hat '$hat'"
     dest=$(hat_ssh "$hat")
     [[ -n "$dest" ]] || die "hat '$hat' has no ssh destination"
@@ -6968,6 +7014,7 @@ cmd_attach() {
 
     # A hat: pick one of its workspaces.
     hat="$target"
+    hat_require_enabled "$hat"
     local list n
     list=$(hat_workspaces "$hat")
     n=$(printf '%s' "$list" | grep -c '' || true)
@@ -7423,7 +7470,9 @@ cmd_find() {
         else
             dests+=("$dest"); hats_of+=("$hat")
         fi
-    done < <(hat_names)
+    # Disabled hats too: their conversations are history, which is what
+    # find searches (#255).
+    done < <(all_hat_names)
     [[ ${#dests[@]} -gt 0 ]] || die "no hats to search"
 
     local args="exec bash -s --"
@@ -8949,12 +8998,191 @@ backup_auto() {
     return 0
 }
 
+# hat_sessions_to_end <hat> <live sessions>: the running sessions that are
+# this hat's: the ones its groups record, and the ones that would go into its
+# Unassigned. Other hats on the same server keep theirs.
+hat_sessions_to_end() {
+    local hat="$1" live="$2"
+    {
+        cfg --arg l "$hat" --arg live "$live" '
+            ($live | split("\n") | map(select(. != ""))) as $run
+            | .groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?
+            | select(. as $s | $run | index($s))'
+        hat_unrecorded "$hat" "$live"
+    } | awk 'NF && !seen[$0]++'
+}
+
+# hat disable <hat> [--yes] [--no-sync] [--keep-running]: put a hat away
+# (#255). The config keeps its groups and the workspaces and tabs they record;
+# its tmux sessions end, its window closes, and every loop over hats passes it
+# by until it is enabled again.
+hat_disable() {
+    local hat="" yes=0 nosync=0 keep=0 usage="usage: hatter hat disable <hat> [--yes] [--no-sync] [--keep-running]"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) yes=1; shift ;;
+            --no-sync) nosync=1; shift ;;
+            --keep-running) keep=1; shift ;;
+            -*) die "unknown flag: $1  ($usage)" ;;
+            *) [[ -z "$hat" ]] || die "$usage"; hat="$1"; shift ;;
+        esac
+    done
+    [[ -n "$hat" ]] || die "$usage"
+    hat_exists "$hat" || die "unknown hat: $hat"
+    # Already disabled: done, unless some of its sessions still run (a
+    # disable cut off partway), which a second one ends.
+    local again=0
+    if hat_disabled "$hat"; then
+        [[ "$keep" == 0 ]] || { info "Hat '$hat' is already disabled"; return 0; }
+        again=1 nosync=1
+    fi
+    local host
+    host=$(hat_ssh "$hat")
+
+    # 1. The config is what enable rebuilds from, so it has to be current.
+    if [[ "$nosync" == 0 ]]; then
+        if cmux_alive; then
+            info "Syncing first, so the config holds '$hat' as it is now"
+            cmd_sync
+        else
+            warn "cmux is not reachable, so no sync: '$hat' keeps its layout as last synced"
+        fi
+    fi
+
+    # 2. What ends.
+    local live="" ending="" n=0 why
+    if [[ "$keep" == 0 ]]; then
+        [[ -n "$host" ]] || die "hat '$hat' has no ssh destination; nothing changed (--keep-running disables it without touching a server)"
+        if ! live=$(hat_live_sessions "$host" 2>/dev/null); then
+            why=$(ssh_probe "$host") || true
+            die "could not read the tmux sessions on $host${why:+ ($why)}; nothing changed.
+  --keep-running disables the hat and leaves the server alone."
+        fi
+        ending=$(hat_sessions_to_end "$hat" "$live")
+        n=$(grep -c . <<<"$ending" || true)
+    fi
+    if [[ "$again" == 1 && "$n" == 0 ]]; then
+        info "Hat '$hat' is already disabled"
+        return 0
+    fi
+    local groups workspaces
+    groups=$(cfg --arg l "$hat" '[.groups[] | select(.hat == $l)] | length')
+    workspaces=$(cfg --arg l "$hat" '[.groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?] | length')
+
+    if [[ "$yes" == 0 ]]; then
+        [[ -t 0 ]] || die "disabling '$hat' ends its tmux sessions: pass --yes to go ahead without a terminal"
+        echo "Disabling hat '$hat' keeps its $groups group(s) and $workspaces workspace(s) in the config."
+        if [[ "$n" -gt 0 ]]; then
+            echo "These tmux sessions on $host end, with everything running in them:"
+            sed 's/^/    /' <<<"$ending"
+        elif [[ "$keep" == 0 ]]; then
+            echo "No tmux session of '$hat' is running on $host."
+        fi
+        local a
+        read -r -p "  Disable '$hat'? [y/N] " a || a=""
+        [[ "$a" == [yY]* ]] || die "nothing changed"
+    fi
+
+    # 3. Disabled before anything ends: an autosave sync running meanwhile
+    # would otherwise take the ended sessions for closed ones and drop them.
+    local win=""
+    cmux_alive && win=$(find_hat_window "$hat" 2>/dev/null) || true
+    if [[ "$again" == 0 ]]; then
+        backup_config
+        jq_write --arg l "$hat" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.hats[$l].disabled = true | .hats[$l].disabled_at = $t'
+    fi
+
+    # 4. End the sessions, each kept out of what a reboot brings back.
+    local s errf failed=0
+    errf=$(mktemp "${TMPDIR:-/tmp}/hatter-disable.XXXXXX")
+    while IFS= read -r s; do
+        [[ -z "$s" ]] && continue
+        if remote_end_session "$host" "$s" >/dev/null 2>"$errf"; then
+            echo "  ended $s"
+        else
+            warn "could not end '$s' on $host: $(head -n 1 "$errf")"
+            failed=$((failed + 1))
+        fi
+    done <<<"$ending"
+    rm -f "$errf"
+    [[ "$failed" == 0 ]] || warn "run 'hatter hat disable $hat' again to end what is left"
+
+    if [[ "$keep" == 0 ]]; then
+        # The pane registry: their agents' conversations become history, and
+        # their snoozed tabs end too, or a wake would bring a session back.
+        local all out
+        all=$(cfg --arg l "$hat" '.groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?')
+        all=$(printf '%s\n%s\n' "$all" "$ending" | awk 'NF && !seen[$0]++')
+        if [[ -n "$all" ]]; then
+            # shellcheck disable=SC2046
+            out=$(remote_sh "$host" "r=\$HOME/.local/bin/hat-registry; [ -x \"\$r\" ] && \"\$r\" forget $(while IFS= read -r s; do printf '%s ' "$(sq "$s")"; done <<<"$all")" 2>/dev/null) || out=""
+            grep -q '^hat-registry: forgot' <<<"$out" \
+                || warn "$host: the pane registry was not told; run 'hatter provision $hat' once, so a reboot cannot bring back a closed agent"
+        fi
+        tell_server_sessions "$host" 2>/dev/null \
+            || warn "$host: could not tell the server what to bring back after a reboot"
+    fi
+
+    # 5. The window goes too. Its workspaces were mirrors of what just ended.
+    if [[ -n "$win" ]]; then
+        cmux_change close-window --window "$win" >/dev/null 2>&1 \
+            || warn "could not close the cmux window of '$hat' ($win)"
+    fi
+
+    local ended=", $((n - failed)) tmux session(s) ended"
+    [[ "$keep" == 0 ]] || ended=", its server left as it was"
+    info "Disabled hat '$hat': $groups group(s) and $workspaces workspace(s) kept$ended"
+    echo "  hatter hat enable $hat brings them back, as fresh shells."
+    [[ "$failed" == 0 ]]
+}
+
+# hat enable <hat> [--no-restore]: take a hat back up. Its groups and the
+# workspaces they record are restored, each tab a fresh shell in its recorded
+# directory; no agent conversation is resumed.
+hat_enable() {
+    local hat="" norestore=0 usage="usage: hatter hat enable <hat> [--no-restore]"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-restore) norestore=1; shift ;;
+            -*) die "unknown flag: $1  ($usage)" ;;
+            *) [[ -z "$hat" ]] || die "$usage"; hat="$1"; shift ;;
+        esac
+    done
+    [[ -n "$hat" ]] || die "$usage"
+    hat_exists "$hat" || die "unknown hat: $hat"
+    if ! hat_disabled "$hat"; then
+        info "Hat '$hat' is not disabled"
+        return 0
+    fi
+    # Checked before anything changes, so a dead cmux does not leave the hat
+    # enabled with nothing restored.
+    [[ "$norestore" == 1 ]] || require_cmux "hat enable $hat"
+    backup_config
+    jq_write --arg l "$hat" 'del(.hats[$l].disabled, .hats[$l].disabled_at)'
+    info "Enabled hat '$hat'"
+    if [[ "$norestore" == 1 ]]; then
+        echo "  hatter restore $hat brings back its groups and workspaces."
+        return 0
+    fi
+    # restore makes the sessions; the server has to hear they are wanted, or
+    # a reboot before the next sync leaves them closed. Told whether or not
+    # restore got all the way: what it made is wanted either way.
+    local rc=0
+    ( cmd_restore "$hat" ) || rc=$?
+    tell_server_sessions "$(hat_ssh "$hat")" 2>/dev/null \
+        || warn "could not tell the server what to bring back after a reboot"
+    [[ "$rc" == 0 ]] || warn "restore did not finish: run 'hatter restore $hat' to complete it"
+    return "$rc"
+}
+
 cmd_hat() {
     local sub="${1:-list}"; shift || true
     case "$sub" in
         list|"")
             cfg '.hats | to_entries[]
                  | "\(.key)\t-> \(.value.ssh)  [\(.value.remote_dir)]"
+                   + (if .value.disabled then "  DISABLED" else "" end)
                    + (if .value.default_group then "  default group: \(.value.default_group)" else "" end)
                    + (if .value.mosh then "  mosh" else "" end)
                    + (if .value.launch.kind then "  launches \(.value.launch.kind)" else "" end)'
@@ -9015,10 +9243,16 @@ cmd_hat() {
             cmux_snapshot
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
+                if hat_disabled "$hat"; then
+                    printf '%-10s  %-24s  %s\n' "$hat" "$(hat_ssh "$hat")" "disabled"
+                    continue
+                fi
                 hat_status_row "$hat"
-            done < <(hat_names)
+            done < <(all_hat_names)
             cmux_snapshot_drop
             ;;
+        disable) hat_disable "$@" ;;
+        enable)  hat_enable "$@" ;;
         rename|mv)
             local old="${1:-}" new="${2:-}"
             [[ -n "$old" && -n "$new" ]] || die "usage: hatter hat rename <old> <new>"
@@ -9883,12 +10117,18 @@ cmd_restore() {
         local tok resolved=() l
         for tok in "$@"; do
             if hat_exists "$tok"; then
-                resolved+=("$tok")
+                l="$tok"
             elif group_exists "$tok"; then
-                resolved+=("$(group_hat "$tok")")
+                l=$(group_hat "$tok")
             else
                 warn "unknown hat or group: $tok"
+                continue
             fi
+            if hat_disabled "$l"; then
+                warn "hat '$l' is disabled, skipping it (hatter hat enable $l brings it back)"
+                continue
+            fi
+            resolved+=("$l")
         done
         [[ ${#resolved[@]} -gt 0 ]] || die "nothing to restore"
         hats=$(printf '%s\n' "${resolved[@]}" | sort -u)
@@ -10231,6 +10471,12 @@ cmd_list() {
     local orphans
     orphans=$(cfg '.groups | to_entries[] | select((.value.hat // "") == "") | .key')
     [[ -n "$orphans" ]] && { echo "groups with no hat:"; sed 's/^/  /' <<<"$orphans"; echo; }
+
+    local off
+    off=$(cfg '.hats as $h | [.groups[] | select($h[.hat // ""].disabled)] as $g
+        | $h | to_entries[] | select(.value.disabled) | .key as $l
+        | "\($l)  (\([$g[] | select(.hat == $l)] | length) groups, \([$g[] | select(.hat == $l) | .sessions | keys_unsorted[]?] | length) workspaces kept; hatter hat enable \($l))"')
+    [[ -n "$off" ]] && { echo "disabled hats:"; sed 's/^/  /' <<<"$off"; echo; }
 
     echo "live cmux windows:"
     local w
@@ -10783,9 +11029,11 @@ cmux_attached() {
 
 watch_mirrored_file() { printf '%s/mirrored' "$AUTOSAVE_DIR"; }
 
-# "<hat> TAB <session>" for every recorded session, once each.
+# "<hat> TAB <session>" for every recorded session, once each. A disabled
+# hat's are not watched: they are meant to be down.
 watch_recorded() {
-    cfg '.groups[]? | .hat as $h | .sessions | keys_unsorted[]? | "\($h)\t\(.)"' 2>/dev/null | awk '!seen[$0]++'
+    cfg '.hats as $hats | .groups[]? | .hat as $h | select($hats[$h].disabled | not)
+         | .sessions | keys_unsorted[]? | "\($h)\t\(.)"' 2>/dev/null | awk '!seen[$0]++'
 }
 
 # watch_wake_tick: start of a watcher round. Notices a wake and arms the look.
@@ -13839,6 +14087,11 @@ Subcommands:
                                           `hatter provision`.
   rename <old> <new>                      Rename a hat and re-prefix its sessions
   rm <hat>                                Forget a hat (server untouched)
+  disable <hat> [--yes] [--no-sync] [--keep-running]
+                                          Put a hat away while you are not
+                                          working in it. See below.
+  enable <hat> [--no-restore]             Take it back up: restores its window,
+                                          groups and workspaces.
 
   hatter hat add cloud --ssh you@shell.example.com
   hatter hat set cloud --kind claude --args claude='--permission-mode auto'
@@ -13846,6 +14099,24 @@ Subcommands:
 
 Hats that share an ssh destination share one tmux server, so they must agree
 on --kind and on each kind's --args; provision refuses if they do not.
+
+Disabling a hat keeps its shape and ends what runs in it. It syncs first, so
+the config holds the hat's groups, workspaces and tabs as they are now; asks
+before going on (--yes skips the question); then ends every tmux session of
+the hat, with whatever runs in them, and closes its window. Other hats on the
+same server keep theirs. The server is told, so a reboot brings none of them
+back, and a Claude conversation that was running is kept as history for
+`hatter find`, as when its tab closes. --keep-running marks the hat disabled
+and leaves the server alone, for one that cannot be reached.
+
+While a hat is disabled, sync, restore, autosave, the rack, list and the other
+commands that go over every hat pass it by, and its groups stay in the config
+as they were. new, attach and restore refuse it by name. `hat list` and
+`hat status` still show it, marked disabled.
+
+Enabling it restores it: its window, its groups, and each workspace with its
+tabs, names, directories and pins, every tab a fresh shell. No agent is
+resumed. --no-restore only clears the mark; `hatter restore <hat>` finishes.
 USAGE
     ;;
     group) cat <<'USAGE'
