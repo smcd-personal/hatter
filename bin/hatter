@@ -14656,7 +14656,7 @@ case "$cmd" in
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
     *)         if meant=$(subcommand_word "$cmd"); then
-                   die "'$cmd' is not a top-level command; nothing changed. Did you mean: $meant
+                   die "'$cmd' is not a top-level command, so no workspace was made. Did you mean: $meant
   (a workspace named '$cmd' is: hatter new $cmd)"
                fi
                cmd_new "$cmd" "$@" ;;
