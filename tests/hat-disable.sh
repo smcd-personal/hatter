@@ -211,6 +211,24 @@ hatter_in hat disable dev --yes --no-sync --keep-running || true
 expect "--keep-running marks it disabled" "$(yes_if [ "$(cfg_of '.hats.dev.disabled')" = true ])"
 expect "...and ends nothing" "$(yes_if bash -c '! grep -q "^kill" "$1" && grep -qx dev-a "$2"' _ "$d/log" "$d/server.u")"
 
+# --- a disable cut off partway is finished by another ------------------------------
+# Marked disabled, but dev-a still runs: a second disable ends it (the
+# control: with nothing left running it says so and does nothing).
+setup again "$(jq '.hats.dev.disabled = true' <<<"$TWO_HATS")" "$TWO_TREE"; two_groups
+printf 'dev-a\nops-b\n' > "$d/server.u"
+hatter_in hat disable dev --yes || true
+expect "a second disable ends a disabled hat's session still running" "$(yes_if logged "kill u dev-a")"
+expect "...and leaves the other hat's" "$(yes_if bash -c '! grep -q "kill u ops-b" "$1"' _ "$d/log")"
+
+# --- enable with no cmux to restore into changes nothing -----------------------------
+setup nocmux "$(jq '.hats.dev.disabled = true' <<<"$TWO_HATS")" "$TWO_TREE"; two_groups
+mkdir -p "$d/bin"; cp "$work/bin/ssh" "$d/bin/ssh"
+rc=0
+env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" XDG_STATE_HOME="$d/state" \
+    PATH="$d/bin:/usr/bin:/bin" STUB_DIR="$d" /bin/bash "$hatter" hat enable dev < /dev/null > "$d/out" 2>&1 || rc=$?
+expect "enable with no cmux fails" "$(yes_if [ "$rc" != 0 ])"
+expect "...and leaves the hat disabled" "$(yes_if [ "$(cfg_of '.hats.dev.disabled')" = true ])"
+
 # --- enable ---------------------------------------------------------------------
 hatter_in hat enable dev --no-restore || true
 expect "enable clears the mark" "$(yes_if [ "$(cfg_of '.hats.dev | has("disabled") or has("disabled_at")')" = false ])"

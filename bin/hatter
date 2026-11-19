@@ -7470,7 +7470,9 @@ cmd_find() {
         else
             dests+=("$dest"); hats_of+=("$hat")
         fi
-    done < <(hat_names)
+    # Disabled hats too: their conversations are history, which is what
+    # find searches (#255).
+    done < <(all_hat_names)
     [[ ${#dests[@]} -gt 0 ]] || die "no hats to search"
 
     local args="exec bash -s --"
@@ -9027,9 +9029,12 @@ hat_disable() {
     done
     [[ -n "$hat" ]] || die "$usage"
     hat_exists "$hat" || die "unknown hat: $hat"
+    # Already disabled: done, unless some of its sessions still run (a
+    # disable cut off partway), which a second one ends.
+    local again=0
     if hat_disabled "$hat"; then
-        info "Hat '$hat' is already disabled"
-        return 0
+        [[ "$keep" == 0 ]] || { info "Hat '$hat' is already disabled"; return 0; }
+        again=1 nosync=1
     fi
     local host
     host=$(hat_ssh "$hat")
@@ -9056,6 +9061,10 @@ hat_disable() {
         ending=$(hat_sessions_to_end "$hat" "$live")
         n=$(grep -c . <<<"$ending" || true)
     fi
+    if [[ "$again" == 1 && "$n" == 0 ]]; then
+        info "Hat '$hat' is already disabled"
+        return 0
+    fi
     local groups workspaces
     groups=$(cfg --arg l "$hat" '[.groups[] | select(.hat == $l)] | length')
     workspaces=$(cfg --arg l "$hat" '[.groups[] | select(.hat == $l) | .sessions | keys_unsorted[]?] | length')
@@ -9078,9 +9087,11 @@ hat_disable() {
     # would otherwise take the ended sessions for closed ones and drop them.
     local win=""
     cmux_alive && win=$(find_hat_window "$hat" 2>/dev/null) || true
-    backup_config
-    jq_write --arg l "$hat" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '.hats[$l].disabled = true | .hats[$l].disabled_at = $t'
+    if [[ "$again" == 0 ]]; then
+        backup_config
+        jq_write --arg l "$hat" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.hats[$l].disabled = true | .hats[$l].disabled_at = $t'
+    fi
 
     # 4. End the sessions, each kept out of what a reboot brings back.
     local s errf failed=0
@@ -9095,6 +9106,7 @@ hat_disable() {
         fi
     done <<<"$ending"
     rm -f "$errf"
+    [[ "$failed" == 0 ]] || warn "run 'hatter hat disable $hat' again to end what is left"
 
     if [[ "$keep" == 0 ]]; then
         # The pane registry: their agents' conversations become history, and
@@ -9143,6 +9155,9 @@ hat_enable() {
         info "Hat '$hat' is not disabled"
         return 0
     fi
+    # Checked before anything changes, so a dead cmux does not leave the hat
+    # enabled with nothing restored.
+    [[ "$norestore" == 1 ]] || require_cmux "hat enable $hat"
     backup_config
     jq_write --arg l "$hat" 'del(.hats[$l].disabled, .hats[$l].disabled_at)'
     info "Enabled hat '$hat'"
@@ -9150,11 +9165,15 @@ hat_enable() {
         echo "  hatter restore $hat brings back its groups and workspaces."
         return 0
     fi
-    cmd_restore "$hat"
     # restore makes the sessions; the server has to hear they are wanted, or
-    # a reboot before the next sync leaves them closed.
+    # a reboot before the next sync leaves them closed. Told whether or not
+    # restore got all the way: what it made is wanted either way.
+    local rc=0
+    ( cmd_restore "$hat" ) || rc=$?
     tell_server_sessions "$(hat_ssh "$hat")" 2>/dev/null \
         || warn "could not tell the server what to bring back after a reboot"
+    [[ "$rc" == 0 ]] || warn "restore did not finish: run 'hatter restore $hat' to complete it"
+    return "$rc"
 }
 
 cmd_hat() {
