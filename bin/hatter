@@ -6461,7 +6461,11 @@ heal_hat_drags() {
         # cmux has just said this surface was dropped here, so the drag is
         # over: no second look, but nothing moves except that tab.
         second=$(AWK_S="$(upper "$onlysf")" awk -F '\037' '($1 == "move" || $1 == "local") && toupper($2) == ENVIRON["AWK_S"]' <<<"$first")
-        [[ -n "$second" ]] || { drag_event_missed "$report" "$host" "$tree" "$onlysf"; return 0; }
+        [[ -n "$second" ]] || {
+            drag_report "$report" "$first"
+            drag_event_missed "$report" "$host" "$tree" "$onlysf"
+            return 0
+        }
     else
         grep -qE '^(move|local)' <<<"$first" || { drag_report "$report" "$first"; return 0; }
         # A tab mid-drag, or a mirror mid-reconnect, can look like this for a
@@ -6553,7 +6557,7 @@ drag_event_missed() {
     title=$(printf '%s' "$title" | tr -d '[:cntrl:]')
     warn "the tab '${title:-tmux window}' dropped into '$wstitle' is blank, and hatter could not tell which tmux window it shows${host:+ on $host}.
   Its window is still in the session it was dragged from: find it with 'tmux list-windows -a' there and move it with
-    tmux move-window -s '=<from-session>:@N' -t '=$wstitle:'"
+    tmux move-window -s '=<from-session>:@N' -t $(sq "=$wstitle:")"
     return 0
 }
 
