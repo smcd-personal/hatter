@@ -420,7 +420,8 @@ hatter backup "first backup"
 ## What about credentials?
 
 `hatter creds push` reads Claude logins from the macOS Keychain via `cswap`,
-which has no Windows or Linux equivalent. Push from the Mac, or log in on the
+which has no Windows or Linux equivalent. Codex logins (`~/.codex-<name>`) need
+no Keychain, but the `creds` command has only been tested on macOS. Push from the Mac, or log in on the
 server itself once; the credential persists there either way.
 
 ## Following the client work

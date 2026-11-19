@@ -2255,19 +2255,26 @@ chmod +x "$HOME/.local/bin/tabname"
 # place a login is ever entered; this just installs what it is handed.
 cat > "$HOME/.local/bin/hat-creds" <<'HATCREDS'
 #!/usr/bin/env python3
-"""hat-creds - receive Claude Code credentials pushed from the hatter client.
+"""hat-creds - receive agent credentials pushed from the hatter client.
 
-The client holds every login (in the macOS Keychain, via cswap) and pushes one
-here over ssh; nothing is ever stored on this server that the client did not
-put here on purpose.
+The client holds every login and pushes one here over ssh; nothing is ever
+stored on this server that the client did not put here on purpose. Claude Code
+logins come from cswap; Codex logins from a ~/.codex-<name> home on the client.
 
     hat-creds install     read a `cswap export` envelope on stdin, install it
     hat-creds status      print what is installed now, as JSON
     hat-creds clear       remove the installed credential
 
-Claude Code reads the credential when a session starts, so an already-running
+    hat-creds install --agent codex   read a Codex auth.json on stdin
+    hat-creds status --agent codex    the Codex login installed, as JSON
+    hat-creds clear --agent codex     remove it
+
+Codex is installed into $CODEX_HOME, or ~/.codex when that is unset.
+
+An agent reads the credential when a session starts, so an already-running
 session keeps the account it started with. New sessions pick up the new one.
 """
+import base64
 import json
 import os
 import sys
@@ -2439,19 +2446,107 @@ def clear():
     print("cleared: %s" % (", ".join(removed) if removed else "nothing to clear"))
 
 
+# --- Codex -------------------------------------------------------------------
+
+def codex_auth_path():
+    home = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    return os.path.join(home, "auth.json")
+
+
+def jwt_claims(token):
+    """The claims of a JWT, unverified: only for reading who and until when."""
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part.encode()).decode())
+    except Exception:
+        return {}
+
+
+def codex_describe(auth):
+    """What a Codex auth.json holds, without any token in the output."""
+    out = {"agent": "codex"}
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else None
+    if tokens:
+        out["kind"] = "chatgpt"
+        idc = jwt_claims(tokens.get("id_token") or "")
+        oa = idc.get("https://api.openai.com/auth") or {}
+        out["email"] = idc.get("email")
+        out["accountId"] = tokens.get("account_id") or oa.get("chatgpt_account_id")
+        out["plan"] = oa.get("chatgpt_plan_type")
+        out["hasRefreshToken"] = bool(tokens.get("refresh_token"))
+        exp = jwt_claims(tokens.get("access_token") or "").get("exp")
+        if isinstance(exp, (int, float)):
+            out["expiresInSeconds"] = int(exp - time.time())
+            out["expired"] = out["expiresInSeconds"] <= 0
+    elif auth.get("OPENAI_API_KEY"):
+        out["kind"] = "api_key"
+    else:
+        out["kind"] = "unknown"
+    return out
+
+
+def codex_install():
+    raw = sys.stdin.read()
+    try:
+        auth = json.loads(raw)
+    except ValueError as e:
+        die("stdin is not a Codex auth.json: %s" % e)
+    if not isinstance(auth, dict):
+        die("a Codex auth.json must be a JSON object")
+    d = codex_describe(auth)
+    if d["kind"] == "unknown":
+        die("stdin holds neither ChatGPT tokens nor an API key")
+    path = codex_auth_path()
+    write_private(path, raw if raw.endswith("\n") else raw + "\n")
+    print("installed %s for %s in %s" % (
+        "Codex login" if d["kind"] == "chatgpt" else "Codex API key",
+        d.get("email") or "(unknown)", os.path.dirname(path)))
+
+
+def codex_status():
+    path = codex_auth_path()
+    auth = read_json(path)
+    if auth is None:
+        kind = "unreadable" if os.path.exists(path) else "none"
+        print(json.dumps({"agent": "codex", "kind": kind}))
+        return
+    print(json.dumps(codex_describe(auth) if isinstance(auth, dict)
+                     else {"agent": "codex", "kind": "unreadable"}))
+
+
+def codex_clear():
+    path = codex_auth_path()
+    try:
+        os.unlink(path)
+        print("cleared: %s" % path)
+    except OSError:
+        print("cleared: nothing to clear")
+
+
 def main():
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    args = sys.argv[1:]
+    agent = "claude"
+    if "--agent" in args:
+        i = args.index("--agent")
+        if i + 1 >= len(args):
+            die("--agent needs a value (claude|codex)")
+        agent = args[i + 1]
+        del args[i:i + 2]
+    if agent not in ("claude", "codex"):
+        die("unknown agent %r (claude|codex)" % agent)
+    cmd = args[0] if args else "status"
     if cmd in ("-h", "--help", "help"):
         sys.stdout.write(__doc__)
         return
-    if cmd == "install":
-        install()
-    elif cmd == "status":
-        status()
-    elif cmd == "clear":
-        clear()
-    else:
+    table = {
+        "claude": {"install": install, "status": status, "clear": clear},
+        "codex": {"install": codex_install, "status": codex_status,
+                  "clear": codex_clear},
+    }[agent]
+    if cmd not in table:
         die("unknown command %r (install|status|clear)" % cmd)
+    table[cmd]()
 
 
 if __name__ == "__main__":
@@ -12263,7 +12358,7 @@ creds_eta() {
 creds_dot() {
     local r worst=""
     for r in "$@"; do
-        [[ "$r" == "-" || -z "$r" ]] && continue
+        [[ "$r" =~ ^-?[0-9]+$ ]] || continue
         [[ -z "$worst" || "$r" -lt "$worst" ]] && worst="$r"
     done
     if [[ -z "$worst" ]]; then printf '%s●%s' "$C_DIM" "$C_R"; return 0; fi
@@ -12277,6 +12372,10 @@ creds_gauge() {
     if [[ "$r" == "-" || -z "$r" ]]; then
         printf '%s%-16s%s' "$C_DIM" "none" "$C_R"; return 0
     fi
+    # "?": the reading failed, which is not the same as a full or empty window.
+    if [[ "$r" == "?" ]]; then
+        printf '%s%-16s%s' "$C_YL" "unknown" "$C_R"; return 0
+    fi
     printf '%s %3s%% %4s' "$(creds_bar "$r")" "$r" "$(creds_eta "$e")"
 }
 
@@ -12285,21 +12384,34 @@ creds_gauges() {
     printf '5h %s   7d %s' "$(creds_gauge "$1" "$3")" "$(creds_gauge "$2" "$4")"
 }
 
-# creds_resolve <sel>: prints "slot<US>email<US>org" for the one credential
-# <sel> names: a letter, a cswap slot number, an exact email, or a unique
-# substring of one. An email held in two organizations is ambiguous by itself,
-# so it asks for the letter instead of guessing which one to push.
+# creds_all_rows: every login, Claude first, each row led by its agent:
+#   agent  letter  slot|name  email  org|workspace  role  label  rem5 rem7 e5 e7 active
+creds_all_rows() {
+    local rows n=0
+    rows=$(creds_rows)
+    if [[ -n "$rows" ]]; then
+        printf '%s\n' "$rows" | sed 's/^/claude\x1f/'
+        n=$(printf '%s\n' "$rows" | wc -l | tr -d ' ')
+    fi
+    codex_rows "$n" | sed 's/^/codex\x1f/'
+}
+
+# creds_resolve <sel>: prints "agent<US>slot<US>email<US>org" for the one login
+# <sel> names: a letter, a cswap slot number, a Codex home name, an exact
+# email, or a unique substring of one. An email held twice (two organizations,
+# two workspaces, or both agents) is ambiguous by itself, so it asks for the
+# letter instead of guessing which one to push.
 creds_resolve() {
-    local sel="$1" letter slot email org rest hit="" n=0
-    while IFS=$'\x1f' read -r letter slot email org rest; do
+    local sel="$1" agent letter slot email org rest hit="" n=0
+    while IFS=$'\x1f' read -r agent letter slot email org rest; do
         [[ -z "$email" ]] && continue
         if [[ "$sel" == "$letter" || "$sel" == "$slot" ]]; then
-            printf '%s\x1f%s\x1f%s' "$slot" "$email" "$org"; return 0
+            printf '%s\x1f%s\x1f%s\x1f%s' "$agent" "$slot" "$email" "$org"; return 0
         fi
         case "$email" in *"$sel"*)
-            hit=$(printf '%s\x1f%s\x1f%s' "$slot" "$email" "$org"); n=$((n+1)) ;;
+            hit=$(printf '%s\x1f%s\x1f%s\x1f%s' "$agent" "$slot" "$email" "$org"); n=$((n+1)) ;;
         esac
-    done < <(creds_rows)
+    done < <(creds_all_rows)
     [[ $n -eq 1 ]] && { printf '%s' "$hit"; return 0; }
     [[ $n -gt 1 ]] && { warn "'$sel' matches $n credentials - use its letter (see: hatter creds)"; return 1; }
     return 1
@@ -12350,13 +12462,14 @@ creds_push_to() {
     return 1
 }
 
-# creds_probe_hat <hat>: hat-creds' status JSON, or nothing. On a server that
-# cannot be reached, prints "@@unreachable <why>" instead.
+# creds_probe_hat <hat>: hat-creds' status JSON, then "@@codex" and the Codex
+# status JSON (empty from a hat-creds too old to know Codex), or nothing. On a
+# server that cannot be reached, prints "@@unreachable <why>" instead.
 creds_probe_hat() {
     local out errf rc=0
     errf=$(mktemp "${TMPDIR:-/tmp}/hatter-creds.XXXXXX")
     out=$(ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$(hat_ssh "$1")" \
-        "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" status')" 2>"$errf") || rc=$?
+        "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" status; echo @@codex; python3 "$HOME/.local/bin/hat-creds" status --agent codex 2>/dev/null')" 2>"$errf") || rc=$?
     if [[ "$rc" == 255 ]]; then
         printf '@@unreachable %s\n' "$(ssh_why "$(cat "$errf")")"
     else
@@ -12366,58 +12479,276 @@ creds_probe_hat() {
     return 0
 }
 
+# --------------------------------------------------------- codex credentials
+#
+# A Codex login is a directory: ~/.codex-<name>, holding the auth.json Codex
+# writes on `CODEX_HOME=~/.codex-<name> codex login`. cswap knows nothing of
+# Codex, so hatter reads these itself. The name is only a label: who the login
+# is comes from auth.json, because one email can sign in to more than one
+# ChatGPT workspace (a personal plan and a team) and a name cannot say which.
+# The workspace id plays the part cswap's organization id plays for Claude.
+#
+# Codex refresh tokens rotate on use, more strictly than Claude's: a login used
+# in two places at once logs one of them out. A home pushed to a hat should not
+# also be used on this Mac, and should be on one hat only.
+
+CODEX_BIN="${HATTER_CODEX:-codex}"
+
+# How long a usage reading stays good. Each reading starts a Codex process, so
+# they are cached; the windows move slowly enough that two minutes is plenty.
+CODEX_USAGE_TTL="${HATTER_CODEX_USAGE_TTL:-120}"
+
+codex_usage_dir() { printf '%s/hatter/codex-usage' "${XDG_CACHE_HOME:-$HOME/.cache}"; }
+
+# Every ~/.codex-<name> that holds a login, one path per line, in name order.
+codex_homes() {
+    local d
+    for d in "$HOME"/.codex-*; do
+        [[ -f "$d/auth.json" ]] && printf '%s\n' "$d"
+    done
+    return 0
+}
+
+# codex_ident <home>: "email<US>workspace<US>plan<US>kind" from its auth.json.
+# The id token is a JWT; its claims are read, not verified, only to say who.
+codex_ident() {
+    jq -r '
+        def claims: split(".")[1] // "" | gsub("-"; "+") | gsub("_"; "/")
+            | . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson;
+        if (.tokens | type) == "object" then
+            (.tokens.id_token // "" | try claims catch {}) as $c
+            | ($c["https://api.openai.com/auth"] // {}) as $a
+            | [ ($c.email // ""), (.tokens.account_id // $a.chatgpt_account_id // ""),
+                ($a.chatgpt_plan_type // ""), "chatgpt" ]
+        elif (.OPENAI_API_KEY // "") != "" then ["", "", "", "api_key"]
+        else ["", "", "", "unknown"] end
+        | join("\u001f")' < "$1/auth.json" 2>/dev/null || true
+}
+
+# A ChatGPT plan type as a role. Team-shaped plans are billed to a workspace;
+# the rest belong to one person.
+codex_role() {
+    case "$1" in
+        "") printf '' ;;
+        team|business|enterprise|edu|education) printf 'team' ;;
+        *) printf 'personal' ;;
+    esac
+}
+
+# codex_probe <home>: ask Codex itself for the login's rate limits and cache
+# the answer. `codex app-server` speaks JSON-RPC on stdio and quits at EOF, so
+# stdin is held open on a fifo until the reply is in, at most 15 seconds.
+codex_probe() {
+    local home="$1" name out tmp pid i=0
+    name=$(basename "$home"); out="$(codex_usage_dir)/$name.json"
+    mkdir -p "$(codex_usage_dir)"
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-codex.XXXXXX")
+    mkfifo "$tmp/in"
+    CODEX_HOME="$home" "$CODEX_BIN" app-server < "$tmp/in" > "$tmp/out" 2>/dev/null &
+    pid=$!
+    exec 7> "$tmp/in"
+    printf '%s\n' \
+        '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"hatter","version":"0"}}}' \
+        '{"method":"initialized"}' \
+        '{"id":3,"method":"account/rateLimits/read"}' >&7 2>/dev/null || true
+    while [[ $i -lt 150 ]]; do
+        grep -q '"id":3' "$tmp/out" 2>/dev/null && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1; i=$((i+1))
+    done
+    exec 7>&-
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    # The reply is kept whole only if it is one: an error or no answer leaves
+    # a marker, so the row says "unknown" and not some stale number.
+    if grep '"id":3' "$tmp/out" 2>/dev/null | jq -e '.result.rateLimits' > "$out.tmp" 2>/dev/null; then
+        mv "$out.tmp" "$out"
+    else
+        rm -f "$out.tmp"; printf '{"unknown":true}\n' > "$out"
+    fi
+    rm -rf "$tmp"
+}
+
+# Re-read every home whose cached reading is older than the TTL, all at once.
+codex_usage_refresh() {
+    local home f now age
+    command -v "$CODEX_BIN" >/dev/null 2>&1 || return 0
+    now=$(date +%s)
+    while IFS= read -r home; do
+        f="$(codex_usage_dir)/$(basename "$home").json"
+        age=$CODEX_USAGE_TTL
+        [[ -f "$f" ]] && age=$(( now - $(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0) ))
+        [[ "$age" -ge "$CODEX_USAGE_TTL" ]] && codex_probe "$home" &
+    done < <(codex_homes)
+    wait
+    return 0
+}
+
+# codex_rows <first-letter-index>: one row per Codex login, in the same fields
+# as creds_rows so the same code draws both:
+#   letter  name  email  workspace  role  plan  rem5  rem7  reset5s  reset7s  ''
+# Letters carry on from the Claude rows, so one letter names one login.
+# Windows are told apart by length, not by position: a plan without a 5-hour
+# window reads "-" there, as Claude's do (#264), and an unanswered probe "?".
+codex_rows() {
+    local off="${1:-0}" home name ident email ws plan kind usage i
+    codex_usage_refresh
+    i=$off
+    while IFS= read -r home; do
+        name=$(basename "$home"); name=${name#.codex-}
+        ident=$(codex_ident "$home")
+        IFS=$'\x1f' read -r email ws plan kind <<< "$ident"
+        [[ "$kind" == api_key ]] && plan="api key"
+        usage="$(codex_usage_dir)/.codex-$name.json"
+        [[ -f "$usage" ]] || usage=/dev/null
+        jq -rn --arg l "${CRED_LETTERS:$i:1}" --arg n "$name" --arg e "${email:-?}" \
+            --arg w "$ws" --arg r "$(codex_role "$plan")" --arg p "$plan" \
+            --slurpfile u "$usage" '
+            ($u[0] // {"unknown": true}) as $u
+            | [$u.primary, $u.secondary] | map(select(. != null)) as $ws
+            | def pick(f): if $u.unknown then "?" else ([$ws[] | select(f)][0]) end;
+              def rem: if . == "?" then "?" elif . == null then "-"
+                       else (100 - (.usedPercent | floor)) | tostring end;
+              def eta: if . == "?" or . == null or .resetsAt == null then "-1"
+                       else (.resetsAt - (now | floor)) | tostring end;
+              pick(.windowDurationMins < 1440) as $short
+            | pick(.windowDurationMins >= 1440) as $long
+            | [$l, $n, $e, $w, $r, $p, ($short | rem), ($long | rem),
+               ($short | eta), ($long | eta), ""]
+            | join("\u001f")' 2>/dev/null || true
+        i=$((i+1))
+    done < <(codex_homes)
+}
+
+codex_home_of() { printf '%s/.codex-%s' "$HOME" "$1"; }
+
+# codex_hats_holding <email> [workspace]: hats that hold this Codex login.
+codex_hats_holding() {
+    cfg --arg e "$1" --arg w "${2:-}" '[.hats | to_entries[]
+        | select(.value.codex_credential == $e
+                 and ($w == "" or (.value.codex_credential_workspace // "") == ""
+                      or .value.codex_credential_workspace == $w))
+        | .key] | join(", ")'
+}
+
+# codex_push_to <name> <email> <workspace> <hat>: auth.json goes down the ssh
+# pipe straight from its home; nothing is copied on this side.
+codex_push_to() {
+    local name="$1" email="$2" ws="$3" hat="$4" host out home
+    hat_exists "$hat" || { warn "unknown hat: $hat"; return 1; }
+    home=$(codex_home_of "$name")
+    [[ -f "$home/auth.json" ]] || { warn "no Codex login in $home"; return 1; }
+    host=$(hat_ssh "$hat")
+    info "Pushing Codex $email ($name) -> $hat ($host)"
+    if out=$(ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 "$host" \
+                 "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" install --agent codex')" \
+                 < "$home/auth.json" 2>&1); then
+        echo "    ${out##*$'\n'}"
+        jq_write --arg l "$hat" --arg e "$email" --arg w "$ws" --arg n "$name" \
+            --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '.hats[$l].codex_credential = $e | .hats[$l].codex_credential_home = $n
+             | .hats[$l].codex_credential_pushed_at = $t
+             | if $w == "" then del(.hats[$l].codex_credential_workspace)
+               else .hats[$l].codex_credential_workspace = $w end'
+        return 0
+    fi
+    warn "push to $hat failed: ${out:-no output}"
+    case "$out" in
+        *"No such file"*|*"can't open file"*|*"unknown command"*|*"unrecognized"*)
+            warn "run: hatter provision $hat   (installs a hat-creds that knows Codex)" ;;
+    esac
+    return 1
+}
+
+# creds_list_row <agent> <letter> <email> <org> <role> <r5> <r7> <e5> <e7> <active> [shown]
+# <shown> is what the row prints where the email goes; it defaults to the email.
+creds_list_row() {
+    local agent="$1" letter="$2" email="$3" org="$4" role="$5"
+    local r5="$6" r7="$7" e5="$8" e7="$9" active="${10}" shown="${11:-$3}" holders n
+    if [[ "$agent" == codex ]]; then holders=$(codex_hats_holding "$email" "$org")
+    else holders=$(creds_hats_holding "$email" "$org"); fi
+    printf '  %s %s %-28s %s%s%s%s\n' \
+        "$letter" "$(creds_dot "$r5" "$r7")" "$shown" "$(creds_role "$role")" \
+        "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+        "${active:+  ${C_CY}<- active here${C_R}}" \
+        "${holders:+  ${C_DIM}-> $holders${C_R}}"
+    # A Codex refresh token rotates on use: two hats on one login log each
+    # other out. Claude tolerates it better, so only Codex gets the warning.
+    if [[ "$agent" == codex && "$holders" == *", "* ]]; then
+        n=$(( $(printf '%s' "$holders" | tr -cd ',' | wc -c) + 1 ))
+        printf '      %s! held by %s hats: Codex logs all but one of them out%s\n' "$C_YL" "$n" "$C_R"
+    fi
+}
+
 cmd_creds() {
     local sub="${1:-list}"; [[ $# -gt 0 ]] && shift || true
     case "$sub" in
         list|ls|"")
-            need_cswap
             colour_setup
-            local letter slot email org role label r5 r7 e5 e7 active holders
-            echo "Credentials (on this Mac, in the Keychain via cswap):"
+            local agent letter slot email org role label r5 r7 e5 e7 active seen="" shown
+            have_cswap || warn "cswap is not installed - no Claude logins (uv tool install claude-swap)"
+            while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 active; do
+                [[ -z "$email" ]] && continue
+                if [[ "$agent" != "$seen" ]]; then
+                    [[ -n "$seen" ]] && echo
+                    if [[ "$agent" == claude ]]; then
+                        echo "Claude logins (on this Mac, in the Keychain via cswap):"
+                    else
+                        echo "Codex logins (on this Mac, one ~/.codex-<name> home each):"
+                    fi
+                    seen="$agent"
+                fi
+                shown="$email"
+                [[ "$agent" == codex ]] && shown="$email ($slot)"
+                creds_list_row "$agent" "$letter" "$email" "$org" "$role" \
+                    "$r5" "$r7" "$e5" "$e7" "$active" "$shown"
+            done < <(creds_all_rows)
+            [[ -z "$seen" ]] && echo "No logins found: none in cswap, no ~/.codex-<name> homes."
             echo "  bars are capacity left, then time to the window reset;"
             echo "  'none' is a window the plan does not have"
-            while IFS=$'\x1f' read -r letter slot email org role label r5 r7 e5 e7 active; do
-                [[ -z "$email" ]] && continue
-                holders=$(creds_hats_holding "$email" "$org")
-                printf '  %s %s %-28s %s%s%s%s\n' \
-                    "$letter" "$(creds_dot "$r5" "$r7")" "$email" "$(creds_role "$role")" \
-                    "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
-                    "${active:+  ${C_CY}<- active here${C_R}}" \
-                    "${holders:+  ${C_DIM}-> $holders${C_R}}"
-            done < <(creds_rows)
             echo
-            echo "Hats and the credential each one holds:"
-            local hat cred
+            echo "Hats and the logins each one holds:"
+            local hat cred cx
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
                 cred=$(hat_credential "$hat")
-                printf '  %-11s %-26s %s\n' "$hat" "$(hat_ssh "$hat")" \
-                    "${cred:-(none pushed)}"
+                cx=$(cfg --arg l "$hat" '.hats[$l].codex_credential_home // empty')
+                printf '  %-11s %-26s %s%s\n' "$hat" "$(hat_ssh "$hat")" \
+                    "${cred:-(no Claude login pushed)}" "${cx:+   codex: $cx}"
             done < <(hat_names)
             echo
             echo "Push one with: hatter creds push <letter> <hat>"
             ;;
         push)
-            need_cswap
             local sel="${1:-}"; shift || true
-            [[ -n "$sel" ]] || die "usage: hatter creds push <letter|slot|email> <hat...|--all>"
-            local picked slot email org
+            [[ -n "$sel" ]] || die "usage: hatter creds push <letter|slot|name|email> <hat...|--all>"
+            local picked agent slot email org
             picked=$(creds_resolve "$sel") || die "no credential matches '$sel' - see: hatter creds"
-            IFS=$'\x1f' read -r slot email org <<< "$picked"
+            IFS=$'\x1f' read -r agent slot email org <<< "$picked"
+            [[ "$agent" == claude ]] && need_cswap
             local targets=() hat rc=0
             if [[ "${1:-}" == "--all" ]]; then
+                [[ "$agent" == codex ]] && die "a Codex login goes to one hat: its refresh token rotates, so a second hat logs the first out"
                 while IFS= read -r hat; do [[ -n "$hat" ]] && targets+=("$hat"); done < <(hat_names)
             else
                 [[ $# -gt 0 ]] || die "which hat? usage: hatter creds push $sel <hat...|--all>"
                 targets=("$@")
             fi
             for hat in "${targets[@]}"; do
-                creds_push_to "$slot" "$email" "$org" "$hat" || rc=1
+                if [[ "$agent" == codex ]]; then
+                    codex_push_to "$slot" "$email" "$org" "$hat" || rc=1
+                else
+                    creds_push_to "$slot" "$email" "$org" "$hat" || rc=1
+                fi
             done
+            if [[ "$agent" == codex && $rc == 0 ]]; then
+                local holders; holders=$(codex_hats_holding "$email" "$org")
+                [[ "$holders" == *", "* ]] && warn "Codex $email is now on $holders: only one of them will stay logged in"
+            fi
             return $rc
             ;;
         status)
-            local hat js
+            local hat js cjs
             local want="${1:-}"
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
@@ -12427,6 +12758,8 @@ cmd_creds() {
                     printf '  %-11s unreachable (%s)\n' "$hat" "${js#@@unreachable }"
                     continue
                 fi
+                cjs=$(printf '%s\n' "$js" | sed -n '/^@@codex$/,$p' | sed 1d)
+                js=$(printf '%s\n' "$js" | sed '/^@@codex$/,$d')
                 if [[ -z "$js" ]]; then
                     printf '  %-11s %s\n' "$hat" "no answer from hat-creds - is it installed? run: hatter provision $hat"
                     continue
@@ -12440,15 +12773,35 @@ cmd_creds() {
                         "\(.email // "?")  stale, refreshes itself on next run"
                     else "\(.email // "?")  token ok for \(((.expiresInSeconds // 0) / 60) | floor)m"
                     end')"
+                if [[ -z "$cjs" ]]; then
+                    printf '  %-11s %s\n' "" "codex: hat-creds predates Codex - run: hatter provision $hat"
+                else
+                    printf '  %-11s codex: %s\n' "" "$(printf '%s' "$cjs" | jq -r '
+                        if .kind == "none" then "no login installed"
+                        elif .kind == "api_key" then "API key installed"
+                        elif .kind != "chatgpt" then "unreadable auth.json"
+                        elif .hasRefreshToken | not then "\(.email // "?") - no refresh token, push it again"
+                        elif .expired == true then "\(.email // "?")  stale, refreshes itself on next run"
+                        else "\(.email // "?")  token ok for \(((.expiresInSeconds // 0) / 60) | floor)m"
+                        end')"
+                fi
             done < <(hat_names)
             ;;
         clear)
-            local hat="${1:-}"
-            [[ -n "$hat" ]] || die "usage: hatter creds clear <hat>"
+            local hat="${1:-}" which="${2:-claude}"
+            [[ -n "$hat" ]] || die "usage: hatter creds clear <hat> [claude|codex|all]"
             hat_exists "$hat" || die "unknown hat: $hat"
-            remote_sh "$(hat_ssh "$hat")" 'python3 "$HOME/.local/bin/hat-creds" clear' || true
-            jq_write --arg l "$hat" 'del(.hats[$l].credential, .hats[$l].credential_org, .hats[$l].credential_pushed_at)'
-            info "Cleared the credential on '$hat'"
+            case "$which" in claude|codex|all) ;; *) die "clear what? claude, codex or all" ;; esac
+            if [[ "$which" != codex ]]; then
+                remote_sh "$(hat_ssh "$hat")" 'python3 "$HOME/.local/bin/hat-creds" clear' || true
+                jq_write --arg l "$hat" 'del(.hats[$l].credential, .hats[$l].credential_org, .hats[$l].credential_pushed_at)'
+                info "Cleared the Claude login on '$hat'"
+            fi
+            if [[ "$which" != claude ]]; then
+                remote_sh "$(hat_ssh "$hat")" 'python3 "$HOME/.local/bin/hat-creds" clear --agent codex' || true
+                jq_write --arg l "$hat" 'del(.hats[$l].codex_credential, .hats[$l].codex_credential_workspace, .hats[$l].codex_credential_home, .hats[$l].codex_credential_pushed_at)'
+                info "Cleared the Codex login on '$hat'"
+            fi
             ;;
         *) die "unknown creds subcommand: $sub (list|push|status|clear)" ;;
     esac
@@ -12601,16 +12954,17 @@ edit_sessions_file() { printf '%s/sessions.%s' "$EDIT_CACHE" "$1"; }
 edit_fetch_hat() {
     local hat="$1" host f
     host=$(hat_ssh "$hat"); f=$(edit_sessions_file "$hat")
-    : > "$f"; : > "$f.cred"; rm -f "$f.down"
+    : > "$f"; : > "$f.cred"; : > "$f.codex"; rm -f "$f.down"
     # A server that cannot be reached is not one with no tmux: keep why (#185).
     ssh -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 "$host" \
-        "$(posix_sh "tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' 2>/dev/null; printf '@@@\n'; python3 \"\$HOME/.local/bin/hat-creds\" status 2>/dev/null || true")" \
+        "$(posix_sh "tmux list-sessions -F '#{session_name}	#{session_windows}	#{session_attached}' 2>/dev/null; printf '@@@\n'; python3 \"\$HOME/.local/bin/hat-creds\" status 2>/dev/null || true; printf '@@codex\n'; python3 \"\$HOME/.local/bin/hat-creds\" status --agent codex 2>/dev/null || true")" \
         > "$f.raw" 2>"$f.err" || {
         [[ $? != 255 ]] || ssh_fail_code "$(cat "$f.err")" > "$f.down"
         : > "$f.raw"; }
     rm -f "$f.err"
-    awk -v sf="$f" -v cf="$f.cred" \
-        '/^@@@$/ { seen = 1; next } seen { print > cf; next } { print > sf }' \
+    awk -v sf="$f" -v cf="$f.cred" -v xf="$f.codex" \
+        '/^@@@$/ { seen = 1; next } /^@@codex$/ { cx = 1; next }
+         cx { print > xf; next } seen { print > cf; next } { print > sf }' \
         "$f.raw" 2>/dev/null || true
     rm -f "$f.raw"
 }
@@ -12627,6 +12981,14 @@ edit_hat_cred_org() {
     local f="$(edit_sessions_file "$1").cred"
     [[ -s "$f" ]] || return 0
     jq -r '.organizationUuid // ""' < "$f" 2>/dev/null || true
+}
+
+# The Codex login a hat holds: "email<US>workspace", or "" for none or unknown.
+edit_hat_codex() {
+    local f="$(edit_sessions_file "$1").codex"
+    [[ -s "$f" ]] || return 0
+    jq -r 'select(.kind == "chatgpt") | [(.email // ""), (.accountId // "")]
+           | join("\u001f")' < "$f" 2>/dev/null || true
 }
 
 # cred_is <email> <org> <held-email> <held-org>: the held login is this one.
@@ -12801,7 +13163,8 @@ edit_top() {
     local SEL=1 nc nh nt i idx hat host state scol sess cred credorg credstate dot dirty=1
     local preselect=1 ch=""
     local cols lastcols="" hdrtail
-    local letter slot email org role label r5 r7 e5 e7 active holders detached=""
+    local agent letter slot email org role label r5 r7 e5 e7 active holders detached=""
+    local cx cxemail cxws
     while :; do
         # Gathering is what costs: `cswap list --json` alone is ~300ms, and
         # every hat row is several more jq reads on top. It happens only when
@@ -12810,21 +13173,26 @@ edit_top() {
         cols=$(term_cols)
         [[ "$cols" != "$lastcols" ]] && { dirty=1; lastcols="$cols"; }
         if [[ "$dirty" == 1 ]]; then
-            CLETTER=(); CEMAIL=(); CSLOT=(); CORG=(); CMETA=(); CICON=(); nc=0
-            while IFS=$'\x1f' read -r letter slot email org role label r5 r7 e5 e7 active; do
+            CLETTER=(); CEMAIL=(); CSLOT=(); CORG=(); CAGENT=(); CNAME=()
+            CMETA=(); CICON=(); nc=0
+            while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
-                CSLOT[$nc]="$slot"; CORG[$nc]="$org"
+                CSLOT[$nc]="$slot"; CORG[$nc]="$org"; CAGENT[$nc]="$agent"
+                # A Codex row names its home too: one email can have several.
+                CNAME[$nc]="$email"
+                [[ "$agent" == codex ]] && CNAME[$nc]="codex: $slot"
                 CICON[$nc]=$(creds_dot "$r5" "$r7")
                 # Which hats hold this login. A login is not tied to one hat -
                 # push it to as many as you want - and this is the only place
                 # the many side of that is visible.
-                holders=$(creds_hats_holding "$email" "$org")
+                if [[ "$agent" == codex ]]; then holders=$(codex_hats_holding "$email" "$org")
+                else holders=$(creds_hats_holding "$email" "$org"); fi
                 CMETA[$nc]=$(printf '%s%s%s' "$(creds_role "$role")" \
                     "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
                     "$(creds_tail $((cols - CREDS_TAIL_COL)) "$holders" "$active")")
                 nc=$((nc+1))
-            done < <(creds_rows)
+            done < <(creds_all_rows)
 
             HATS=(); HICON=(); HMETA=(); nh=0
             while IFS= read -r hat; do
@@ -12850,6 +13218,7 @@ edit_top() {
                 dot=""
                 idx=0
                 while [[ $idx -lt $nc ]]; do
+                    [[ "${CAGENT[$idx]}" == claude ]] &&
                     cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cred" "$credorg" &&
                         { dot="${CICON[$idx]} "; break; }
                     idx=$((idx+1))
@@ -12860,6 +13229,19 @@ edit_top() {
                     none)     cred=$(printf '%sno credential%s' "$C_DIM" "$C_R") ;;
                     *)        cred=$(printf '%snot provisioned%s' "$C_YL" "$C_R") ;;
                 esac
+                # The Codex login, when there is one, after the Claude one.
+                cx=$(edit_hat_codex "$hat")
+                if [[ -n "$cx" ]]; then
+                    IFS=$'\x1f' read -r cxemail cxws <<< "$cx"
+                    dot=""; idx=0
+                    while [[ $idx -lt $nc ]]; do
+                        [[ "${CAGENT[$idx]}" == codex ]] &&
+                        cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cxemail" "$cxws" &&
+                            { dot="${CICON[$idx]} "; break; }
+                        idx=$((idx+1))
+                    done
+                    cred=$(printf '%s  %s%scodex %s%s' "$cred" "$dot" "$C_DIM" "${cxemail%%@*}" "$C_R")
+                fi
                 HATS[$nh]="$hat"
                 HICON[$nh]=$(printf '%b' "$(hat_icon "$hat")")
                 HMETA[$nh]=$(printf '%s%-24s%s %s%-11s%s %s' \
@@ -12913,7 +13295,7 @@ edit_top() {
         ROW_LABEL=""; ROW_ICON=""
         [[ $nh -eq 0 ]] && printf '   %s(no hats yet - press A to add one)%s\n' "$C_DIM" "$C_R"
 
-        printf '\n  %sCREDENTIALS%s  %s·  one Claude login each. Bars are capacity left,%s\n' \
+        printf '\n  %sCREDENTIALS%s  %s·  Claude and Codex logins. Bars are capacity left,%s\n' \
             "$C_B" "$C_R" "$C_DIM" "$C_R"
         printf '     %sthen time to reset; red is spent, amber under half a session.%s\n\n' \
             "$C_DIM" "$C_R"
@@ -12927,12 +13309,12 @@ edit_top() {
         i=0
         while [[ $i -lt $nc ]]; do
             ROW_LABEL="${CLETTER[$i]}"; ROW_ICON="${CICON[$i]}"
-            edit_row $((nh+i+1)) "$SEL" "${CEMAIL[$i]}" 28 "${CMETA[$i]}"
+            edit_row $((nh+i+1)) "$SEL" "${CNAME[$i]}" 28 "${CMETA[$i]}"
             i=$((i+1))
         done
         ROW_LABEL=""; ROW_ICON=""
         [[ $nc -eq 0 ]] && \
-            printf '   %s(no credentials - is cswap installed?)%s\n' "$C_DIM" "$C_R"
+            printf '   %s(no logins - is cswap installed? any ~/.codex-<name> homes?)%s\n' "$C_DIM" "$C_R"
 
         printf '\n  %s↑↓ move   1-9 hat   a-z credential   → enter open   q quit%s\n' \
             "$C_DIM" "$C_R"
@@ -12975,8 +13357,8 @@ edit_top() {
                 if [[ -n "$hat" ]]; then
                     edit_groups "$hat" || return 0
                 elif [[ $nc -gt 0 ]]; then
-                    edit_credential "${CSLOT[$((idx-nh))]}" "${CEMAIL[$((idx-nh))]}" \
-                        "${CORG[$((idx-nh))]}" || return 0
+                    edit_credential "${CAGENT[$((idx-nh))]}" "${CSLOT[$((idx-nh))]}" \
+                        "${CEMAIL[$((idx-nh))]}" "${CORG[$((idx-nh))]}" || return 0
                 fi
                 : ;;
             !) edit_refresh_all ;;
@@ -13115,7 +13497,8 @@ edit_sync_restore() {
 # --- level 2 (from a credential): push it to a hat ---------------------------
 
 edit_credential() {
-    local slot="$1" email="$2" org="$3" SEL=1 n i hat host cred credstate held
+    local agent="$1" slot="$2" email="$3" org="$4" SEL=1 n i hat host cred credstate held
+    local cx cxemail cxws
     while :; do
         HATS=(); n=0
         while IFS= read -r hat; do
@@ -13124,7 +13507,7 @@ edit_credential() {
         done < <(hat_names)
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$email" "PUSH TO A HAT" \
+        edit_header "$email ($agent)" "PUSH TO A HAT" \
             "the login travels down the ssh pipe and is written 0600 on the server." \
             "One credential per hat is safest: a shared account can log itself out."
 
@@ -13132,9 +13515,23 @@ edit_credential() {
         while [[ $i -lt $n ]]; do
             hat="${HATS[$i]}"; host=$(hat_ssh "$hat")
             cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
+            if [[ "$agent" == codex ]]; then
+                # Codex is judged on its own status, not the Claude one.
+                cx=$(edit_hat_codex "$hat"); cxemail=""; cxws=""
+                [[ -n "$cx" ]] && IFS=$'\x1f' read -r cxemail cxws <<< "$cx"
+                cred="$cxemail"
+                if [[ -z "$credstate" ]]; then :
+                elif [[ ! -s "$(edit_sessions_file "$hat").codex" ]]; then credstate=old
+                elif [[ -z "$cxemail" ]]; then credstate=none
+                fi
+            fi
             if [[ -z "$credstate" ]]; then
                 held=$(printf '%snot provisioned - press P on the hats screen%s' "$C_YL" "$C_R")
-            elif cred_is "$email" "$org" "$cred" "$(edit_hat_cred_org "$hat")"; then
+            elif [[ "$credstate" == old ]]; then
+                held=$(printf '%shat-creds predates Codex - press P on the hats screen%s' "$C_YL" "$C_R")
+            elif [[ "$agent" == codex ]] && cred_is "$email" "$org" "$cxemail" "$cxws"; then
+                held=$(printf '%s✓ holds this one%s' "$C_GR" "$C_R")
+            elif [[ "$agent" == claude ]] && cred_is "$email" "$org" "$cred" "$(edit_hat_cred_org "$hat")"; then
                 held=$(printf '%s✓ holds this one%s' "$C_GR" "$C_R")
             elif [[ "$credstate" == "none" ]]; then
                 held=$(printf '%sno credential%s' "$C_DIM" "$C_R")
@@ -13159,10 +13556,18 @@ edit_credential() {
             enter|right|l)
                 [[ -z "$hat" ]] && continue
                 printf '\n'
-                creds_push_to "$slot" "$email" "$org" "$hat" || true
+                if [[ "$agent" == codex ]]; then
+                    codex_push_to "$slot" "$email" "$org" "$hat" || true
+                else
+                    creds_push_to "$slot" "$email" "$org" "$hat" || true
+                fi
                 edit_fetch_hat "$hat"; edit_pause ;;
             A)
-                if edit_confirm "push $email to every hat?"; then
+                if [[ "$agent" == codex ]]; then
+                    printf '\n'
+                    warn "a Codex login goes to one hat: a second one logs the first out"
+                    edit_pause
+                elif edit_confirm "push $email to every hat?"; then
                     printf '\n'
                     for hat in "${HATS[@]:-}"; do
                         [[ -z "$hat" ]] && continue
@@ -13172,9 +13577,9 @@ edit_credential() {
                 fi ;;
             X)
                 [[ -z "$hat" ]] && continue
-                if edit_confirm "remove the credential from '$hat'?"; then
+                if edit_confirm "remove the $agent login from '$hat'?"; then
                     printf '\n'
-                    cmd_creds clear "$hat" || true
+                    cmd_creds clear "$hat" "$agent" || true
                     edit_fetch_hat "$hat"; edit_pause
                 fi ;;
         esac
@@ -13543,20 +13948,35 @@ usage_cmd() {
     creds|cred|credential|credentials) cat <<'USAGE'
 hatter creds [subcommand]
 
-A credential is one Claude login. They live on this Mac only - in the macOS
-Keychain, managed by cswap - and are pushed to a hat over ssh when Claude Code
-on that server needs to run as an account. No shell server is ever asked to log
-in, and nothing is written to disk on either side: the export goes straight down
-the ssh pipe and lands 0600 on the server.
+A credential is one agent login: Claude Code or Codex. They live on this Mac
+only and are pushed to a hat over ssh when the agent on that server needs to
+run as an account. No shell server is ever asked to log in, and nothing is
+written to disk on this side: the login goes straight down the ssh pipe and
+lands 0600 on the server.
 
-  list                   Credentials (lettered) and the hat each one is on
-  push <sel> <hat>...    Push a credential to one or more hats
-  push <sel> --all       ...to every hat
-  status [hat]           Ask each hat which credential it is holding
-  clear <hat>            Remove the credential from a hat
+  Claude Code logins are kept in the macOS Keychain by cswap.
+  Codex logins are directories, one per account: ~/.codex-<name>, made with
+      CODEX_HOME=~/.codex-<name> codex login
+  The name is only a label. Who the login is (email, ChatGPT workspace, plan)
+  is read from its auth.json, because one email can sign in to a personal plan
+  and to a team workspace. A Codex login lands in the hat's ~/.codex (or its
+  $CODEX_HOME).
 
-<sel> is the letter from `hatter creds`, the cswap slot number, or enough of
-the email address to be unique.
+  list                   Logins (lettered) and the hats each one is on
+  push <sel> <hat>...    Push a login to one or more hats
+  push <sel> --all       ...to every hat (Claude only)
+  status [hat]           Ask each hat which logins it is holding
+  clear <hat> [agent]    Remove a login from a hat: claude (the default),
+                         codex or all
+
+<sel> is the letter from `hatter creds`, the cswap slot number, a Codex home's
+<name>, or enough of the email address to be unique. An email held twice
+(two organizations, two workspaces, or both agents) needs the letter.
+
+Each login shows its role, personal or team, and its usage windows: bars are
+capacity left, then time to reset. "none" is a window the plan does not have
+(some plans have no 5-hour window); "unknown" is a reading that failed. Codex
+usage is read from Codex itself (`codex app-server`) and cached for 2 minutes.
 
 One credential per hat is the arrangement to aim for. Sharing one account
 across machines works, but each machine refreshes the OAuth token on its own
@@ -13564,11 +13984,19 @@ and a refresh can rotate the refresh token, so a shared account may get logged
 out from under whichever machine refreshed last. Pushing again fixes it;
 different accounts per hat avoid it.
 
+A Codex login is stricter: its refresh token rotates on every refresh, so a
+Codex login on two hats, or on a hat and also in use on this Mac, logs all but
+one of them out. Give each hat its own Codex home, and do not run Codex on this
+Mac with a home that is out on a hat. `push --all` is refused for Codex, and
+`list` warns when one Codex login is on more than one hat.
+
 An *expired* access token is not a problem - Claude Code trades the refresh
 token for a new one by itself. Only a credential reported as "dead" (expired
 with no refresh token) needs pushing again.
 
-Requires cswap on this Mac and `hatter provision <hat>` on the server.
+Requires cswap (for Claude) or a ~/.codex-<name> home (for Codex) on this Mac,
+and `hatter provision <hat>` on the server. A hat provisioned before Codex
+support needs provisioning again before it can take a Codex login.
 USAGE
     ;;
     autosave) cat <<'USAGE'

@@ -59,7 +59,8 @@ session still running on its server, and `hatter rm` ends one for good
   loop, so a stray ctrl-D hands back a fresh prompt. Two deliberate ways out:
   `bye`, or `exit 99`.
 - **Credentials stay on your machine.** Claude Code logins live in your
-  OS keychain and are pushed to a hat over ssh when that server needs one.
+  OS keychain, Codex logins in one `~/.codex-<name>` home each, and either is
+  pushed to a hat over ssh when that server needs one.
   Nothing is written to disk on either side, and no shell server is ever asked
   to log in. One login can sit on as many hats as you like — `creds push a
   --all` puts it on every one — while a hat holds exactly one at a time,
