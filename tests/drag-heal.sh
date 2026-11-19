@@ -36,9 +36,11 @@ case "$*" in
       twin=""; [[ "$STUB_LOCAL" == twin ]] && twin=',{"surfaces":[{"id":"s-twin","title":"two","type":"terminal"}]}'
       local_ws=',{"id":"ws-l","title":"'"${STUB_LOCAL_TITLE:-scratch}"'","panes":[{"surfaces":[{"id":"s-new","title":"two","type":"terminal"}]}'"$twin"']}'
     fi
+    # STUB_TWOWIN: dev-b is in a second window, as for two hats on one
+    # server that each have a window (#259).
+    split='},{"id":"ws-b"'; [[ "${STUB_TWOWIN:-}" ]] && split='}]},{"id":"W2","workspaces":[{"id":"ws-b"'
     echo '{"windows":[{"id":"W1","workspaces":[
-      {"id":"ws-a","title":"dev-a","panes":'"$a_panes"'},
-      {"id":"ws-b","title":"dev-b","panes":[{"surfaces":[{"id":"s-3","title":"three","type":"terminal"}]}'"$b_drop"']}'"$local_ws"']}]}' ;;
+      {"id":"ws-a","title":"dev-a","panes":'"$a_panes"''"$split"',"title":"dev-b","panes":[{"surfaces":[{"id":"s-3","title":"three","type":"terminal"}]}'"$b_drop"']}'"$local_ws"']}]}' ;;
   *"workspace list"*)
     # dev-a goes when its workspace is closed, and comes back new once mirrored.
     a='{"id":"ws-a","title":"dev-a"},'
@@ -117,7 +119,12 @@ cmd="${*: -1}"
 # hatter sends every command as `sh -c '<script>'`; take the script out.
 [[ "$cmd" == "sh -c "* ]] && { eval "set -- $cmd"; cmd="$3"; }
 case "$cmd" in
-  *list-sessions*)
+  # STUB_OTHERHOST: dev-b lives on a second server, other@example.org.
+  *list-sessions*) if [[ "${STUB_OTHERHOST:-}" ]]; then
+      if [[ "$*" == *other@example.org* ]]; then printf 'S\tdev-b\nW\tdev-b\t@3\tthree\t/\t\n'
+      else printf 'S\tdev-a\nW\tdev-a\t@1\tone\t/\t\nW\tdev-a\t@2\ttwo\t/\t\n'; fi
+      exit 0
+    fi
     wid=@2; [[ "${STUB_SECOND:-}" == newid && -f "$STUB_DIR/pass2" ]] && wid=@5
     if [[ -f "$STUB_DIR/moved" ]]; then
       printf 'S\tdev-a\nS\tdev-b\nW\tdev-a\t@1\tone\t/\t\nW\tdev-b\t@3\tthree\t/\t\nW\tdev-b\t@2\ttwo\t/\t\n'
@@ -154,12 +161,27 @@ run() {
     shift 2
     [[ "${KEEP:-}" ]] || rm -rf "$d"
     mkdir -p "$d/home/.config/hatter"
+    # TWO_HATS: dev-a and dev-b belong to two hats, on one server ("same") or
+    # on two ("other").
+    if [[ "${TWO_HATS:-}" ]]; then
+        local lexssh=dev@example.com
+        [[ "$TWO_HATS" == other ]] && lexssh=other@example.org
+        echo '{"version":3,"hats":{"dev":{"ssh":"dev@example.com","remote_dir":"$HOME"},
+                                   "lex":{"ssh":"'"$lexssh"'","remote_dir":"$HOME"}},
+               "groups":{"G":{"hat":"dev","sessions":{"dev-a":{}}},
+                         "L":{"hat":"lex","sessions":{"dev-b":{}}}}}' \
+            > "$d/home/.config/hatter/config.json"
+    else
     echo '{"version":3,"hats":{"dev":{"ssh":"dev@example.com","remote_dir":"$HOME"}},
            "groups":{"G":{"hat":"dev","sessions":{"dev-a":{},"dev-b":{}}}}}' \
         > "$d/home/.config/hatter/config.json"
+    fi
+    # HATTER_CMD is split as the shell would, so '' passes an empty argument.
+    local cmd
+    eval "cmd=(${HATTER_CMD:-_drag-heal})"
     rm -f "$d/log" "$d/looked" "$d/pass2" "$d/unpinned" "$d/closed" "$d/remirrored" "$d/hopped"; touch "$d/log"
     env HOME="$d/home" XDG_CONFIG_HOME="$d/home/.config" PATH="$work/bin:$PATH" \
-        STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" ${HATTER_CMD:-_drag-heal} >"$d/out" 2>&1 || true
+        STUB_DIR="$d" STUB_SCREEN="$screen" "$@" /bin/bash "$hatter" "${cmd[@]}" >"$d/out" 2>&1 || true
     cat "$d/log"
 }
 
@@ -273,6 +295,35 @@ log=$(HATTER_CMD="_drag-heal dev report ws-b S-NEW" run event-case blank)
 expect "a drop event's ids match whatever their case" "$(grep -q '^move' <<<"$log" && echo y)"
 log=$(HATTER_CMD="_drag-heal dev report ws-b s-3" run event-other blank)
 expect "a drop event for another tab moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
+expect "a drop event for a tab with a terminal behind it logs nothing" \
+    "$(! grep -q 'could not tell which tmux window' "$work/run-event-other/out" && echo y)"
+
+# Two hats on one server, each with a window of its own (#259): the tab was
+# dragged from dev-a in one hat's window into dev-b in the other's.
+log=$(TWO_HATS=same HATTER_CMD="_drag-heal '' once ws-b s-new" run twowin-event unavailable STUB_TWOWIN=1)
+expect "a drop between two windows of one server: its window is moved" \
+    "$(grep -q "^move .*'=dev-a:@2' .*'=dev-b:'" <<<"$log" && echo y)"
+expect "a drop between two windows of one server: the blank tab is closed in the window it was dropped into" \
+    "$(grep -q '^close .*--surface s-new --workspace ws-b --window W2' <<<"$log" && echo y)"
+log=$(TWO_HATS=same run twowin-timer unavailable STUB_TWOWIN=1)
+expect "a drag between two windows of one server, found without an event: healed" \
+    "$(grep -q "^move .*'=dev-a:@2' .*'=dev-b:'" <<<"$log" \
+        && grep -q '^close .*--surface s-new --workspace ws-b --window W2' <<<"$log" && echo y)"
+log=$(TWO_HATS=same HATTER_CMD="_drag-heal lex report" run twowin-hat unavailable STUB_TWOWIN=1)
+expect "healing one hat looks at its server's other hats' windows too (repair)" \
+    "$(grep -q "^move .*'=dev-a:@2' .*'=dev-b:'" <<<"$log" && echo y)"
+log=$(TWO_HATS=same run twowin-nodrag unavailable STUB_TWOWIN=1 STUB_NODRAG=1)
+expect "two windows of one server with no drag: nothing moves" \
+    "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
+
+# Two hats on two servers: tmux cannot move a window between them, so the
+# tab is left alone, and the drop event says so rather than nothing.
+log=$(TWO_HATS=other HATTER_CMD="_drag-heal '' once ws-b s-new" run twohost-event unavailable STUB_TWOWIN=1 STUB_OTHERHOST=1)
+expect "a drop between windows of two servers: nothing moves" \
+    "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
+expect "a drop between windows of two servers: the log says the tab is blank and how to look" \
+    "$(grep -q "the tab 'two' dropped into 'dev-b' is blank, and hatter could not tell which tmux window it shows on other@example.org" \
+        "$work/run-twohost-event/out" && echo y)"
 log=$(HATTER_CMD="_drag-heal dev report ws-gone s-new" run event-nows blank)
 expect "a drop event for a workspace in no window moves nothing" "$(! grep -qE '^(move|close)' <<<"$log" && echo y)"
 
