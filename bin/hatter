@@ -13630,6 +13630,10 @@ USAGE
     new) cat <<'USAGE'
 hatter new <session> [options]        ("new" is optional: `hatter <session>`)
 
+`hatter <session>` refuses a name that is a `hat` or `group` subcommand
+(disable, enable, status, add, set, mv), so a mistyped command never becomes
+a workspace; `hatter new <name>` makes one with that name.
+
 Create or reattach a tmux session and surface it as a workspace, in the right
 group, in the right hat's window. Creates the group and the hat's window if
 they do not exist yet.
@@ -14516,6 +14520,21 @@ USAGE
 
 usage_exit() { usage_main; exit 1; }
 
+# subcommand_word <word>: the command a word belongs to when it names a
+# subcommand of `hat` or `group` but is not a top-level command itself (#262).
+# Bare `hatter <word>` means `hatter new <word>`, and new takes its hat from
+# the window it was typed in, so a mistyped `hatter disable` would quietly
+# make a <hat>-disable workspace wherever it was typed. Such a word is refused
+# instead; `hatter new <word>` still makes the workspace when that is meant.
+subcommand_word() {
+    case "$1" in
+        disable|enable)         echo "hatter hat $1 <hat>" ;;
+        status)                 echo "hatter hat status" ;;
+        add|set|mv)             echo "hatter hat $1 ... or hatter group $1 ..." ;;
+        *) return 1 ;;
+    esac
+}
+
 cmd_help() {
     if [[ -n "${1:-}" ]]; then
         usage_cmd "$1"
@@ -14636,7 +14655,11 @@ case "$cmd" in
     restore)   cmd_restore "$@" ;;
 
     -*)        die "unknown option: $cmd  (try: hatter --help)" ;;
-    *)         cmd_new "$cmd" "$@" ;;
+    *)         if meant=$(subcommand_word "$cmd"); then
+                   die "'$cmd' is not a top-level command, so no workspace was made. Did you mean: $meant
+  (a workspace named '$cmd' is: hatter new $cmd)"
+               fi
+               cmd_new "$cmd" "$@" ;;
 esac
 
 # A snapshot after every run. This is only a cmp plus, at most, a file copy -
