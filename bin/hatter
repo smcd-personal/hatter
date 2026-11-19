@@ -2418,6 +2418,8 @@ def status():
     if isinstance(acct, dict):
         out["email"] = acct.get("emailAddress")
         out["organizationName"] = acct.get("organizationName")
+        # One email can hold logins in two organizations; this says which.
+        out["organizationUuid"] = acct.get("organizationUuid")
     print(json.dumps(out))
 
 
@@ -12158,25 +12160,37 @@ need_cswap() {
   Install with: uv tool install claude-swap"
 }
 
-# One TSV row per credential:
-#   letter  slot  email  label  5h-used%  7d-used%  open|limited  active|''
-# One TSV row per credential. pct from cswap is percent *used*, so everything
-# downstream works in remaining = 100 - pct. resetsAt carries fractional seconds
-# and a +00:00 offset, neither of which fromdateiso8601 accepts.
-#   letter  slot  email  label  rem5  rem7  reset5s  reset7s  active
+# One row per credential, fields split by \x1f:
+#   letter  slot  email  org  role  label  rem5  rem7  reset5s  reset7s  active
+# pct from cswap is percent *used*, so everything downstream works in
+# remaining = 100 - pct. resetsAt carries fractional seconds and a +00:00
+# offset, neither of which fromdateiso8601 accepts.
+#
+# A window the plan does not have is "-", not 100: some plans have no 5-hour
+# window at all, and cswap then leaves fiveHour out (#264). A window that is
+# merely idle still has a pct, so the two stay apart.
+#
+# One email can hold two logins (a personal plan and a team seat), and cswap
+# keys an account on (email, organization). org is that organization's id and
+# role says which kind it is, so the two can be told apart and pushed apart.
 creds_rows() {
     have_cswap || return 0
     "$CSWAP_BIN" list --json 2>/dev/null | jq -r --arg L "$CRED_LETTERS" '
         def eta: if . == null then -1
                  else (sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
                        | fromdateiso8601) - (now | floor) end;
+        def rem: if . == null or .pct == null then "-"
+                 else (100 - (.pct | floor)) | tostring end;
+        def role: (.plan.organizationType // "") as $t
+                  | if $t == "" then ""
+                    elif ($t | test("team|enterprise")) then "team"
+                    else "personal" end;
         [.accounts[]?] | to_entries[]
         | .key as $i | .value as $a
-        | (100 - (($a.usage.fiveHour.pct // 0) | floor)) as $r5
-        | (100 - (($a.usage.sevenDay.pct  // 0) | floor)) as $r7
         | [ $L[$i:$i+1], ($a.number | tostring), $a.email,
+            ($a.organizationUuid // ""), ($a | role),
             ($a.alias // $a.organizationName // ""),
-            ($r5 | tostring), ($r7 | tostring),
+            ($a.usage.fiveHour | rem), ($a.usage.sevenDay | rem),
             (($a.usage.fiveHour.resetsAt | eta) | floor | tostring),
             (($a.usage.sevenDay.resetsAt  | eta) | floor | tostring),
             (if $a.active then "active" else "" end) ]
@@ -12195,8 +12209,11 @@ creds_colour() {
 }
 
 # Everything before the tail is fixed width: 8 columns of marker, label and
-# icon, 28 of email, a space, and 41 of gauges.
-CREDS_TAIL_COL=78
+# icon, 28 of email, a space, 9 of role, and 41 of gauges.
+CREDS_TAIL_COL=87
+
+# The role column: personal or team, padded so the gauges line up.
+creds_role() { printf '%s%-8s%s ' "$C_DIM" "${1:--}" "$C_R"; }
 
 # What follows the gauges, cut to fit. A wrapped row would push every row under
 # it out of alignment, which is worse than losing the end of a hat list. The
@@ -12242,59 +12259,87 @@ creds_eta() {
 }
 
 # Red when a window is spent, amber under half a 5-hour session, green above it.
+# Only the windows the plan has count; with none known the dot is dim.
 creds_dot() {
-    local r5="$1" r7="$2" worst="$1"
-    [[ "$r7" -lt "$worst" ]] && worst="$r7"
+    local r worst=""
+    for r in "$@"; do
+        [[ "$r" == "-" || -z "$r" ]] && continue
+        [[ -z "$worst" || "$r" -lt "$worst" ]] && worst="$r"
+    done
+    if [[ -z "$worst" ]]; then printf '%s●%s' "$C_DIM" "$C_R"; return 0; fi
     printf '%s●%s' "$(creds_colour "$worst")" "$C_R"
 }
 
-# 5h and 7d remaining, as bar + percent + time to reset.
-creds_gauges() {
-    local r5="$1" r7="$2" e5="$3" e7="$4"
-    printf '5h %s %3s%% %4s   7d %s %3s%% %4s' \
-        "$(creds_bar "$r5")" "$r5" "$(creds_eta "$e5")" \
-        "$(creds_bar "$r7")" "$r7" "$(creds_eta "$e7")"
+# One window: bar + percent + time to reset, 16 columns. A window the plan does
+# not have reads "none", dimmed, in the same width so the next one lines up.
+creds_gauge() {
+    local r="$1" e="$2"
+    if [[ "$r" == "-" || -z "$r" ]]; then
+        printf '%s%-16s%s' "$C_DIM" "none" "$C_R"; return 0
+    fi
+    printf '%s %3s%% %4s' "$(creds_bar "$r")" "$r" "$(creds_eta "$e")"
 }
 
-# Accept a letter, a cswap slot number, or any unique substring of an email.
+# 5h and 7d remaining.
+creds_gauges() {
+    printf '5h %s   7d %s' "$(creds_gauge "$1" "$3")" "$(creds_gauge "$2" "$4")"
+}
+
+# creds_resolve <sel>: prints "slot<US>email<US>org" for the one credential
+# <sel> names: a letter, a cswap slot number, an exact email, or a unique
+# substring of one. An email held in two organizations is ambiguous by itself,
+# so it asks for the letter instead of guessing which one to push.
 creds_resolve() {
-    local sel="$1" letter slot email rest hit="" n=0
-    while IFS=$'\x1f' read -r letter slot email rest; do
+    local sel="$1" letter slot email org rest hit="" n=0
+    while IFS=$'\x1f' read -r letter slot email org rest; do
         [[ -z "$email" ]] && continue
-        if [[ "$sel" == "$letter" || "$sel" == "$slot" || "$sel" == "$email" ]]; then
-            printf '%s' "$email"; return 0
+        if [[ "$sel" == "$letter" || "$sel" == "$slot" ]]; then
+            printf '%s\x1f%s\x1f%s' "$slot" "$email" "$org"; return 0
         fi
-        case "$email" in *"$sel"*) hit="$email"; n=$((n+1)) ;; esac
+        case "$email" in *"$sel"*)
+            hit=$(printf '%s\x1f%s\x1f%s' "$slot" "$email" "$org"); n=$((n+1)) ;;
+        esac
     done < <(creds_rows)
     [[ $n -eq 1 ]] && { printf '%s' "$hit"; return 0; }
-    [[ $n -gt 1 ]] && { warn "'$sel' matches $n credentials - be more specific"; return 1; }
+    [[ $n -gt 1 ]] && { warn "'$sel' matches $n credentials - use its letter (see: hatter creds)"; return 1; }
     return 1
 }
 
 hat_credential() { cfg --arg l "$1" '.hats[$l].credential // empty'; }
 
 set_hat_credential() {
-    jq_write --arg l "$1" --arg e "$2" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '.hats[$l].credential = $e | .hats[$l].credential_pushed_at = $t'
+    jq_write --arg l "$1" --arg e "$2" --arg o "${3:-}" \
+        --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '.hats[$l].credential = $e | .hats[$l].credential_pushed_at = $t
+         | if $o == "" then del(.hats[$l].credential_org)
+           else .hats[$l].credential_org = $o end'
 }
 
-# Which hats hold this credential, per the config, comma separated.
+# creds_hats_holding <email> [org]: which hats hold this credential, per the
+# config, comma separated. A hat pushed before #264 recorded no organization;
+# it still matches on the email alone.
 creds_hats_holding() {
-    cfg --arg e "$1" '[.hats | to_entries[] | select(.value.credential == $e) | .key] | join(", ")'
+    cfg --arg e "$1" --arg o "${2:-}" '[.hats | to_entries[]
+        | select(.value.credential == $e
+                 and ($o == "" or (.value.credential_org // "") == ""
+                      or .value.credential_org == $o))
+        | .key] | join(", ")'
 }
 
+# creds_push_to <slot> <email> <org> <hat>: the export is asked for by slot,
+# because an email held in two organizations would be ambiguous to cswap.
 creds_push_to() {
-    local email="$1" hat="$2" host out
+    local slot="$1" email="$2" org="$3" hat="$4" host out
     hat_exists "$hat" || { warn "unknown hat: $hat"; return 1; }
     host=$(hat_ssh "$hat")
     info "Pushing $email -> $hat ($host)"
     # The export carries a live refresh token, so it goes straight down the ssh
     # pipe: it is never written to disk on either side.
-    if out=$("$CSWAP_BIN" export - --account "$email" \
+    if out=$("$CSWAP_BIN" export - --account "$slot" \
              | ssh "${SSH_OPTS[@]}" -o ConnectTimeout=15 "$host" \
                    "$(posix_sh 'python3 "$HOME/.local/bin/hat-creds" install')" 2>&1); then
         echo "    ${out##*$'\n'}"
-        set_hat_credential "$hat" "$email"
+        set_hat_credential "$hat" "$email" "$org"
         return 0
     fi
     warn "push to $hat failed: ${out:-no output}"
@@ -12327,14 +12372,15 @@ cmd_creds() {
         list|ls|"")
             need_cswap
             colour_setup
-            local letter slot email label r5 r7 e5 e7 active holders
+            local letter slot email org role label r5 r7 e5 e7 active holders
             echo "Credentials (on this Mac, in the Keychain via cswap):"
-            echo "  bars are capacity left, then time to the window reset"
-            while IFS=$'\x1f' read -r letter slot email label r5 r7 e5 e7 active; do
+            echo "  bars are capacity left, then time to the window reset;"
+            echo "  'none' is a window the plan does not have"
+            while IFS=$'\x1f' read -r letter slot email org role label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
-                holders=$(creds_hats_holding "$email")
-                printf '  %s %s %-28s %s%s%s\n' \
-                    "$letter" "$(creds_dot "$r5" "$r7")" "$email" \
+                holders=$(creds_hats_holding "$email" "$org")
+                printf '  %s %s %-28s %s%s%s%s\n' \
+                    "$letter" "$(creds_dot "$r5" "$r7")" "$email" "$(creds_role "$role")" \
                     "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
                     "${active:+  ${C_CY}<- active here${C_R}}" \
                     "${holders:+  ${C_DIM}-> $holders${C_R}}"
@@ -12355,8 +12401,9 @@ cmd_creds() {
             need_cswap
             local sel="${1:-}"; shift || true
             [[ -n "$sel" ]] || die "usage: hatter creds push <letter|slot|email> <hat...|--all>"
-            local email
-            email=$(creds_resolve "$sel") || die "no credential matches '$sel' - see: hatter creds"
+            local picked slot email org
+            picked=$(creds_resolve "$sel") || die "no credential matches '$sel' - see: hatter creds"
+            IFS=$'\x1f' read -r slot email org <<< "$picked"
             local targets=() hat rc=0
             if [[ "${1:-}" == "--all" ]]; then
                 while IFS= read -r hat; do [[ -n "$hat" ]] && targets+=("$hat"); done < <(hat_names)
@@ -12365,7 +12412,7 @@ cmd_creds() {
                 targets=("$@")
             fi
             for hat in "${targets[@]}"; do
-                creds_push_to "$email" "$hat" || rc=1
+                creds_push_to "$slot" "$email" "$org" "$hat" || rc=1
             done
             return $rc
             ;;
@@ -12400,7 +12447,7 @@ cmd_creds() {
             [[ -n "$hat" ]] || die "usage: hatter creds clear <hat>"
             hat_exists "$hat" || die "unknown hat: $hat"
             remote_sh "$(hat_ssh "$hat")" 'python3 "$HOME/.local/bin/hat-creds" clear' || true
-            jq_write --arg l "$hat" 'del(.hats[$l].credential, .hats[$l].credential_pushed_at)'
+            jq_write --arg l "$hat" 'del(.hats[$l].credential, .hats[$l].credential_org, .hats[$l].credential_pushed_at)'
             info "Cleared the credential on '$hat'"
             ;;
         *) die "unknown creds subcommand: $sub (list|push|status|clear)" ;;
@@ -12574,6 +12621,20 @@ edit_hat_cred() {
     jq -r '.email // ""' < "$f" 2>/dev/null || true
 }
 
+# The organization of the login a hat holds, or "" when its hat-creds predates
+# #264 and does not say. Matching then falls back to the email alone.
+edit_hat_cred_org() {
+    local f="$(edit_sessions_file "$1").cred"
+    [[ -s "$f" ]] || return 0
+    jq -r '.organizationUuid // ""' < "$f" 2>/dev/null || true
+}
+
+# cred_is <email> <org> <held-email> <held-org>: the held login is this one.
+cred_is() {
+    [[ -n "$3" && "$1" == "$3" ]] || return 1
+    [[ -z "$2" || -z "$4" || "$2" == "$4" ]]
+}
+
 # "" when the hat could not be read at all, so the row can stay silent instead
 # of claiming there is no credential.
 edit_hat_cred_state() {
@@ -12737,10 +12798,10 @@ edit_detached_banner() {
 # through both; a letter or a digit jumps straight into either one.
 
 edit_top() {
-    local SEL=1 nc nh nt i idx hat host state scol sess cred credstate dot dirty=1
+    local SEL=1 nc nh nt i idx hat host state scol sess cred credorg credstate dot dirty=1
     local preselect=1 ch=""
     local cols lastcols="" hdrtail
-    local letter slot email label r5 r7 e5 e7 active holders detached=""
+    local letter slot email org role label r5 r7 e5 e7 active holders detached=""
     while :; do
         # Gathering is what costs: `cswap list --json` alone is ~300ms, and
         # every hat row is several more jq reads on top. It happens only when
@@ -12749,16 +12810,17 @@ edit_top() {
         cols=$(term_cols)
         [[ "$cols" != "$lastcols" ]] && { dirty=1; lastcols="$cols"; }
         if [[ "$dirty" == 1 ]]; then
-            CLETTER=(); CEMAIL=(); CMETA=(); CICON=(); nc=0
-            while IFS=$'\x1f' read -r letter slot email label r5 r7 e5 e7 active; do
+            CLETTER=(); CEMAIL=(); CSLOT=(); CORG=(); CMETA=(); CICON=(); nc=0
+            while IFS=$'\x1f' read -r letter slot email org role label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
+                CSLOT[$nc]="$slot"; CORG[$nc]="$org"
                 CICON[$nc]=$(creds_dot "$r5" "$r7")
                 # Which hats hold this login. A login is not tied to one hat -
                 # push it to as many as you want - and this is the only place
                 # the many side of that is visible.
-                holders=$(creds_hats_holding "$email")
-                CMETA[$nc]=$(printf '%s%s' \
+                holders=$(creds_hats_holding "$email" "$org")
+                CMETA[$nc]=$(printf '%s%s%s' "$(creds_role "$role")" \
                     "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
                     "$(creds_tail $((cols - CREDS_TAIL_COL)) "$holders" "$active")")
                 nc=$((nc+1))
@@ -12782,12 +12844,14 @@ edit_top() {
                     state="?  unprobed"; scol="$C_DIM"
                 fi
                 cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
+                credorg=$(edit_hat_cred_org "$hat")
                 # Reuse the credential's own dot so a hat shows the health of
                 # the account it is actually holding.
                 dot=""
                 idx=0
                 while [[ $idx -lt $nc ]]; do
-                    [[ "${CEMAIL[$idx]}" == "$cred" ]] && { dot="${CICON[$idx]} "; break; }
+                    cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cred" "$credorg" &&
+                        { dot="${CICON[$idx]} "; break; }
                     idx=$((idx+1))
                 done
                 case "$credstate" in
@@ -12853,12 +12917,12 @@ edit_top() {
             "$C_B" "$C_R" "$C_DIM" "$C_R"
         printf '     %sthen time to reset; red is spent, amber under half a session.%s\n\n' \
             "$C_DIM" "$C_R"
-        # The header is 78 columns before "HELD BY", which is exactly where the
+        # The header is 87 columns before "HELD BY", which is exactly where the
         # tail starts - so it only earns its place when the tail can show.
         hdrtail=""
         [[ $cols -ge $((CREDS_TAIL_COL + 9)) ]] && hdrtail="  HELD BY"
-        printf '        %s%-28s %-19s   %-19s%s%s\n' \
-            "$C_DIM" "LOGIN" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
+        printf '        %s%-28s %-8s %-19s   %-19s%s%s\n' \
+            "$C_DIM" "LOGIN" "ROLE" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
 
         i=0
         while [[ $i -lt $nc ]]; do
@@ -12911,7 +12975,8 @@ edit_top() {
                 if [[ -n "$hat" ]]; then
                     edit_groups "$hat" || return 0
                 elif [[ $nc -gt 0 ]]; then
-                    edit_credential "${CEMAIL[$((idx-nh))]}" || return 0
+                    edit_credential "${CSLOT[$((idx-nh))]}" "${CEMAIL[$((idx-nh))]}" \
+                        "${CORG[$((idx-nh))]}" || return 0
                 fi
                 : ;;
             !) edit_refresh_all ;;
@@ -13050,7 +13115,7 @@ edit_sync_restore() {
 # --- level 2 (from a credential): push it to a hat ---------------------------
 
 edit_credential() {
-    local email="$1" SEL=1 n i hat host cred credstate held
+    local slot="$1" email="$2" org="$3" SEL=1 n i hat host cred credstate held
     while :; do
         HATS=(); n=0
         while IFS= read -r hat; do
@@ -13069,7 +13134,7 @@ edit_credential() {
             cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
             if [[ -z "$credstate" ]]; then
                 held=$(printf '%snot provisioned - press P on the hats screen%s' "$C_YL" "$C_R")
-            elif [[ "$cred" == "$email" ]]; then
+            elif cred_is "$email" "$org" "$cred" "$(edit_hat_cred_org "$hat")"; then
                 held=$(printf '%s✓ holds this one%s' "$C_GR" "$C_R")
             elif [[ "$credstate" == "none" ]]; then
                 held=$(printf '%sno credential%s' "$C_DIM" "$C_R")
@@ -13094,14 +13159,14 @@ edit_credential() {
             enter|right|l)
                 [[ -z "$hat" ]] && continue
                 printf '\n'
-                creds_push_to "$email" "$hat" || true
+                creds_push_to "$slot" "$email" "$org" "$hat" || true
                 edit_fetch_hat "$hat"; edit_pause ;;
             A)
                 if edit_confirm "push $email to every hat?"; then
                     printf '\n'
                     for hat in "${HATS[@]:-}"; do
                         [[ -z "$hat" ]] && continue
-                        creds_push_to "$email" "$hat" || true
+                        creds_push_to "$slot" "$email" "$org" "$hat" || true
                     done
                     edit_refresh_all; edit_pause
                 fi ;;
