@@ -12376,6 +12376,10 @@ creds_gauge() {
     if [[ "$r" == "?" ]]; then
         printf '%s%-16s%s' "$C_YL" "unknown" "$C_R"; return 0
     fi
+    # "h": a Codex login out on a hat, deliberately not read from here.
+    if [[ "$r" == "h" ]]; then
+        printf '%s%-16s%s' "$C_DIM" "not read: on hat" "$C_R"; return 0
+    fi
     printf '%s %3s%% %4s' "$(creds_bar "$r")" "$r" "$(creds_eta "$e")"
 }
 
@@ -12402,16 +12406,21 @@ creds_all_rows() {
 # two workspaces, or both agents) is ambiguous by itself, so it asks for the
 # letter instead of guessing which one to push.
 creds_resolve() {
-    local sel="$1" agent letter slot email org rest hit="" n=0
+    local sel="$1" agent letter slot email org rest rows
+    local hit="" n=0 exact="" ne=0 one
+    rows=$(creds_all_rows)
     while IFS=$'\x1f' read -r agent letter slot email org rest; do
         [[ -z "$email" ]] && continue
-        if [[ "$sel" == "$letter" || "$sel" == "$slot" ]]; then
-            printf '%s\x1f%s\x1f%s\x1f%s' "$agent" "$slot" "$email" "$org"; return 0
-        fi
-        case "$email" in *"$sel"*)
-            hit=$(printf '%s\x1f%s\x1f%s\x1f%s' "$agent" "$slot" "$email" "$org"); n=$((n+1)) ;;
-        esac
-    done < <(creds_all_rows)
+        one=$(printf '%s\x1f%s\x1f%s\x1f%s' "$agent" "$slot" "$email" "$org")
+        if [[ "$sel" == "$letter" ]]; then printf '%s' "$one"; return 0; fi
+        # A slot number belongs to cswap; a Codex home is named in full.
+        if [[ "$sel" == "$slot" ]]; then printf '%s' "$one"; return 0; fi
+        [[ "$sel" == "$email" ]] && { exact="$one"; ne=$((ne+1)); }
+        case "$email" in *"$sel"*) hit="$one"; n=$((n+1)) ;; esac
+    done <<< "$rows"
+    # An exact email beats a longer one that merely contains it.
+    [[ $ne -eq 1 ]] && { printf '%s' "$exact"; return 0; }
+    [[ $ne -gt 1 ]] && { warn "'$sel' matches $ne credentials - use its letter (see: hatter creds)"; return 1; }
     [[ $n -eq 1 ]] && { printf '%s' "$hit"; return 0; }
     [[ $n -gt 1 ]] && { warn "'$sel' matches $n credentials - use its letter (see: hatter creds)"; return 1; }
     return 1
@@ -12538,11 +12547,17 @@ codex_role() {
 # codex_probe <home>: ask Codex itself for the login's rate limits and cache
 # the answer. `codex app-server` speaks JSON-RPC on stdio and quits at EOF, so
 # stdin is held open on a fifo until the reply is in, at most 15 seconds.
-codex_probe() {
-    local home="$1" name out tmp pid i=0
+# A subshell, so its traps are its own: the temp dir goes whatever happens, and
+# a codex that dies before reading (too old for app-server, or a crash) leaves
+# the write with no reader, whose SIGPIPE would otherwise kill the probe before
+# it could write the "unknown" marker.
+codex_probe() (
+    home="$1"; i=0
     name=$(basename "$home"); out="$(codex_usage_dir)/$name.json"
     mkdir -p "$(codex_usage_dir)"
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-codex.XXXXXX")
+    trap 'rm -rf "$tmp"' EXIT
+    trap '' PIPE
     mkfifo "$tmp/in"
     CODEX_HOME="$home" "$CODEX_BIN" app-server < "$tmp/in" > "$tmp/out" 2>/dev/null &
     pid=$!
@@ -12566,16 +12581,29 @@ codex_probe() {
     else
         rm -f "$out.tmp"; printf '{"unknown":true}\n' > "$out"
     fi
-    rm -rf "$tmp"
+)
+
+# The Codex homes the config says are out on some hat, one name per line.
+codex_homes_pushed() {
+    cfg '[.hats[] | .codex_credential_home // empty] | unique | .[]'
 }
 
 # Re-read every home whose cached reading is older than the TTL, all at once.
+# A home that is out on a hat is never probed from here: reading its limits
+# can make Codex refresh the token, and a refresh rotates it, which would log
+# the hat out. Its row says so instead of showing a number.
 codex_usage_refresh() {
-    local home f now age
+    local home f now age pushed
     command -v "$CODEX_BIN" >/dev/null 2>&1 || return 0
     now=$(date +%s)
+    pushed=$(codex_homes_pushed)
+    mkdir -p "$(codex_usage_dir)"
     while IFS= read -r home; do
         f="$(codex_usage_dir)/$(basename "$home").json"
+        if printf '%s\n' "$pushed" | grep -qxF "${home##*/.codex-}"; then
+            printf '{"onhat":true}\n' > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+            continue
+        fi
         age=$CODEX_USAGE_TTL
         [[ -f "$f" ]] && age=$(( now - $(lock_mtime "$f") ))
         [[ "$age" -ge "$CODEX_USAGE_TTL" ]] && codex_probe "$home" &
@@ -12598,7 +12626,8 @@ codex_rows() {
         name=$(basename "$home"); name=${name#.codex-}
         ident=$(codex_ident "$home")
         IFS=$'\x1f' read -r email ws plan kind <<< "$ident"
-        [[ "$kind" == api_key ]] && plan="api key"
+        # An API key carries no email: the home is all that names it.
+        [[ "$kind" == api_key ]] && { plan="api key"; email="API key ($name)"; }
         usage="$(codex_usage_dir)/.codex-$name.json"
         [[ -f "$usage" ]] || usage=/dev/null
         jq -rn --arg l "${CRED_LETTERS:$i:1}" --arg n "$name" --arg e "${email:-?}" \
@@ -12606,8 +12635,8 @@ codex_rows() {
             --slurpfile u "$usage" '
             ($u[0] // {"unknown": true}) as $u
             | [$u.primary, $u.secondary] | map(select(. != null)) as $ws
-            | def pick(f): if $u.unknown then "?" else ([$ws[] | select(f)][0]) end;
-              def rem: if . == "?" then "?" elif . == null then "-"
+            | def pick(f): if $u.unknown or $u.onhat then "?" else ([$ws[] | select(f)][0]) end;
+              def rem: if $u.onhat then "h" elif . == "?" then "?" elif . == null then "-"
                        else (100 - (.usedPercent | floor)) | tostring end;
               def eta: if . == "?" or . == null or .resetsAt == null then "-1"
                        else (.resetsAt - (now | floor)) | tostring end;
@@ -12759,6 +12788,10 @@ cmd_creds() {
                     continue
                 fi
                 cjs=$(printf '%s\n' "$js" | sed -n '/^@@codex$/,$p' | sed 1d)
+                # A hat-creds older than Codex support ignores --agent and
+                # answers with its Claude status: only a reply that says it is
+                # about Codex is one.
+                [[ "$(printf '%s' "$cjs" | jq -r '.agent // empty' 2>/dev/null)" == codex ]] || cjs=""
                 js=$(printf '%s\n' "$js" | sed '/^@@codex$/,$d')
                 if [[ -z "$js" ]]; then
                     printf '  %-11s %s\n' "$hat" "no answer from hat-creds - is it installed? run: hatter provision $hat"
@@ -12798,7 +12831,15 @@ cmd_creds() {
                 info "Cleared the Claude login on '$hat'"
             fi
             if [[ "$which" != claude ]]; then
-                remote_sh "$(hat_ssh "$hat")" 'python3 "$HOME/.local/bin/hat-creds" clear --agent codex' || true
+                # An old hat-creds ignores --agent: "clear --agent codex" would
+                # clear the Claude login. Ask it first, and clear only if the
+                # answer is about Codex.
+                local ans
+                ans=$(remote_sh "$(hat_ssh "$hat")" 'h="$HOME/.local/bin/hat-creds"; case "$(python3 "$h" status --agent codex 2>/dev/null)" in *"\"agent\": \"codex\""*) python3 "$h" clear --agent codex ;; *) echo "@@old" ;; esac' 2>&1 || true)
+                if [[ "$ans" == *"@@old"* ]]; then
+                    warn "hat-creds on '$hat' predates Codex - nothing cleared. Run: hatter provision $hat"
+                    return 1
+                fi
                 jq_write --arg l "$hat" 'del(.hats[$l].codex_credential, .hats[$l].codex_credential_workspace, .hats[$l].codex_credential_home, .hats[$l].codex_credential_pushed_at)'
                 info "Cleared the Codex login on '$hat'"
             fi
@@ -12987,7 +13028,11 @@ edit_hat_cred_org() {
 edit_hat_codex() {
     local f="$(edit_sessions_file "$1").codex"
     [[ -s "$f" ]] || return 0
-    jq -r 'select(.kind == "chatgpt") | [(.email // ""), (.accountId // "")]
+    # Only a reply about Codex counts: an old hat-creds answers with Claude's.
+    jq -r 'select(.agent == "codex")
+           | if .kind == "chatgpt" then [(.email // ""), (.accountId // "")]
+             elif .kind == "api_key" then ["API key", ""]
+             else empty end
            | join("\u001f")' < "$f" 2>/dev/null || true
 }
 
@@ -13521,7 +13566,8 @@ edit_credential() {
                 [[ -n "$cx" ]] && IFS=$'\x1f' read -r cxemail cxws <<< "$cx"
                 cred="$cxemail"
                 if [[ -z "$credstate" ]]; then :
-                elif [[ ! -s "$(edit_sessions_file "$hat").codex" ]]; then credstate=old
+                elif [[ "$(jq -r '.agent // empty' < "$(edit_sessions_file "$hat").codex" 2>/dev/null)" != codex ]]; then
+                    credstate=old
                 elif [[ -z "$cxemail" ]]; then credstate=none
                 fi
             fi
