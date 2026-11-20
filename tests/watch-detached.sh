@@ -19,13 +19,18 @@ mkdir -p "$work/bin" "$work/self"
 cp "$here/../bin/hatter" "$work/self/hatter"
 
 # cmux: the event stream is $STUB_DIR/events, a script of event lines plus
-# "SLEEP n", "LOCK", "UNLOCK" and "FORGET <session>" (a hatter command drops it
+# "SLEEP n", "LOCK", "UNLOCK", "TREE <titles...>" (cmux now shows those) and
+# "FORGET <session>" (a hatter command drops it
 # from the config). `tree --all` answers $STUB_DIR/tree, or fails when that is
 # missing.
 cat > "$work/bin/cmux" <<'STUB'
 #!/usr/bin/env bash
 [[ "$1" == --id-format ]] && shift 2
 case "$1" in
+  # A mirror is connected when its session is listed in $STUB_DIR/attached.
+  rpc)
+    s=$(jq -r '.session' <<<"$3")
+    if grep -qxF -- "$s" "$STUB_DIR/attached" 2>/dev/null; then echo '{"attached":true}'; else echo '{"attached":false}'; fi ;;
   # Each window's selection when the stream opens: $STUB_DIR/windows, if any.
   list-windows) cat "$STUB_DIR/windows" 2>/dev/null || echo '[]' ;;
   tree)
@@ -44,13 +49,17 @@ case "$1" in
       case "$l" in
         "SLEEP "*)  sleep "${l#SLEEP }" ;;
         LOCK)       mkdir "$STUB_DIR/config/hatter/.lock" ;;
+        "TREE"*)    jq -nc --args '{windows: [{id: "W1", workspaces: [$ARGS.positional[] | {id: ("WS-" + .), title: .}]}]}' \
+                        ${l#TREE} > "$STUB_DIR/tree" ;;
         UNLOCK)     rmdir "$STUB_DIR/config/hatter/.lock" ;;
         "FORGET "*) c="$STUB_DIR/config/hatter/config.json"
                     jq --arg s "${l#FORGET }" 'del(.groups[].sessions[$s])' "$c" > "$c.new"
                     mv "$c.new" "$c" ;;
         *)          printf '%s\n' "$l" ;;
       esac
-    done < "$STUB_DIR/events" ;;
+    done < "$STUB_DIR/events"
+    # The next stream, if the case has one, reads $STUB_DIR/events.next.
+    [[ ! -f "$STUB_DIR/events.next" ]] || mv "$STUB_DIR/events.next" "$STUB_DIR/events" ;;
 esac
 exit 0
 STUB
@@ -677,6 +686,31 @@ reattach re-opened
 expect "a workspace already open when the lock was taken is not detached" \
     "$(! grep -q 'close-workspace' "$work/re-opened/calls" && echo y)" "$(cat "$work/re-opened/calls")"
 
+# #266: a mirror brought back besides that was connected before (in the
+# record of what was mirrored) and that nobody was seen closing: cmux closed
+# it too, and that close has not reached the watcher yet. It stays.
+mkdir -p "$work/re-expected/config/hatter/autosave"
+cp "$work/re-ok/after" "$work/re-expected/after"
+cp "$work/re-ok/mirrors" "$work/re-expected/mirrors"
+printf 'dev\tdev-web\ndev\tdev-stray\n' > "$work/re-expected/config/hatter/autosave/mirrored"
+reattach re-expected
+d="$work/re-expected"
+expect "a mirror brought back besides that was connected before is kept, not detached again (#266)" \
+    "$(! grep -q 'close-workspace' "$d/calls" && grep -q "kept 'dev-stray'" "$d/log" \
+       && ! grep -q "detached 'dev-stray' again" "$d/log" && echo y)" "calls: $(cat "$d/calls")
+log: $(cat "$d/log")"
+# The same with a record that does not list it: detached again, as before.
+mkdir -p "$work/re-unexpected/config/hatter/autosave"
+cp "$work/re-ok/after" "$work/re-unexpected/after"
+cp "$work/re-ok/mirrors" "$work/re-unexpected/mirrors"
+printf 'dev\tdev-web\n' > "$work/re-unexpected/config/hatter/autosave/mirrored"
+reattach re-unexpected
+d="$work/re-unexpected"
+expect "  one the record does not list is still detached again" \
+    "$(grep -qx 'cmux close-workspace --force --workspace WS-new-stray' "$d/calls" \
+       && ! grep -q "kept 'dev-stray'" "$d/log" && echo y)" "calls: $(cat "$d/calls")
+log: $(cat "$d/log")"
+
 reattach re-fail STUB_NEW_FAILS=1
 expect "a reattach that fails says why, and keeps the session for a retry rather than reporting it (#229)" \
     "$(grep -q "reattaching it failed: no cmux workspace appeared for dev-api; trying again at" "$work/re-fail/log" \
@@ -713,6 +747,66 @@ expect "a reattach that cannot be recorded is not made: without the record there
        && grep -q "cannot record reattaching 'dev-api'" "$work/re-norecord/log" && echo y)" \
     "names: $(cat "$work/re-norecord/names")
 log: $(cat "$work/re-norecord/log")"
+
+# --- what is expected back (#266) ---------------------------------------------
+# The first round records what is connected (dev-api, dev-web). Then a person
+# closes dev-api, and cmux tears down dev-web: only dev-api stops being
+# expected, so a later reattach of the host detaches it again but keeps dev-web.
+mkdir -p "$work/expect-drop"; d="$work/expect-drop"
+tree_of dev-api dev-web > "$d/tree"; printf '%s\n' dev-api dev-web > "$d/attached"
+out=$(watch expect-drop <<<"$ack
+SLEEP 2
+TREE next-dev-api
+$(close dev-api)
+$(lost dev-web)
+SLEEP 2")
+expect "a person's close takes the session out of what is expected back (#266)" \
+    "$(logged "$out" dev-api dev-api && ! grep -q $'\tdev-api$' "$d/config/hatter/autosave/mirrored" && echo y)" \
+    "$out
+mirrored: $(cat "$d/config/hatter/autosave/mirrored" 2>/dev/null)"
+expect "  cmux's own close leaves it expected" \
+    "$(grep -qx 'reattach dev-web into Work' <<<"$out" && grep -qx $'dev\tdev-web' "$d/config/hatter/autosave/mirrored" && echo y)" \
+    "$out
+mirrored: $(cat "$d/config/hatter/autosave/mirrored" 2>/dev/null)"
+
+# A person's close whose server does not answer is still theirs: it leaves
+# what is expected back at once, while cmux's own close there stays expected.
+mkdir -p "$work/expect-down/config/hatter/autosave"; d="$work/expect-down"
+echo ops@two.example.com > "$d/down"
+tree_of dev-api ops-db > "$d/tree"; printf '%s\n' dev-api ops-db > "$d/attached"
+out=$(watch expect-down <<<"$ack
+SLEEP 2
+TREE next-ops-db
+$(close ops-db)
+SLEEP 2")
+expect "a person's close leaves what is expected back even when its server does not answer (#266)" \
+    "$(grep -q "'ops-db' closed in cmux, but ops@two.example.com did not answer" <<<"$out" \
+       && ! grep -q $'\tops-db$' "$d/config/hatter/autosave/mirrored" \
+       && grep -qx $'dev\tdev-api' "$d/config/hatter/autosave/mirrored" && echo y)" \
+    "$out
+mirrored: $(cat "$d/config/hatter/autosave/mirrored" 2>/dev/null)"
+
+# A close that came in just before the stream ended, while another hatter
+# command held the lock, is not dropped: the next stream acts on it. cmux
+# never sends it again, since the cursor has moved past it.
+mkdir -p "$work/carry"; d="$work/carry"
+tree_of dev-web > "$d/tree"
+printf '%s\n' UNLOCK "$ack" "SLEEP 2" > "$d/events.next"
+out=$(watch carry HATTER_WATCH_ONCE=2 <<<"$ack
+SLEEP 2
+$(lost dev-api)
+LOCK")
+expect "a close left by a stream that ended under the lock is acted on by the next (#266)" \
+    "$(grep -qx 'reattach dev-api into Work' <<<"$out" && echo y)" "$out"
+# Without the lock the first stream acts on it, and the next has nothing left.
+mkdir -p "$work/carry-free"; d="$work/carry-free"
+tree_of dev-web > "$d/tree"
+printf '%s\n' "$ack" "SLEEP 2" > "$d/events.next"
+out=$(watch carry-free HATTER_WATCH_ONCE=2 <<<"$ack
+SLEEP 2
+$(lost dev-api)")
+expect "  without the lock it is acted on once, not again by the next stream" \
+    "$([[ "$(reattached "$out")" == 1 ]] && echo y)" "$out"
 
 # --- the rack's banner ---------------------------------------------------------
 # hatter's functions, sourced without main, against the same config. The rack

@@ -11147,8 +11147,9 @@ watch_signin() {
 # each recorded session that cmux showed, attached, at the last look while
 # awake (every WATCH_MIRRORED_EVERY seconds). A file, so a restart of the Mac
 # keeps it. A workspace closed on purpose, or one that never connected, is
-# not in it and is not waited for. With no file yet, every recorded session
-# that still runs is.
+# not in it and is not waited for: a close the watcher sees as a person's
+# takes it out at once (watch_mirrored_drop), not at the next look. With no
+# file yet, every recorded session that still runs is.
 #
 # A wake is the Mac's last wake time (kern.waketime) changing between two
 # rounds of the watcher, or a watcher that starts within WATCH_WAKE_BOOT
@@ -11202,6 +11203,25 @@ cmux_attached() {
 }
 
 watch_mirrored_file() { printf '%s/mirrored' "$AUTOSAVE_DIR"; }
+
+# watch_mirrored_expected <session>: it was connected at the last look while
+# awake, and no close by a person has been seen since.
+watch_mirrored_expected() {
+    AWK_S="$1" awk -F '\t' '($2 "") == (ENVIRON["AWK_S"] "") { f = 1 } END { exit !f }' \
+        "$(watch_mirrored_file)" 2>/dev/null
+}
+
+# watch_mirrored_drop <session>: a close that is meant to stay closed. It is
+# no longer expected back, until the next look while awake sees it again.
+watch_mirrored_drop() {
+    local f
+    f=$(watch_mirrored_file)
+    [[ -f "$f" ]] || return 0
+    watch_mirrored_expected "$1" || return 0
+    { AWK_S="$1" awk -F '\t' '($2 "") != (ENVIRON["AWK_S"] "")' "$f" > "$f.tmp" && mv "$f.tmp" "$f"; } 2>/dev/null \
+        || rm -f "$f.tmp"
+    return 0
+}
 
 # "<hat> TAB <session>" for every recorded session, once each. A disabled
 # hat's are not watched: they are meant to be down.
@@ -11424,6 +11444,9 @@ watch_closed() {
     while IFS=$'\t' read -r s kind; do
         [[ -n "$s" ]] || continue
         [[ "$(cfg --arg s "$s" 'any(.groups[]?; .sessions[$s]? != null)')" == true ]] || { watch_retry_clear "$s"; continue; }
+        # A person's close is theirs whatever comes next (its server may not
+        # answer): not expected back, so a host reattach does not keep it (#266).
+        [[ "${kind:-user}" == lost ]] || watch_mirrored_drop "$s"
         if grep -qxF -- "$s" <<<"$shown"; then watch_retry_clear "$s"; continue; fi
         hat=$(session_hat "$s")
         [[ -n "$hat" ]] || { watch_retry_clear "$s"; continue; }
@@ -11479,6 +11502,10 @@ watch_closed() {
         # Reported, so no retry is owed: one inside the reattach gap would
         # otherwise be reported again at each try.
         watch_retry_clear "$s"
+        # Closed for good: a person's close, or cmux's twice inside the gap.
+        # It is no longer expected back, so a later reattach of its host
+        # detaches it again rather than keeping it (#266).
+        watch_mirrored_drop "$s"
         cmd="hatter new $(watch_word "$s")"
         watch_log "'$s' closed in cmux while its tmux session still runs; $cmd brings it back"
         said+="${said:+, }$s"; n=$((n + 1))
@@ -11676,7 +11703,9 @@ watch_retry_take() {
 # back every session of it that no workspace shows, including ones a person
 # closed: each such mirror that was not there when the lock was taken, and was
 # not asked back, is detached again (a close, which for a mirror leaves the
-# session running). Focus goes back where it was.
+# session running). Except one still expected back (watch_mirrored_expected):
+# a close the watcher has not seen yet, or missed, is not taken for a
+# person's (#266). Focus goes back where it was.
 # Prints the sessions that are not back, one per line, for the caller to
 # report; what it logs goes to stderr, which the watch log takes as well.
 watch_reattach() {
@@ -11747,6 +11776,14 @@ watch_reattach() {
         while IFS=$'\t' read -r id title; do
             [[ -n "$id" ]] || continue
             grep -qxF -- "$title" <<<"$want" && continue
+            # Not asked back is no proof a person closed it: cmux may have
+            # torn it down too, with that close not seen yet (#266). One
+            # connected at the last look while awake, and not closed by a
+            # person since, is expected back, so it stays.
+            if watch_mirrored_expected "$title"; then
+                watch_log "kept '$title': reattaching its host brought it back, and it was connected before cmux closed it" >&2
+                continue
+            fi
             while IFS= read -r h; do
                 [[ -n "$h" ]] || continue
                 cmux_pane_map "$h" "$title" </dev/null 2>/dev/null | jq -e '.mirrored == true' >/dev/null 2>&1 || continue
@@ -11820,6 +11857,10 @@ watch_stream() {
     WATCH_DIR=$dir
     fifo="$dir/events"
     mkfifo "$fifo" || { watch_cleanup; return 0; }
+    # Closes the last stream collected but could not act on (#266). Taken
+    # only once this stream can run, so a failed start keeps them.
+    if [[ -n "$WATCH_CARRY_CLOSES" ]]; then closes=$WATCH_CARRY_CLOSES; sync=1; fi
+    WATCH_CARRY_CLOSES=""
     watch_journal_prune
     cmux events --category workspace --category surface --category window \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
@@ -11865,19 +11906,27 @@ watch_stream() {
     done
     # What came in just before the stream ended is still owed.
     [[ "$rc" != 0 ]] || watch_act 3<&-
+    # A close the cursor has moved past is never sent again: if another
+    # hatter command held the lock, so watch_act left it, the next stream
+    # takes it over rather than dropping it (#266).
+    WATCH_CARRY_CLOSES=$closes
     WATCH_STREAM_ERR=$(grep -m 1 '[^[:space:]]' "$dir/err" 2>/dev/null || true)
     watch_cleanup
     return "$rc"
 }
 WATCH_STREAM_ERR=""
 WATCH_DIR=""
+WATCH_CARRY_CLOSES=""
 
 # Ends the stream and removes its fifo. Also the TERM/INT trap, so a watcher
 # that is killed does not leave cmux events and jq running behind it: they are
 # its direct children, and nothing else it starts is (the heal and the sync
 # run in subshells).
 watch_cleanup() {
-    exec 3<&- 2>/dev/null || true
+    # The braces keep 2>/dev/null to the close: on a bare exec every
+    # redirection is permanent, and stderr (all that watch_reattach logs)
+    # would go to /dev/null from the first stream's end on (#266).
+    { exec 3<&-; } 2>/dev/null || true
     pkill -P $$ 2>/dev/null || true
     if [[ -n "$WATCH_DIR" ]]; then
         rm -f "$WATCH_DIR/events" "$WATCH_DIR/err"
@@ -11889,9 +11938,9 @@ watch_cleanup() {
 
 # What `hatter autosave watch` runs, and what launchd keeps running. Never
 # returns on its own except to pick up a new hatter, or once the stream ends
-# under HATTER_WATCH_ONCE (the tests).
+# under HATTER_WATCH_ONCE (the tests; a number above 1 follows that many).
 watch_run() {
-    local backoff=5 said="" said_stream="" msg rc started
+    local backoff=5 said="" said_stream="" msg rc started streams=0
     if ! have_cmux; then
         # launchd would restart it at once; once a minute is plenty.
         watch_log "the cmux CLI is not on PATH; the watcher needs it"
@@ -11923,7 +11972,12 @@ watch_run() {
         started=$(date +%s)
         rc=0; watch_stream || rc=$?
         if [[ "$rc" == 3 ]]; then watch_log "hatter was updated; restarting"; return 0; fi
-        [[ -z "${HATTER_WATCH_ONCE:-}" ]] || return 0
+        # The tests: HATTER_WATCH_ONCE=<n> follows n streams, one after another.
+        if [[ -n "${HATTER_WATCH_ONCE:-}" ]]; then
+            streams=$((streams + 1))
+            [[ "$HATTER_WATCH_ONCE" =~ ^[0-9]+$ ]] && (( streams < HATTER_WATCH_ONCE )) || return 0
+            continue
+        fi
         if [[ $(( $(date +%s) - started )) -ge 30 ]]; then
             # It ran a while, so this is a fresh failure: say it, retry soon.
             backoff=5; said_stream=""
@@ -14084,6 +14138,10 @@ runs" and posts a macOS notification naming `hatter new <session>`, which
 brings it back. A close from a script, or from the sidebar of a workspace
 that is not selected, looks like cmux's own. So a session is reattached at
 most once in 30 minutes: closing it again keeps it closed, with the notice.
+Reattaching one session mirrors its whole server, which also brings back
+the server's other sessions that no workspace shows. Those are closed again,
+except the ones that were connected before and that nobody was seen closing:
+those stay, since cmux may have closed them too.
 
 A reattach that fails is tried again after 1, 2, 5, 10, 20 and 30 minutes,
 with a line in the log each time. Only when the last try fails does the
