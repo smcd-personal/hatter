@@ -6494,7 +6494,7 @@ drag_facts() {
     printf '%s' "$tree" | jq --arg w "$wins" --argjson m "$maps" --arg st "$state" '. as $t
       | ($w | split("\n")) as $ws | {
         workspaces: [$t.windows[]? | select(.id as $i | $ws | index([$i])) | .workspaces[]?
-            | {id, title, surfaces: [.panes[]?.surfaces[]? | {id, title, type}]}],
+            | {id, title, surfaces: [.panes[]?.surfaces[]? | {id, ref, title, type}]}],
         surfaces: [$t.windows[]?.workspaces[]?.panes[]?.surfaces[]?.id],
         maps: $m,
         sessions: [$st | split("\n")[] | select(startswith("S\t")) | split("\t")[1]],
@@ -6523,7 +6523,9 @@ drag_suspect() {
 # Sessions heal_dragged_tabs moved a tab into, one per line.
 HEAL_MOVED=""
 
-# heal_dragged_tabs [hat] [report|once] [workspace surface]
+# heal_dragged_tabs [hat] [report|once|leftovers] [workspace surface]
+# First, unless a drop event is named, close the local shells a server reboot
+# left in mirrored workspaces (heal_hat_leftovers); "leftovers" does only that.
 # Put every dragged tab's tmux window where the tab was dropped, then close the
 # blank tab: cmux draws the moved window as a new tab of its own. Every hat when
 # none is named; a named hat brings in every hat on its server, since a tab can
@@ -6544,7 +6546,10 @@ HEAL_MOVED=""
 # nothing to do.
 heal_dragged_tabs() {
     local only="${1:-}" report="${2:-}" onlyws="${3:-}" onlysf="${4:-}" onlywin="" onlyhost="" hat w h tree i j tmp
-    local wins=() hosts=()
+    local wins=() hosts=() drags=1 fresh
+    # "leftovers" reports as "report" does, and only closes what a server
+    # reboot left (heal_hat_leftovers): restore wants that, not the drags.
+    [[ "$report" != leftovers ]] || { report=report; drags=0; }
     HEAL_MOVED=""
     HEAL_REFUSED=""
     cmux_alive || return 0
@@ -6596,7 +6601,17 @@ heal_dragged_tabs() {
     done
     wait_all ${pids[@]+"${pids[@]}"}
     for ((i = 0; i < ${#hosts[@]}; i++)); do
-        heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" "$onlysf" || true
+        # A drop event is about one tab; the reboot leftovers wait for a look
+        # at the whole server. Their closes change the tree, so the drag
+        # healer gets a fresh one.
+        if [[ -z "$onlysf" ]]; then
+            heal_hat_leftovers "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" || true
+            if [[ "$LEFTOVER_CLOSED" == 1 && "$drags" == 1 ]]; then
+                fresh=$(cmux_json tree --all 2>/dev/null) || fresh=""
+                [[ -z "$fresh" ]] || tree="$fresh"
+            fi
+        fi
+        [[ "$drags" == 0 ]] || heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" "$onlysf" || true
     done
     rm -rf "$tmp"
     return 0
@@ -6834,6 +6849,163 @@ heal_close_blank() {
         && return 0
     HEAL_CLOSE_ERR=$(printf '%s\n' "$err" | grep -m 1 '[^[:space:]]' | tr -d '[:cntrl:]' | cut -c 1-120 || true)
     return 1
+}
+
+# ------------------------------------- local shells a server reboot leaves (#125)
+#
+# When a hat's server reboots, cmux closes every mirrored tab. A workspace
+# cmux keeps cannot hold no tabs, so cmux opens a local shell in it, titled
+# "Terminal". When the mirror comes back, the tmux windows land after that
+# shell, which stays first: a shell on the Mac, not on the server. When the
+# mirror comes back over a different connection, cmux can instead open a new
+# workspace for the session and leave the old one, holding that shell, as a
+# twin with the same title.
+#
+# The plan reads drag_facts' JSON and prints a line per finding, \x1f separated:
+#   tab   surface workspace session
+#         a "Terminal" tab no session maps, in a workspace that shows the
+#         session's mirrored tabs too
+#   twin  workspace session surfaces all-terminal
+#         a workspace titled as a mirrored session, with none of its tabs,
+#         while another workspace of that title shows them. surfaces is a
+#         comma list; all-terminal is 1 when every one is a "Terminal" tab.
+# A tmux window named "Terminal" that cmux shows nowhere makes a "Terminal"
+# tab a possible dragged tab instead (see DRAG_PLAN_JQ), so then nothing is
+# planned: the drag healer owns it.
+#
+# Only a tab older than every tab cmux shows for the session counts. The
+# leftover is opened while the mirror is down, so the mirrored tabs that come
+# back are all newer; a local shell opened in a mirrored workspace afterwards
+# is newer than they are. Age is the number in cmux's "surface:N" ref, which
+# only goes up. A tab without one is not known to be old.
+LEFTOVER_PLAN_JQ='
+  .surfaces as $all
+  | .maps as $maps
+  | (.windows | map({key: .id, value: .}) | from_entries) as $win
+  | ([$maps | to_entries[] | .value | map(select(.window_id != null)) | group_by(.window_id)[]
+      | select(all(.[]; .surface_id as $x | $all | index([$x]) | not))
+      | $win[.[0].window_id].name // ""] | index(["Terminal"]) != null) as $blocked
+  | select($blocked | not)
+  | ([.workspaces[].surfaces[]? | {key: .id, value: ((.ref // "") | capture(":(?<n>[0-9]+)$").n // null | tonumber?)}]
+      | from_entries) as $age
+  | ($maps | with_entries(.value = ([.value[].surface_id | $age[.] // empty] | min))) as $first
+  | def term: .type == "terminal" and .title == "Terminal";
+    def older($s): $age[.id] != null and $first[$s] != null and $age[.id] < $first[$s];
+    [.workspaces[] | select(.title != null and $maps[.title] != null)
+      | [$maps[.title][].surface_id] as $m
+      | . + {mapped: [.surfaces[]? | select(.id as $x | $m | index([$x]))] | length,
+             loose: [.surfaces[]? | select(.id as $x | $m | index([$x]) | not)]}] as $ws
+  | ($ws[] | select(.mapped > 0) | .id as $w | .title as $s
+      | .loose[] | select(term and older($s)) | ["tab", .id, $w, $s]),
+    ($ws[] | select(.mapped == 0) | .title as $t
+      | select(any($ws[]; .title == $t and .mapped > 0))
+      | ["twin", .id, $t, ([.surfaces[]?.id] | join(",")),
+         (if (.surfaces | length) > 0 and all(.surfaces[]; term and older($t)) then "1" else "0" end)])
+  | map(. // "" | tostring) | join("\u001f")'
+
+leftover_plan() { jq -r "$LEFTOVER_PLAN_JQ"; }
+
+# leftover_suspect <windows> <tree> <state>: cheap first look, so the pane maps
+# are only asked for when a workspace titled as a session on this server holds
+# a "Terminal" tab.
+leftover_suspect() {
+    printf '%s' "$2" | jq -e --arg w "$1" --arg st "$3" '
+        . as $t | ($w | split("\n")) as $ws
+        | [$st | split("\n")[] | select(startswith("S\t")) | split("\t")[1]] as $s
+        | any($t.windows[]? | select(.id as $i | $ws | index([$i])) | .workspaces[]?;
+              (.title as $x | $s | index([$x])) != null
+              and any(.panes[]?.surfaces[]?; .type == "terminal" and .title == "Terminal"))' \
+        >/dev/null 2>&1
+}
+
+# idle_shell_screen: stdin is a tab's screen. True when it shows a shell that
+# has done nothing: at most "Last login:" lines, then one prompt ("user@host
+# ~ %": text, a space, the mark) with nothing typed after it. An empty screen
+# is not known to be a shell, so it is not.
+idle_shell_screen() {
+    awk 'NF { l[++n] = $0 }
+         END {
+             if (n == 0) exit 1
+             for (i = 1; i < n; i++) if (l[i] !~ /^Last login: /) exit 1
+             if (l[n] !~ /[^ \t].* [%$#>][ \t]*$/) exit 1
+             exit 0
+         }'
+}
+
+# leftover_idle <window> <workspace> <surface>: the tab shows an idle shell.
+# cmux has not drawn a tab nobody has looked at since the reboot, and the
+# first read of one comes back empty or fails while the read itself starts
+# drawing it. So an empty or failed read is tried again a little later; one
+# that shows anything else is the answer.
+LEFTOVER_READS=4
+LEFTOVER_READ_WAIT=0.5
+leftover_idle() {
+    local screen i
+    for ((i = 1; i <= LEFTOVER_READS; i++)); do
+        if screen=$(cmux read-screen --surface "$3" --workspace "$2" --window "$1" </dev/null 2>/dev/null) \
+           && [[ -n "${screen//[[:space:]]/}" ]]; then
+            idle_shell_screen <<<"$screen"
+            return
+        fi
+        [[ "$i" == "$LEFTOVER_READS" ]] || sleep "$LEFTOVER_READ_WAIT"
+    done
+    return 1
+}
+
+# heal_hat_leftovers <host> <windows> <tree> <state> <report>
+# Close what a reboot of <host> left behind (see LEFTOVER_PLAN_JQ): each tab
+# only while it shows an idle shell, a twin only when every tab in it does.
+# Never forced, so a shell cmux takes for busy stays. With "report", says what
+# it left and why; otherwise only what it closed.
+LEFTOVER_CLOSED=0
+heal_hat_leftovers() {
+    local host="$1" wins="$2" tree="$3" state="$4" report="$5" plan kind a b c d e win sf ok
+    LEFTOVER_CLOSED=0
+    [[ -n "$state" ]] || return 0
+    leftover_suspect "$wins" "$tree" "$state" || return 0
+    plan=$(drag_facts "$wins" "$host" "$tree" "$state" | leftover_plan) || return 0
+    [[ -n "$plan" ]] || return 0
+    while IFS=$'\x1f' read -r kind a b c d e; do
+        case "$kind" in
+            tab)
+                # a surface, b workspace, c session
+                win=$(tree_workspace_window "$tree" "$b")
+                [[ -n "$win" ]] || continue
+                if ! leftover_idle "$win" "$b" "$a"; then
+                    [[ "$report" != report ]] || warn "left a local \"Terminal\" tab in '$c': it is not an idle shell. Close it by hand if it is the one a server reboot left."
+                    continue
+                fi
+                if cmux_change close-surface --surface "$a" --workspace "$b" --window "$win" </dev/null >/dev/null 2>&1; then
+                    LEFTOVER_CLOSED=1
+                    info "Closed the local \"Terminal\" tab a server reboot left in '$c'"
+                else
+                    warn "could not close the local \"Terminal\" tab a server reboot left in '$c'"
+                fi
+                ;;
+            twin)
+                # a workspace, b session, c surfaces, d all-terminal
+                win=$(tree_workspace_window "$tree" "$a")
+                [[ -n "$win" ]] || continue
+                ok="$d"
+                if [[ "$ok" == 1 ]]; then
+                    for sf in ${c//,/ }; do
+                        leftover_idle "$win" "$a" "$sf" || { ok=0; break; }
+                    done
+                fi
+                if [[ "$ok" != 1 ]]; then
+                    [[ "$report" != report ]] || warn "'$b' has a second workspace, without its tabs: the one a server reboot left. It holds more than an idle shell, so it was kept; close it by hand."
+                    continue
+                fi
+                if cmux_change close-workspace --workspace "$a" --window "$win" </dev/null >/dev/null 2>&1; then
+                    LEFTOVER_CLOSED=1
+                    info "Closed the second '$b' workspace a server reboot left"
+                else
+                    warn "could not close the second '$b' workspace a server reboot left"
+                fi
+                ;;
+        esac
+    done <<<"$plan"
+    return 0
 }
 
 # heal_local_drop <host> <cmux-window> <orphan> <workspace> <workspace-title>
@@ -10531,6 +10703,8 @@ cmd_restore() {
         live=$(hat_live_sessions "$host" 2>/dev/null) || live=""
         settle_ungrouped "$hat" "$win" "$live"
         discard_stray_workspace "$win"
+        # A server reboot left a local shell in each workspace cmux kept (#125).
+        heal_dragged_tabs "$hat" leftovers
 
         # 5. windows a restore made with no client attached come up at 80x24
         # unless the server knew the size cmux uses. Mirroring alone does not
@@ -14276,9 +14450,10 @@ hatter autosave [subcommand]
 
 Snapshots of config.json, kept separately from git.
 
-  run                Move dragged tabs (see: hatter help repair), sync from the
-                     live client, snapshot, then back up if due (what the
-                     timer runs)
+  run                Move dragged tabs (see: hatter help repair), close the
+                     local shells a server reboot left (see: hatter help
+                     restore), sync from the live client, snapshot, then back
+                     up if due (what the timer runs)
   watch              Follow cmux events: move a dragged tab the moment it is
                      dropped, sync a second after any layout change, and say
                      when a closed workspace's tmux session still runs
@@ -15141,6 +15316,17 @@ restore asks once, at the end, whether to keep the current order or put back
 the saved one. Keeping it offers a sync, so the config records the order you
 kept. With no terminal to ask at, the current order is kept.
 
+When a shell server reboots, cmux closes every mirrored tab, and a workspace
+it keeps cannot be empty, so it opens a local shell there, titled "Terminal".
+The mirror comes back after it, and that shell on the Mac stays first. Or
+cmux opens a second workspace for the session and leaves the old one holding
+the shell. Restore closes either one once the mirror is back, and so do
+repair and the autosave timer, so it usually goes without a restore. Only a tab
+still titled "Terminal", which no tmux window maps, which is older than
+every tab of the session (so it was opened while the mirror was down, not by
+you afterwards), and which shows an idle shell (a login line and a prompt
+with nothing typed) is closed, and never by force. One that shows more is kept, and restore says so.
+
 With no arguments, every hat. Hats with nothing recorded, or whose server is
 unreachable, are skipped rather than failing the run. An unreachable one says
 why: a key refused (often one with a passphrase that is not loaded in the
@@ -15347,7 +15533,7 @@ seed_config
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|state|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|state|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan|_leftover-plan) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -15360,7 +15546,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|state|resize|shortcuts|sync|_drag-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|state|resize|shortcuts|sync|_drag-plan|_leftover-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -15426,6 +15612,7 @@ case "$cmd" in
     shortcuts) cmd_shortcuts "$@" ;;
     # Not for people: the dragged-tab planner, and the healer, for the tests.
     _drag-plan) drag_plan ;;
+    _leftover-plan) leftover_plan ;;
     _drag-heal) heal_dragged_tabs "${1:-}" "${2:-report}" "${3:-}" "${4:-}" ;;
     restore)   cmd_restore "$@" ;;
 
