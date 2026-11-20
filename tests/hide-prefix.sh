@@ -3,7 +3,8 @@
 # the attach picker show "atlas" for the session "dev-atlas"; a session with no
 # prefix, or one whose short label would match another session, keeps its full
 # name. What is picked or acted on is still the full session name, and a new
-# name typed into the rack's rename takes the prefix the way add's does.
+# name typed into the rack's rename is resolved the way add's is (#276): kept
+# as typed unless the server already has it.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -22,7 +23,9 @@ EOF
 lib="$work/hatter-lib.sh"
 sed '/^# -* main$/,$d' "$root/bin/hatter" > "$lib"
 # Plain output: colour_setup picks no colours when stdout is not a terminal.
-run() { XDG_CONFIG_HOME="$work/cfg" bash -c "source '$lib'; colour_setup; $1" 2>&1; }
+# No server: nothing is running, so only the config decides a name is taken.
+run() { XDG_CONFIG_HOME="$work/cfg" bash -c "source '$lib'; colour_setup
+    remote_session_exists() { return 1; }; $1" 2>&1; }
 
 # --- hat_short_names: which names lose the prefix ----------------------------
 out=$(printf '%s\n' dev-atlas notes dev-notes dev- prod-x dev-dev-y | run 'hat_short_names dev') || fail "hat_short_names: $out"
@@ -34,8 +37,9 @@ $want"
 [[ "$(run 'hat_short_name dev dev-atlas')" == atlas ]] || fail "hat_short_name dev-atlas"
 [[ "$(run 'hat_short_name dev notes')" == notes ]] || fail "hat_short_name notes"
 
-# --- hat_new_name: a bare name takes the prefix, a prefixed one does not -----
-[[ "$(run 'hat_new_name dev maps')" == dev-maps ]] || fail "hat_new_name maps"
+# --- hat_new_name: a free bare name is kept, a taken one takes the prefix ----
+[[ "$(run 'hat_new_name dev maps')" == maps ]] || fail "hat_new_name maps"
+[[ "$(run 'hat_new_name dev notes 2>/dev/null')" == dev-notes ]] || fail "hat_new_name notes (taken)"
 [[ "$(run 'hat_new_name dev dev-maps')" == dev-maps ]] || fail "hat_new_name dev-maps"
 
 # --- rack: the workspace screen ----------------------------------------------
@@ -70,13 +74,16 @@ grep -qx 'TABS dev-atlas atlas' <<<"$out" || fail "rack enter: $out"
 # Rename: the prompt shows the short name; a bare new name takes the prefix...
 out=$(rack 'r q' 'maps') || fail "rack rename: $out"
 grep -qx "ASK new name for workspace 'atlas'" <<<"$out" || fail "rename prompt: $out"
-grep -qx 'RENAME dev-atlas dev-maps --hat dev' <<<"$out" || fail "rename bare: $out"
+grep -qx 'RENAME dev-atlas maps --hat dev' <<<"$out" || fail "rename bare: $out"
 # ...and one that already carries it is used as typed.
 out=$(rack 'r q' 'dev-maps') || fail "rack rename: $out"
 grep -qx 'RENAME dev-atlas dev-maps --hat dev' <<<"$out" || fail "rename prefixed: $out"
+# The same name again is no rename (it is not a clash with itself).
+out=$(rack 'r q' 'atlas') || fail "rack rename same: $out"
+! grep -q '^RENAME' <<<"$out" || fail "rename to its own name: $out"
 # An unprefixed session still renames by its full name.
 out=$(rack '2 r q' 'maps') || fail "rack rename 2: $out"
-grep -qx 'RENAME notes dev-maps --hat dev' <<<"$out" || fail "rename unprefixed: $out"
+grep -qx 'RENAME notes maps --hat dev' <<<"$out" || fail "rename unprefixed: $out"
 
 # Add asks for a name and says nothing about a prefix.
 out=$(rack 'a q' '') || fail "rack add: $out"
@@ -125,6 +132,6 @@ grep -qx 'ATTACH dev notes' <<<"$out" || fail "picker attach 2: $out"
 
 out=$(pick '3 maps') || fail "pick new: $out"
 grep -qx 'ASK new workspace name, Esc to cancel' <<<"$out" || fail "picker new prompt: $out"
-grep -qx 'ATTACH dev dev-maps' <<<"$out" || fail "picker new: $out"
+grep -qx 'ATTACH dev maps' <<<"$out" || fail "picker new: $out"
 
 echo "ok - hide-prefix"

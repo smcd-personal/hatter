@@ -91,8 +91,9 @@ hatter provision dev
 A server with more than 10 workspaces needs sshd's `MaxSessions` raised;
 provision says so when it does (see `hatter help provision`).
 
-Then make your first workspace. A workspace is a tmux session named
-`<hat>-<subproject>`, shown as one entry in the cmux sidebar:
+Then make your first workspace. A workspace is a tmux session, shown as one
+entry in the cmux sidebar. A name that starts with a hat's name and a dash
+picks that hat:
 
 ```sh
 hatter dev-website

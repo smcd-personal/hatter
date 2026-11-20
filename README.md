@@ -28,16 +28,16 @@ Four nouns, and one of them is the idea:
 |---|---|
 | **hat** | a login — one `user@host`, one ssh connection, one tmux server, one terminal window. "I'm wearing my work hat." |
 | **group** | a project or area inside one hat |
-| **workspace** | a tmux session, named `<hat>-<subproject>` |
+| **workspace** | a tmux session, named as you type it (`hatter help new`) |
 | **tab** | a tmux window inside that session |
 
 No workspace runs outside a group: a running session that no group records
 goes into its hat's **Unassigned** group, which hatter manages itself and
 removes once it is empty (`hatter help group`).
 
-The hat prefix on a session name is what selects the window and the ssh
-connection, so a side project can live under your main hat as
-`dev-website-parser` and still land in the right place.
+The config records which hat owns each workspace, and so which window and ssh
+connection it lands in. A name like `dev-parser` also says it, which is how a
+session the config does not record finds its hat.
 
 **The server is the source of truth. The client is disposable.** Everything real
 runs in remote tmux. `hatter sync` records the live layout, in the order cmux
