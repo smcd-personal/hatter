@@ -18,8 +18,9 @@ mkdir -p "$work/bin"
 cat > "$work/bin/cmux" <<'STUB'
 #!/usr/bin/env bash
 log="$STUB_DIR/log"
-sh='{"surfaces":[{"id":"s-sh","title":"'"${STUB_TITLE:-Terminal}"'","type":"terminal"}]}'
-mirror='{"surfaces":[{"id":"s-1","title":"one","type":"terminal"}]},{"surfaces":[{"id":"s-2","title":"two","type":"terminal"}]}'
+# STUB_SH_REF: the shell's surface number; 5 is older than the mirrored tabs.
+sh='{"surfaces":[{"id":"s-sh","ref":"surface:'"${STUB_SH_REF:-5}"'","title":"'"${STUB_TITLE:-Terminal}"'","type":"terminal"}]}'
+mirror='{"surfaces":[{"id":"s-1","ref":"surface:10","title":"one","type":"terminal"}]},{"surfaces":[{"id":"s-2","ref":"surface:11","title":"two","type":"terminal"}]}'
 case "$*" in
   *"list-windows --json"*) echo '[{"id":"W1"}]' ;;
   *"tree --all --json"*)
@@ -40,6 +41,9 @@ case "$*" in
     case "$STUB_SCREEN" in
       idle)   printf 'Last login: Thu Nov 19 21:05:43 on ttys020\nuser@mac ~ %% \n\n\n' ;;
       prompt) printf 'user@mac ~ $ \n' ;;
+      # Text that ends in a prompt mark but is no prompt.
+      percent) printf 'Progress 50%%\n' ;;
+      cont)    printf '> \n' ;;
       typed)  printf 'Last login: Thu Nov 19 21:05:43 on ttys020\nuser@mac ~ %% make test\n' ;;
       output) printf 'user@mac ~ %% ls\nnotes.txt\nuser@mac ~ %% \n' ;;
       blank)  printf '  \n\n' ;;
@@ -110,7 +114,7 @@ done
 log=$(run prompt prompt report)
 expect "a bare prompt, no login line, is idle too" "$(grep -q '^close .*--surface s-sh ' <<<"$log" && echo y)"
 
-for s in typed output blank fail; do
+for s in typed output blank fail percent cont; do
     log=$(run "$s" "$s" report)
     expect "a leftover showing '$s' is kept" "$(! grep -q '^close' <<<"$log" && echo y)"
     expect "...and report says why" "$(grep -q 'not an idle shell' "$work/run-$s/out" && echo y)"
@@ -125,6 +129,10 @@ expect "the timer closes an idle one" "$(grep -q '^close .*--surface s-sh ' <<<"
 
 log=$(run renamed idle report STUB_TITLE=scratch)
 expect "a local tab with its own title is not read or closed" \
+    "$(! grep -qE '^(read|close)' <<<"$log" && echo y)"
+
+log=$(run newer idle once STUB_SH_REF=20)
+expect "the timer leaves an idle shell opened after the mirror came back" \
     "$(! grep -qE '^(read|close)' <<<"$log" && echo y)"
 
 log=$(run none idle report STUB_LEFT=none)
