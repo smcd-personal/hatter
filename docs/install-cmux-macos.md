@@ -151,20 +151,23 @@ to push to, the timer also pushes a backup by itself when the config has
 changed a lot or sat unpushed for a week; `hatter help autosave` has the
 rules.
 
-## 7. Optional: Claude logins
+## 7. Optional: Claude and Codex logins
 
-If you run Claude Code on your servers, hatter can push a login from this Mac's
-Keychain to a hat over ssh, without the login ever touching disk on either side.
+If you run Claude Code or Codex on your servers, hatter can push a login from
+this Mac to a hat over ssh, without the login touching disk on this side.
 
 ```sh
-uv tool install claude-swap     # provides `cswap`
-hatter creds                    # lists logins and which hats hold them
+uv tool install claude-swap               # Claude logins: provides `cswap`
+CODEX_HOME=~/.codex-work codex login      # Codex: one ~/.codex-<name> per account
+hatter creds                              # lists logins and which hats hold them
 hatter creds push a dev
 hatter creds status
 ```
 
-One login can go to as many hats as you like. A hat holds one at a time,
-because Claude Code reads a single credentials file.
+`hatter help creds` covers both, including why a Codex login belongs on one
+hat only.
+
+A hat holds one Claude login and one Codex login at a time.
 
 ## Where to go next
 

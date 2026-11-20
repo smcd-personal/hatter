@@ -106,9 +106,9 @@ expect "with no window known the dot is dim" "$(yes_if [ "$(dot - -)" = "D●" ]
 # --- one email, two organizations ----------------------------------------------
 out=$(run 'creds_resolve b@example.com' || true)
 expect "an email held twice is ambiguous" "$(yes_if has "$out" "matches 2 credentials")"
-expect "a letter picks one of them" "$(yes_if [ "$(run 'creds_resolve c' | tr '\037' ' ')" = "3 b@example.com org-t" ])"
-expect "a slot number does too" "$(yes_if [ "$(run 'creds_resolve 2' | tr '\037' ' ')" = "2 b@example.com org-p" ])"
-expect "a unique email still resolves" "$(yes_if [ "$(run 'creds_resolve a@example.com' | tr '\037' ' ')" = "1 a@example.com org-t" ])"
+expect "a letter picks one of them" "$(yes_if [ "$(run 'creds_resolve c' | tr '\037' ' ')" = "claude 3 b@example.com org-t" ])"
+expect "a slot number does too" "$(yes_if [ "$(run 'creds_resolve 2' | tr '\037' ' ')" = "claude 2 b@example.com org-p" ])"
+expect "a unique email still resolves" "$(yes_if [ "$(run 'creds_resolve a@example.com' | tr '\037' ' ')" = "claude 1 a@example.com org-t" ])"
 
 run 'cmd_creds push c dev' > /dev/null
 expect "a push exports by slot, not by email" "$(yes_if [ "$(cat "$work/export-args")" = "- --account 3" ])"
