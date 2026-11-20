@@ -229,6 +229,34 @@ expect "...without a reorder or a focus restore" "$(! grep -q 'reorder\|restored
 expect "...and is logged once" "$([[ $(grep -c 'could not move the sign-in' "$work/fail.log") == 1 ]] && echo y || echo n)"
 unset -f cmux focus_restore
 
+# --- a round returns while the event stream runs (#269) ----------------------
+# The watcher runs watch_signin in the shell that keeps its cmux event stream
+# going as a background job. A bare `wait` on the way (cmux_snapshot had one)
+# waits for that job too, and hangs the watcher. held_round runs one round in
+# a subshell that holds such a job, and says whether it came back within 10s.
+held_round() {
+    rm -f "$work/held"
+    # Off this function's stdout: a job left holding it would hold up $( ).
+    ( sleep 600 & h=$!; WATCH_SIGNIN_LAST=0; WATCH_SIGNIN_PLACED=""
+      watch_signin > "$work/round" 2>&1; echo done > "$work/held"; kill "$h" 2>/dev/null ) >/dev/null 2>&1 &
+    local p=$! t
+    for t in 1 2 3 4 5 6 7 8 9 10; do
+        [[ -s "$work/held" ]] && break
+        sleep 1
+    done
+    pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
+    [[ -s "$work/held" ]] && echo y || echo n
+}
+reset
+printf '%s\n' "W1${T}ops-main" "W1${T}Sign in to me@dev.example.com" "W2${T}dev-main" > "$work/titles"
+expect "a sign-in for a hat's host: the round returns while a stream job runs" "$(held_round)"
+expect "...and places the sign-in" \
+    "$(grep -qx 'move WS-Sign in to me@dev.example.com W2' "$work/round" && echo y || echo n)"
+reset
+printf '%s\n' "W1${T}ops-main" "W1${T}Sign in to someone@else.example.com" > "$work/titles"
+expect "a sign-in for no hat's host: the round returns too" "$(held_round)"
+expect "...and places nothing" "$(! grep -qE '^(move|top) ' "$work/round" && echo y || echo n)"
+
 # --- the watcher really calls it, and survives set -euo pipefail -------------
 reset
 unset -f access_gate

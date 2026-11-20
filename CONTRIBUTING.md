@@ -79,6 +79,10 @@ You need `ssh`, `jq` and a server running `tmux`. The cmux commands need
   puts it back however the run ends. Only reads call `cmux` directly.
   `tests/focus-restore.sh` fails on a bare change. If you add an EXIT
   trap, call `hatter_on_exit` from it.
+- **Wait for the jobs you started, with `wait_all <pid>...`**, never a bare
+  `wait`. A bare `wait` waits for every background job the shell has, and
+  the watcher keeps its event stream running as one, so the watcher would
+  never come back. `tests/wait-all.sh` fails on a bare `wait`.
 - **tmux output that hatter parses is read as `tmux -u`, with fields joined
   by a tab.** tmux 3.4 escapes `\x1f` in `-F` output. A client with no UTF-8
   locale (an ssh command, a tmux hook, a server started at boot) gets every
