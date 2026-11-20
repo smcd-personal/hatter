@@ -11676,6 +11676,7 @@ watch_wake_tick() {
     [[ "$WATCH_WAKE_PENDING" == 1 ]] || return 0
     mac_dark_wake && return 0
     WATCH_WAKE_PENDING=0
+    watch_probe_arm "$now"
     [[ "$(cfg '.prefs.wake_notify // "on"' 2>/dev/null)" != off ]] || return 0
     WATCH_WAKE_AT=$now; WATCH_READY_LAST=0; WATCH_READY_PREV=""
     watch_log "the Mac woke; watching for everything to come back"
@@ -11708,6 +11709,166 @@ watch_mirrored_snap() {
     return 0
 }
 
+# After a short sleep, cmux's mirror ssh can be half-open: through a
+# ProxyCommand (cloudflared and the like) the proxy's own stream died in the
+# sleep, but ssh's pipe to the proxy is fine, so ssh only gives up after its
+# keepalives go unanswered. cmux sets those on the command line
+# (ServerAliveInterval=20, ServerAliveCountMax=3), so no ssh_config can
+# shorten them, and cmux reconnects about a minute after the wake. Meanwhile
+# cmux still reports the mirror attached (#278).
+#
+# So on every wake (even with wake_notify off) the watcher probes each of
+# cmux's ssh masters: a round trip through it that must answer within
+# WATCH_PROBE_CAP seconds. One that does is left alone: a mirror over a
+# direct connection often survives a sleep. One that does not is checked
+# against a new connection to the same place: if that connects and answers
+# in less time, the network is back and the master is dead, so it is dropped (`ssh -O exit`) and cmux
+# reconnects at once. If the new connection fails too, the network is not
+# back yet, and the next round tries again. Rounds run every
+# WATCH_PROBE_EVERY seconds until every master has answered, or for
+# WATCH_READY_CAP seconds. A master is known by its ControlPath and pid, so
+# the new master cmux starts after a drop is probed again.
+#
+# Until a host's masters have answered, its mirrors count as "connection not
+# answering yet" in watch_ready_look, so "hatter: ready" waits for a
+# connection that works, not one cmux only thinks is up.
+# "prefs": {"wake_probe": "off"} turns the probe (and that wait) off.
+WATCH_PROBE_CAP=8
+WATCH_PROBE_EVERY=5
+WATCH_PROBE_AT=0
+WATCH_PROBE_LAST=0
+WATCH_PROBE_OK=""        # "<path> TAB <pid>": answered since the wake
+WATCH_PROBE_PENDING=""   # one dest per line: not proven since the wake
+
+# cmux_ssh_masters_parse: read `ps -axo command=` and print
+# "<ControlPath> TAB <dest>" once per ControlPath under ~/.cmux/ssh, taken
+# from the command lines of the ssh clients cmux runs for its mirrors
+# ("ssh ... -o ControlPath=<path> ... -- <dest> ..."). The masters' own
+# process titles carry no dest.
+cmux_ssh_masters_parse() {
+    AWK_DIR="$HOME/.cmux/ssh/" awk '
+        BEGIN { dir = ENVIRON["AWK_DIR"] }
+        $1 ~ /(^|\/)ssh$/ {
+            path = ""; dest = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^ControlPath=/) {
+                    p = substr($i, 13)
+                    if (index(p, dir) == 1) path = p
+                } else if ($i == "--" && i < NF) { dest = $(i + 1); break }
+            }
+            if (path != "" && dest != "" && !seen[path]++) print path "\t" dest
+        }'
+}
+cmux_ssh_masters() { ps -axo command= 2>/dev/null | cmux_ssh_masters_parse; }
+
+# watch_probe_arm <now>: a wake; probe from scratch.
+watch_probe_arm() {
+    WATCH_PROBE_AT=0; WATCH_PROBE_OK=""; WATCH_PROBE_PENDING=""; WATCH_PROBE_LAST=0
+    [[ "$(cfg '.prefs.wake_probe // "on"' 2>/dev/null)" != off ]] || return 0
+    WATCH_PROBE_AT=$1
+}
+
+# watch_probe_pending <dest>: its mirrors' ssh has not been proven since the wake.
+watch_probe_pending() {
+    [[ -n "$WATCH_PROBE_PENDING" ]] || return 1
+    grep -qxF -- "$1" <<<"$WATCH_PROBE_PENDING"
+}
+
+# watch_probe_one <path> <dest> <out>: probe one master; write
+# "ok|dropped|down|gone TAB <pid>" to <out>.
+watch_probe_one() {
+    local path="$1" dest="$2" out="$3" pid
+    # No master answers -O check with 255: under pipefail that fails the
+    # assignment, and set -e would end this job before it says "gone".
+    pid=$(wall_cap 3 ssh -S "$path" -O check "$dest" </dev/null 2>&1 | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1) || pid=""
+    if [[ -z "$pid" ]]; then printf 'gone\t\n' > "$out"; return 0; fi
+    if grep -qxF -- "$path"$'\t'"$pid" <<<"$WATCH_PROBE_OK"; then printf 'ok\t%s\n' "$pid" > "$out"; return 0; fi
+    # Any reply is an answer, an error too: a server at its MaxSessions
+    # refuses the probe's session at once, over a connection that works. Only
+    # the cap running out (SIGALRM, 142) is no answer.
+    local rc=0
+    wall_cap "$WATCH_PROBE_CAP" ssh -S "$path" -o ControlMaster=no -o BatchMode=yes "$dest" true \
+        </dev/null >/dev/null 2>&1 || rc=$?
+    if [[ "$rc" != 142 ]]; then printf 'ok\t%s\n' "$pid" > "$out"; return 0; fi
+    # No answer: a dead master, no network yet, or a server too slow to run
+    # `true` in WATCH_PROBE_CAP seconds. A new connection tells which: only
+    # if it does the same round trip, handshake and all, in less time than
+    # the master was given is the master dead. A slow server fails both.
+    local t0 t1
+    t0=$(date +%s)
+    if wall_cap "$WATCH_PROBE_CAP" ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
+            -o ConnectTimeout="$WATCH_PROBE_CAP" "$dest" true </dev/null >/dev/null 2>&1 \
+       && t1=$(date +%s) && (( t1 - t0 < WATCH_PROBE_CAP )); then
+        wall_cap 5 ssh -S "$path" -O exit "$dest" </dev/null >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
+        printf 'dropped\t%s\n' "$pid" > "$out"; return 0
+    fi
+    printf 'down\t%s\n' "$pid" > "$out"
+    return 0
+}
+
+# watch_probe: one round, while a wake's probe is armed. The masters are
+# probed side by side; only the jobs started here are waited for (#269).
+watch_probe() {
+    [[ "$WATCH_PROBE_AT" != 0 ]] || return 0
+    local now masters path dest i=0 started="" pid res state mpid pending="" left
+    now=$(date +%s)
+    if (( now - WATCH_PROBE_AT >= WATCH_READY_CAP )); then
+        [[ -z "$WATCH_PROBE_PENDING" ]] \
+            || watch_log "after the wake, cmux's ssh to $(paste -sd, - <<<"$WATCH_PROBE_PENDING" | sed 's/,/, /g') never answered a probe; stopped probing"
+        WATCH_PROBE_AT=0; WATCH_PROBE_PENDING=""; WATCH_PROBE_OK=""
+        return 0
+    fi
+    (( now - WATCH_PROBE_LAST >= WATCH_PROBE_EVERY )) || return 0
+    mac_dark_wake && return 0
+    WATCH_PROBE_LAST=$now
+    masters=$(cmux_ssh_masters) || masters=""
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+    while IFS=$'\t' read -r path dest; do
+        [[ -n "$path" ]] || continue
+        i=$((i + 1))
+        rm -f "$AUTOSAVE_DIR/.probe-$i"
+        watch_probe_one "$path" "$dest" "$AUTOSAVE_DIR/.probe-$i" &
+        started+="$! "
+    done <<<"$masters"
+    for pid in $started; do wait "$pid" 2>/dev/null || true; done
+    i=0
+    # A dest dropped earlier stays pending until its new master answers.
+    left=$(printf '%s\n' "$WATCH_PROBE_PENDING")
+    while IFS=$'\t' read -r path dest; do
+        [[ -n "$path" ]] || continue
+        i=$((i + 1))
+        res=$(cat "$AUTOSAVE_DIR/.probe-$i" 2>/dev/null || true)
+        rm -f "$AUTOSAVE_DIR/.probe-$i"
+        state=${res%%$'\t'*}; mpid=${res#*$'\t'}
+        case "$state" in
+            ok)
+                grep -qxF -- "$path"$'\t'"$mpid" <<<"$WATCH_PROBE_OK" \
+                    || WATCH_PROBE_OK+="$path"$'\t'"$mpid"$'\n' ;;
+            dropped)
+                watch_log "after the wake, cmux's ssh to $dest did not answer but a new connection did; dropped it so cmux reconnects now"
+                pending+="$dest"$'\n' ;;
+            # No master on it: cmux is between connections. One dropped
+            # earlier stays pending until its new master answers.
+            gone) grep -qxF -- "$dest" <<<"$left" && pending+="$dest"$'\n' ;;
+            *) pending+="$dest"$'\n' ;;
+        esac
+    done <<<"$masters"
+    # Still pending from before: a dest dropped, with no answering master yet.
+    # One with masters now was judged by them above.
+    while IFS= read -r dest; do
+        [[ -n "$dest" ]] || continue
+        AWK_D="$dest" awk -F '\t' '$2 == ENVIRON["AWK_D"] { f = 1 } END { exit !f }' <<<"$masters" \
+            || pending+="$dest"$'\n'
+    done <<<"$left"
+    WATCH_PROBE_PENDING=$(printf '%s' "$pending" | awk 'NF && !seen[$0]++')
+    if [[ -z "$WATCH_PROBE_PENDING" ]]; then
+        [[ -z "$masters" ]] \
+            || watch_log "after the wake, cmux's ssh answered on every connection ($(watch_took $((now - WATCH_PROBE_AT))))"
+        WATCH_PROBE_AT=0; WATCH_PROBE_OK=""
+    fi
+    return 0
+}
+
 # watch_ready_look: one look at how far the recovery is. Prints
 #   back TAB <n>                      sessions that are back and connected
 #   signin TAB <dest> TAB <surface>   a hat's sign-in workspace is open
@@ -11736,7 +11897,9 @@ watch_ready_look() {
         # Its host is waiting on a sign-in: that is the one thing to do.
         grep -qxF -- "$host" <<<"$signins" && continue
         if grep -qxF -- "$s" <<<"$shown"; then
-            if cmux_attached "$host" "$s"; then n=$((n + 1)); else printf 'wait\t%s\tnot connected\n' "$s"; fi
+            if ! cmux_attached "$host" "$s"; then printf 'wait\t%s\tnot connected\n' "$s"
+            elif watch_probe_pending "$host"; then printf 'wait\t%s\tconnection not answering yet\n' "$s"
+            else n=$((n + 1)); fi
             continue
         fi
         # Not shown: still running (missing) or ended? One look per host.
@@ -12240,6 +12403,7 @@ watch_reattach() {
 watch_act() {
     local w sf mtime
     watch_wake_tick
+    watch_probe
     if [[ "$heal_all" == 1 ]]; then
         watch_heal
     elif [[ -n "$heals" ]]; then
@@ -14686,7 +14850,13 @@ watcher could not clear by itself, the notification is "hatter: sign in to
 <host>" instead, and clicking it opens that sign-in tab. cmux opens a sign-in
 workspace in whichever window is in front; the watcher moves it, once, to the
 top of its own hat's window. If not everything is back within 3 minutes, "hatter: not all back" names what is missing and any
-server that did not answer. A workspace you closed before the sleep is not
+server that did not answer. After a short sleep, a connection that goes
+through a proxy (cloudflared and the like) can look up to cmux while it is
+dead, and cmux would wait about a minute to find out. The watcher tests each
+of cmux's ssh connections once the network is back, drops one that does not
+answer so cmux reconnects at once, and does not count a workspace as back
+until its connection answers. Turn that off with "prefs": {"wake_probe": "off"}.
+A workspace you closed before the sleep is not
 waited for: the watcher keeps a list of what is connected, refreshed every 5
 minutes while the Mac is awake, in ~/.config/hatter/autosave/mirrored, so a
 workspace closed in the last 5 minutes before the sleep can still be waited
