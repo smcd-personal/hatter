@@ -12343,7 +12343,8 @@ creds_rows() {
                     elif ($t | test("team|enterprise")) then "team"
                     else "personal" end;
         # Too little left to be worth switching to counts as spent.
-        def spentbelow(min): . != null and .pct != null and (100 - .pct) < min;
+        # Rounded as rem rounds it, so a row reading 10% is never spent at 10.
+        def spentbelow(min): . != null and .pct != null and (100 - (.pct | floor)) < min;
         # Seconds to a reset. A window with no reset time has not started: it
         # runs a full span from first use, so it counts as that far away.
         def until(span): if . == null or .resetsAt == null then span
@@ -12410,9 +12411,15 @@ creds_marks() {
 }
 
 creds_tail() {
-    local avail="$1" holders="$2" active="$3" act="" hold=""
-    act=$(creds_marks "$active")
-    if [[ ${#act} -gt $avail ]]; then act=""; else avail=$((avail - ${#act})); fi
+    local avail="$1" holders="$2" active="$3" act="" hold="" m
+    # Each mark is fitted on its own, active first, so a narrow row loses
+    # "next" before it loses both.
+    for m in active best; do
+        case ",$active," in *,"$m",*)
+            m=$(creds_marks "$m")
+            [[ ${#m} -le $avail ]] && { act="$act$m"; avail=$((avail - ${#m})); } ;;
+        esac
+    done
     if [[ -n "$holders" && $avail -gt 4 ]]; then
         hold="  -> $holders"
         [[ ${#hold} -gt $avail ]] && hold="${hold:0:$((avail-1))}…"

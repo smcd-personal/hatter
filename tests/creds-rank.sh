@@ -95,6 +95,29 @@ expect "spent ones go by when they can run again" "$(yes_if has "$got" "s-5h s-7
 expect "the thresholds can be changed" \
     "$(yes_if has "$(order HATTER_CREDS_MIN_5H=5)" "t-soon s-5h edge t-idle s-7d")"
 
+expect "the 7d threshold can be changed too" \
+    "$(yes_if has "$(order HATTER_CREDS_MIN_7D=1)" "t-soon s-7dlow edge t-idle")"
+
+# Both windows spent: it can run again only when the later one resets.
+write_list "$(acct 1 both@example.com claude_team 100 $H 100 $((3*D)))" \
+           "$(acct 2 seven@example.com claude_team 0 $H 100 $((2*D)))"
+expect "a login spent in both windows waits for the later reset" \
+    "$(yes_if [ "$(order)" = "seven both" ])"
+write_list \
+    "$(acct 1 p-late@example.com claude_max - 0 50 $((3*D)))" \
+    "$(acct 2 p-soon@example.com claude_max - 0 50 $((1*D)))" \
+    "$(acct 3 t-soon@example.com claude_team 20 $H 50 $((12*H)))" \
+    "$(acct 4 t-idle@example.com claude_team 0 $H 0 -)" \
+    "$(acct 5 s-7d@example.com claude_max - 0 100 $((2*H)))" \
+    "$(acct 6 s-5h@example.com claude_team 95 $H 10 $((4*D)))" \
+    "$(acct 7 s-7dlow@example.com claude_team 0 $H 99 $((5*D)))" \
+    "$(acct 8 edge@example.com claude_team 90 $H 98 $((6*D)))"
+
+# A narrow row keeps the active mark when both will not fit.
+tail=$(RUN='colour_setup; creds_tail 31 "a, b" best,active' run)
+expect "a narrow row keeps the active mark" "$(yes_if has "$tail" "active on this Mac")"
+expect "...and drops next first" "$(yes_if [ "${tail#*next}" = "$tail" ])"
+
 letters=$(RUN='creds_rows' run | awk -F$'\x1f' '{print $1 $2}' | paste -sd' ' -)
 expect "letters stay with their account, whatever the order" \
     "$(yes_if [ "$letters" = "b2 a1 c3 h8 d4 f6 e5 g7" ])"
@@ -114,6 +137,21 @@ held=$(jq -r '[.hats | to_entries[] | select(.value.credential == "p-soon@exampl
     "$work/home/.config/hatter/config.json")
 expect "...and records it for every hat on those destinations" "$(yes_if [ "$held" = "dev dev2 ops" ])"
 expect "a disabled hat is left alone" "$(yes_if [ "$(jq -r '.hats.old.credential // "none"' "$work/home/.config/hatter/config.json")" = none ])"
+
+# A failed push to a shared server records it for none of the hats there.
+cat > "$work/bin/ssh" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = -G ] && exit 0
+cat > /dev/null
+case "$*" in *srv.example.com*) echo "boom" >&2; exit 1 ;; esac
+echo installed
+STUB
+jq '.hats |= with_entries(del(.value.credential, .value.credential_org))' \
+    "$work/home/.config/hatter/config.json" > "$work/c.json" && mv "$work/c.json" "$work/home/.config/hatter/config.json"
+RUN='cmd_creds push' run > /dev/null || true
+held=$(jq -r '[.hats | to_entries[] | select(.value.credential != null) | .key] | join(" ")' \
+    "$work/home/.config/hatter/config.json")
+expect "a failed push to a shared server records it for no hat there" "$(yes_if [ "$held" = ops ])"
 
 # --- nothing usable ----------------------------------------------------------------
 write_list "$(acct 5 s-7d@example.com claude_max - 0 100 $((2*H)))" \
