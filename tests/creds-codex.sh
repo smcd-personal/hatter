@@ -146,7 +146,7 @@ expect "a home name picks one" "$(yes_if [ "$(run 'creds_resolve sam-team' | tr 
 run 'cmd_creds push sam-team dev' > /dev/null
 expect "a push installs with --agent codex" "$(yes_if has "$(tail -1 "$work/ssh-log")" "hat-creds\" install --agent codex")"
 expect "...landing that home's auth.json in the hat's ~/.codex" "$(yes_if [ "$(jq -cS . "$work/remote/.codex/auth.json")" = "$(jq -cS . "$work/home/.codex-sam-team/auth.json")" ])"
-expect "...0600" "$(yes_if [ "$(stat -f %Lp "$work/remote/.codex/auth.json" 2>/dev/null || stat -c %a "$work/remote/.codex/auth.json")" = 600 ])"
+expect "...0600" "$(yes_if [ "$(stat -c %a "$work/remote/.codex/auth.json" 2>/dev/null || stat -f %Lp "$work/remote/.codex/auth.json")" = 600 ])"
 c=$(jq -c '.hats.dev | {codex_credential, codex_credential_workspace, codex_credential_home}' "$work/home/.config/hatter/config.json")
 expect "a push records email, workspace and home" "$(yes_if [ "$c" = '{"codex_credential":"sam@example.com","codex_credential_workspace":"ws-t","codex_credential_home":"sam-team"}' ])"
 expect "...and leaves the Claude login alone" "$(yes_if [ "$(jq -r '.hats.dev.credential // "none"' "$work/home/.config/hatter/config.json")" = none ])"
