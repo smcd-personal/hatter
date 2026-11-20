@@ -79,7 +79,9 @@ run() {
         PATH="$work/bin:$PATH" STUB_DIR="$work" NO_COLOR=1 \
         /bin/bash -c "source '$work/hatter-lib.sh'; $1" < /dev/null 2>&1
 }
-field() { run 'creds_rows' | sed -n "${1}p" | awk -F$'\x1f' -v f="$2" '{print $f}'; }
+# field <slot> <n>: field n of the row for cswap slot <slot>. Rows come in
+# rank order (#273), so a row is found by its slot, not its line.
+field() { run 'creds_rows' | awk -F$'\x1f' -v s="$1" -v f="$2" '$2 == s {print $f}'; }
 
 # --- rows: a missing window is "-", an idle one is a number -------------------
 expect "a plan with a 5h window reports what is left of it" "$(yes_if [ "$(field 1 7)" = 70 ])"

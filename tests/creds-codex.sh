@@ -81,7 +81,9 @@ STUB
 mkdir -p "$work/remote/.local/bin"
 extract() { sed -n '/^cat > "\$HOME\/.local\/bin\/hat-creds" <<.HATCREDS.$/,/^HATCREDS$/p' | sed '1d;$d'; }
 extract < "$hatter" > "$work/hat-creds.new"
-git -C "$here/.." show origin/main:bin/hatter 2>/dev/null | extract > "$work/hat-creds.old" || true
+# hat-creds as it was before Codex support, kept as a fixture: it ignores
+# --agent, which is the case the client has to guard against.
+cp "$here/fixtures/hat-creds-pre-codex.py" "$work/hat-creds.old"
 use_hatcreds() { cp "$work/hat-creds.$1" "$work/remote/.local/bin/hat-creds"; }
 use_hatcreds new
 printf '#!/bin/sh\nexit 1\n' > "$work/bin/cmux"
