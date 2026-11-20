@@ -43,7 +43,8 @@ write_config
 # The ssh stub. A master at <path> runs while $work/pid-<base> holds its pid.
 # A round trip through it does what $work/mux-<base> says: ok, refuse (an
 # error at once, as a server at MaxSessions gives) or hang. A new connection
-# (ControlPath=none) connects while $work/net exists. Every -O exit is logged.
+# (ControlPath=none) connects while $work/net exists, and hangs if it says
+# "slow". Every -O exit is logged.
 mkdir -p "$work/bin"
 cat > "$work/bin/ssh" <<'STUB'
 #!/usr/bin/env bash
@@ -61,7 +62,11 @@ case "$op" in
            echo "Master running (pid=$(cat "$w/pid-$b"))" >&2; exit 0 ;;
     exit)  echo "$path" >> "$w/exits"; rm -f "$w/pid-$b"; exit 0 ;;
 esac
-if [[ "$fresh" == 1 ]]; then [[ -e "$w/net" ]] && exit 0; exit 255; fi
+if [[ "$fresh" == 1 ]]; then
+    [[ -e "$w/net" ]] || exit 255
+    [[ "$(cat "$w/net")" != slow ]] || exec sleep 30
+    exit 0
+fi
 case "$(cat "$w/mux-$b" 2>/dev/null)" in
     ok) exit 0 ;;
     refuse) echo "channel 0: open failed: administratively prohibited" >&2; exit 255 ;;
@@ -75,8 +80,7 @@ C="$HOME/.cmux/ssh"
 D=me@dev.example.com; O=me@ops.example.com
 cmux_ssh_masters() { cat "$work/masters"; }
 mac_dark_wake() { return 1; }
-WATCH_PROBE_CAP=1
-WATCH_PROBE_FRESH_CAP=2
+WATCH_PROBE_CAP=2
 
 reset() {
     rm -f "$work"/pid-* "$work"/mux-* "$work/exits" "$work/net" "$work/log"
@@ -131,6 +135,18 @@ expect "no answer and no network: not dropped, pending" \
     "$([[ -z "$(exits)" ]] && watch_probe_pending "$D" && echo y || echo n)"
 touch "$work/net"; round
 expect "...dropped once the network is back" "$([[ "$(exits)" == "$C/tmux-dev.sock" ]] && echo y || echo n)"
+
+reset; echo ok > "$work/mux-tmux-dev.sock"; echo hang > "$work/mux-tmux-ops.sock"; echo slow > "$work/net"
+round
+expect "a slow server (a new connection no faster) is not dropped, but pending" \
+    "$([[ -z "$(exits)" ]] && watch_probe_pending "$O" && echo y || echo n)"
+
+# The watcher runs under set -euo pipefail: a master that is gone, on a host
+# that was not pending, is no reason to wait.
+reset; echo ok > "$work/mux-tmux-dev.sock"; rm -f "$work/pid-tmux-ops.sock"
+set -euo pipefail; round; set +euo pipefail
+expect "a master gone (cmux between connections) is not waited for, under set -e" \
+    "$(! watch_probe_pending "$O" && [[ "$WATCH_PROBE_AT" == 0 ]] && echo y || echo n)"
 
 reset; echo ok > "$work/mux-tmux-dev.sock"; echo hang > "$work/mux-tmux-ops.sock"; rm -f "$work/net"
 round; WATCH_PROBE_AT=$(( $(date +%s) - WATCH_READY_CAP )); round

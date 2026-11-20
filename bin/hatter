@@ -11721,8 +11721,8 @@ watch_mirrored_snap() {
 # cmux's ssh masters: a round trip through it that must answer within
 # WATCH_PROBE_CAP seconds. One that does is left alone: a mirror over a
 # direct connection often survives a sleep. One that does not is checked
-# against a new connection to the same place: if that connects, the network
-# is back and the master is dead, so it is dropped (`ssh -O exit`) and cmux
+# against a new connection to the same place: if that connects and answers
+# in less time, the network is back and the master is dead, so it is dropped (`ssh -O exit`) and cmux
 # reconnects at once. If the new connection fails too, the network is not
 # back yet, and the next round tries again. Rounds run every
 # WATCH_PROBE_EVERY seconds until every master has answered, or for
@@ -11733,8 +11733,7 @@ watch_mirrored_snap() {
 # answering yet" in watch_ready_look, so "hatter: ready" waits for a
 # connection that works, not one cmux only thinks is up.
 # "prefs": {"wake_probe": "off"} turns the probe (and that wait) off.
-WATCH_PROBE_CAP=5
-WATCH_PROBE_FRESH_CAP=20
+WATCH_PROBE_CAP=8
 WATCH_PROBE_EVERY=5
 WATCH_PROBE_AT=0
 WATCH_PROBE_LAST=0
@@ -11779,7 +11778,9 @@ watch_probe_pending() {
 # "ok|dropped|down|gone TAB <pid>" to <out>.
 watch_probe_one() {
     local path="$1" dest="$2" out="$3" pid
-    pid=$(wall_cap 3 ssh -S "$path" -O check "$dest" </dev/null 2>&1 | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1)
+    # No master answers -O check with 255: under pipefail that fails the
+    # assignment, and set -e would end this job before it says "gone".
+    pid=$(wall_cap 3 ssh -S "$path" -O check "$dest" </dev/null 2>&1 | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1) || pid=""
     if [[ -z "$pid" ]]; then printf 'gone\t\n' > "$out"; return 0; fi
     if grep -qxF -- "$path"$'\t'"$pid" <<<"$WATCH_PROBE_OK"; then printf 'ok\t%s\n' "$pid" > "$out"; return 0; fi
     # Any reply is an answer, an error too: a server at its MaxSessions
@@ -11789,9 +11790,15 @@ watch_probe_one() {
     wall_cap "$WATCH_PROBE_CAP" ssh -S "$path" -o ControlMaster=no -o BatchMode=yes "$dest" true \
         </dev/null >/dev/null 2>&1 || rc=$?
     if [[ "$rc" != 142 ]]; then printf 'ok\t%s\n' "$pid" > "$out"; return 0; fi
-    # No answer: a dead master, or no network yet. A new connection tells which.
-    if wall_cap "$WATCH_PROBE_FRESH_CAP" ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
-            -o ConnectTimeout=10 "$dest" true </dev/null >/dev/null 2>&1; then
+    # No answer: a dead master, no network yet, or a server too slow to run
+    # `true` in WATCH_PROBE_CAP seconds. A new connection tells which: only
+    # if it does the same round trip, handshake and all, in less time than
+    # the master was given is the master dead. A slow server fails both.
+    local t0 t1
+    t0=$(date +%s)
+    if wall_cap "$WATCH_PROBE_CAP" ssh -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
+            -o ConnectTimeout="$WATCH_PROBE_CAP" "$dest" true </dev/null >/dev/null 2>&1 \
+       && t1=$(date +%s) && (( t1 - t0 < WATCH_PROBE_CAP )); then
         wall_cap 5 ssh -S "$path" -O exit "$dest" </dev/null >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
         printf 'dropped\t%s\n' "$pid" > "$out"; return 0
     fi
