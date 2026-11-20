@@ -6920,10 +6920,23 @@ idle_shell_screen() {
 }
 
 # leftover_idle <window> <workspace> <surface>: the tab shows an idle shell.
+# cmux has not drawn a tab nobody has looked at since the reboot, and the
+# first read of one comes back empty or fails while the read itself starts
+# drawing it. So an empty or failed read is tried again a little later; one
+# that shows anything else is the answer.
+LEFTOVER_READS=4
+LEFTOVER_READ_WAIT=0.5
 leftover_idle() {
-    local screen
-    screen=$(cmux read-screen --surface "$3" --workspace "$2" --window "$1" </dev/null 2>/dev/null) || return 1
-    idle_shell_screen <<<"$screen"
+    local screen i
+    for ((i = 1; i <= LEFTOVER_READS; i++)); do
+        if screen=$(cmux read-screen --surface "$3" --workspace "$2" --window "$1" </dev/null 2>/dev/null) \
+           && [[ -n "${screen//[[:space:]]/}" ]]; then
+            idle_shell_screen <<<"$screen"
+            return
+        fi
+        [[ "$i" == "$LEFTOVER_READS" ]] || sleep "$LEFTOVER_READ_WAIT"
+    done
+    return 1
 }
 
 # heal_hat_leftovers <host> <windows> <tree> <state> <report>

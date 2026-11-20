@@ -43,6 +43,16 @@ case "$*" in
       typed)  printf 'Last login: Thu Nov 19 21:05:43 on ttys020\nuser@mac ~ %% make test\n' ;;
       output) printf 'user@mac ~ %% ls\nnotes.txt\nuser@mac ~ %% \n' ;;
       blank)  printf '  \n\n' ;;
+      # A tab cmux has not drawn yet: the first reads come back empty or fail,
+      # and start the drawing.
+      undrawn|undrawn-fail)
+        n=$(( $(cat "$STUB_DIR/reads" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$STUB_DIR/reads"
+        if (( n < 3 )); then
+          [[ "$STUB_SCREEN" == undrawn ]] || { echo 'Error: internal_error' >&2; exit 1; }
+          printf '\n\n'
+        else
+          printf 'Last login: Thu Nov 19 21:05:43 on ttys020\nuser@mac ~ %% \n'
+        fi ;;
       fail)   echo 'Error: surface_unavailable' >&2; exit 1 ;;
     esac ;;
   close-surface*)
@@ -90,6 +100,12 @@ expect "...without force" "$(! grep -q -- '--force' <<<"$log" && echo y)"
 expect "...and says so" "$(grep -q 'Closed the local "Terminal" tab .* in .dev-a.' "$work/run-idle/out" && echo y)"
 expect "...and no mirrored tab is touched" \
     "$(! grep -qE 'close .*--surface s-[12] ' <<<"$log" && echo y)"
+
+for s in undrawn undrawn-fail; do
+    log=$(run "$s" "$s" report)
+    expect "a tab cmux had not drawn ($s) is read again and closed" \
+        "$(grep -q '^close .*--surface s-sh ' <<<"$log" && [[ "$(grep -c '^read' <<<"$log")" == 3 ]] && echo y)"
+done
 
 log=$(run prompt prompt report)
 expect "a bare prompt, no login line, is idle too" "$(grep -q '^close .*--surface s-sh ' <<<"$log" && echo y)"
