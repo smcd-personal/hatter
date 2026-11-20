@@ -12309,8 +12309,15 @@ need_cswap() {
   Install with: uv tool install claude-swap"
 }
 
-# One row per credential, fields split by \x1f:
-#   letter  slot  email  org  role  label  rem5  rem7  reset5s  reset7s  active
+# A login with less than this left, in percent of a window, is not worth
+# switching to: it ranks with the spent ones and is never "best" (#273).
+CREDS_MIN_5H="${HATTER_CREDS_MIN_5H:-10}"
+CREDS_MIN_7D="${HATTER_CREDS_MIN_7D:-2}"
+
+# One row per credential, fields split by \x1f, best pick first (see rankkey):
+#   letter  slot  email  org  role  label  rem5  rem7  reset5s  reset7s  marks
+# marks is a comma list: "active" for the login this Mac is using, "best" on
+# the top-ranked one when it is usable.
 # pct from cswap is percent *used*, so everything downstream works in
 # remaining = 100 - pct. resetsAt carries fractional seconds and a +00:00
 # offset, neither of which fromdateiso8601 accepts.
@@ -12324,7 +12331,8 @@ need_cswap() {
 # role says which kind it is, so the two can be told apart and pushed apart.
 creds_rows() {
     have_cswap || return 0
-    "$CSWAP_BIN" list --json 2>/dev/null | jq -r --arg L "$CRED_LETTERS" '
+    "$CSWAP_BIN" list --json 2>/dev/null | jq -r --arg L "$CRED_LETTERS" \
+        --argjson min5 "$CREDS_MIN_5H" --argjson min7 "$CREDS_MIN_7D" '
         def eta: if . == null then -1
                  else (sub("\\.[0-9]+"; "") | sub("\\+00:00"; "Z")
                        | fromdateiso8601) - (now | floor) end;
@@ -12334,15 +12342,42 @@ creds_rows() {
                   | if $t == "" then ""
                     elif ($t | test("team|enterprise")) then "team"
                     else "personal" end;
-        [.accounts[]?] | to_entries[]
-        | .key as $i | .value as $a
-        | [ $L[$i:$i+1], ($a.number | tostring), $a.email,
+        # Too little left to be worth switching to counts as spent.
+        # Rounded as rem rounds it, so a row reading 10% is never spent at 10.
+        def spentbelow(min): . != null and .pct != null and (100 - (.pct | floor)) < min;
+        # Seconds to a reset. A window with no reset time has not started: it
+        # runs a full span from first use, so it counts as that far away.
+        def until(span): if . == null or .resetsAt == null then span
+                         else (.resetsAt | eta) end;
+        # The rank (#273): usable before spent, where spent means under
+        # CREDS_MIN_5H percent of the 5h window or CREDS_MIN_7D of the 7d
+        # one is left; among usable, personal before
+        # team, then the sooner 7d reset (what is left in it is lost at the
+        # reset). Spent ones by when they can run again: the latest reset
+        # among their spent windows.
+        def rankkey:
+            .usage.fiveHour as $f | .usage.sevenDay as $s
+            | if ($f | spentbelow($min5)) or ($s | spentbelow($min7)) then
+                [1, ([(if $f | spentbelow($min5) then $f | until(18000) else 0 end),
+                      (if $s | spentbelow($min7) then $s | until(604800) else 0 end)] | max), 0]
+              else
+                [0, (if role == "personal" then 0 else 1 end), ($s | until(604800))]
+              end;
+        # Letters are given before sorting, so each stays with its account.
+        [.accounts[]?] | to_entries
+        | map(.value + {letter: $L[.key:.key+1]}) | map(. + {rank: rankkey})
+        | sort_by(.rank)
+        | to_entries[]
+        | .key as $n | .value as $a
+        | [ $a.letter, ($a.number | tostring), $a.email,
             ($a.organizationUuid // ""), ($a | role),
             ($a.alias // $a.organizationName // ""),
             ($a.usage.fiveHour | rem), ($a.usage.sevenDay | rem),
             (($a.usage.fiveHour.resetsAt | eta) | floor | tostring),
             (($a.usage.sevenDay.resetsAt  | eta) | floor | tostring),
-            (if $a.active then "active" else "" end) ]
+            ([ (if $a.active then "active" else empty end),
+               (if $n == 0 and $a.rank[0] == 0 then "best" else empty end) ]
+             | join(",")) ]
         | map(. // "" | tostring) | join("\u001f")' 2>/dev/null || true
 }
 
@@ -12368,10 +12403,23 @@ creds_role() { printf '%s%-8s%s ' "$C_DIM" "${1:--}" "$C_R"; }
 # it out of alignment, which is worse than losing the end of a hat list. The
 # "active" marker is reserved first when it fits at all, because which login
 # this Mac is using matters more than the tail of the list.
+# creds_marks <marks>: the plain text for a row's marks ("active", "best").
+creds_marks() {
+    case ",$1," in *,best,*) printf '  <- next' ;; esac
+    case ",$1," in *,active,*) printf '  <- active on this Mac' ;; esac
+    return 0
+}
+
 creds_tail() {
-    local avail="$1" holders="$2" active="$3" act="" hold=""
-    [[ -n "$active" ]] && act="  <- active on this Mac"
-    if [[ ${#act} -gt $avail ]]; then act=""; else avail=$((avail - ${#act})); fi
+    local avail="$1" holders="$2" active="$3" act="" hold="" m
+    # Each mark is fitted on its own, active first, so a narrow row loses
+    # "next" before it loses both.
+    for m in active best; do
+        case ",$active," in *,"$m",*)
+            m=$(creds_marks "$m")
+            [[ ${#m} -le $avail ]] && { act="$act$m"; avail=$((avail - ${#m})); } ;;
+        esac
+    done
     if [[ -n "$holders" && $avail -gt 4 ]]; then
         hold="  -> $holders"
         [[ ${#hold} -gt $avail ]] && hold="${hold:0:$((avail-1))}…"
@@ -12455,17 +12503,22 @@ creds_all_rows() {
 }
 
 # creds_resolve <sel>: prints "agent<US>slot<US>email<US>org" for the one login
-# <sel> names: a letter, a cswap slot number, a Codex home name, an exact
+# <sel> names: "best", a letter, a cswap slot number, a Codex home name, an exact
 # email, or a unique substring of one. An email held twice (two organizations,
 # two workspaces, or both agents) is ambiguous by itself, so it asks for the
 # letter instead of guessing which one to push.
 creds_resolve() {
-    local sel="$1" agent letter slot email org rest rows
+    local sel="$1" agent letter slot email org role label r5 r7 e5 e7 marks rows
     local hit="" n=0 exact="" ne=0 one
     rows=$(creds_all_rows)
-    while IFS=$'\x1f' read -r agent letter slot email org rest; do
+    while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 marks; do
         [[ -z "$email" ]] && continue
         one=$(printf '%s\x1f%s\x1f%s\x1f%s' "$agent" "$slot" "$email" "$org")
+        # "best": the top-ranked Claude login, when it is usable (#273).
+        if [[ "$sel" == best ]]; then
+            case ",$marks," in *,best,*) printf '%s' "$one"; return 0 ;; esac
+            continue
+        fi
         if [[ "$sel" == "$letter" ]]; then printf '%s' "$one"; return 0; fi
         # A slot number belongs to cswap; a Codex home is named in full.
         if [[ "$sel" == "$slot" ]]; then printf '%s' "$one"; return 0; fi
@@ -12475,6 +12528,7 @@ creds_resolve() {
     # An exact email beats a longer one that merely contains it.
     [[ $ne -eq 1 ]] && { printf '%s' "$exact"; return 0; }
     [[ $ne -gt 1 ]] && { warn "'$sel' matches $ne credentials - use its letter (see: hatter creds)"; return 1; }
+    [[ "$sel" == best ]] && { warn "no usable Claude login: every one has a spent window (see: hatter creds)"; return 1; }
     [[ $n -eq 1 ]] && { printf '%s' "$hit"; return 0; }
     [[ $n -gt 1 ]] && { warn "'$sel' matches $n credentials - use its letter (see: hatter creds)"; return 1; }
     return 1
@@ -12753,7 +12807,7 @@ creds_list_row() {
     printf '  %s %s %-28s %s%s%s%s\n' \
         "$letter" "$(creds_dot "$r5" "$r7")" "$shown" "$(creds_role "$role")" \
         "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
-        "${active:+  ${C_CY}<- active here${C_R}}" \
+        "$(m=$(creds_marks "$active"); printf '%s' "${m:+${C_CY}${m}${C_R}}")" \
         "${holders:+  ${C_DIM}-> $holders${C_R}}"
     # A Codex refresh token rotates on use: two hats on one login log each
     # other out. Claude tolerates it better, so only Codex gets the warning.
@@ -12804,7 +12858,8 @@ cmd_creds() {
             ;;
         push)
             local sel="${1:-}"; shift || true
-            [[ -n "$sel" ]] || die "usage: hatter creds push <letter|slot|name|email> <hat...|--all>"
+            # Bare `push`: the best Claude login, to every hat (#273).
+            if [[ -z "$sel" ]]; then set -- --all; sel=best; fi
             local picked agent slot email org
             picked=$(creds_resolve "$sel") || die "no credential matches '$sel' - see: hatter creds"
             IFS=$'\x1f' read -r agent slot email org <<< "$picked"
@@ -12817,11 +12872,28 @@ cmd_creds() {
                 [[ $# -gt 0 ]] || die "which hat? usage: hatter creds push $sel <hat...|--all>"
                 targets=("$@")
             fi
+            [[ "$sel" == best ]] && info "Best Claude login now: $email"
+            # Hats on one ssh destination share one credentials file: push it
+            # once, and record it for every hat there.
+            local dests="" dest first
             for hat in "${targets[@]}"; do
                 if [[ "$agent" == codex ]]; then
                     codex_push_to "$slot" "$email" "$org" "$hat" || rc=1
+                    continue
+                fi
+                dest=$(hat_ssh "$hat" 2>/dev/null || true)
+                first=$(printf '%s' "$dests" | awk -F'\t' -v d="$dest" '$1 == d { print $2; exit }')
+                if [[ -n "$dest" && -n "$first" ]]; then
+                    if [[ "$first" != "@failed" ]]; then
+                        set_hat_credential "$hat" "$email" "$org"
+                        info "$hat shares $dest with $first: already there"
+                    fi
+                    continue
+                fi
+                if creds_push_to "$slot" "$email" "$org" "$hat"; then
+                    dests=$(printf '%s%s\t%s\n' "$dests" "$dest" "$hat")
                 else
-                    creds_push_to "$slot" "$email" "$org" "$hat" || rc=1
+                    rc=1; dests=$(printf '%s%s\t@failed\n' "$dests" "$dest")
                 fi
             done
             if [[ "$agent" == codex && $rc == 0 ]]; then
@@ -14063,15 +14135,29 @@ lands 0600 on the server.
   $CODEX_HOME).
 
   list                   Logins (lettered) and the hats each one is on
+  push                   Push the best Claude login to every hat
   push <sel> <hat>...    Push a login to one or more hats
   push <sel> --all       ...to every hat (Claude only)
   status [hat]           Ask each hat which logins it is holding
   clear <hat> [agent]    Remove a login from a hat: claude (the default),
                          codex or all
 
-<sel> is the letter from `hatter creds`, the cswap slot number, a Codex home's
-<name>, or enough of the email address to be unique. An email held twice
-(two organizations, two workspaces, or both agents) needs the letter.
+<sel> is "best", the letter from `hatter creds`, the cswap slot number, a
+Codex home's <name>, or enough of the email address to be unique. An email
+held twice (two organizations, two workspaces, or both agents) needs the
+letter.
+
+Claude logins are listed best first, and the top one is marked "<- next":
+  1. Usable before spent. A login with under 10% of its 5h window or under 2%
+     of its 7d window left is not worth switching to, and counts as spent.
+     (HATTER_CREDS_MIN_5H and HATTER_CREDS_MIN_7D change the two numbers.)
+  2. Among usable logins, personal before team.
+  3. Then the sooner 7d reset first: what is left at a reset is lost.
+  4. Spent logins last, by when they can run again.
+Letters stay with their account, so a letter read off the list still names the
+same login. Bare `push` sends the best one to every enabled hat, once per ssh
+destination: hats on one server account share one credentials file. With
+every login spent it pushes nothing.
 
 Each login shows its role, personal or team, and its usage windows: bars are
 capacity left, then time to reset. "none" is a window the plan does not have
