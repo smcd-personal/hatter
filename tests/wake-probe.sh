@@ -144,7 +144,7 @@ expect "a slow server (a new connection no faster) is not dropped, but pending" 
 # The watcher runs under set -euo pipefail: a master that is gone, on a host
 # that was not pending, is no reason to wait.
 reset; echo ok > "$work/mux-tmux-dev.sock"; rm -f "$work/pid-tmux-ops.sock"
-set -euo pipefail; round; set +euo pipefail
+set -euo pipefail; round; set +e
 expect "a master gone (cmux between connections) is not waited for, under set -e" \
     "$(! watch_probe_pending "$O" && [[ "$WATCH_PROBE_AT" == 0 ]] && echo y || echo n)"
 
