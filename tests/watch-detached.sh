@@ -769,6 +769,23 @@ expect "  cmux's own close leaves it expected" \
     "$out
 mirrored: $(cat "$d/config/hatter/autosave/mirrored" 2>/dev/null)"
 
+# A person's close whose server does not answer is still theirs: it leaves
+# what is expected back at once, while cmux's own close there stays expected.
+mkdir -p "$work/expect-down/config/hatter/autosave"; d="$work/expect-down"
+echo ops@two.example.com > "$d/down"
+tree_of dev-api ops-db > "$d/tree"; printf '%s\n' dev-api ops-db > "$d/attached"
+out=$(watch expect-down <<<"$ack
+SLEEP 2
+TREE next-ops-db
+$(close ops-db)
+SLEEP 2")
+expect "a person's close leaves what is expected back even when its server does not answer (#266)" \
+    "$(grep -q "'ops-db' closed in cmux, but ops@two.example.com did not answer" <<<"$out" \
+       && ! grep -q $'\tops-db$' "$d/config/hatter/autosave/mirrored" \
+       && grep -qx $'dev\tdev-api' "$d/config/hatter/autosave/mirrored" && echo y)" \
+    "$out
+mirrored: $(cat "$d/config/hatter/autosave/mirrored" 2>/dev/null)"
+
 # A close that came in just before the stream ended, while another hatter
 # command held the lock, is not dropped: the next stream acts on it. cmux
 # never sends it again, since the cursor has moved past it.
