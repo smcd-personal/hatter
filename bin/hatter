@@ -4,12 +4,12 @@
 #
 #   cmux window     <-> a hat (user@host); one ssh connection, one tmux server
 #   workspace group <-> a project / area within that hat
-#   workspace       <-> a tmux session, named "<hat-prefix>-<subproject>"
+#   workspace       <-> a tmux session, named as typed (see: hatter help new)
 #   tab             <-> a tmux window inside that session
 #
-# The hat prefix on a session name is what picks the window and the ssh
-# connection, so a side project can live under your main hat as
-# "dev-website-parser" and still land in the dev window.
+# The config records which hat owns each session. A name like "dev-parser"
+# also says it, so one the config does not record still lands in the dev
+# window.
 #
 # State lives in ~/.config/hatter/config.json so a reboot of the Mac or of
 # any shell server can be walked back to the previous layout.
@@ -770,32 +770,70 @@ session_group() {
         | select(.value.sessions[$s] and ($l == "" or .value.hat == $l)) | .key' | head -1
 }
 
-# The session a name means on a hat: the name as given if it already carries
-# the hat's prefix, if the config records it under this hat, or if it is
-# running on the hat's server; otherwise "<hat>-<name>". The prefix is a
-# naming convention for new sessions, not a rule every session follows (rename
-# and plain tmux make unprefixed ones), so an existing session is looked up
-# before the prefix is added, never after.
-hat_session_name() {
+# hat_existing_session <hat> <name>: the existing session a name means on a
+# hat, or nothing. The name as given if it carries the hat's prefix or the
+# config records it under this hat; then "<hat>-<name>" if that is recorded (a
+# workspace made before #276, typed by its short name); then the name as given
+# if it is running on the hat's server and no other hat there records it (one
+# made by rename or plain tmux); then "<hat>-<name>" if that is running.
+hat_existing_session() {
     local hat="$1" name="$2" host
     if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
     if [[ -n "$(session_group "$name" "$hat")" ]]; then
         printf '%s' "$name"; return 0
     fi
-    host=$(hat_ssh "$hat")
-    if [[ -n "$host" ]] && remote_session_exists "$host" "$name"; then
-        printf '%s' "$name"; return 0
+    if [[ -n "$(session_group "$hat-$name" "$hat")" ]]; then
+        printf '%s-%s' "$hat" "$name"; return 0
     fi
-    printf '%s-%s' "$hat" "$name"
+    host=$(hat_ssh "$hat")
+    if [[ -n "$host" ]]; then
+        if remote_session_exists "$host" "$name" \
+                && ! name_recorded_by_other_hat "$hat" "$name"; then
+            printf '%s' "$name"; return 0
+        fi
+        if remote_session_exists "$host" "$hat-$name"; then
+            printf '%s-%s' "$hat" "$name"; return 0
+        fi
+    fi
     return 0
 }
 
-# hat_new_name <hat> <name>: the session a new name means on a hat, with no
-# lookup: the name as given if it already carries the hat's prefix, otherwise
-# "<hat>-<name>". For a name that must not exist yet, such as the target of a
-# rename, where reattaching is not on offer (#220).
+# The session a name means on a hat: an existing one, so it is reattached
+# (hat_existing_session), otherwise the name for a new one (hat_new_name).
+hat_session_name() {
+    local found
+    found=$(hat_existing_session "$1" "$2")
+    if [[ -n "$found" ]]; then printf '%s' "$found"; else hat_new_name "$1" "$2"; fi
+    return 0
+}
+
+# name_recorded_by_other_hat <hat> <name>: true when a different hat on the
+# same ssh destination (so the same tmux server) records the session.
+name_recorded_by_other_hat() {
+    [[ -n "$(cfg --arg l "$1" --arg s "$2" '
+        .hats[$l].ssh as $h
+        | [.hats | to_entries[] | select(.key != $l and .value.ssh == $h) | .key] as $o
+        | [.groups[] | select(.hat as $x | $o | index($x)) | select(.sessions[$s]?)]
+        | if length > 0 then "y" else empty end')" ]]
+}
+
+# hat_new_name <hat> <name>: the session a name for a new workspace means on a
+# hat, with no reattach. A new workspace keeps the name as typed, so the cmux
+# sidebar shows it without the hat (#276). The tmux server is shared by every
+# hat on the same ssh destination, so when the name is already taken there,
+# running or recorded by any of those hats, it takes the "<hat>-" prefix
+# instead. A name that already carries the prefix is kept as given.
 hat_new_name() {
-    if [[ "$2" == "$1"-* ]]; then printf '%s' "$2"; else printf '%s-%s' "$1" "$2"; fi
+    local hat="$1" name="$2" host
+    if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
+    host=$(hat_ssh "$hat")
+    if [[ -n "$host" ]] && { host_recorded_sessions "$host" | grep -qxF -- "$name" \
+            || remote_session_exists "$host" "$name"; }; then
+        info "'$name' is already a workspace on this server - using '$hat-$name'" >&2
+        printf '%s-%s' "$hat" "$name"; return 0
+    fi
+    printf '%s' "$name"
+    return 0
 }
 
 # hat_short_names <hat>: session names on stdin, one per line, out as the
@@ -6320,15 +6358,13 @@ $listing
     [[ -z "$hat" ]] || group=$(session_group "$session" "$hat")
 
     if [[ -z "$hat" ]]; then
-        # A bare workspace name typed inside a cmux window: try this hat's
-        # prefix before giving up. Only an existing workspace counts - `tab`
+        # A bare workspace name typed inside a cmux window: look it up on this
+        # hat before giving up. Only an existing workspace counts - `tab`
         # adds to one, so a guess that names nothing is no better than failing.
-        # The name as given is tried before the prefixed one, since a running
-        # session need not carry the prefix.
         local cur="" found=""
         cur=$(current_hat || true)
-        [[ -n "$cur" ]] && found=$(hat_session_name "$cur" "$session")
-        if [[ -n "$found" && ( "$found" == "$session" || -n "$(session_group "$found" "$cur")" ) ]]; then
+        [[ -n "$cur" ]] && found=$(hat_existing_session "$cur" "$session")
+        if [[ -n "$found" ]]; then
             session="$found"
             group=$(session_group "$session" "$cur")
             hat="$cur"
@@ -7567,7 +7603,7 @@ find_resume_pick() {
         echo "  pick a number from 1 to ${#choices[@]}" >&2
     done
     if [[ "$session" == "+ new workspace" ]]; then
-        ask_line "name (becomes $hat-<name>), Esc to cancel" || return 0
+        ask_line "new workspace name, Esc to cancel" || return 0
         [[ -n "$EDIT_REPLY" ]] || return 0
         session=$(hat_session_name "$hat" "$(tmux_session_name "$EDIT_REPLY")")
     fi
@@ -14106,7 +14142,7 @@ hatter - cmux windows, groups and workspaces backed by remote tmux
 
   hat        a login (user@host): one ssh connection, one tmux server, one window
   group      a project or area within a hat
-  workspace  a tmux session named <hat>-<subproject>
+  workspace  a tmux session in a hat (see: hatter help new)
   tab        a tmux window inside that session
   credential a Claude login, held on this Mac by cswap and pushed to a hat
 
@@ -14369,16 +14405,22 @@ Options:
   --focus, --go      Stay on the new workspace when done. Without it, cmux
                      focus goes back to the window and workspace you were in.
 
-A bare name is auto-prefixed once the hat is known:
-  hatter dev-atlas --group "Atlas"
-  hatter atlas --group "Atlas"                # -> dev-atlas, hat from group
+A new workspace keeps the name you type, so the cmux sidebar shows atlas, not
+dev-atlas:
+  hatter atlas --group "Atlas"                # -> atlas, hat from group
   hatter atlas --group "New Project" --hat dev
+  hatter dev-atlas --group "Atlas"            # a <hat>- name is kept as given
 
-An existing session is matched before the prefix is added: if the config
-records the name as given under that hat, or a session by that exact name is
-running on the hat's server (one made by `hatter rename` or by tmux itself),
-that session is reattached and nothing new is created. Only a name that
-matches neither takes the prefix.
+Hats that share an ssh destination share one tmux server, where session names
+must be unique. If the name is already used there, running or recorded by any
+of those hats, the new workspace takes the hat prefix instead (dev-atlas) and
+hatter says so.
+
+An existing session is matched first, and reattached rather than duplicated:
+the name as given if the config records it under that hat; dev-atlas if that
+is recorded (workspaces made before names were kept as typed); the name as
+given if it is running on the hat's server and no other hat there records it
+(one made by `hatter rename` or by tmux itself); dev-atlas if that is running.
 
 Run from a terminal inside a cmux window, a bare name with nothing else to go
 on takes that window's hat, so `hatter atlas` while wearing dev means
@@ -14786,7 +14828,7 @@ Termux on Android included.
 
 Given a hat, the choice is every workspace the config records for it plus any
 running on its server. The list shows them without the hat prefix (atlas for
-dev-atlas), and a name typed for a new one takes it. Detach with the tmux prefix then d; the session keeps
+dev-atlas), and a name typed for a new one follows `hatter help new`. Detach with the tmux prefix then d; the session keeps
 running. On a machine without cmux, bare `hatter` does the same as
 `hatter attach`.
 

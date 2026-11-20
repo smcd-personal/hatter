@@ -2,7 +2,9 @@
 # A bare session name is looked up before it takes the hat prefix (#75):
 # `hatter new <bare>` reattaches a running or recorded unprefixed session
 # instead of creating an empty <hat>-<bare> beside it, and `hatter tab <bare>`
-# finds the same session. A name that matches nothing still gets the prefix.
+# finds the same session. A name that matches nothing is kept as typed, unless
+# the tmux server already has it, running or recorded by a hat sharing the
+# server; then it takes the prefix (#276).
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -87,12 +89,48 @@ $out"
 [[ "$(created)" == "notes " ]] || fail "new notes (recorded, not running): created '$(created)', want 'notes'"
 [[ "$(recorded)" == "dev-main notes" ]] || fail "new notes: config has '$(recorded)'"
 
-# --- new: a bare name that matches nothing still takes the prefix ------------
+# --- new: a bare name that matches nothing is kept as typed (#276) -----------
 setup other
 out=$(run 'cmd_new atlas --group Atlas') || fail "new atlas: $out"
-grep -q 'tmux: *dev-atlas$' <<<"$out" || fail "new atlas (unknown): not prefixed:
+grep -q 'tmux: *atlas$' <<<"$out" || fail "new atlas (unknown): not kept bare:
 $out"
-[[ "$(created)" == "dev-atlas " ]] || fail "new atlas: created '$(created)', want 'dev-atlas'"
+[[ "$(created)" == "atlas " ]] || fail "new atlas: created '$(created)', want 'atlas'"
+[[ "$(recorded)" == "atlas dev-main notes" ]] || fail "new atlas: config has '$(recorded)'"
+
+# --- new: a short name reattaches a workspace made with the prefix -----------
+setup dev-main
+out=$(run 'cmd_new main --group Atlas') || fail "new main: $out"
+[[ -z "$(created)" ]] || fail "new main (dev-main recorded): created '$(created)'"
+grep -q 'tmux: *dev-main$' <<<"$out" || fail "new main: did not use 'dev-main':
+$out"
+# Running but not recorded: still found by the prefixed name.
+setup dev-maps
+out=$(run 'cmd_new maps --group Atlas') || fail "new maps: $out"
+[[ -z "$(created)" ]] || fail "new maps (dev-maps running): created '$(created)'"
+grep -q 'tmux: *dev-maps$' <<<"$out" || fail "new maps: did not use 'dev-maps':
+$out"
+
+# --- new: a name another hat on the same server records takes the prefix ----
+# ops shares dev's server and records portal; side is on another server.
+setup_shared() {
+    setup "$@"
+    jq '.hats.ops = {"ssh":"u@dev.example.com"} | .hats.side = {"ssh":"u@side.example.com"}
+        | .groups.Ops = {"hat":"ops","sessions":{"portal":{}}}
+        | .groups.Side = {"hat":"side","sessions":{"wiki":{}}}' \
+        "$work/cfg/hatter/config.json" > "$work/c.json" && mv "$work/c.json" "$work/cfg/hatter/config.json"
+}
+setup_shared
+out=$(run 'cmd_new portal --hat dev --group Atlas') || fail "new portal: $out"
+[[ "$(created)" == "dev-portal " ]] || fail "new portal (ops records it): created '$(created)', want 'dev-portal'"
+grep -q "already a workspace on this server" <<<"$out" || fail "new portal: no notice: $out"
+# Also when ops's portal is running: it is ops's, so dev does not reattach it.
+setup_shared portal
+out=$(run 'cmd_new portal --hat dev --group Atlas') || fail "new portal (running): $out"
+[[ "$(created)" == "dev-portal " ]] || fail "new portal (ops's, running): created '$(created)', want 'dev-portal'"
+# A name recorded only by a hat on another server is free here.
+setup_shared
+out=$(run 'cmd_new wiki --hat dev --group Atlas') || fail "new wiki: $out"
+[[ "$(created)" == "wiki " ]] || fail "new wiki (other server): created '$(created)', want 'wiki'"
 
 # --- new: a name already carrying the prefix is left alone, with no lookup ---
 setup
