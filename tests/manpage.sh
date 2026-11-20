@@ -21,7 +21,8 @@ if command -v mandoc >/dev/null; then
     [ -z "$lint" ] || fail "mandoc warns: $lint"
     mandoc -T ascii "$page" | col -bx > "$work/out"
 elif command -v groff >/dev/null; then
-    groff -man -T ascii -ww "$page" 2>"$work/err" | col -bx > "$work/out"
+    # Every warning but "break": a long URL kept whole cannot be justified.
+    groff -man -T ascii -ww -Wbreak "$page" 2>"$work/err" | col -bx > "$work/out"
     [ ! -s "$work/err" ] || fail "groff warns: $(cat "$work/err")"
 else
     echo "skip render: no mandoc or groff"
