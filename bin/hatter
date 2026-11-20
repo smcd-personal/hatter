@@ -1530,19 +1530,31 @@ cmux_snapshot_drop() {
     CMUX_SNAP_IDS=(); CMUX_SNAP_WS=(); CMUX_SNAP_TITLES=(); CMUX_SNAP_GROUPS=(); CMUX_SNAP_GNAMES=()
 }
 
+# wait_all <pid>...: wait for these background jobs, and only these. A bare
+# `wait` waits for every job the shell has. The watcher keeps its cmux event
+# stream running as one, and that never ends, so a bare `wait` anywhere the
+# watcher's own shell reaches hangs it for good (#269). tests/wait-all.sh
+# fails on a bare one. Always returns 0, as a bare `wait` does.
+wait_all() {
+    local p
+    for p in "$@"; do wait "$p" 2>/dev/null || true; done
+    return 0
+}
+
 cmux_snapshot() {
     local w ws groups
     cmux_snapshot_drop
     CMUX_SNAP_TREE=$(cmux_json tree --all 2>/dev/null) || { CMUX_SNAP_TREE=""; return 0; }
     # The tree has no groups, so ask each window for those - all at once.
-    local tmp i=0 ids
+    local tmp i=0 ids pids=()
     ids=$(jq -r '.windows[]?.id' <<<"$CMUX_SNAP_TREE")
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-snap.XXXXXX")
     for w in $ids; do
         cmux_json workspace-group list --window "$w" > "$tmp/$i" 2>/dev/null &
+        pids+=($!)
         i=$((i + 1))
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     i=0
     for w in $ids; do
         ws=$(jq -c --arg w "$w" \
@@ -5811,6 +5823,7 @@ tz_set() {
     jq_write --arg z "$z" '.prefs.timezone = $z'
     info "Timezone: $z"
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-tz.XXXXXX")
+    local pids=()
     while IFS= read -r hat; do
         [[ -n "$hat" ]] || continue
         host=$(hat_ssh "$hat")
@@ -5818,9 +5831,10 @@ tz_set() {
         seen+="$host"$'\n'
         names+=("$hat")
         ( rc=0; snooze_sh "$host" tz "$(sq "$z")" > "$tmp/$i" 2>&1 || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
+        pids+=($!)
         i=$((i + 1))
     done < <(hat_names)
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     for ((i = 0; i < ${#names[@]}; i++)); do
         case "$(cat "$tmp/$i.rc" 2>/dev/null)" in
             0) echo "  ${names[$i]}: set" ;;
@@ -5957,7 +5971,7 @@ cmd_unsnooze() {
 
 # hatter snoozed [hat]: every snoozed tab, each server asked once, all at once.
 cmd_snoozed() {
-    local hats=() asked=() hat host i n tmp t found=0 seen=$'\n'
+    local hats=() asked=() hat host i n tmp t found=0 seen=$'\n' pids=()
     if [[ $# -gt 0 ]]; then
         hat_exists "$1" || die "unknown hat: $1"
         hats=("$1")
@@ -5974,8 +5988,9 @@ cmd_snoozed() {
         asked+=("$hat")
         # set -e holds in the subshell: catch the status, or it never gets written.
         ( rc=0; snooze_sh "$host" list > "$tmp/$i" 2>/dev/null || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
+        pids+=($!)
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     t=$(date +%s)
     n=${#asked[@]}
     for ((i = 0; i < n; i++)); do
@@ -6118,6 +6133,7 @@ cmd_hibernated() {
         while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
     fi
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-hibernated.XXXXXX")
+    local pids=()
     for hat in ${hats[@]+"${hats[@]}"}; do
         host=$(hat_ssh "$hat")
         [[ -n "$host" && "$seen" != *$'\n'"$host"$'\n'* ]] || continue
@@ -6125,8 +6141,9 @@ cmd_hibernated() {
         i=${#asked[@]}
         asked+=("$hat")
         ( rc=0; hib_sh "$host" list > "$tmp/$i" 2>/dev/null || rc=$?; echo "$rc" > "$tmp/$i.rc" ) &
+        pids+=($!)
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     t=$(date +%s)
     n=${#asked[@]}
     for ((i = 0; i < n; i++)); do
@@ -6413,18 +6430,19 @@ drag_plan() { jq -r "$DRAG_PLAN_JQ"; }
 # mirrors get a map: an empty map would make every tab in the workspace look
 # dragged.
 drag_facts() {
-    local wins="$1" host="$2" tree="$3" state="$4" tmp k=0 title maps
+    local wins="$1" host="$2" tree="$3" state="$4" tmp k=0 title maps pids=()
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-drag.XXXXXX")
     while IFS= read -r title; do
         [[ -n "$title" ]] || continue
         AWK_S="$title" awk -F '\t' '$1 == "S" && ($2 "") == (ENVIRON["AWK_S"] "") { f = 1 } END { exit !f }' <<<"$state" || continue
         printf '%s' "$title" > "$tmp/t.$k"
         ( cmux_pane_map "$host" "$title" > "$tmp/m.$k" || true ) &
+        pids+=($!)
         k=$((k + 1))
-        [[ $((k % 8)) -ne 0 ]] || wait
+        [[ $((k % 8)) -ne 0 ]] || { wait_all ${pids[@]+"${pids[@]}"}; pids=(); }
     done < <(jq -r --arg w "$wins" '($w | split("\n")) as $ws
         | .windows[]? | select(.id as $i | $ws | index([$i])) | .workspaces[]?.title // empty' <<<"$tree" | awk '!seen[$0]++')
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     maps=$(for ((k = k - 1; k >= 0; k--)); do
         jq -c --arg s "$(cat "$tmp/t.$k")" '
             select(.mirrored == true and ((.panes // []) | length) > 0)
@@ -6529,10 +6547,12 @@ heal_dragged_tabs() {
     fi
     # Every server at once, as sync does.
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-heal.XXXXXX") || return 0
+    local pids=()
     for ((i = 0; i < ${#hosts[@]}; i++)); do
         remote_tmux_state "${hosts[$i]}" > "$tmp/$i" 2>/dev/null &
+        pids+=($!)
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     for ((i = 0; i < ${#hosts[@]}; i++)); do
         heal_hat_drags "${hosts[$i]}" "${wins[$i]}" "$tree" "$(cat "$tmp/$i")" "$report" "$onlysf" || true
     done
@@ -7656,12 +7676,14 @@ cmd_find() {
 
     local tmp
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-find.XXXXXX")
+    local pids=()
     info "Searching $( [[ "$all" == 1 ]] && echo "live and closed (last ${days}d)" || echo live ) Claude sessions on ${#dests[@]} hat(s)..." >&2
     for ((i = 0; i < ${#dests[@]}; i++)); do
         printf '%s\n' "$FIND_SH" | ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=8 \
             "${dests[$i]}" "$(posix_sh "$args")" > "$tmp/$i" 2>"$tmp/$i.err" &
+        pids+=($!)
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
 
     # Each match, prefixed with the hat it belongs to and its destination's index.
     local line score state mtime session window wid sid cwd name title snip owner h
@@ -7956,7 +7978,7 @@ EOF
 done <<WINS
 $(printf '%s\n' "$wins" | tr '\t' '\037')
 WINS
-wait
+wait  # runs on the server, in a shell of its own (#269)
 cat "$out"/[0-9]* 2>/dev/null
 
 # Each session, with how many clients it has and how many of them are in
@@ -8293,7 +8315,7 @@ ps_dests() {
 # what destination i printed, and <dir>/<i>.why: empty when it answered, else
 # why it did not.
 ps_fetch() {
-    local dir="$1" dest i=0 rc
+    local dir="$1" dest i=0 rc pids=()
     shift
     for dest in "$@"; do
         (
@@ -8305,9 +8327,10 @@ ps_fetch() {
             else ssh_why "$(cat "$dir/$i.err")" > "$dir/$i.why"; fi
             exit 0
         ) 2>/dev/null &   # bash's own "Alarm clock" report of a capped ssh
+        pids+=($!)
         i=$((i + 1))
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     return 0
 }
 
@@ -9821,13 +9844,16 @@ sync_once() {
     n=${#hats[@]}
 
     # Every server at once: its sessions, and every session's windows.
+    local pids=()
     for ((i = 0; i < n; i++)); do
         [[ -n "${wins[$i]}" && -n "${hosts[$i]}" ]] || continue
         # The exit status and stderr too: an unreachable server says why.
         { rc=0; remote_tmux_state "${hosts[$i]}" > "$tmp/ssh.$i" 2>"$tmp/ssh-err.$i" || rc=$?
           echo "$rc" > "$tmp/ssh-rc.$i"; } &
+        pids+=($!)
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
+    pids=()
 
     # Then every mirrored session's pane map at once, eight at a time.
     local groups_json ws_json wref title live jobs=0
@@ -9840,13 +9866,15 @@ sync_once() {
             [[ -z "$wref" || -z "$title" ]] && continue
             grep -qxF "$title" <<<"$live" || continue
             ( cmux_pane_map "${hosts[$i]}" "$title" > "$tmp/map.${wref//[^A-Za-z0-9_-]/_}" || true ) &
+            pids+=($!)
             jobs=$((jobs + 1))
-            [[ $((jobs % 8)) -ne 0 ]] || wait
+            [[ $((jobs % 8)) -ne 0 ]] || { wait_all ${pids[@]+"${pids[@]}"}; pids=(); }
         done < <(jq -r --argjson ws "$ws_json" '
             ($ws.workspaces | map({key: .id, value: (.title // "")}) | from_entries) as $t
             | .groups[]?.member_workspace_ids[]? | [., ($t[.] // "")] | map(. // "" | tostring) | join("\u001f")' <<<"$groups_json")
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
+    pids=()
 
     # Work out the new config, all in memory, saying what was found.
     local patch='{}' adopt="" forget="" w host gname gkey order recorded owner wjson seen ukey
@@ -10111,8 +10139,9 @@ sync_once() {
         [[ -z "$h" ]] && continue
         ( tell_server_sessions "$h" \
             || warn "$h: could not tell the server what to bring back after a reboot" ) &
+        pids+=($!)
     done < <(printf '%s' "$reached" | sort -u)
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
 
     info "Config synced: $CONFIG"
 }
@@ -10583,11 +10612,13 @@ cmd_list() {
     done < <(hat_names)
     n=${#hats[@]}
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/hatter-list.XXXXXX")
+    local pids=()
     for ((i = 0; i < n; i++)); do
         ( hat_live_sessions "$(hat_ssh "${hats[$i]}")" > "$tmp/$i" 2>"$tmp/$i.err" \
             || mv "$tmp/$i" "$tmp/$i.failed" ) &
+        pids+=($!)
     done
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     local cmux_up=0
     if cmux_alive; then cmux_up=1; cmux_snapshot; fi
 
@@ -12701,7 +12732,7 @@ codex_homes_pushed() {
 # can make Codex refresh the token, and a refresh rotates it, which would log
 # the hat out. Its row says so instead of showing a number.
 codex_usage_refresh() {
-    local home f now age pushed
+    local home f now age pushed pids=()
     command -v "$CODEX_BIN" >/dev/null 2>&1 || return 0
     now=$(date +%s)
     pushed=$(codex_homes_pushed)
@@ -12714,9 +12745,12 @@ codex_usage_refresh() {
         fi
         age=$CODEX_USAGE_TTL
         [[ -f "$f" ]] && age=$(( now - $(lock_mtime "$f") ))
-        [[ "$age" -ge "$CODEX_USAGE_TTL" ]] && codex_probe "$home" &
+        if [[ "$age" -ge "$CODEX_USAGE_TTL" ]]; then
+            codex_probe "$home" &
+            pids+=($!)
+        fi
     done < <(codex_homes)
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
     return 0
 }
 
@@ -13180,13 +13214,14 @@ edit_hat_cred_state() {
 }
 
 edit_refresh_all() {
-    local hat
+    local hat pids=()
     printf '  %sprobing hats...%s\n' "$C_DIM" "$C_R" >&2
     while IFS= read -r hat; do
         [[ -z "$hat" ]] && continue
         edit_fetch_hat "$hat" &
+        pids+=($!)
     done < <(hat_names)
-    wait
+    wait_all ${pids[@]+"${pids[@]}"}
 }
 
 edit_session_field() {
