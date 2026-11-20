@@ -16,17 +16,23 @@ expect() {
 }
 
 # --- no bare wait in bin/hatter ------------------------------------------------
-# A line whose command is `wait` with no pid. Comments, and a wait inside a
-# script that runs on a server (marked so), do not count.
-bare=$(grep -nE '(^|[;&|{[:space:]])wait[[:space:]]*($|;|\}|#)' "$root/bin/hatter" \
-    | grep -vE '^[0-9]+:[[:space:]]*#' \
-    | grep -v 'runs on the server, in a shell of its own' || true)
+# bare_waits <file>: the lines whose command is `wait` with no pid. Comments,
+# and a wait inside a script that runs on a server (marked so), do not count.
+bare_waits() {
+    grep -nE '(^|[;&|{([:space:]])wait([[:space:]]*($|[;&|})#])|[[:space:]]+[0-9]*[<>])' "$1" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' \
+        | grep -v 'runs on the server, in a shell of its own' || true
+}
+bare=$(bare_waits "$root/bin/hatter")
 expect "no bare wait in bin/hatter" "$([[ -z "$bare" ]] && echo y || echo n)"
 [[ -z "$bare" ]] || printf '     %s\n' "$bare"
-# The check itself finds one.
-printf 'f() {\n    x &\n    wait\n}\n    [[ 1 ]] || wait\n' > "$work/sample"
-found=$(grep -cE '(^|[;&|{[:space:]])wait[[:space:]]*($|;|\}|#)' "$work/sample" || true)
-expect "...and the check catches a bare wait" "$([[ "$found" == 2 ]] && echo y || echo n)"
+# The check itself: five bare forms it must catch, then lines it must not.
+printf '%s\n' '    wait' '    [[ 1 ]] || wait' '    wait 2>/dev/null' '    wait && echo' '    x=$(wait)' \
+    '    wait "$p"' '    wait $p' '# a comment: wait' '    echo "wait this long"' \
+    'wait  # runs on the server, in a shell of its own' > "$work/sample"
+found=$(bare_waits "$work/sample" | cut -d: -f1 | tr '\n' ' ')
+expect "...and the check catches each bare form, and nothing else" "$([[ "$found" == "1 2 3 4 5 " ]] && echo y || echo n)"
+[[ "$found" == "1 2 3 4 5 " ]] || echo "     matched lines: $found"
 
 # --- wait_all ------------------------------------------------------------------
 lib="$work/hatter-lib.sh"

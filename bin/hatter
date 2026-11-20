@@ -8315,7 +8315,7 @@ ps_dests() {
 # what destination i printed, and <dir>/<i>.why: empty when it answered, else
 # why it did not.
 ps_fetch() {
-    local dir="$1" dest i=0 rc
+    local dir="$1" dest i=0 rc pids=()
     shift
     for dest in "$@"; do
         (

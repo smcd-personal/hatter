@@ -237,8 +237,9 @@ unset -f cmux focus_restore
 held_round() {
     rm -f "$work/held"
     # Off this function's stdout: a job left holding it would hold up $( ).
-    ( sleep 600 & h=$!; WATCH_SIGNIN_LAST=0; WATCH_SIGNIN_PLACED=""
-      watch_signin > "$work/round" 2>&1; echo done > "$work/held"; kill "$h" 2>/dev/null ) >/dev/null 2>&1 &
+    ( sleep 600 & h=$!; trap 'kill "$h" 2>/dev/null' EXIT
+      WATCH_SIGNIN_LAST=0; WATCH_SIGNIN_PLACED=""
+      watch_signin > "$work/round" 2>&1 || true; echo done > "$work/held" ) >/dev/null 2>&1 &
     local p=$! t
     for t in 1 2 3 4 5 6 7 8 9 10; do
         [[ -s "$work/held" ]] && break
