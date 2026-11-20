@@ -71,82 +71,72 @@ if command -v tmux >/dev/null 2>&1; then
     [ "$got" = 150x40 ] || fail "real tmux: no record, stuck window came out $got ($out)"
     [ -z "$pin" ] || fail "real tmux: resized window left pinned: $pin"
 
-    # The after-refresh-client hook (#169), driven by a real control-mode
-    # client, the kind cmux mirrors with. tmux itself resizes only the current
-    # window; the hook brings every other one along, smaller and then larger.
-    # A client at 80 columns is one cmux has not sized: nothing follows it.
-    # The session name has a space, so the hook must not pass it unquoted.
-    # The hook runs a wrapper that logs each run, under its own HOME.
-    hook=$(extract BLOCK | grep "^set-hook -g 'after-refresh-client\[43\]'") || true
-    [ -n "$hook" ] || fail "no after-refresh-client hook in the managed block"
-    printf '%s\n' 'set -g window-size latest' 'setw -g aggressive-resize on' "$hook" > "$work/hook.conf"
-    mkdir -p "$work/hh/.local/bin"
-    cp "$work/hd/.local/bin/hat-resize" "$work/hh/.local/bin/hat-resize.real"
-    printf '%s\n' '#!/usr/bin/env bash' "echo \"\$*\" >> '$work/runs'" \
-        "exec '$work/hh/.local/bin/hat-resize.real' \"\$@\"" > "$work/hh/.local/bin/hat-resize"
-    chmod +x "$work/hh/.local/bin/hat-resize"
-    runs() { if [ -e "$work/runs" ]; then wc -l < "$work/runs" | tr -d ' '; else echo 0; fi; }
-    rm -f "$work/state/hatter/window-size"
-    TMUX_TMPDIR="$work/tmuxdir" HOME="$work/hh" XDG_STATE_HOME="$work/state" \
-        tmux -f "$work/hook.conf" new-session -d -s 'cc one' -x 182 -y 59
+    # --sweep (#169), against a real control-mode client, the kind cmux
+    # mirrors with. cmux sizes each window with refresh-client -C '@id:WxH';
+    # tmux takes the size but applies it only to the session's current window,
+    # so the others keep the size a larger display left them at. The sweep
+    # applies it. One window has a smaller pin of its own, as a tab in a cmux
+    # split does; it must keep it. The session name has a space.
+    TMUX_TMPDIR="$work/tmuxdir" tmux -f /dev/null new-session -d -s 'cc one' -x 185 -y 59
+    rt set -g window-size latest
+    rt setw -g aggressive-resize on
     rt new-window -d -t '=cc one:'
     rt new-window -d -t '=cc one:'
+    rt new-window -d -t '=cc one:'
+    ids=$(rt list-windows -t '=cc one' -F '#{window_id}')
+    split=$(printf '%s\n' "$ids" | sed -n 4p)
+    # One window left narrower, as a smaller display would leave it.
+    narrow=$(printf '%s\n' "$ids" | sed -n 3p)
+    rt resize-window -t "$narrow" -x 150 -y 59
+    rt set-window-option -u -t "$narrow" window-size
     mkfifo "$work/cc.in"
     TMUX_TMPDIR="$work/tmuxdir" perl -e 'alarm 60; exec @ARGV' tmux -C attach -t '=cc one' \
-        < "$work/cc.in" > /dev/null 2>&1 &
+        < "$work/cc.in" > "$work/cc.out" 2>&1 &
     exec 3> "$work/cc.in"
-    settle() {  # wait up to 5s for every window of session $2 to be $1
-        local i=0
-        while [ $i -lt 50 ]; do
-            got=$(rt list-windows -t "=${2:-cc one}" -F '#{window_width}x#{window_height}' | sort -u | tr '\n' ' ')
-            [ "$got" = "$1 " ] && return 0
-            sleep 0.1; i=$((i + 1))
-        done
-        return 1
-    }
-    key_is() {  # wait up to 5s for the session's @hat_size_key to be $1
-        local i=0
-        while [ $i -lt 50 ]; do
-            [ "$(rt show-option -qv -t '=cc one:' @hat_size_key)" = "$1" ] && return 0
-            sleep 0.1; i=$((i + 1))
-        done
-        return 1
-    }
-    echo 'refresh-client -C 150x40' >&3
-    settle 150x40 || fail "real tmux hook: client shrank to 150x40, windows at $got"
-    key_is 150/150x40 || fail "real tmux hook: key '$(rt show-option -qv -t '=cc one:' @hat_size_key)', not 150/150x40"
-    echo 'refresh-client -C 200x50' >&3
-    settle 200x50 || fail "real tmux hook: client grew to 200x50, windows at $got"
-    key_is 200/200x50 || fail "real tmux hook: key '$(rt show-option -qv -t '=cc one:' @hat_size_key)', not 200/200x50"
-    # The record is written just after the resize, in the background.
+    echo 'refresh-client -C 174x50' >&3
+    for id in $ids; do
+        if [ "$id" = "$split" ]; then echo "refresh-client -C '$id:100x50'" >&3
+        else echo "refresh-client -C '$id:174x50'" >&3; fi
+    done
+    sizes_of() { rt list-windows -t "=$1" -F '#{window_id}=#{window_width}x#{window_height}' | tr '\n' ' '; }
     i=0
-    while [ $i -lt 50 ] && [ "$(cat "$work/state/hatter/window-size" 2>/dev/null)" != 200x50 ]; do
+    while [ $i -lt 50 ] && [ "$(rt list-windows -t '=cc one' -F '#{window_active} #{window_width}' | awk '$1 == 1 {print $2}')" != 174 ]; do
         sleep 0.1; i=$((i + 1))
     done
-    [ "$(cat "$work/state/hatter/window-size" 2>/dev/null)" = 200x50 ] \
-        || fail "real tmux hook: recorded '$(cat "$work/state/hatter/window-size" 2>/dev/null)', not 200x50"
-    # One run per size change. The key stored is the size the run left, so a
-    # refresh at the same size, the key already equal, runs nothing.
-    [ "$(runs)" = 2 ] || fail "real tmux hook: $(runs) runs for two size changes: $(cat "$work/runs")"
-    echo 'refresh-client -C 200x50' >&3
-    sleep 1
-    [ "$(runs)" = 2 ] || fail "real tmux hook: ran again with the key unchanged: $(cat "$work/runs")"
-    echo 'refresh-client -C 80x24' >&3
-    sleep 1
-    got=$(rt list-windows -t '=cc one' -F '#{window_active} #{window_width}x#{window_height}' | awk '$1 == 0 {print $2}' | sort -u)
-    [ "$got" = 200x50 ] || fail "real tmux hook: followed a client at 80 columns: $got"
+    stale=$(rt list-windows -t '=cc one' -F '#{window_active} #{window_width}x#{window_height}' | awk '$1 == 0 {print $2}' | sort -u | tr '\n' ' ')
+    [ "$stale" = "150x59 185x59 " ] || fail "real tmux: want the pins unapplied to other windows before the sweep (the bug), got $stale"
+    sweep() { TMUX_TMPDIR="$work/tmuxdir" HOME="$work/hd" XDG_STATE_HOME="$work/state" HAT_RESIZE_SETTLE="$1" \
+        "$work/hd/.local/bin/hat-resize" --sweep; }
+    # A client attached under the settle time is mid-attach: left alone.
+    out=$(sweep 600)
+    [ -z "$out" ] || fail "real tmux sweep: a fresh client, still said '$out'"
+    stale=$(rt list-windows -t '=cc one' -F '#{window_active} #{window_width}x#{window_height}' | awk '$1 == 0 {print $2}' | sort -u | tr '\n' ' ')
+    [ "$stale" = "150x59 185x59 " ] || fail "real tmux sweep: resized under a fresh client: $stale"
+    out=$(sweep 0)
+    want=""
+    for id in $ids; do
+        if [ "$id" = "$split" ]; then want="$want$id=100x50 "; else want="$want$id=174x50 "; fi
+    done
+    [ "$(sizes_of 'cc one')" = "$want" ] || fail "real tmux sweep: want $want got $(sizes_of 'cc one') ($out)"
+    case "$out" in "hat-resize: 3 window(s) resized to their client's size") ;; *) fail "real tmux sweep: said '$out'" ;; esac
+    for id in $ids; do
+        [ -z "$(rt show-window-options -t "$id" window-size)" ] || fail "real tmux sweep: $id left at window-size manual"
+    done
+    # Run again with nothing to do: silent, and no layout change sent to cmux.
+    before=$(grep -c '^%layout-change' "$work/cc.out" || true)
+    out=$(sweep 0)
+    sleep 0.3
+    [ -z "$out" ] || fail "real tmux sweep: nothing to do, said '$out'"
+    [ "$(grep -c '^%layout-change' "$work/cc.out" || true)" = "$before" ] \
+        || fail "real tmux sweep: nothing to do, still sent cmux a layout change: $(grep "^%layout-change" "$work/cc.out" | tail -n +$((before + 1)) | tr "\n" ";") sizes $(sizes_of "cc one")"
     exec 3>&-
 
-    # A plain terminal client at 80 columns, attached before the control
-    # client so it is listed first, must not stop the control client's resize
-    # being followed. The terminal is a pane of another tmux server. The
-    # control client is the narrower, so it is the size resize-window -a takes.
-    TMUX_TMPDIR="$work/tmuxdir" HOME="$work/hh" XDG_STATE_HOME="$work/state" \
-        tmux new-session -d -s mc -x 182 -y 59
-    rt new-window -d -t '=mc:'
+    # A plain terminal attached beside the control client: the sweep leaves
+    # the session alone (resize-window -a would take the smaller size).
+    TMUX_TMPDIR="$work/tmuxdir" tmux new-session -d -s mc -x 185 -y 59
     rt new-window -d -t '=mc:'
     echo 'set -g default-terminal screen' > "$work/outer.conf"
-    tmux -S "$work/tmuxdir/outer" -f "$work/outer.conf" new-session -d -s term -x 80 -y 24 \
+    tmux -S "$work/tmuxdir/outer" -f "$work/outer.conf" new-session -d -s term -x 120 -y 30 \
         "env -u TMUX TMUX_TMPDIR='$work/tmuxdir' tmux attach -t '=mc'"
     i=0
     while [ $i -lt 50 ] && [ -z "$(rt list-clients -t '=mc' -F '#{client_name}')" ]; do
@@ -157,14 +147,15 @@ if command -v tmux >/dev/null 2>&1; then
     TMUX_TMPDIR="$work/tmuxdir" perl -e 'alarm 60; exec @ARGV' tmux -C attach -t '=mc' \
         < "$work/mc.in" > /dev/null 2>&1 &
     exec 3> "$work/mc.in"
+    echo 'refresh-client -C 174x50' >&3
     i=0
-    while [ $i -lt 50 ] && [ "$(rt list-clients -t '=mc' -F '#{client_control_mode}' | tr -d '\n')" != 01 ]; do
+    while [ $i -lt 50 ] && [ "$(rt list-clients -t '=mc' -F '#{client_control_mode}' | sort | tr -d '\n')" != 01 ]; do
         sleep 0.1; i=$((i + 1))
     done
-    [ "$(rt list-clients -t '=mc' -F '#{client_control_mode}' | tr -d '\n')" = 01 ] \
-        || fail "real tmux: want the terminal client listed before the control client: $(rt list-clients -t '=mc' -F '#{client_name} #{client_control_mode}')"
-    echo 'refresh-client -C 70x20' >&3
-    settle 70x20 mc || fail "real tmux hook: a terminal client listed first stopped the follow: windows at $got"
+    sleep 0.3
+    before=$(sizes_of mc)
+    out=$(sweep 0)
+    [ "$(sizes_of mc)" = "$before" ] || fail "real tmux sweep: resized a session a terminal shares: $before -> $(sizes_of mc)"
     exec 3>&-
     tmux -S "$work/tmuxdir/outer" kill-server 2>/dev/null || true
     rt kill-server 2>/dev/null || true
@@ -174,8 +165,9 @@ fi
 
 # --- stubs: tmux answers from windows.txt; ssh runs the command here ----------
 # windows.txt lines: <session> <window id> <WxH>
-# clients.txt lines: <session> <WxH> [<name> <control mode>], a client of that
-# session; cmux's by default (control mode 1). resize-window -a takes the
+# clients.txt lines: <session> <WxH> [<name> <control mode> [<created>]], a
+# client of that session; cmux's by default (control mode 1), attached at
+# epoch 0 unless <created> says otherwise. resize-window -a takes the
 # smallest, as tmux does; no line is a session with no client. A window id in
 # failresize makes resize-window -a fail on it.
 cat > "$work/bin/tmux" <<EOF
@@ -187,14 +179,20 @@ case "\$1" in
     list-sessions) cut -d' ' -f1 "\$w" | awk '!seen[\$0]++' ;;
     list-clients)
         s="\${3#=}"
-        [ -e "\$c" ] && awk -v s="\$s" '\$1 == s {
-            split(\$2, wh, "x"); printf "%s\t%s\t%s\n", (\$3 == "" ? "client-" s : \$3), (\$4 == "" ? 1 : \$4), wh[1] }' "\$c"
+        case "\$*" in *client_created*) fmt=sweep ;; *) fmt=width ;; esac
+        [ -e "\$c" ] && awk -v s="\$s" -v fmt="\$fmt" '\$1 == s {
+            split(\$2, wh, "x"); ctl = (\$4 == "" ? 1 : \$4)
+            if (fmt == "sweep") printf "%s %s %s\n", ctl, wh[1], (\$5 == "" ? 0 : \$5)
+            else printf "%s\t%s\n", ctl, wh[1] }' "\$c"
         true ;;
     list-windows)
         if [ "\$2" = -a ]; then rows=\$(cat "\$w")
         else s="\${3#=}"; rows=\$(grep "^\$s " "\$w") || exit 1; fi
         # With #{window_id} in the format: "<id> <WxH>"; without: "<WxH>".
+        # The sweep's format: "<id> <W> <H> <@hat_resize_key>".
         case "\$*" in
+            *hat_resize_key*) printf '%s\n' "\$rows" | while read -r _ id sz; do
+                    printf '%s %s %s %s\n' "\$id" "\${sz%x*}" "\${sz#*x}" "\$(cat "$work/key.\$id" 2>/dev/null)"; done ;;
             *window_id*) printf '%s\n' "\$rows" | cut -d' ' -f2,3 ;;
             *)           printf '%s\n' "\$rows" | cut -d' ' -f3 ;;
         esac ;;
@@ -210,7 +208,10 @@ case "\$1" in
             awk -v id="\$4" -v sz="\$size" '\$2 == id {\$3 = sz} {print}' "\$w" > "\$w.new" && mv "\$w.new" "\$w"
         fi ;;
     set-window-option) echo "\$*" >> "$work/unpinned" ;;
-    set-option) echo "\$*" >> "$work/options" ;;
+    set-option)
+        if [ "\$2" = -w ] && [ "\$5" = @hat_resize_key ]; then echo "\$6" > "$work/key.\$4"
+        else echo "\$*" >> "$work/options"; fi ;;
+    display-message) awk -v id="\$4" '\$2 == id {print \$3}' "\$w" ;;
     show-option) cat "$work/defsize" 2>/dev/null || echo 80x24 ;;
     *) echo "stub tmux: unexpected: \$*" >&2; exit 1 ;;
 esac
@@ -319,59 +320,30 @@ printf '%s\n' 'dev-atlas 150x40' > "$work/clients.txt"
 hr dev-atlas --size 200x60 >/dev/null
 [ "$(resized)" = "resize-window -t @2 -x 200 -y 60;" ] || fail "hat-resize: --size followed the client: $(resized)"
 
-# --follow, as the hook runs it: follows, sets the key, records the size.
-cat > "$work/windows.txt" <<'EOF'
-dev-atlas @1 182x59
-dev-atlas @2 150x40
-EOF
-rm -f "$work/options"
-cp "$work/state/hatter/window-size" "$work/window-size.keep"
-out=$(hr --follow dev-atlas 150/150x40)
-[ -z "$out" ] || fail "hat-resize --follow: printed '$out'"
-[ "$(sizes)" = "@1=150x40;@2=150x40;" ] || fail "hat-resize --follow: $(sizes)"
-grep -qx 'set-option -t dev-atlas @hat_size_key 150/150x40' "$work/options" \
-    || fail "hat-resize --follow: key not set: $(cat "$work/options" 2>/dev/null)"
-[ "$(cat "$work/state/hatter/window-size")" = 150x40 ] \
-    || fail "hat-resize --follow: recorded $(cat "$work/state/hatter/window-size")"
-grep -qx 'set-option -g default-size 150x40' "$work/options" || fail "hat-resize --follow: default-size not set"
+# --sweep, as the timer runs it: every session whose clients are all cmux's,
+# sized and settled; quiet when nothing changed.
+printf '%s\n' 'dev-atlas @1 182x59' 'dev-atlas @2 150x40' 'dev-web @3 182x59' 'ops @4 182x59' \
+    'term @5 182x59' 'fresh @6 182x59' 'unsized @7 182x59' > "$work/windows.txt"
+printf '%s\n' 'dev-atlas 150x40' 'dev-web 200x60' 'term 150x40' 'term 120x30 /dev/pts/1 0' \
+    "fresh 150x40 client-f 1 $(date +%s)" 'unsized 80x24' > "$work/clients.txt"
+out=$(hr --sweep)
+[ "$(sizes)" = "@1=150x40;@2=150x40;@3=200x60;@4=182x59;@5=182x59;@6=182x59;@7=182x59;" ] \
+    || fail "hat-resize --sweep: $(sizes) ($out)"
+[ "$out" = "hat-resize: 2 window(s) resized to their client's size" ] || fail "hat-resize --sweep: said '$out'"
+case "$(resized)" in *"@4"*|*"@5"*|*"@6"*|*"@7"*) fail "hat-resize --sweep: touched a session it must leave: $(resized)" ;; esac
+case "$(resized)" in *"-x "*) fail "hat-resize --sweep: ran the stuck-window pass: $(resized)" ;; esac
+out=$(hr --sweep)
+[ -z "$out" ] || fail "hat-resize --sweep: nothing changed, said '$out'"
+# The settle time is a setting: at 0, a client just attached counts.
+out=$(HAT_RESIZE_SETTLE=0 hr --sweep)
+case "$(sizes)" in *"@6=150x40;"*) ;; *) fail "hat-resize --sweep: HAT_RESIZE_SETTLE=0 left the fresh client: $(sizes)" ;; esac
 
-# --follow with an unsized client changes nothing, not even the key.
-cp "$work/window-size.keep" "$work/state/hatter/window-size"
-cat > "$work/windows.txt" <<'EOF'
-dev-atlas @1 182x59
-EOF
-printf '%s\n' 'dev-atlas 80x24' > "$work/clients.txt"
-rm -f "$work/options"
-hr --follow dev-atlas 80/182x59 >/dev/null
-[ -z "$(resized)" ] && [ ! -e "$work/options" ] || fail "hat-resize --follow: acted on an unsized client"
-[ "$(cat "$work/state/hatter/window-size")" = "$(cat "$work/window-size.keep")" ] || fail "hat-resize --follow: unsized client changed the record"
-
-# --follow sets default-size even when the record already holds the size:
-# hat-save writes the same record, so a match says nothing about default-size.
-echo 150x40 > "$work/state/hatter/window-size"
-printf '%s\n' 'dev-atlas @1 182x59' 'dev-atlas @2 150x40' > "$work/windows.txt"
-printf '%s\n' 'dev-atlas 150x40' > "$work/clients.txt"
-rm -f "$work/options"
-hr --follow dev-atlas 150/150x40 >/dev/null
-grep -qx 'set-option -g default-size 150x40' "$work/options" 2>/dev/null \
-    || fail "hat-resize --follow: record already 150x40, default-size not set: $(cat "$work/options" 2>/dev/null)"
-
-# A plain terminal at 80 columns listed before cmux's client: the client the
-# hook names is the one read, and so is the control client on demand.
+# On demand, a plain terminal at 80 columns listed before cmux's client does
+# not stop the follow.
 printf '%s\n' 'dev-atlas @1 182x59' 'dev-atlas @2 150x40' > "$work/windows.txt"
 printf '%s\n' 'dev-atlas 80x24 /dev/pts/1 0' 'dev-atlas 150x40 client-9 1' > "$work/clients.txt"
-rm -f "$work/options"
-hr --follow dev-atlas 150/150x40 client-9 >/dev/null
-case "$(resized)" in *"resize-window -a -t @1;"*) ;; *) fail "hat-resize --follow: a terminal listed first stopped the follow: $(resized)" ;; esac
-grep -qx 'set-option -t dev-atlas @hat_size_key 150/150x40' "$work/options" 2>/dev/null \
-    || fail "hat-resize --follow: terminal listed first, key not set: $(cat "$work/options" 2>/dev/null)"
-printf '%s\n' 'dev-atlas @1 182x59' 'dev-atlas @2 150x40' > "$work/windows.txt"
 out=$(hr dev-atlas)
 case "$out" in *"window(s) resized to their client's size"*) ;; *) fail "hat-resize: a terminal listed first stopped the follow: '$out'" ;; esac
-# ...and a refresh from the terminal itself is not followed.
-rm -f "$work/options"
-hr --follow dev-atlas 80/80x24 /dev/pts/1 >/dev/null
-[ -z "$(resized)" ] && [ ! -e "$work/options" ] || fail "hat-resize --follow: followed a plain terminal: $(resized)"
 
 # A window resize-window -a fails on is counted, said, and falls back to the
 # stuck-window pass: at 80x24, it is resized to the record.
@@ -382,15 +354,7 @@ echo 180x57 > "$work/state/hatter/window-size"
 out=$(hr dev-atlas 2>&1)
 case "$(resized)" in *"resize-window -t @2 -x 180 -y 57;") ;; *) fail "hat-resize: a failed follow skipped the stuck pass: $(resized)" ;; esac
 case "$out" in *"1 window(s) did not follow"*"1 window(s) resized to 180x57"*) ;; *) fail "hat-resize: failed follow said '$out'" ;; esac
-# --follow: the same window goes to the client's size, and the key stays
-# unset so the next refresh tries again.
-printf '%s\n' 'dev-atlas @1 182x59' 'dev-atlas @2 80x24' 'dev-atlas @3 182x59' > "$work/windows.txt"
-rm -f "$work/options"
-hr --follow dev-atlas 150/150x40 >/dev/null 2>&1
-case "$(resized)" in *"resize-window -t @2 -x 150 -y 40;"*) ;; *) fail "hat-resize --follow: failed window not resized: $(resized)" ;; esac
-if grep -q '@hat_size_key' "$work/options" 2>/dev/null; then fail "hat-resize --follow: key set after a failed resize"; fi
 rm -f "$work/failresize"
-cp "$work/window-size.keep" "$work/state/hatter/window-size"
 
 rm -f "$work/clients.txt"
 cp "$work/windows.all" "$work/windows.txt"
