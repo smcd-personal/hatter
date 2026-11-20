@@ -355,6 +355,7 @@ ssh you@shell.example.com true && echo "ssh works"
 git clone https://github.com/smcd-personal/hatter ~/src/hatter
 mkdir -p ~/.local/bin
 install -m 755 ~/src/hatter/bin/hatter ~/.local/bin/hatter
+~/src/hatter/tools/manpage.py -o ~/.local/share/man/man1/hatter.1   # man hatter
 export PATH="$HOME/.local/bin:$PATH"      # add to ~/.bashrc or ~/.zshrc
 hatter --help
 ```

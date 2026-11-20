@@ -115,6 +115,7 @@ The short version, once your terminal is sorted:
 ```sh
 git clone https://github.com/smcd-personal/hatter
 install -m 755 hatter/bin/hatter ~/.local/bin/hatter
+hatter/tools/manpage.py -o ~/.local/share/man/man1/hatter.1   # man hatter
 
 hatter hat add dev --ssh you@shell.work.com
 hatter provision dev
@@ -129,6 +130,7 @@ hatter restore
 ```
 
 `hatter --help` explains every command; `hatter help <command>` goes deeper.
+`man hatter` has the command list and this README in one page.
 
 ## Contributing
 
