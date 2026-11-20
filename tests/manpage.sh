@@ -21,8 +21,9 @@ if command -v mandoc >/dev/null; then
     [ -z "$lint" ] || fail "mandoc warns: $lint"
     mandoc -T ascii "$page" | col -bx > "$work/out"
 elif command -v groff >/dev/null; then
-    # Every warning but "break": a long URL kept whole cannot be justified.
-    groff -man -T ascii -ww -Wbreak "$page" 2>"$work/err" | col -bx > "$work/out"
+    # groff's default warnings, less "break": a URL kept whole on purpose
+    # cannot be justified. -P -cbu: plain text, no SGR bold or underline.
+    groff -man -T ascii -Wbreak -P -cbu "$page" 2>"$work/err" | col -bx > "$work/out"
     [ ! -s "$work/err" ] || fail "groff warns: $(cat "$work/err")"
 else
     echo "skip render: no mandoc or groff"
