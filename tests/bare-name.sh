@@ -127,6 +127,18 @@ grep -q "already a workspace on this server" <<<"$out" || fail "new portal: no n
 setup_shared portal
 out=$(run 'cmd_new portal --hat dev --group Atlas') || fail "new portal (running): $out"
 [[ "$(created)" == "dev-portal " ]] || fail "new portal (ops's, running): created '$(created)', want 'dev-portal'"
+# ops's portal running beside dev's own dev-portal: dev reattaches its own.
+setup_shared portal dev-portal
+out=$(run 'cmd_new portal --hat dev --group Atlas') || fail "new portal (both running): $out"
+[[ -z "$(created)" ]] || fail "new portal (dev-portal running): created '$(created)'"
+grep -q 'tmux: *dev-portal$' <<<"$out" || fail "new portal: did not use 'dev-portal':
+$out"
+# A disabled hat on the server still holds its names.
+setup_shared
+jq '.hats.ops.disabled = true' "$work/cfg/hatter/config.json" > "$work/c.json" \
+    && mv "$work/c.json" "$work/cfg/hatter/config.json"
+out=$(run 'hat_new_name dev portal 2>/dev/null') || fail "hat_new_name (disabled ops): $out"
+[[ "$out" == dev-portal ]] || fail "hat_new_name portal, ops disabled: got '$out', want 'dev-portal'"
 # A name recorded only by a hat on another server is free here.
 setup_shared
 out=$(run 'cmd_new wiki --hat dev --group Atlas') || fail "new wiki: $out"

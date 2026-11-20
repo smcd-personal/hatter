@@ -78,6 +78,9 @@ grep -qx 'RENAME dev-atlas maps --hat dev' <<<"$out" || fail "rename bare: $out"
 # ...and one that already carries it is used as typed.
 out=$(rack 'r q' 'dev-maps') || fail "rack rename: $out"
 grep -qx 'RENAME dev-atlas dev-maps --hat dev' <<<"$out" || fail "rename prefixed: $out"
+# The same name again is no rename (it is not a clash with itself).
+out=$(rack 'r q' 'atlas') || fail "rack rename same: $out"
+! grep -q '^RENAME' <<<"$out" || fail "rename to its own name: $out"
 # An unprefixed session still renames by its full name.
 out=$(rack '2 r q' 'maps') || fail "rack rename 2: $out"
 grep -qx 'RENAME notes maps --hat dev' <<<"$out" || fail "rename unprefixed: $out"
