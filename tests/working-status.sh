@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# The watcher marks workspaces with a busy agent in cmux's sidebar (#288).
+# The watcher lists each mirrored workspace's tabs, with their agents' state,
+# as status lines in cmux's sidebar (#288, #304).
 #
-#   - working_tabs: a tab is working while its turn is open (@hatter-working)
-#     and its window printed something in the last WORKING_QUIET seconds; an
-#     open turn that went quiet (a permission prompt, an Esc), a closed turn,
-#     and output with no server clock all count as not working
-#   - working_labels: workspaces are placed by title on the one destination
-#     recording them; a title on two destinations is left alone; a
-#     destination that did not answer clears its workspaces; long lists cut
+#   - tab_states: a tab is working while its turn is open (@hatter-working)
+#     and its window printed something in the last WORKING_QUIET seconds, or
+#     WORKING_WAIT_QUIET once hat-attn flagged approval or a question; a quiet
+#     flagged tab is approval or question; anything else is idle, and with no
+#     server clock nothing is working
+#   - tab_lines: workspaces are placed by title on the one destination
+#     recording them; a title on two destinations is left alone; one line per
+#     tab keyed by window index, waiting first, then working, then idle;
+#     long names cut; colour-blind shades from the pref
 #   - watch_working, end to end with an ssh stub on PATH and cmux stubbed:
-#     sets a status once, calls cmux again only on a change, clears it when
-#     the turn ends, holds it while a server misses up to two rounds and
-#     clears it at the third, retries a set or clear that failed, sets it
-#     again after the stream restarts (cmux may have restarted), and clears
-#     what it set when "prefs.working_status" is "off", also after a restart
+#     reads each placed workspace's lines once per stream and clears the old
+#     hatter_working and stale tab keys, sets lines once and again only on a
+#     change, clears a closed tab's line, holds a silent server's lines for
+#     two rounds and clears them at the third, retries a failed set or clear,
+#     leaves a workspace it could not read alone until it can, reads again
+#     after the stream restarts, and clears every line when
+#     "prefs.working_status" is "off", also after a restart
 #
 # Needs bash, jq and perl.
 set -euo pipefail
@@ -38,31 +43,33 @@ source "$lib"
 set +e
 
 T=$'\t'
+R='#ff453a' B='#0a84ff' G='#8e8e93'
 
-# --- working_tabs --------------------------------------------------------------
-out=$(printf 'N\t1000\nW\ts\tbusy\t990\t998\t\nW\ts\tquiet\t900\t950\t\nW\ts\tdone\t\t1000\t\nW\ts\tedge\t1\t970\t\nW\ts\tbad\tx\t1000\t\n' | working_tabs)
-expect "working_tabs: open and printing counts, quiet or closed does not" \
-    "$(is "$out" "s${T}busy"$'\n'"s${T}edge")"
-# A tab flagged as waiting on the human goes idle sooner: 10s quiet is idle
-# with approval or question, busy with done or no flag; printing is busy.
-out=$(printf 'N\t1000\nW\ts\tappr\t1\t990\tapproval\nW\ts\tques\t1\t990\tquestion\nW\ts\tdone\t1\t990\tdone\nW\ts\tnone\t1\t990\t\nW\ts\tresumed\t1\t998\tapproval\n' | working_tabs)
-expect "working_tabs: a prompt on screen is idle after a short quiet, a resumed one busy" \
-    "$(is "$out" "s${T}done"$'\n'"s${T}none"$'\n'"s${T}resumed")"
-out=$(printf 'W\ts\tbusy\t990\t998\n' | working_tabs)
-expect "working_tabs: no server clock, nothing counts" "$(is "$out" "")"
+# --- tab_states ------------------------------------------------------------------
+out=$(printf 'N\t1000\nW\ts\t1\tbusy\t990\t998\t\nW\ts\t2\tquiet\t900\t950\t\nW\ts\t3\tdone\t\t1000\tdone\nW\ts\t4\tedge\t1\t970\t\nW\ts\tx\tbad\t1\t1000\t\n' | tab_states)
+expect "tab_states: open and printing is working, quiet or closed is idle" \
+    "$(is "$out" "s${T}1${T}busy${T}working"$'\n'"s${T}2${T}quiet${T}idle"$'\n'"s${T}3${T}done${T}idle"$'\n'"s${T}4${T}edge${T}working")"
+out=$(printf 'N\t1000\nW\ts\t1\tappr\t1\t990\tapproval\nW\ts\t2\tques\t\t990\tquestion\nW\ts\t3\tnone\t1\t990\t\nW\ts\t4\tresumed\t1\t998\tapproval\n' | tab_states)
+expect "tab_states: a quiet prompt is approval or question, a resumed one working" \
+    "$(is "$out" "s${T}1${T}appr${T}approval"$'\n'"s${T}2${T}ques${T}question"$'\n'"s${T}3${T}none${T}working"$'\n'"s${T}4${T}resumed${T}working")"
+out=$(printf 'W\ts\t1\tbusy\t990\t998\t\n' | tab_states)
+expect "tab_states: no server clock, nothing is working" "$(is "$out" "s${T}1${T}busy${T}idle")"
 
-# --- working_labels --------------------------------------------------------------
+# --- tab_lines -------------------------------------------------------------------
 rec="a.example.com${T}api"$'\n'"a.example.com${T}docs"$'\n'"b.example.com${T}ops"$'\n'"a.example.com${T}both"$'\n'"b.example.com${T}both"
-tabs="a.example.com${T}api${T}one"$'\n'"a.example.com${T}api${T}two"$'\n'"b.example.com${T}api${T}elsewhere"$'\n'"a.example.com${T}both${T}x"
+tabs="a.example.com${T}api${T}1${T}one${T}idle"$'\n'"a.example.com${T}api${T}2${T}two${T}working"$'\n'"a.example.com${T}api${T}3${T}three${T}approval"$'\n'"a.example.com${T}api${T}4${T}${T}question"$'\n'"b.example.com${T}api${T}1${T}elsewhere${T}working"$'\n'"a.example.com${T}both${T}1${T}x${T}idle"
 wss="W1${T}api"$'\n'"W2${T}docs"$'\n'"W3${T}ops"$'\n'"W4${T}both"$'\n'"W5${T}notes"
-out=$(working_labels "$rec" "$tabs" "$wss")
-expect "working_labels: names the tabs, clears idle, skips ambiguous and unrecorded" \
-    "$(is "$out" "W1${T}working: one, two"$'\n'"W2${T}"$'\n'"W3${T}")"
-tabs=""
-for n in alpha bravo charlie delta echo; do tabs+="a.example.com${T}api${T}tab-$n"$'\n'; done
-out=$(working_labels "$rec" "$tabs" "W1${T}api")
-expect "working_labels: a long list is cut with a count" \
-    "$(is "$out" "W1${T}working: tab-alpha, tab-bravo, tab-charlie +2")"
+out=$(tab_lines "$rec" "$tabs" "$wss")
+expect "tab_lines: a line per tab with its state, skips ambiguous and unrecorded" \
+    "$(is "$out" "W1"$'\n'"W1${T}hatter_tab_1${T}one${T}circle${T}${G}${T}1998"$'\n'"W1${T}hatter_tab_2${T}two${T}bolt.fill${T}${R}${T}2997"$'\n'"W1${T}hatter_tab_3${T}three${T}hand.raised.fill${T}${B}${T}3996"$'\n'"W1${T}hatter_tab_4${T}window 4${T}questionmark.bubble.fill${T}${B}${T}3995"$'\n'"W2"$'\n'"W3")"
+out=$(tab_lines "$rec" "$tabs" "$wss" "a.example.com")
+expect "tab_lines: a held destination's workspaces are left out" "$(is "$out" "W3")"
+out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
+expect "tab_lines: a long name is cut" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABC…")"
+COLORBLIND_SAFE=on
+out=$(tab_lines "$rec" "a.example.com${T}api${T}1${T}one${T}working" "W1${T}api" | sed -n 2p | cut -f5)
+expect "tab_lines: colour-blind safe shades" "$(is "$out" "#d55e00")"
+COLORBLIND_SAFE=""
 
 # --- watch_working end to end -------------------------------------------------------
 CONFIG="$work/config.json"
@@ -92,90 +99,110 @@ chmod +x "$work/bin/ssh"
 export PATH="$work/bin:$PATH" HATTER_TEST_WORK="$work"
 SSH_OPTS=(-o ControlMaster=no)
 
-# cmux: tree shows the workspaces; changes are logged.
 cmux_json() {
     [[ "$1" == tree ]] || return 1
     jq -n '{windows: [{workspaces: [{id: "W-api", title: "dev-api"}, {id: "W-docs", title: "dev-docs"},
                                     {id: "W-x", title: "off-x"}, {id: "W-local", title: "Personal"}]}]}'
 }
-# A change fails while $work/cmux-fail exists (logged all the same).
-cmux() { echo "$*" >> "$work/cmux.log"; [[ ! -f "$work/cmux-fail" ]]; }
+# list-status prints $work/status-<id> (fails while $work/list-fail exists)
+# and is logged apart; a change is logged, and fails while $work/cmux-fail
+# exists.
+cmux() {
+    if [[ "$*" == *list-status* ]]; then
+        local all="$*"; local id="${all##*--workspace }"
+        echo "$id" >> "$work/list.log"
+        [[ ! -f "$work/list-fail" ]] || return 1
+        cat "$work/status-$id" 2>/dev/null
+        return 0
+    fi
+    echo "$*" >> "$work/cmux.log"; [[ ! -f "$work/cmux-fail" ]]
+}
 mac_dark_wake() { return 1; }
 WATCH_WAKE_PENDING=0
-calls() { cat "$work/cmux.log" 2>/dev/null; : > "$work/cmux.log"; }
+calls() { sort "$work/cmux.log" 2>/dev/null; : > "$work/cmux.log"; }
+lists() { sort "$work/list.log" 2>/dev/null; : > "$work/list.log"; }
 round() { WATCH_WORKING_LAST=0; watch_working; }
 server() { printf 'N\t1000\n%s' "$1" > "$work/server"; }
+set1() { echo "set-status hatter_tab_$1 $2 --workspace $3 --icon $4 --color $5 --priority $6"; }
 
-server "W${T}dev-api${T}main${T}990${T}999"$'\n'"W${T}dev-docs${T}main${T}${T}999"$'\n'
+# Left by an earlier watcher: #288's line, a tab that has since closed, and
+# a line someone else owns.
+printf '%s\n' "hatter_working=working: main icon=bolt.fill color=#ff453a" \
+    "hatter_tab_9=gone icon=circle color=#8e8e93 priority=1990" "other=keep me" > "$work/status-W-api"
+server "W${T}dev-api${T}1${T}main${T}990${T}999${T}"$'\n'"W${T}dev-api${T}2${T}shell${T}${T}900${T}"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
 round
 out=$(calls)
-expect "first round: sets the busy workspace" \
-    "$(grep -qxF "set-status hatter_working working: main --workspace W-api --icon bolt.fill --color #ff453a" <<<"$out" && echo y || echo n)"
-expect "first round: clears the idle one once (what cmux shows is unknown)" \
-    "$(grep -qxF "clear-status hatter_working --workspace W-docs" <<<"$out" && echo y || echo n)"
-expect "first round: leaves a disabled hat's and an unrecorded workspace alone" \
-    "$(grep -qE 'W-x|W-local' <<<"$out" && echo n || echo y)"
+expect "first round: reads each placed workspace's lines once" "$(is "$(lists)" "W-api"$'\n'"W-docs")"
+expect "first round: sets a line per tab and clears the old ones it owns" \
+    "$(is "$out" "$(sort <<<"clear-status hatter_tab_9 --workspace W-api
+clear-status hatter_working --workspace W-api
+$(set1 1 main W-api bolt.fill "$R" 2998)
+$(set1 2 shell W-api circle "$G" 1997)
+$(set1 1 main W-docs circle "$G" 1998)")")"
 expect "first round: one ssh, to the enabled hat only" \
     "$(is "$(grep -vc "^-G " "$work/ssh.log")$(grep -c off.example.com "$work/ssh.log")" "10")"
 
 round
-expect "no change: no cmux call" "$(is "$(calls)" "")"
+expect "no change: no cmux call, no second read" "$(is "$(calls)$(lists)" "")"
 
-server "W${T}dev-api${T}main${T}${T}999"$'\n'
+server "W${T}dev-api${T}1${T}main${T}${T}999${T}question"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
 round
-expect "turn ended: cleared" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+expect "turn ends on a question, a tab closes: one set, one clear" \
+    "$(is "$(calls)" "clear-status hatter_tab_2 --workspace W-api"$'\n'"$(set1 1 main W-api questionmark.bubble.fill "$B" 3998)")"
 
-server "W${T}dev-api${T}main${T}990${T}999"$'\n'
-round; calls >/dev/null
 rm -f "$work/server"
 round
-expect "server misses a round: status held" "$(is "$(calls)" "")"
+expect "server misses a round: lines held" "$(is "$(calls)" "")"
 round
 expect "server misses two: still held" "$(is "$(calls)" "")"
 round
-expect "server misses three: cleared" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+expect "server misses three: cleared" \
+    "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api"$'\n'"clear-status hatter_tab_1 --workspace W-docs")"
 
 # A failed change is tried again next round, from what cmux was last told.
-server "W${T}dev-api${T}main${T}990${T}999"$'\n'
-round; calls >/dev/null
-server "W${T}dev-api${T}main${T}990${T}999"$'\n'"W${T}dev-api${T}two${T}990${T}999"$'\n'
-touch "$work/cmux-fail"; round; calls >/dev/null; rm -f "$work/cmux-fail"
-# The new label never landed, so cmux still shows the old one: going idle
-# must clear it.
-server "W${T}dev-api${T}main${T}${T}999"$'\n'
-round
-expect "failed set, then idle: the old label is cleared" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
-server "W${T}dev-api${T}main${T}990${T}999"$'\n'
-round; calls >/dev/null
-server "W${T}dev-api${T}main${T}${T}999"$'\n'
+server "W${T}dev-api${T}1${T}main${T}990${T}999${T}"$'\n'
 touch "$work/cmux-fail"; round; calls >/dev/null; rm -f "$work/cmux-fail"
 round
-expect "failed clear: tried again next round" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+expect "failed set: tried again next round" "$(is "$(calls)" "$(set1 1 main W-api bolt.fill "$R" 2998)")"
+server ""
+touch "$work/cmux-fail"; round; calls >/dev/null; rm -f "$work/cmux-fail"
+round
+expect "failed clear: tried again next round" "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api")"
 
-server "W${T}dev-api${T}main${T}990${T}999"$'\n'
+# A new stream reads again: cmux may have restarted, or another watcher run.
+server "W${T}dev-api${T}1${T}main${T}990${T}999${T}"$'\n'
 round; calls >/dev/null
-WATCH_WORKING_KNOWN=0   # what watch_stream does when a stream opens
+WATCH_WORKING_KNOWN=0 WATCH_WORKING_SEEN=""   # what watch_stream does
+printf '%s\n' "hatter_tab_1=main icon=bolt.fill color=#ff453a priority=2998" > "$work/status-W-api"
 round
-out=$(calls)
-expect "new stream: sets it again though it was already set" \
-    "$(grep -qF "set-status hatter_working working: main --workspace W-api" <<<"$out" && echo y || echo n)"
+expect "new stream: reads again, and sets what it wants again" \
+    "$(is "$(lists)|$(calls)" "W-api"$'\n'"W-docs|$(set1 1 main W-api bolt.fill "$R" 2998)")"
+
+# A workspace whose lines cannot be read is left alone until they can.
+WATCH_WORKING_KNOWN=0 WATCH_WORKING_SEEN="" WATCH_WORKING_SHOWN=""
+touch "$work/list-fail"; round; rm -f "$work/list-fail"
+expect "unreadable: no change made" "$(is "$(calls)" "")"
+lists >/dev/null
+round
+expect "unreadable: read and set once it can be" \
+    "$(is "$(lists)|$(calls)" "W-api"$'\n'"W-docs|$(set1 1 main W-api bolt.fill "$R" 2998)")"
 
 write_config '"prefs": {"working_status": "off"}, '
 round
 expect "pref off: clears what it set, then stays quiet" \
-    "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+    "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api")"
 round
-expect "pref off: second round quiet" "$(is "$(calls)" "")"
+expect "pref off: second round quiet" "$(is "$(calls)$(lists)" "")"
 
-# Off after a restart: what an earlier watcher set is unknown, so every placed
-# workspace is cleared once.
-WATCH_WORKING_SHOWN=""; WATCH_WORKING_KNOWN=0
+# Off after a restart: what an earlier watcher set is read and cleared.
+WATCH_WORKING_SHOWN="" WATCH_WORKING_KNOWN=0 WATCH_WORKING_SEEN=""
+printf '%s\n' "hatter_tab_3=x icon=circle" "hatter_working=working: x" > "$work/status-W-docs"
 round
-out=$(calls)
-expect "pref off after a restart: sweeps the placed workspaces once" \
-    "$(is "$(sort <<<"$out")" "clear-status hatter_working --workspace W-api"$'\n'"clear-status hatter_working --workspace W-docs")"
+expect "pref off after a restart: reads both" "$(is "$(lists)" "W-api"$'\n'"W-docs")"
+expect "pref off after a restart: clears what it finds" \
+    "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api"$'\n'"clear-status hatter_tab_3 --workspace W-docs"$'\n'"clear-status hatter_working --workspace W-docs")"
 round
-expect "pref off after a restart: then quiet" "$(is "$(calls)" "")"
+expect "pref off after a restart: then quiet" "$(is "$(calls)$(lists)" "")"
 
 echo
 if [[ "$fails" -gt 0 ]]; then echo "$fails failed"; exit 1; fi
