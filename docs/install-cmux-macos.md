@@ -10,7 +10,7 @@ For WezTerm, or for Windows, see [install-wezterm.md](install-wezterm.md).
 
 You need:
 
-- **macOS.** The system `bash` (3.2) is fine — hatter is written for it.
+- **macOS.** The system `bash` (3.2) is fine; hatter is written for it.
 - **An ssh key that reaches your servers**, and `ssh you@host` working from
   Terminal without a password prompt. hatter never handles ssh auth itself; if
   ssh works, hatter works. hatter's ssh cannot prompt, so a key with a
@@ -53,7 +53,7 @@ If `cmux --version` prints a version, the CLI is reachable.
 brew install jq git
 ```
 
-`jq` is required — every config read and write goes through it. `git` is only
+`jq` is required: every config read and write goes through it. `git` is only
 needed for `hatter backup`, but you want that.
 
 ## 4. Install hatter
@@ -74,7 +74,7 @@ exec zsh
 hatter --help
 ```
 
-## 5a. First run — no config yet
+## 5a. First run: no config yet
 
 Add a hat. A hat is one login: `user@host`, one ssh connection, one tmux
 server, one cmux window.
@@ -108,7 +108,7 @@ Open the rack to see what you have:
 hatter
 ```
 
-## 5b. Restore — you already have a config
+## 5b. Restore: you already have a config
 
 Your config lives in `~/.config/hatter` and `hatter backup` commits it to a git
 remote you control. On a new Mac, clone it back:
@@ -127,7 +127,7 @@ config before installing hatter you already have it:
 install -m 755 ~/.config/hatter/bin/hatter ~/.local/bin/hatter
 ```
 
-Then rebuild the layout — recreate missing tmux sessions and their tabs, open
+Then rebuild the layout: recreate missing tmux sessions and their tabs, open
 each hat's window, re-mirror, put the workspaces back in their groups:
 
 ```sh
