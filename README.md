@@ -24,7 +24,7 @@ hatter
 
 Four nouns, and one of them is the idea:
 
-| | |
+| Term | Meaning |
 |---|---|
 | **hat** | a login — one `user@host`, one ssh connection, one tmux server, one terminal window. "I'm wearing my work hat." |
 | **group** | a project or area inside one hat |
