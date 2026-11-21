@@ -8814,7 +8814,7 @@ ps_render() {
         if [[ "$k" == "$last_on" ]]; then hdr+="$sep$c"; else hdr+="$sep$c$(printf '%*s' $(( w[k] - ${#c} )) '')"; fi
         sep="  "
     done
-    printf '%s%s%s\n' "$C_DIM" "$hdr" "$C_R"
+    printf '%s%s%s\n' "$C_B" "$hdr" "$C_R"
 
     local row
     while IFS= read -r line; do
@@ -13736,7 +13736,8 @@ creds_health() {
 }
 
 # One window: bar + percent + time to reset, 16 columns. A window the plan does
-# not have reads "none", dimmed, in the same width so the next one lines up.
+# not have reads "none", as secondary text, in the same width so the next one
+# lines up.
 creds_gauge() {
     local r="$1" e="$2"
     if [[ "$r" == "-" || -z "$r" ]]; then
@@ -14266,16 +14267,23 @@ ICON_GROUP="📂"
 ICON_WORKSPACE="📁"
 ICON_TAB="⌨️"
 
+# C_DIM marks secondary text: hosts, hints, key lists, quiet statuses. It used
+# to be faint (SGR 2), but a terminal draws faint by blending the text into the
+# background, which on most themes lands under the 4.5:1 contrast text needs
+# (#291). So secondary text is in the default foreground, told apart by its
+# place and its words, and only C_RULE, for the rack's header rules, is faint.
+# The name stays so secondary text is still marked in one place.
 colour_setup() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-        C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_R=$'\033[0m'; C_SEL=$'\033[7m'
+        C_DIM=""; C_RULE=$'\033[2m'
+        C_B=$'\033[1m'; C_R=$'\033[0m'; C_SEL=$'\033[7m'
         C_CY=$'\033[36m'; C_GR=$'\033[32m'; C_YL=$'\033[33m'; C_RD=$'\033[31m'
         # Red against green is the pair colour blindness most often hides, so
         # the safe palette shows good as blue. Red, yellow and blue stay apart
         # under all three common forms, and the terminal theme sets the shade.
         if colorblind_safe; then C_GR=$'\033[34m'; fi
     else
-        C_DIM=""; C_B=""; C_R=""; C_SEL=""
+        C_DIM=""; C_RULE=""; C_B=""; C_R=""; C_SEL=""
         C_CY=""; C_GR=""; C_YL=""; C_RD=""
     fi
 }
@@ -14637,10 +14645,11 @@ edit_below() {
 edit_header() {
     edit_frame_begin
     [[ "$EDIT_FRAME" == 1 ]] || printf '\033[H\033[2J'
-    printf '%s──── hatter rack ──────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
+    printf '%s────%s hatter rack %s──────────────────────────────────────────%s\n' \
+        "$C_RULE" "$C_R" "$C_RULE" "$C_R"
     printf '  %s%s%s\n' "$C_CY" "${1:-all hats}" "$C_R"
     [[ -n "${6:-}" ]] && printf '  %s%s%s\n' "$C_YL" "$6" "$C_R"
-    printf '%s──────────────────────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
+    printf '%s──────────────────────────────────────────────────────────%s\n' "$C_RULE" "$C_R"
     printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$2" "$C_R" "$C_DIM" "$3" "$C_R"
     [[ -n "${4:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$4" "$C_R"
     [[ -n "${5:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$5" "$C_R"
@@ -14875,7 +14884,7 @@ edit_top() {
         hdrtail=""
         [[ $cols -ge $((CREDS_TAIL_COL + 9)) ]] && hdrtail="  HELD BY"
         printf '        %s%-28s %-8s %-19s   %-19s%s%s\n' \
-            "$C_DIM" "LOGIN" "ROLE" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
+            "$C_B" "LOGIN" "ROLE" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
 
         i=0
         while [[ $i -lt $nc ]]; do
@@ -16093,6 +16102,8 @@ lists every hat, with a HAT column.
                idle                waiting for an hour or more
                snoozed, asleep     a snoozed tab; a hibernated session
                shell               no agent runs in the tab
+               A status that needs you is bold; the rest are plain text,
+               told apart by the word, not greyed out.
   GROUP, WORKSPACE, TAB            where it is; "*" marks a pinned tab
   MODEL        the model of the last turn
   CTX          the context in use: the last turn's whole input, cached or
