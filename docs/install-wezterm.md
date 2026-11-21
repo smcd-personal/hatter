@@ -236,6 +236,7 @@ hatter.apply_to_config(config, {
   key = 'O', mods = 'CTRL|SHIFT',   -- the picker binding
   config_path = 'D:/sync/hatter/config.json',  -- if the config lives elsewhere
   ssh = 'C:/Windows/System32/OpenSSH/ssh.exe', -- if `ssh` on PATH is the wrong one
+  log_path = 'D:/logs/hatter-wezterm.log',     -- where messages are kept (see A7)
 })
 ```
 
@@ -258,6 +259,15 @@ Update config from git (git pull)
 - **+ new workspace** asks for a name, prefixes it with the hat
   (`atlas-ui` becomes `work-atlas-ui`), and creates the session on the server.
 - **Update config from git** runs `git pull` in the config folder.
+
+**Messages.** When something fails (the config cannot be read, a hat has no
+usable ssh destination, `git pull` fails), the plugin says what failed and
+what to do next in a box that stays until you press Enter. A success, such as
+`config updated`, is a short notification. Every message, success or failure,
+is also added to a plain text log you can open in any editor or screen
+reader: `~/.local/state/hatter/wezterm.log` (on Windows
+`%USERPROFILE%\.local\state\hatter\wezterm.log`), or
+`$XDG_STATE_HOME/hatter/wezterm.log` if that is set, or `log_path` from A6.
 
 Every workspace is also in WezTerm's launcher (right-click the `+` button in
 the tab bar), which opens it in a plain tab.
@@ -293,7 +303,7 @@ table.insert(config.keys, {
 Running the installer again checks everything below and says which part is
 wrong. By hand:
 
-- **The picker shows a toast "cannot read …config.json".** The clone is not in
+- **The picker says "cannot read …config.json".** The clone is not in
   `$env:USERPROFILE\.config\hatter`, or `XDG_CONFIG_HOME` points elsewhere.
   Move it, or pass `config_path`.
 - **The tab opens and closes at once.** ssh failed. Run the same command in
@@ -303,8 +313,9 @@ wrong. By hand:
   `.wezterm.lua`, which is also WezTerm's default.
 - **Asked for a passphrase on every tab.** The ssh agent is not running, or
   `ssh` on PATH is not the Windows one. Revisit A3 or set `ssh` in A6.
-- **Errors in the plugin.** `Ctrl+Shift+L` opens the debug overlay with the
-  log.
+- **Errors in the plugin.** The plugin's own messages are in its log (see
+  [Messages in A7](#a7-use-it)). Errors in the plugin's code itself are in
+  WezTerm's debug overlay, which `Ctrl+Shift+L` opens.
 
 ## B. macOS, Linux or WSL
 
