@@ -1794,25 +1794,36 @@ find_hat_window() {
                         next }
         END { # Each of a hat'\''s groups counts once per window, as a group or
               # as a header; a header alone adds the point its group would.
+              # (A window'\''s titles come before its groups, so a group
+              # overwrites its header'\''s 1 with 2.)
               for (k in named) { split(k, p, SUBSEP)
                   groups[p[1], p[2]]++
                   if (named[k] == 1) score[p[1], p[2]] += 1 }
+              # First a window with groups of this hat in it that is not a
+              # sibling'\''s: one with more of the sibling'\''s groups, or as
+              # many and a better score, then the first hat by name. Only then
+              # a window this hat has sessions in but no hat has groups in:
+              # sessions alone say little, as a mirror puts them anywhere, so
+              # they never outrank a window of the hat'\''s own groups, nor
+              # take a window from a sibling with groups there.
               best = ""; bs = 0
               for (i = 1; i <= n; i++) {
-                  w = order[i]
-                  if (score[me, w] + 0 <= bs) continue
-                  # The window is a sibling'\''s if it has more of the
-                  # sibling'\''s groups, or as many and a better score. With
-                  # no group of either there, sessions alone decide nothing:
-                  # a mirror puts them anywhere.
+                  w = order[i]; mg = groups[me, w] + 0; ms = score[me, w] + 0
+                  if (mg == 0 || ms <= bs) continue
                   taken = 0
                   for (j = 1; j <= nh; j++) { h = hats[j]
                       if (h == me) continue
-                      g = groups[h, w] + 0; mg = groups[me, w] + 0
-                      s = score[h, w] + 0;  ms = score[me, w] + 0
-                      if (g > mg || (g == mg && g > 0 && (s > ms || (s == ms && h < me)))) { taken = 1; break }
+                      g = groups[h, w] + 0; s = score[h, w] + 0
+                      if (g > mg || (g == mg && (s > ms || (s == ms && h < me)))) { taken = 1; break }
                   }
-                  if (!taken) { bs = score[me, w]; best = w }
+                  if (!taken) { bs = ms; best = w }
+              }
+              if (best == "") for (i = 1; i <= n; i++) {
+                  w = order[i]; ms = score[me, w] + 0
+                  if (ms <= bs) continue
+                  taken = 0
+                  for (j = 1; j <= nh; j++) if (hats[j] != me && groups[hats[j], w] + 0 > 0) { taken = 1; break }
+                  if (!taken) { bs = ms; best = w }
               }
               printf "%s", best }'
 }
@@ -10656,7 +10667,7 @@ sync_once() {
     SIBLINGS_TOUCHED=""
     for ((i = 0; i < n; i++)); do
         [[ -n "${lives[$i]}" ]] || continue
-        if [[ "${gjsons[$i]}" != "-" ]] && grep -qxF -- "${wins[$i]}" <<<"$SIBLINGS_TOUCHED"; then
+        if [[ -n "${wins[$i]}" && "${gjsons[$i]}" != "-" ]] && grep -qxF -- "${wins[$i]}" <<<"$SIBLINGS_TOUCHED"; then
             gjsons[$i]="" wsjsons[$i]=""
         fi
         settle_ungrouped "${hats[$i]}" "${wins[$i]}" "${lives[$i]}" \

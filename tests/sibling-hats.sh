@@ -119,6 +119,19 @@ layout '{"windows":[{"id":"W9","workspaces":[{"id":"x","title":"Solo"}],"groups"
 layout '{"windows":[{"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],"groups":[]}]}'
 [[ "$(win_of alpha)" == W1 ]] || fail "no groups yet: alpha got '$(win_of alpha)', want W1"
 
+# Loose sessions never outrank a hat's own groups: beta's mirrored sessions in
+# alpha's window, which has no real group of alpha's in it (none made yet, or
+# only alpha's Unassigned), and beta's group in its own window.
+S1='{"windows":[
+ {"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],"groups":[]},
+ {"id":"W2","workspaces":[{"id":"h1","title":"Lab"}],"groups":[{"id":"g-lab","name":"Lab","members":["h1"]}]}]}'
+layout "$S1"
+[[ "$(win_of alpha)" == W1 && "$(win_of beta)" == W2 ]] \
+    || fail "no groups in alpha's window: alpha='$(win_of alpha)' beta='$(win_of beta)', want W1 and W2"
+layout "$(jq -c '(.windows[0].groups) = [{"id":"g-u","name":"Unassigned","members":["a1"]}]' <<<"$S1")"
+[[ "$(win_of alpha)" == W1 && "$(win_of beta)" == W2 ]] \
+    || fail "only Unassigned in alpha's window: alpha='$(win_of alpha)' beta='$(win_of beta)', want W1 and W2"
+
 # As many groups each: the better score wins, then the first hat by name.
 layout '{"windows":[{"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],
   "groups":[{"id":"g1","name":"Ops","members":["a1"]},{"id":"g2","name":"Lab","members":["b1","b2"]}]}]}'
