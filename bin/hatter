@@ -12176,14 +12176,19 @@ watch_probe() {
 # an Esc interrupt fires no Stop, so an open turn alone is not "working". A
 # working agent redraws its spinner many times a second; one that waits, or
 # was interrupted, prints nothing. So a tab is working while its turn is open
-# and its window printed something in the last WORKING_QUIET seconds.
+# and its window printed something in the last WORKING_QUIET seconds. That is
+# generous, because a busy agent can go quiet for over 10 seconds mid-turn.
+# A tab hat-attn flagged as waiting on approval or a question gets only
+# WORKING_WAIT_QUIET: its prompt is on screen, and a prompt is still. The
+# flag stays after the human answers, but by then the agent is printing.
 #
 # The watcher looks every WATCH_WORKING_EVERY seconds: one ssh round trip per
 # destination (over hatter's control master), and a cmux call only when a
 # workspace's status changes. "prefs": {"working_status": "off"} turns it off
 # and clears what it set.
 WORKING_KEY=hatter_working
-WORKING_QUIET=10
+WORKING_QUIET=30
+WORKING_WAIT_QUIET=8
 WORKING_COLOR='#ff453a'
 WORKING_ICON=bolt.fill
 WATCH_WORKING_EVERY=5
@@ -12192,16 +12197,17 @@ WATCH_WORKING_LAST=0
 WATCH_WORKING_SHOWN=""   # "<workspace id> TAB <label>": what the watcher set
 WATCH_WORKING_KNOWN=0    # 0 until a round since the stream opened has run
 
-# What runs on a server: its clock, then every window with its open turn and
-# last output.
-WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_name}	#{@hatter-working}	#{window_activity}" 2>/dev/null || true'
+# What runs on a server: its clock, then every window with its open turn, last
+# output and what hat-attn says it waits for.
+WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}" 2>/dev/null || true'
 
 # working_tabs: WORKING_SH's output on stdin; prints "<session> TAB <tab>" for
 # each working tab. Without the clock line nothing counts.
 working_tabs() {
-    awk -F '\t' -v q="$WORKING_QUIET" '
+    awk -F '\t' -v q="$WORKING_QUIET" -v wq="$WORKING_WAIT_QUIET" '
         $1 == "N" && $2 ~ /^[0-9]+$/ { now = $2; next }
-        $1 == "W" && now != "" && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ && now - $5 <= q { print $2 "\t" $3 }'
+        $1 == "W" && now != "" && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ \
+            && now - $5 <= (($6 == "approval" || $6 == "question") ? wq : q) { print $2 "\t" $3 }'
 }
 
 # working_labels <recorded> <tabs> <workspaces>: one "<id> TAB <label>" for each
@@ -15349,9 +15355,10 @@ config.
 The watcher also marks each workspace whose agent is busy, with a status in
 cmux's sidebar next to the unread badge: "working: api, docs" names the busy
 tabs. A tab is busy while its agent's turn is open (hat-attn's
-@hatter-working) and the tab printed something in the last 10 seconds, so a
-turn waiting on a permission prompt or a question, or one you interrupted,
-does not count. It looks every 5 seconds, one ssh round trip per server. cmux
+@hatter-working) and the tab printed something in the last 30 seconds, or 8
+seconds once hat-attn has flagged a permission prompt or a question. So a
+turn waiting on you stops counting within seconds, and one you interrupted
+within half a minute. It looks every 5 seconds, one ssh round trip per server. cmux
 cannot mark a single mirrored tab, so the mark is per workspace. Turn it off
 with "prefs": {"working_status": "off"}.
 

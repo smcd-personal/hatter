@@ -38,9 +38,14 @@ set +e
 T=$'\t'
 
 # --- working_tabs --------------------------------------------------------------
-out=$(printf 'N\t1000\nW\ts\tbusy\t990\t998\nW\ts\tquiet\t900\t950\nW\ts\tdone\t\t1000\nW\ts\tedge\t1\t990\nW\ts\tbad\tx\t1000\n' | working_tabs)
+out=$(printf 'N\t1000\nW\ts\tbusy\t990\t998\t\nW\ts\tquiet\t900\t950\t\nW\ts\tdone\t\t1000\t\nW\ts\tedge\t1\t970\t\nW\ts\tbad\tx\t1000\t\n' | working_tabs)
 expect "working_tabs: open and printing counts, quiet or closed does not" \
     "$(is "$out" "s${T}busy"$'\n'"s${T}edge")"
+# A tab flagged as waiting on the human goes idle sooner: 10s quiet is idle
+# with approval or question, busy with done or no flag; printing is busy.
+out=$(printf 'N\t1000\nW\ts\tappr\t1\t990\tapproval\nW\ts\tques\t1\t990\tquestion\nW\ts\tdone\t1\t990\tdone\nW\ts\tnone\t1\t990\t\nW\ts\tresumed\t1\t998\tapproval\n' | working_tabs)
+expect "working_tabs: a prompt on screen is idle after a short quiet, a resumed one busy" \
+    "$(is "$out" "s${T}done"$'\n'"s${T}none"$'\n'"s${T}resumed")"
 out=$(printf 'W\ts\tbusy\t990\t998\n' | working_tabs)
 expect "working_tabs: no server clock, nothing counts" "$(is "$out" "")"
 
