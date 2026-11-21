@@ -16442,6 +16442,18 @@ Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
 goes back a level, `q` quits from anywhere. Esc at a question cancels the whole
 action. Takes no options.
 
+The selected row is shown three ways: a ▸ marker, reverse video, and the
+terminal's cursor, which sits on the marker and stays visible. A screen
+magnifier or screen reader that follows the cursor follows the selection, and
+each arrow key moves the cursor to the new row. A redraw writes over the old
+screen instead of clearing it first, so only rows that changed are new text.
+Questions and the output of an action appear below the screen, with the cursor.
+
+With a screen reader, have it follow the cursor, and read the cursor's line
+after each move: that line is the row's number, name and status. The keys for
+the screen are its last lines. A number jumps straight to a row (on the top
+screen, a letter jumps to a credential), so a long list need not be walked.
+
 `hatter` on its own opens the rack. `hatter edit` is the old name and still
 works.
 USAGE
