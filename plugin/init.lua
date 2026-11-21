@@ -30,6 +30,11 @@ local function default_config_path()
   return base .. '/hatter/config.json'
 end
 
+-- The folder a file is in, for either slash.
+local function dir_of(path)
+  return (path:gsub('[/\\][^/\\]*$', ''))
+end
+
 -- The same quoting bin/hatter uses for the remote shell: single-quote
 -- everything, except that "$HOME" and "~" must reach the remote shell
 -- unquoted to mean anything.
@@ -57,11 +62,11 @@ end
 -- would be read by ssh as an option, so it is refused, as bin/hatter does.
 function M.ssh_args(opts, hat, session)
   if type(hat) ~= 'table' then
-    return nil, 'not in the config'
+    return nil, 'is not in the config'
   end
   local dest = hat.ssh
   if type(dest) ~= 'string' or dest == '' or dest:sub(1, 1) == '-' then
-    return nil, 'no usable ssh destination'
+    return nil, 'has no usable ssh destination (it is empty or starts with "-")'
   end
   local remote = 'tmux new-session -A -s ' .. sq(session)
     .. ' -c ' .. sq_dir(hat.remote_dir or '$HOME')
@@ -75,12 +80,16 @@ function M.read(opts)
   local f, err = io.open(path, 'r')
   if not f then
     return nil, 'cannot read ' .. path .. ': ' .. tostring(err)
+      .. '. Clone your hatter config to that folder, or pass config_path to'
+      .. ' hatter.apply_to_config in your WezTerm config.'
   end
   local text = f:read '*a'
   f:close()
   local ok, cfg = pcall(wezterm.json_parse, text)
   if not ok or type(cfg) ~= 'table' then
-    return nil, path .. ' is not valid JSON'
+    return nil, path .. ' is not valid JSON. Fix it by hand, or, if the'
+      .. ' folder is a git clone, go back to the last committed copy with:'
+      .. ' git -C ' .. dir_of(path) .. ' checkout -- ' .. path:match '[^/\\]*$'
   end
   return cfg
 end
@@ -110,9 +119,63 @@ local function hat_names(cfg)
   return names
 end
 
-local function notify(window, msg)
-  wezterm.log_warn('hatter: ' .. msg)
+-- Every message, success or failure, also goes to a plain text log the user
+-- can open in any editor or screen reader after the toast or overlay is gone:
+-- ${XDG_STATE_HOME:-~/.local/state}/hatter/wezterm.log, beside hatter's own
+-- state, unless opts.log_path says otherwise.
+local function default_log_path()
+  local base = os.getenv 'XDG_STATE_HOME'
+  if not base or base == '' then
+    base = wezterm.home_dir .. '/.local/state'
+  end
+  return base .. '/hatter/wezterm.log'
+end
+
+-- Append one message to the log. Returns the log's path, or nil if it could
+-- not be written, which never stops the message being shown.
+local function log(opts, level, msg)
+  local path = opts.log_path or default_log_path()
+  local f = io.open(path, 'a')
+  if not f then
+    -- Lua cannot make a directory, so ask the OS once, then try again.
+    local dir = dir_of(path)
+    local mkdir = { 'mkdir', '-p', dir }
+    if (wezterm.target_triple or ''):find 'windows' then
+      mkdir = { 'cmd.exe', '/c', 'mkdir', (dir:gsub('/', '\\')) }
+    end
+    pcall(wezterm.run_child_process, mkdir)
+    f = io.open(path, 'a')
+  end
+  if not f then return nil end
+  f:write(os.date '%Y-%m-%d %H:%M:%S', ' ', level, ': ',
+    (msg:gsub('\r?\n', '\n    ')), '\n')
+  f:close()
+  return path
+end
+
+-- A success: a toast is enough, as nothing needs doing; the log keeps it.
+local function notify(window, opts, msg)
+  wezterm.log_info('hatter: ' .. msg)
+  log(opts, 'info', msg)
   window:toast_notification('hatter', msg, nil, 5000)
+end
+
+-- A failure stays on screen until the user closes it. A toast is gone in five
+-- seconds and is drawn by the OS, which may never read it out, so it would
+-- take the reason the action failed with it. PromptInputLine shows free
+-- text, newlines kept, on every platform since WezTerm 20230408; Enter closes
+-- it, and so does Escape on an empty line. Whatever is typed is ignored.
+local function fail(window, pane, opts, msg)
+  wezterm.log_warn('hatter: ' .. msg)
+  local path = log(opts, 'error', msg)
+  local text = 'hatter: ' .. msg .. '\n\n'
+  if path then
+    text = text .. 'This message is also kept in ' .. path .. '\n'
+  end
+  window:perform_action(act.PromptInputLine {
+    description = text .. 'Press Enter to close.',
+    action = wezterm.action_callback(function() end),
+  }, pane or window:active_pane())
 end
 
 -- Switch to the hat's workspace and the session's tab, opening either if it
@@ -120,7 +183,10 @@ end
 function M.open(window, opts, cfg, hat_name, session)
   local args, err = M.ssh_args(opts, cfg.hats[hat_name], session)
   if not args then
-    notify(window, "hat '" .. hat_name .. "': " .. err)
+    fail(window, nil, opts, "cannot open workspace '" .. session .. "': hat '"
+      .. hat_name .. "' " .. err .. '. On a machine with hatter, run: hatter hat add '
+      .. hat_name .. ' --ssh user@host, then hatter backup. Then choose'
+      .. " 'Update config from git' in this picker.")
     return
   end
 
@@ -164,20 +230,28 @@ local function prompt_new(window, pane, opts, cfg, hat_name)
 end
 
 function M.pull(window, opts)
-  local path = opts.config_path or default_config_path()
-  local dir = path:gsub('[/\\][^/\\]*$', '')
+  local dir = dir_of(opts.config_path or default_config_path())
   -- run_child_process raises, rather than returning false, when git cannot
   -- be started at all (not on PATH).
   local called, ok, out, errout = pcall(wezterm.run_child_process, {
     'git', '-C', dir, 'pull', '--ff-only',
   })
   if not called then
-    notify(window, 'git pull failed: ' .. tostring(ok))
+    fail(window, nil, opts, 'could not run git to update the config: '
+      .. tostring(ok) .. '\nInstall Git, make sure it is on PATH, and restart WezTerm.')
+    return
+  end
+  if not ok then
+    -- git's own words say why; a failed pull reports on stderr.
+    local why = ((errout ~= '' and errout) or out or ''):gsub('%s+$', '')
+    fail(window, nil, opts, 'git pull in ' .. dir .. ' failed:\n\n' .. why
+      .. '\n\nFix it in a terminal (cd ' .. dir .. ', then git status),'
+      .. " then choose 'Update config from git' again.")
     return
   end
   -- git reports some of a successful pull on stderr, so show whichever has it.
   local msg = ((out ~= '' and out) or errout or ''):gsub('%s+$', '')
-  notify(window, (ok and 'config updated: ' or 'git pull failed: ') .. msg)
+  notify(window, opts, 'config updated: ' .. msg)
 end
 
 -- The picker: every workspace, a "new workspace" line per hat, and a line to
@@ -187,7 +261,7 @@ function M.picker(opts)
   return wezterm.action_callback(function(window, pane)
     local cfg, err = M.read(opts)
     if not cfg then
-      notify(window, err)
+      fail(window, pane, opts, err)
       return
     end
 
@@ -232,6 +306,8 @@ end
 -- opts.config_path  hatter's config.json  (default ~/.config/hatter/config.json)
 -- opts.ssh          the ssh to run        (default "ssh", which on Windows is
 --                                          the built-in OpenSSH client)
+-- opts.log_path     where messages are kept (default
+--                                          ~/.local/state/hatter/wezterm.log)
 function M.apply_to_config(config, opts)
   opts = opts or {}
 

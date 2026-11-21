@@ -26,13 +26,19 @@ jobs:
       - name: shellcheck
         run: |
           command -v shellcheck >/dev/null || brew install shellcheck
-          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh tests/drag-plan.sh tests/drag-heal.sh tests/sync-keep-running.sh tests/hat-restore-names.sh tests/focus-restore.sh tests/unassigned.sh tests/find.sh tests/registry-history.sh tests/watch-detached.sh tests/find-resume.sh tests/launch-suspend.sh tests/tab-rename.sh tests/unreachable-reason.sh tests/manpage.sh
+          shellcheck --severity=error bin/hatter file-issues.sh tools/install-termux.sh tests/drag-plan.sh tests/drag-heal.sh tests/sync-keep-running.sh tests/hat-restore-names.sh tests/focus-restore.sh tests/unassigned.sh tests/find.sh tests/registry-history.sh tests/watch-detached.sh tests/find-resume.sh tests/launch-suspend.sh tests/tab-rename.sh tests/unreachable-reason.sh tests/manpage.sh tests/wezterm-plugin.sh
 
       - name: Help runs with no config and no cmux
         run: |
           HOME="$(mktemp -d)"; export HOME
           /bin/bash bin/hatter --help >/dev/null
           /bin/bash bin/hatter help provision >/dev/null
+
+      # tests/wezterm-plugin.sh needs a Lua; the Windows job runs it again
+      # under WezTerm's own.
+      - name: Lua, for the WezTerm plugin test
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
 
       - name: Tests
         run: for t in tests/*.sh; do /bin/bash "$t"; done
@@ -201,3 +207,18 @@ jobs:
           $entries
           if ($entries.Count -ne 2) { $out; throw "expected 2 entries, got $($entries.Count)" }
           if ($out -notmatch [regex]::Escape("ssh ci@127.0.0.1 tmux new-session -A -s 'ci two' -c `"`$HOME`"")) { throw 'wrong ssh command' }
+
+      - name: The plugin's messages, under WezTerm's Lua on Windows
+        shell: pwsh
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP 'msgs'
+          New-Item -ItemType Directory "$d\state", "$d\home\.local\state\hatter", "$d\cfg" | Out-Null
+          $env:HATTER_PLUGIN = "$env:GITHUB_WORKSPACE\plugin\init.lua" -replace '\\','/'
+          $env:HATTER_TEST_DIR = $d -replace '\\','/'
+          $env:HATTER_TEST_OUT = "$d\result"
+          Remove-Item Env:XDG_STATE_HOME -ErrorAction SilentlyContinue
+          $out = & "$env:ProgramFiles\WezTerm\wezterm.exe" --config-file "$env:GITHUB_WORKSPACE\tests\wezterm-plugin.lua" ls-fonts 2>&1 | Out-String
+          if (-not (Test-Path "$d\result")) { $out; throw 'wezterm-plugin.lua wrote no result' }
+          $r = (Get-Content "$d\result" -Raw).Trim()
+          if ($r -ne 'PASS') { $r; throw 'wezterm-plugin.lua failed' }
+          'wezterm-plugin: all passed'
