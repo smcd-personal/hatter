@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="624" height="580" viewBox="0 0 624 580" role="img" aria-label="hatter">
+<svg xmlns="http://www.w3.org/2000/svg" width="624" height="580" viewBox="0 0 624 580" role="img" aria-labelledby="banner-title banner-desc">
+<title id="banner-title">hatter banner</title>
+<desc id="banner-desc">A wizard hat with terminal boxes inside it - bash, claude, codex, tmux, ssh, cmux and git - and two more hats behind it.</desc>
 <rect width="624" height="580" rx="10" fill="#0d1117"/>
 <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,&quot;Liberation Mono&quot;,monospace" font-size="14" xml:space="preserve">
 <text y="31.0"><tspan x="202.8" fill="#8f6fb5" textLength="16.8" lengthAdjust="spacingAndGlyphs">/\</tspan><tspan x="404.4" fill="#5f8f8f" textLength="16.8" lengthAdjust="spacingAndGlyphs">/\</tspan></text>

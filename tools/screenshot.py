@@ -7,6 +7,17 @@ coloured by the same rules. GitHub strips ANSI from markdown, so a coloured
 screenshot has to be an image; it is still characters, one <tspan> per colour
 run pinned to its column."""
 
+def readme_alt(src):
+    """The README's alt text for <src>. The SVG's <desc> is the same text, so
+    the image is described when opened on its own, and the README stays the
+    one place that text is written (tests/svg-a11y.sh checks they agree)."""
+    import html, os, re
+    readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
+    m = re.search(r'<img src="%s" alt="([^"]+)"' % re.escape(src), open(readme).read())
+    assert m, "README.md has no alt text for " + src
+    return html.unescape(m.group(1))
+
+
 BG, FG, DIM, BOLD = "#0d1117", "#c9d1d9", "#6e7681", "#f0f6fc"
 GREEN, YELLOW, RED, CYAN = "#7ee787", "#e3b341", "#ff7b72", "#56d4dd"
 SEL_BG, SEL_FG = "#c9d1d9", "#0d1117"
@@ -107,7 +118,10 @@ w, h = COLS * CW + 2 * PAD, len(lines) * LH + 2 * PAD
 esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0f}" height="{h:.0f}" '
-       f'viewBox="0 0 {w:.0f} {h:.0f}" role="img" aria-label="hatter rack">',
+       f'viewBox="0 0 {w:.0f} {h:.0f}" role="img" '
+       'aria-labelledby="rack-title rack-desc">',
+       '<title id="rack-title">hatter rack screen</title>',
+       f'<desc id="rack-desc">{esc(readme_alt("rack.svg"))}</desc>',
        f'<rect width="{w:.0f}" height="{h:.0f}" rx="10" fill="{BG}"/>']
 body = ['<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'
         '&quot;Liberation Mono&quot;,monospace" '
