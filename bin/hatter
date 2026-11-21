@@ -639,8 +639,29 @@ hat_launch_conf() {
 # - the rack, and the cmux group headers under it. Eight names rather than free
 # hex: a name maps to both a terminal colour and the hex cmux wants, and eight
 # is as many as anyone can tell apart at a glance.
+#
+# "prefs": {"colorblind_safe": "on"} swaps each name for one colour of the
+# Okabe-Ito palette (Okabe and Ito, "Color Universal Design", 2008), the usual
+# reference for colours that stay apart under the common forms of colour
+# blindness. A hat keeps its name and its place in the set; only the shade
+# changes. The terminal gets the nearest xterm-256 colour, cmux the exact hex.
+# Okabe-Ito has no teal, so teal takes its yellow.
 HAT_COLOURS='amber green cyan blue violet rose teal slate'
+colorblind_safe() {
+    if [[ -z "${COLORBLIND_SAFE:-}" ]]; then
+        COLORBLIND_SAFE=$(cfg '.prefs.colorblind_safe // "off"' 2>/dev/null) || COLORBLIND_SAFE=off
+    fi
+    [[ "$COLORBLIND_SAFE" == on ]]
+}
 hat_colour_ansi() {
+    if colorblind_safe; then
+        case "$1" in
+            amber) printf 178 ;; green) printf  36 ;; cyan)  printf  74 ;; blue)  printf  25 ;;
+            violet) printf 175 ;; rose) printf 166 ;; teal)  printf 221 ;; slate) printf 246 ;;
+            *) printf 246 ;;
+        esac
+        return 0
+    fi
     case "$1" in
         amber) printf 179 ;; green) printf 114 ;; cyan)  printf  73 ;; blue)  printf  75 ;;
         violet) printf 140 ;; rose) printf 168 ;; teal)  printf  66 ;; slate) printf 145 ;;
@@ -648,11 +669,33 @@ hat_colour_ansi() {
     esac
 }
 hat_colour_hex() {
+    if colorblind_safe; then
+        case "$1" in
+            amber) printf '#e69f00' ;; green) printf '#009e73' ;; cyan)  printf '#56b4e9' ;;
+            blue)  printf '#0072b2' ;; violet) printf '#cc79a7' ;; rose) printf '#d55e00' ;;
+            teal)  printf '#f0e442' ;; slate) printf '#999999' ;; *) printf '#999999' ;;
+        esac
+        return 0
+    fi
     case "$1" in
         amber) printf '#d7af5f' ;; green) printf '#87d787' ;; cyan)  printf '#5fafaf' ;;
         blue)  printf '#5fafff' ;; violet) printf '#af87d7' ;; rose) printf '#d75f87' ;;
         teal)  printf '#5f8f8f' ;; slate) printf '#afafaf' ;; *) printf '#afafaf' ;;
     esac
+}
+
+# hat_palette_hex <hex>: true when <hex> is one of the hat colours, in either
+# palette. sync writes the colour cmux shows back into the config, so a group
+# that inherited its hat's colour ends up with that hex recorded as its own;
+# this is how apply_group_style still tells it from one the user picked.
+hat_palette_hex() {
+    local h
+    h=$(printf '%s' "$1" | tr 'A-F' 'a-f')
+    case "$h" in
+        '#d7af5f'|'#87d787'|'#5fafaf'|'#5fafff'|'#af87d7'|'#d75f87'|'#5f8f8f'|'#afafaf') return 0 ;;
+        '#e69f00'|'#009e73'|'#56b4e9'|'#0072b2'|'#cc79a7'|'#d55e00'|'#f0e442'|'#999999') return 0 ;;
+    esac
+    return 1
 }
 
 # An unassigned hat gets one from its own name, not from its position in the
@@ -2106,8 +2149,10 @@ apply_group_style() {
     local group="$1" ref="$2" color icon pinned collapsed hat
     color=$(cfg --arg g "$group" '.groups[$g].color // empty')
     # A group with a colour of its own keeps it; one without inherits its hat's,
-    # so the sidebar shows at a glance which hat a group belongs to.
-    if [[ -z "$color" || "$color" == "null" ]]; then
+    # so the sidebar shows at a glance which hat a group belongs to. A recorded
+    # hat colour counts as inherited (see hat_palette_hex), so it follows the
+    # hat and prefs.colorblind_safe.
+    if [[ -z "$color" || "$color" == "null" ]] || hat_palette_hex "$color"; then
         hat=$(group_hat "$group")
         [[ -n "$hat" ]] && color=$(hat_colour_hex "$(hat_colour "$hat")")
     fi
@@ -13778,6 +13823,10 @@ colour_setup() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
         C_DIM=$'\033[2m'; C_B=$'\033[1m'; C_R=$'\033[0m'; C_SEL=$'\033[7m'
         C_CY=$'\033[36m'; C_GR=$'\033[32m'; C_YL=$'\033[33m'; C_RD=$'\033[31m'
+        # Red against green is the pair colour blindness most often hides, so
+        # the safe palette shows good as blue. Red, yellow and blue stay apart
+        # under all three common forms, and the terminal theme sets the shade.
+        if colorblind_safe; then C_GR=$'\033[34m'; fi
     else
         C_DIM=""; C_B=""; C_R=""; C_SEL=""
         C_CY=""; C_GR=""; C_YL=""; C_RD=""
@@ -15680,6 +15729,15 @@ Subcommands:
   hatter hat add cloud --ssh you@shell.example.com
   hatter hat set cloud --kind claude --args claude='--permission-mode auto'
   hatter hat status
+
+Each hat has a colour, shown on its rack icon and on its cmux group headers:
+one of amber, green, cyan, blue, violet, rose, teal or slate, set with
+"color" in the hat's config entry or else picked from its name. A group with
+a "color" of its own keeps it. "prefs": {"colorblind_safe": "on"} in the
+config switches to colours that stay apart under colour blindness: each hat
+colour becomes one of the Okabe-Ito palette, and green status text (up,
+active, capacity left) becomes blue. cmux group colours follow at the next
+`hatter restore`.
 
 Hats that share an ssh destination share one tmux server, so they must agree
 on --kind and on each kind's --args; provision refuses if they do not. Each
