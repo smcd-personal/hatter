@@ -141,6 +141,17 @@ local function run()
   check(pane == mypane, "unreadable config: the overlay is not on the picker's pane")
   check(#calls.toasts == 0, 'unreadable config: still went to a toast')
 
+  -- 4b. The config is there but is not JSON (the stub parses nothing).
+  reset()
+  local f = assert(io.open(opts.config_path, 'w'))
+  f:write '{ not json'
+  f:close()
+  M.picker(opts)(window, mypane)
+  o = overlay()
+  check(o and has(o.description, 'is not valid JSON')
+    and has(o.description, 'git -C "' .. cfgdir .. '" diff'), 'invalid JSON: no overlay with the fix')
+  os.remove(opts.config_path)
+
   -- 5. A hat whose destination would be read as an ssh option.
   reset()
   local cfg = { hats = { bad = { ssh = '-oProxyCommand=x' } } }

@@ -87,9 +87,11 @@ function M.read(opts)
   f:close()
   local ok, cfg = pcall(wezterm.json_parse, text)
   if not ok or type(cfg) ~= 'table' then
-    return nil, path .. ' is not valid JSON. Fix it by hand, or, if the'
-      .. ' folder is a git clone, go back to the last committed copy with:'
-      .. ' git -C ' .. dir_of(path) .. ' checkout -- ' .. path:match '[^/\\]*$'
+    local git = 'git -C "' .. dir_of(path) .. '" '
+    return nil, path .. ' is not valid JSON. Fix it by hand. If the folder is'
+      .. ' a git clone, ' .. git .. 'diff shows what changed since the last'
+      .. ' commit, and ' .. git .. 'checkout -- ' .. path:match '[^/\\]*$'
+      .. ' throws that change away.'
   end
   return cfg
 end
@@ -245,7 +247,7 @@ function M.pull(window, opts)
     -- git's own words say why; a failed pull reports on stderr.
     local why = ((errout ~= '' and errout) or out or ''):gsub('%s+$', '')
     fail(window, nil, opts, 'git pull in ' .. dir .. ' failed:\n\n' .. why
-      .. '\n\nFix it in a terminal (cd ' .. dir .. ', then git status),'
+      .. '\n\nFix it in a terminal (cd "' .. dir .. '", then git status),'
       .. " then choose 'Update config from git' again.")
     return
   end
