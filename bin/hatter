@@ -13636,31 +13636,94 @@ creds_colour() {
     esac
 }
 
-# Everything before the tail is fixed width: 8 columns of marker, label and
-# icon, 28 of email, a space, 9 of role, and 41 of gauges.
-CREDS_TAIL_COL=87
+# A credential row's columns, fitted to the terminal (#293). The rack, `creds
+# list` and the rack's header all lay a row out from these, so they agree.
+# Left to right: what leads the row (marker, letter, dot), the login, its role,
+# the 5h gauge, the 7d gauge, then the tail (marks, holders) in whatever is
+# left. At full width a gauge is bar, percent and time to reset, 16 columns.
+# CF_NAME is the login's width; the rest say whether a part shows.
+# CF_WIDTH is the width they were fitted to.
+CF_NAME=28 CF_ROLE=1 CF_BAR=1 CF_ETA5=1 CF_ETA7=1 CF_USED=87 CF_WIDTH=200
 
-# The role column: personal or team, padded so the gauges line up.
-creds_role() { printf '%s%-8s%s ' "$C_DIM" "${1:--}" "$C_R"; }
+# creds_fit <width> <lead> <longest login> [room]: <room> is kept free after
+# the gauges, for marks that must show. When the row does not fit, like ps,
+# what matters least goes first: the login is shortened, then the 7d reset
+# time goes, then the role, then the 5h reset, then the login is shortened
+# again, then the bars. The percentages, and the dot before the login, stay.
+# CF_USED is where the tail starts.
+creds_fit() {
+    local width="$1" lead="$2" step min
+    CF_WIDTH="$width" CF_NAME="$3" CF_ROLE=1 CF_BAR=1 CF_ETA5=1 CF_ETA7=1
+    width=$(( width - ${4:-0} ))
+    [[ $CF_NAME -le 28 ]] || CF_NAME=28
+    [[ $CF_NAME -ge 5 ]] || CF_NAME=5            # as wide as LOGIN
+    creds_fit_used "$lead"
+    for step in name:16 eta7 role eta5 name:10 bar name:6; do
+        [[ $CF_USED -gt $width ]] || break
+        case "$step" in
+            name:*)
+                min=${step#name:}
+                CF_NAME=$(( CF_NAME - (CF_USED - width) ))
+                [[ $CF_NAME -ge $min ]] || CF_NAME=$min ;;
+            eta7) CF_ETA7=0 ;;
+            role) CF_ROLE=0 ;;
+            eta5) CF_ETA5=0 ;;
+            bar)  CF_BAR=0 ;;
+        esac
+        # A shorter login can only help; the rest never go back.
+        creds_fit_used "$lead"
+    done
+    return 0
+}
+
+# A gauge's width: the bar and a space, the percent, a space and the reset.
+creds_gauge_w() { printf '%s' $(( CF_BAR * 7 + 4 + $1 * 5 )); }
+
+creds_fit_used() {
+    CF_USED=$(( $1 + CF_NAME + 1 + CF_ROLE * 9 + 3 + $(creds_gauge_w "$CF_ETA5") \
+                + 3 + 3 + $(creds_gauge_w "$CF_ETA7") ))
+}
+
+# The role column: personal or team, padded so the gauges line up. Nothing
+# once the role has been fitted out.
+creds_role() {
+    [[ "$CF_ROLE" == 1 ]] || return 0
+    printf '%s%-8s%s ' "$C_DIM" "${1:--}" "$C_R"
+}
 
 # What follows the gauges, cut to fit. A wrapped row would push every row under
 # it out of alignment, which is worse than losing the end of a hat list. The
 # "active" marker is reserved first when it fits at all, because which login
 # this Mac is using matters more than the tail of the list.
-# creds_marks <marks>: the plain text for a row's marks ("active", "best").
+# creds_marks <marks> [short 0|1]: the plain text for a row's marks ("active",
+# "best"). The short form is for a row with little room left (#293).
 creds_marks() {
+    if [[ "${2:-0}" == 1 ]]; then
+        case ",$1," in *,best,*) printf '  next' ;; esac
+        case ",$1," in *,active,*) printf '  active' ;; esac
+        return 0
+    fi
     case ",$1," in *,best,*) printf '  <- next' ;; esac
     case ",$1," in *,active,*) printf '  <- active on this Mac' ;; esac
     return 0
+}
+
+# The room creds_fit keeps after the gauges for the rows' marks: a login in
+# use on this Mac must still say so on a narrow terminal (#293).
+creds_marks_room() {
+    local m
+    case ",$1," in *,active,*) m=$(creds_marks active 1); printf '%s' "${#m}" ;; *) printf 0 ;; esac
 }
 
 creds_tail() {
     local avail="$1" holders="$2" active="$3" act="" hold="" m
     # Each mark is fitted on its own, active first, so a narrow row loses
     # "next" before it loses both.
+    local short
     for m in active best; do
         case ",$active," in *,"$m",*)
-            m=$(creds_marks "$m")
+            short=$(creds_marks "$m" 1); m=$(creds_marks "$m")
+            [[ ${#m} -le $avail ]] || m="$short"
             [[ ${#m} -le $avail ]] && { act="$act$m"; avail=$((avail - ${#m})); } ;;
         esac
     done
@@ -13735,28 +13798,52 @@ creds_health() {
     printf '%s' "$CREDS_LEVEL"
 }
 
-# One window: bar + percent + time to reset, 16 columns. A window the plan does
-# not have reads "none", as secondary text, in the same width so the next one
-# lines up.
+# creds_gauge <rem> <eta> [reset shown 0|1]: one window, bar + percent + time to
+# reset, 16 columns at full width (creds_fit can take the bar and the reset
+# away). A window the plan does not have reads "none", as secondary text, in
+# the same width so the next one lines up; the other words get shorter as it
+# does.
 creds_gauge() {
-    local r="$1" e="$2"
+    local r="$1" e="$2" eta="${3:-1}" w out=""
+    w=$(creds_gauge_w "$eta")
     if [[ "$r" == "-" || -z "$r" ]]; then
-        printf '%s%-16s%s' "$C_DIM" "none" "$C_R"; return 0
+        printf '%s%-*s%s' "$C_DIM" "$w" "none" "$C_R"; return 0
     fi
     # "?": the reading failed, which is not the same as a full or empty window.
     if [[ "$r" == "?" ]]; then
-        printf '%s%-16s%s' "$C_YL" "unknown" "$C_R"; return 0
+        out="unknown"; [[ ${#out} -le $w ]] || out="?"
+        printf '%s%-*s%s' "$C_YL" "$w" "$out" "$C_R"; return 0
     fi
     # "h": a Codex login out on a hat, deliberately not read from here.
     if [[ "$r" == "h" ]]; then
-        printf '%s%-16s%s' "$C_DIM" "not read: on hat" "$C_R"; return 0
+        out="not read: on hat"; [[ ${#out} -le $w ]] || out="on hat"
+        [[ ${#out} -le $w ]] || out="hat"
+        printf '%s%-*s%s' "$C_DIM" "$w" "$out" "$C_R"; return 0
     fi
-    printf '%s %3s%% %4s' "$(creds_bar "$r")" "$r" "$(creds_eta "$e")"
+    [[ "$CF_BAR" == 1 ]] && out="$(creds_bar "$r") "
+    out="$out$(printf '%3s%%' "$r")"
+    [[ "$eta" == 1 ]] && out="$out$(printf ' %4s' "$(creds_eta "$e")")"
+    printf '%s' "$out"
 }
 
 # 5h and 7d remaining.
 creds_gauges() {
-    printf '5h %s   7d %s' "$(creds_gauge "$1" "$3")" "$(creds_gauge "$2" "$4")"
+    printf '5h %s   7d %s' "$(creds_gauge "$1" "$3" "$CF_ETA5")" \
+        "$(creds_gauge "$2" "$4" "$CF_ETA7")"
+}
+
+# The column names over credential rows, laid out as creds_fit laid the rows
+# out. <tail> is the room left after the gauges, for HELD BY.
+creds_header() {
+    local name="$1" tail="$2" g5 g7 h5="5H WINDOW" h7="7D WINDOW" out
+    g5=$(( 3 + $(creds_gauge_w "$CF_ETA5") )); g7=$(( 3 + $(creds_gauge_w "$CF_ETA7") ))
+    [[ ${#h5} -le $g5 ]] || h5="5H"
+    [[ ${#h7} -le $g7 ]] || h7="7D"
+    out=$(printf '%-*s ' "$CF_NAME" "$name")
+    [[ "$CF_ROLE" == 1 ]] && out="$out$(printf '%-8s ' ROLE)"
+    out="$out$(printf '%-*s   %-*s' "$g5" "$h5" "$g7" "$h7")"
+    [[ $tail -ge 9 ]] && out="$out  HELD BY"
+    printf '%s' "$out"
 }
 
 # creds_all_rows: every login, Claude first, each row led by its agent:
@@ -14071,16 +14158,17 @@ codex_push_to() {
 
 # creds_list_row <agent> <letter> <email> <org> <role> <r5> <r7> <e5> <e7> <active> [shown]
 # <shown> is what the row prints where the email goes; it defaults to the email.
+# Laid out by creds_fit, with CREDS_LIST_LEAD columns before the login.
+CREDS_LIST_LEAD=6
 creds_list_row() {
     local agent="$1" letter="$2" email="$3" org="$4" role="$5"
     local r5="$6" r7="$7" e5="$8" e7="$9" active="${10}" shown="${11:-$3}" holders n
     if [[ "$agent" == codex ]]; then holders=$(codex_hats_holding "$email" "$org")
     else holders=$(creds_hats_holding "$email" "$org"); fi
-    printf '  %s %s %-28s %s%s%s%s\n' \
-        "$letter" "$(creds_dot "$r5" "$r7")" "$shown" "$(creds_role "$role")" \
-        "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
-        "$(m=$(creds_marks "$active"); printf '%s' "${m:+${C_CY}${m}${C_R}}")" \
-        "${holders:+  ${C_DIM}-> $holders${C_R}}"
+    printf '  %s %s %-*s %s%s%s\n' \
+        "$letter" "$(creds_dot "$r5" "$r7")" "$CF_NAME" "$(edit_trunc "$shown" "$CF_NAME")" \
+        "$(creds_role "$role")" "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+        "$(creds_tail $((CF_WIDTH - CF_USED)) "$holders" "$active")"
     # A Codex refresh token rotates on use: two hats on one login log each
     # other out. Claude tolerates it better, so only Codex gets the warning.
     if [[ "$agent" == codex && "$holders" == *", "* ]]; then
@@ -14095,7 +14183,17 @@ cmd_creds() {
         list|ls|"")
             colour_setup
             local agent letter slot email org role label r5 r7 e5 e7 active seen="" shown
+            local rows cols longest=5 marks=""
             have_cswap || warn "cswap is not installed - no Claude logins (uv tool install claude-swap)"
+            # Laid out to the terminal's width, as the rack is (#293).
+            rows=$(creds_all_rows); cols=$(term_cols)
+            while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 active; do
+                [[ -z "$email" ]] && continue
+                shown="$email"; [[ "$agent" == codex ]] && shown="$email ($slot)"
+                [[ ${#shown} -le $longest ]] || longest=${#shown}
+                marks="$marks,$active"
+            done <<< "$rows"
+            creds_fit "$cols" "$CREDS_LIST_LEAD" "$longest" "$(creds_marks_room "$marks")"
             while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 if [[ "$agent" != "$seen" ]]; then
@@ -14111,20 +14209,38 @@ cmd_creds() {
                 [[ "$agent" == codex ]] && shown="$email ($slot)"
                 creds_list_row "$agent" "$letter" "$email" "$org" "$role" \
                     "$r5" "$r7" "$e5" "$e7" "$active" "$shown"
-            done < <(creds_all_rows)
+            done <<< "$rows"
             [[ -z "$seen" ]] && echo "No logins found: none in cswap, no ~/.codex-<name> homes."
             echo "  bars are capacity left, then time to the window reset;"
             echo "  'none' is a window the plan does not have"
             echo
             echo "Hats and the logins each one holds:"
-            local hat cred cx
+            # The host goes first when a line does not fit, then the end of
+            # the Claude login is cut (#293).
+            local hat cred cx host hw=4 sw=4 rw=0 room i
+            local -a lh=() lhost=() lrest=() lcx=()
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
                 cred=$(hat_credential "$hat")
                 cx=$(cfg --arg l "$hat" '.hats[$l].codex_credential_home // empty')
-                printf '  %-11s %-26s %s%s\n' "$hat" "$(hat_ssh "$hat")" \
-                    "${cred:-(no Claude login pushed)}" "${cx:+   codex: $cx}"
+                host=$(hat_ssh "$hat"); cred="${cred:-(no Claude login pushed)}"
+                cx="${cx:+   codex: $cx}"
+                lh+=("$hat"); lhost+=("$host"); lrest+=("$cred"); lcx+=("$cx")
+                [[ ${#hat} -le $hw ]] || hw=${#hat}
+                [[ ${#host} -le $sw ]] || sw=${#host}
+                [[ $(( ${#cred} + ${#cx} )) -le $rw ]] || rw=$(( ${#cred} + ${#cx} ))
             done < <(hat_names)
+            [[ $hw -le 11 ]] || hw=11
+            [[ $sw -le 26 ]] || sw=26
+            [[ $(( 2 + hw + 1 + sw + 1 + rw )) -le $cols ]] || sw=0
+            for ((i = 0; i < ${#lh[@]}; i++)); do
+                room=$(( cols - 2 - hw - 1 - ${#lcx[$i]} ))
+                [[ $sw -eq 0 ]] || room=$(( room - sw - 1 ))
+                [[ $room -ge 8 ]] || room=8
+                printf '  %-*s ' "$hw" "$(edit_trunc "${lh[$i]}" "$hw")"
+                [[ $sw -eq 0 ]] || printf '%-*s ' "$sw" "$(edit_trunc "${lhost[$i]}" "$sw")"
+                printf '%s%s\n' "$(edit_trunc "${lrest[$i]}" "$room")" "${lcx[$i]}"
+            done
             echo
             echo "Push one with: hatter creds push <letter> <hat>"
             ;;
@@ -14643,17 +14759,60 @@ edit_below() {
 # a warning that belongs above everything else on the screen. It starts the
 # screen's frame.
 edit_header() {
+    local w
     edit_frame_begin
     [[ "$EDIT_FRAME" == 1 ]] || printf '\033[H\033[2J'
-    printf '%s────%s hatter rack %s──────────────────────────────────────────%s\n' \
-        "$C_RULE" "$C_R" "$C_RULE" "$C_R"
-    printf '  %s%s%s\n' "$C_CY" "${1:-all hats}" "$C_R"
+    # The rules are 58 columns, or the terminal's width when that is less, and
+    # a long path keeps its end, the level being shown (#293).
+    w=$(term_cols); [[ $w -le 58 ]] || w=58
+    printf '%s────%s hatter rack %s%s%s\n' \
+        "$C_RULE" "$C_R" "$C_RULE" "$(edit_rule $((w - 17)))" "$C_R"
+    printf '  %s%s%s\n' "$C_CY" "$(edit_trunc_left "${1:-all hats}" $((w - 2)))" "$C_R"
     [[ -n "${6:-}" ]] && printf '  %s%s%s\n' "$C_YL" "$6" "$C_R"
-    printf '%s──────────────────────────────────────────────────────────%s\n' "$C_RULE" "$C_R"
-    printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$2" "$C_R" "$C_DIM" "$3" "$C_R"
-    [[ -n "${4:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$4" "$C_R"
-    [[ -n "${5:-}" ]] && printf '     %s%s%s\n' "$C_DIM" "$5" "$C_R"
+    printf '%s%s%s\n' "$C_RULE" "$(edit_rule "$w")" "$C_R"
+    edit_caption "$2" "$3" "${4:-}" "${5:-}"
     printf '\n'
+}
+
+# edit_caption <title> <text> [line] [line]: "  TITLE  ·  text", and any further
+# lines under it, indented. Kept as written where it fits the terminal; where a
+# line would not, the whole caption is wrapped again to the width (#293).
+edit_caption() {
+    local title="$1" cols lead l fits=1 line="" room w
+    local -a words
+    shift
+    cols=$(term_cols); lead="  $title  ·  "
+    [[ $(( ${#lead} + ${#1} )) -le $cols ]] || fits=0
+    for l in "${@:2}"; do
+        [[ -z "$l" || $(( 5 + ${#l} )) -le $cols ]] || fits=0
+    done
+    if [[ $fits == 1 ]]; then
+        printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$title" "$C_R" "$C_DIM" "$1" "$C_R"
+        for l in "${@:2}"; do
+            [[ -z "$l" ]] || printf '     %s%s%s\n' "$C_DIM" "$l" "$C_R"
+        done
+        return 0
+    fi
+    read -r -a words <<< "$*"
+    room=$(( cols - ${#lead} ))
+    for w in ${words[@]+"${words[@]}"}; do
+        if [[ -n "$line" && $(( ${#line} + 1 + ${#w} )) -gt $room ]]; then
+            edit_caption_line "$title" "$line"; title=""; room=$(( cols - 5 )); line="$w"
+        else
+            line="${line:+$line }$w"
+        fi
+    done
+    [[ -z "$line" ]] || edit_caption_line "$title" "$line"
+    return 0
+}
+
+# One line of a wrapped caption: the first carries the title.
+edit_caption_line() {
+    if [[ -n "$1" ]]; then
+        printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$1" "$C_R" "$C_DIM" "$2" "$C_R"
+    else
+        printf '     %s%s%s\n' "$C_DIM" "$2" "$C_R"
+    fi
 }
 
 # edit_row <index> <selected-index> <name> <width> <meta...>
@@ -14663,6 +14822,9 @@ edit_header() {
 # passed, so the four call sites stay readable.
 ROW_LABEL=""
 ROW_ICON=""
+# The columns before the name: a space, the marker and a space, the label, a
+# space, a one-column icon and a space. The hat icon is two columns wider.
+EDIT_ROW_LEAD=8
 
 edit_row() {
     local i="$1" sel="$2" name="$3" w="$4"; shift 4
@@ -14678,9 +14840,23 @@ edit_row() {
         "$open" "$w" "$(edit_trunc "$name" "$w")" "$close" "$*"
 }
 
+# The keys every level shares, then the screen's own: on one line when they
+# fit the terminal, on two when they do not (#293).
 edit_keys() {
-    printf '\n  %s↑↓ move   → enter open   ← esc back   1-9 jump   %s%s\n' \
-        "$C_DIM" "$1" "$C_R"
+    local common="↑↓ move   → enter open   ← esc back   1-9 jump"
+    if [[ $(( 2 + ${#common} + 3 + ${#1} )) -le $(term_cols) ]]; then
+        printf '\n  %s%s   %s%s\n' "$C_DIM" "$common" "$1" "$C_R"
+    else
+        printf '\n  %s%s%s\n  %s%s%s\n' "$C_DIM" "$common" "$C_R" "$C_DIM" "$1" "$C_R"
+    fi
+}
+
+# edit_rule <n>: a horizontal rule <n> columns long.
+edit_rule() {
+    local n="$1" out=""
+    # braces required: bash 3.2 reads the rule character as part of the name
+    while [[ $n -gt 0 ]]; do out="${out}─"; n=$((n - 1)); done
+    printf '%s' "$out"
 }
 
 # Move the highlight. Returns 0 if the key was a navigation key.
@@ -14730,6 +14906,86 @@ edit_detached_banner() {
 }
 
 # --- level 1: credentials and hats ------------------------------------------
+
+# edit_hat_rows <width> <count>: lays out the top screen's hat rows (HMETA, and
+# HNAME_W for the name) from the parts edit_top gathered, to fit the terminal
+# (#293). Like ps, what matters least goes first: the host is shortened, then
+# dropped; then the login names are shortened, then the hat's name. The
+# state, and each login's mark and health word, always stay.
+HNAME_W=11
+edit_hat_rows() {
+    local width="$1" n="$2" i hw=4 sw=1 lw=4 credw used step kind dot name word
+    local xdot xname xword out host=1
+    HNAME_W=4
+    for ((i = 0; i < n; i++)); do
+        [[ ${#HATS[$i]} -le $HNAME_W ]] || HNAME_W=${#HATS[$i]}
+        [[ ${#HHOST[$i]} -le $hw ]] || hw=${#HHOST[$i]}
+        [[ ${#HSTATE[$i]} -le $sw ]] || sw=${#HSTATE[$i]}
+        IFS=$'\x1f' read -r kind dot name word <<< "${HCRED[$i]}"
+        [[ ${#name} -le $lw ]] || lw=${#name}
+        IFS=$'\x1f' read -r xdot xname xword <<< "${HCODEX[$i]}"
+        [[ ${#xname} -le $lw ]] || lw=${#xname}
+    done
+    [[ $HNAME_W -le 11 ]] || HNAME_W=11
+    [[ $hw -le 24 ]] || hw=24
+    [[ $lw -le 20 ]] || lw=20
+    for step in - host:12 host:0 login:8 name:6 login:4; do
+        case "$step" in
+            host:0) host=0 ;;
+            host:*) [[ $hw -le ${step#host:} ]] || hw=${step#host:} ;;
+            login:*) [[ $lw -le ${step#login:} ]] || lw=${step#login:} ;;
+            name:*) [[ $HNAME_W -le ${step#name:} ]] || HNAME_W=${step#name:} ;;
+        esac
+        # The widest row: lead, name, host, state, then the logins.
+        used=0
+        for ((i = 0; i < n; i++)); do
+            credw=$(edit_hat_cred_cols "$i" "$lw")
+            [[ $credw -le $used ]] || used=$credw
+        done
+        used=$(( EDIT_ROW_LEAD + 2 + HNAME_W + 1 + host * (hw + 1) + sw + 1 + used ))
+        [[ $used -gt $width ]] || break
+    done
+    for ((i = 0; i < n; i++)); do
+        out=""
+        [[ $host == 0 ]] || out=$(printf '%s%-*s%s ' "$C_DIM" "$hw" "$(edit_trunc "${HHOST[$i]}" "$hw")" "$C_R")
+        out="$out$(printf '%s%-*s%s ' "${HSCOL[$i]}" "$sw" "${HSTATE[$i]}" "$C_R")"
+        IFS=$'\x1f' read -r kind dot name word <<< "${HCRED[$i]}"
+        name=$(edit_trunc "$name" "$lw")
+        case "$kind" in
+            ok)   out="$out$(printf '%s%s%s%s%s' "$dot" "$C_DIM" "$name" "$C_R" "$word")" ;;
+            # Dead on the hat whatever the account has left: the copy there
+            # cannot refresh, so the mark and word say that.
+            dead) out="$out$(printf '%s✕%s %s%s%s dead' "$C_RD" "$C_R" "$C_DIM" "$name" "$C_R")" ;;
+            none) out="$out$(printf '%sno credential%s' "$C_DIM" "$C_R")" ;;
+            *)    out="$out$(printf '%snot provisioned%s' "$C_YL" "$C_R")" ;;
+        esac
+        if [[ -n "${HCODEX[$i]}" ]]; then
+            IFS=$'\x1f' read -r xdot xname xword <<< "${HCODEX[$i]}"
+            out="$out$(printf '  %s%scodex %s%s%s' "$xdot" "$C_DIM" "$(edit_trunc "$xname" "$lw")" "$C_R" "$xword")"
+        fi
+        HMETA[$i]="$out"
+    done
+    return 0
+}
+
+# The columns hat <i>'s logins take with names cut to <width>.
+edit_hat_cred_cols() {
+    local i="$1" lw="$2" kind dot name word xdot xname xword c
+    IFS=$'\x1f' read -r kind dot name word <<< "${HCRED[$i]}"
+    [[ ${#name} -le $lw ]] || name="${name:0:$lw}"
+    case "$kind" in
+        ok)   c=$(( ${dot:+2} + 0 + ${#name} + ${#word} )) ;;
+        dead) c=$(( 2 + ${#name} + 5 )) ;;
+        none) c=13 ;;
+        *)    c=15 ;;
+    esac
+    if [[ -n "${HCODEX[$i]}" ]]; then
+        IFS=$'\x1f' read -r xdot xname xword <<< "${HCODEX[$i]}"
+        [[ ${#xname} -le $lw ]] || xname="${xname:0:$lw}"
+        c=$(( c + 2 + ${xdot:+2} + 0 + 6 + ${#xname} + ${#xword} ))
+    fi
+    printf '%s' "$c"
+}
 #
 # The top screen holds two lists at once: the Claude logins on this Mac
 # (lettered) and the hats they can be pushed to (numbered). Up/Down runs
@@ -14738,7 +14994,7 @@ edit_detached_banner() {
 edit_top() {
     local SEL=1 nc nh nt i idx hat host state scol sess cred credorg credstate dot word dirty=1
     local preselect=1 ch=""
-    local cols lastcols="" hdrtail
+    local cols lastcols="" longest marks
     local agent letter slot email org role label r5 r7 e5 e7 active holders detached=""
     local cx cxemail cxws
     while :; do
@@ -14750,7 +15006,7 @@ edit_top() {
         [[ "$cols" != "$lastcols" ]] && { dirty=1; lastcols="$cols"; }
         if [[ "$dirty" == 1 ]]; then
             CLETTER=(); CEMAIL=(); CSLOT=(); CORG=(); CAGENT=(); CNAME=()
-            CMETA=(); CICON=(); CHEALTH=(); nc=0
+            CMETA=(); CICON=(); CHEALTH=(); nc=0; longest=5; marks=""
             while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
@@ -14765,13 +15021,26 @@ edit_top() {
                 # the many side of that is visible.
                 if [[ "$agent" == codex ]]; then holders=$(codex_hats_holding "$email" "$org")
                 else holders=$(creds_hats_holding "$email" "$org"); fi
-                CMETA[$nc]=$(printf '%s%s%s' "$(creds_role "$role")" \
-                    "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
-                    "$(creds_tail $((cols - CREDS_TAIL_COL)) "$holders" "$active")")
+                # Kept as parts: the row is laid out once every login is in.
+                CMETA[$nc]="$role$US$r5$US$r7$US$e5$US$e7$US$holders$US$active"
+                [[ ${#CNAME[$nc]} -le $longest ]] || longest=${#CNAME[$nc]}
+                marks="$marks,$active"
                 nc=$((nc+1))
             done < <(creds_all_rows)
+            # Fitted to the terminal: a row that wraps throws every row under
+            # it out of line (#293).
+            creds_fit "$cols" "$EDIT_ROW_LEAD" "$longest" "$(creds_marks_room "$marks")"
+            i=0
+            while [[ $i -lt $nc ]]; do
+                IFS=$'\x1f' read -r role r5 r7 e5 e7 holders active <<< "${CMETA[$i]}"
+                CMETA[$i]=$(printf '%s%s%s' "$(creds_role "$role")" \
+                    "$(creds_gauges "$r5" "$r7" "$e5" "$e7")" \
+                    "$(creds_tail $((cols - CF_USED)) "$holders" "$active")")
+                i=$((i+1))
+            done
 
-            HATS=(); HICON=(); HMETA=(); nh=0
+            HATS=(); HICON=(); HMETA=(); HHOST=(); HSTATE=(); HSCOL=()
+            HCRED=(); HCODEX=(); nh=0
             while IFS= read -r hat; do
                 [[ -z "$hat" ]] && continue
                 host=$(hat_ssh "$hat")
@@ -14801,15 +15070,11 @@ edit_top() {
                         { dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
                     idx=$((idx+1))
                 done
-                case "$credstate" in
-                    ok|stale) cred=$(printf '%s%s%s%s%s' "$dot" "$C_DIM" "${cred%%@*}" "$C_R" "$word") ;;
-                    # Dead on the hat whatever the account has left: the copy
-                    # there cannot refresh, so the mark and word say that.
-                    dead)     cred=$(printf '%s✕%s %s%s%s dead' "$C_RD" "$C_R" "$C_DIM" "${cred%%@*}" "$C_R") ;;
-                    none)     cred=$(printf '%sno credential%s' "$C_DIM" "$C_R") ;;
-                    *)        cred=$(printf '%snot provisioned%s' "$C_YL" "$C_R") ;;
-                esac
+                # Kept as parts, laid out below once every hat is in (#293).
+                [[ "$credstate" == stale ]] && credstate=ok
+                HCRED[$nh]="${credstate:-unprov}$US$dot$US${cred%%@*}$US$word"
                 # The Codex login, when there is one, after the Claude one.
+                HCODEX[$nh]=""
                 cx=$(edit_hat_codex "$hat")
                 if [[ -n "$cx" ]]; then
                     IFS=$'\x1f' read -r cxemail cxws <<< "$cx"
@@ -14820,14 +15085,13 @@ edit_top() {
                             { dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
                         idx=$((idx+1))
                     done
-                    cred=$(printf '%s  %s%scodex %s%s%s' "$cred" "$dot" "$C_DIM" "${cxemail%%@*}" "$C_R" "$word")
+                    HCODEX[$nh]="$dot$US${cxemail%%@*}$US$word"
                 fi
-                HATS[$nh]="$hat"
+                HATS[$nh]="$hat"; HHOST[$nh]="$host"; HSTATE[$nh]="$state"; HSCOL[$nh]="$scol"
                 HICON[$nh]=$(printf '%b' "$(hat_icon "$hat")")
-                HMETA[$nh]=$(printf '%s%-24s%s %s%-11s%s %s' \
-                    "$C_DIM" "$host" "$C_R" "$scol" "$state" "$C_R" "$cred")
                 nh=$((nh+1))
             done < <(hat_names)
+            edit_hat_rows "$cols" "$nh"
             dirty=0
 
             # One snapshot for the banner and the preselect below, dropped
@@ -14869,27 +15133,25 @@ edit_top() {
         i=0
         while [[ $i -lt $nh ]]; do
             ROW_LABEL="$((i+1))"; ROW_ICON="${HICON[$i]}"
-            edit_row $((i+1)) "$SEL" "${HATS[$i]}" 11 "${HMETA[$i]}"
+            edit_row $((i+1)) "$SEL" "${HATS[$i]}" "$HNAME_W" "${HMETA[$i]}"
             i=$((i+1))
         done
         ROW_LABEL=""; ROW_ICON=""
         [[ $nh -eq 0 ]] && printf '   %s(no hats yet - press A to add one)%s\n' "$C_DIM" "$C_R"
 
-        printf '\n  %sCREDENTIALS%s  %s·  Claude and Codex logins. Bars are capacity left,%s\n' \
-            "$C_B" "$C_R" "$C_DIM" "$C_R"
-        printf '     %sthen time to reset. ● ok over half a session, ◐ low, ○ spent.%s\n\n' \
-            "$C_DIM" "$C_R"
-        # The header is 87 columns before "HELD BY", which is exactly where the
-        # tail starts - so it only earns its place when the tail can show.
-        hdrtail=""
-        [[ $cols -ge $((CREDS_TAIL_COL + 9)) ]] && hdrtail="  HELD BY"
-        printf '        %s%-28s %-8s %-19s   %-19s%s%s\n' \
-            "$C_B" "LOGIN" "ROLE" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
+        printf '\n'
+        edit_caption CREDENTIALS "Claude and Codex logins. Bars are capacity left," \
+            "then time to reset. ● ok over half a session, ◐ low, ○ spent."
+        printf '\n'
+        # HELD BY heads the tail, so it only earns its place when the tail can
+        # show.
+        printf '%*s%s%s%s\n' "$EDIT_ROW_LEAD" "" \
+            "$C_B" "$(creds_header LOGIN $((cols - CF_USED)))" "$C_R"
 
         i=0
         while [[ $i -lt $nc ]]; do
             ROW_LABEL="${CLETTER[$i]}"; ROW_ICON="${CICON[$i]}"
-            edit_row $((nh+i+1)) "$SEL" "${CNAME[$i]}" 28 "${CMETA[$i]}"
+            edit_row $((nh+i+1)) "$SEL" "${CNAME[$i]}" "$CF_NAME" "${CMETA[$i]}"
             i=$((i+1))
         done
         ROW_LABEL=""; ROW_ICON=""
@@ -15594,6 +15856,14 @@ Each login shows its role, personal or team, and its usage windows: bars are
 capacity left, then time to reset. "none" is a window the plan does not have
 (some plans have no 5-hour window); "unknown" is a reading that failed. Codex
 usage is read from Codex itself (`codex app-server`) and cached for 2 minutes.
+
+The list and the rack fit each row to the terminal's width rather than
+wrapping it. On a narrow terminal the least needed part goes first: a long
+email is shortened, then the 7d reset time goes, then the role, then the 5h
+reset, then the email is shortened again, then the bars. The percentages
+stay, and a login in use on this Mac still says "active". The rack's hat rows
+do the same: the host is shortened, then dropped, then the login names are
+shortened. Each hat's state, and each login's symbol and word, stay.
 
 The symbol before each login sums up its lowest window by shape, so it reads
 the same without colour: ● ok (over half left), ◐ low (under half), ○ spent,

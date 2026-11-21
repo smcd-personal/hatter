@@ -127,7 +127,8 @@ expect "cred_is: a hat that does not report its org matches on email" "$(yes_if 
 
 # --- the list shows the role and 'none' -----------------------------------------
 out=$(run 'cmd_creds list')
-expect "list shows each login's role" "$(yes_if all_of has "$out" "a@example.com                team" -- has "$out" "b@example.com                personal")"
+# The login column is as wide as the longest login (#293), so one space here.
+expect "list shows each login's role" "$(yes_if all_of has "$out" "a@example.com team" -- has "$out" "b@example.com personal")"
 expect "list shows a missing window as none" "$(yes_if has "$out" "5h none")"
 
 [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
