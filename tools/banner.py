@@ -14,7 +14,7 @@ def readme_alt(src):
     one place that text is written (tests/svg-a11y.sh checks they agree)."""
     import html, os, re
     readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
-    m = re.search(r'<img src="%s" alt="([^"]+)"' % re.escape(src), open(readme).read())
+    m = re.search(r'<img src="%s" alt="([^"]+)"' % re.escape(src), open(readme, encoding="utf-8").read())
     assert m, "README.md has no alt text for " + src
     return html.unescape(m.group(1))
 
