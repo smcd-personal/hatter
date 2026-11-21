@@ -8156,16 +8156,34 @@ find_resume_pick() {
     return 0
 }
 
-# find_autojump_wait <where>: say a jump to <where> is coming and give the user
-# 2 seconds to hit any key to stop it. Returns 0 to jump, 1 when aborted, and
-# prints what happened either way. Under cmux, switching to another tab also
-# aborts: the focus is read when the countdown starts and again each second and
-# just before the jump. Reads /dev/tty, with whole-second timeouts for bash 3.2.
+# find_autojump_seconds: how long find waits before its auto-jump (#294).
+# "prefs": {"find_autojump_seconds": N}, a whole number from 1 to 600 (a JSON
+# number or a string); default 2. Anything else warns and uses the default.
+find_autojump_seconds() {
+    local s
+    s=$(cfg '.prefs.find_autojump_seconds // 2' 2>/dev/null) || s=2
+    if [[ "$s" =~ ^[0-9]{1,3}$ ]] && (( 10#$s >= 1 && 10#$s <= 600 )); then
+        printf '%d' "$((10#$s))"
+    else
+        warn "prefs.find_autojump_seconds is '$s', not a whole number of seconds from 1 to 600 - using 2"
+        printf '2'
+    fi
+    return 0
+}
+
+# find_autojump_wait <where> <seconds>: say once that a jump to <where> comes in
+# <seconds>, then wait that long for the user to hit any key to stop it. Returns
+# 0 to jump, 1 when aborted, and prints what happened either way. The notice is
+# one line, printed once, not redrawn each second, so a screen reader reads it
+# once (#294). Under cmux, switching to another tab also aborts: the focus is
+# read when the wait starts and again each second and just before the jump.
+# Reads /dev/tty, with whole-second timeouts for bash 3.2.
 find_autojump_wait() {
-    local where="$1" i k="" f0="" f1="" why=""
+    local where="$1" secs="$2" i k="" f0="" f1="" why=""
     f0=$(focus_now 2>/dev/null) || f0=""
-    for i in 2 1; do
-        printf '\r\033[K  %sOne live match: jumping to %s in %ds, any key or another tab to stay%s' "$C_B" "$where" "$i" "$C_R" >&2
+    printf '  %sOne live match: jumping to %s in %ds. Press any key or switch tabs to stay.%s\n' \
+        "$C_B" "$where" "$secs" "$C_R" >&2
+    for ((i = 0; i < secs; i++)); do
         if IFS= read -rsn1 -t 1 k < /dev/tty; then
             why="key pressed"; break
         fi
@@ -8175,20 +8193,20 @@ find_autojump_wait() {
         fi
     done
     if [[ -n "$why" ]]; then
-        printf '\r\033[K  %sAuto-jump to %s aborted (%s). Go there with: hatter find --go ...%s\n' "$C_YL" "$where" "$why" "$C_R" >&2
+        printf '  %sAuto-jump to %s aborted (%s). Go there with: hatter find --go ...%s\n' "$C_YL" "$where" "$why" "$C_R" >&2
         return 1
     fi
-    printf '\r\033[K' >&2
     return 0
 }
 
 cmd_find() {
-    local all=0 days=7 only="" limit=20 go=0 a
+    local all=0 days=7 only="" limit=20 go=0 nojump=0 a
     local -a terms=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all)  all=1; shift ;;
-            --go)   go=1; shift ;;
+            --go)   go=1; nojump=0; shift ;;
+            --no-go) go=0; nojump=1; shift ;;
             --days) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--days needs a number of days"
                     all=1; days="$2"; shift 2 ;;
             --limit) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--limit needs a number (0 for all)"
@@ -8305,11 +8323,14 @@ cmd_find() {
     local pick
     if [[ "$go" == 1 ]]; then
         pick=1
-    elif [[ "$n" -eq 1 && "$total" -eq 1 && -t 0 && -t 1 ]] \
+    elif [[ "$n" -eq 1 && "$total" -eq 1 && -t 0 && -t 1 && "$nojump" == 0 ]] \
+         && [[ "$(cfg '.prefs.find_autojump // "on"' 2>/dev/null)" != off ]] \
          && IFS=$'\037' read -r _ _ _ state _ <<<"${rows[0]}" && [[ "$state" == live ]]; then
-        # One running match: go there, unless a key is hit within 2 seconds.
+        # One running match: go there, unless a key is hit in the wait
+        # (prefs.find_autojump_seconds). --no-go or prefs.find_autojump "off"
+        # skip this and ask, as for several matches (#294).
         IFS=$'\037' read -r owner di score state mtime session window wid sid cwd name title snip <<<"${rows[0]}"
-        if find_autojump_wait "$session:$window${name:+ ($name)}"; then
+        if find_autojump_wait "$session:$window${name:+ ($name)}" "$(find_autojump_seconds)"; then
             dest="${dests[$di]}"
             if have_cmux; then
                 if find_focus "$owner" "$dest" "$session" "$wid"; then
@@ -15998,7 +16019,7 @@ For people: hatter list, hatter ps, or the rack.
 USAGE
     ;;
     find) cat <<'USAGE'
-hatter find [--all] [--days N] [--hat <hat>] [--limit N] [--go] <term>...
+hatter find [--all] [--days N] [--hat <hat>] [--limit N] [--go | --no-go] <term>...
 
 Search the Claude sessions on every hat and list the matches, best first. At a
 terminal, pick one to go to its tab in cmux (or, without cmux, to attach to it
@@ -16019,10 +16040,15 @@ prompt or tab name has every term come first.
   --hat <hat>  Search only this hat
   --limit N    List the best N (default 20; 0 lists every match)
   --go         Go straight to the best match, without asking
+  --no-go      Never jump by itself: list a single match and ask, as for several
 
 With exactly one match, a running session, at a terminal, hatter jumps to it
-by itself after 2 seconds, counting down. Any key in that time stops the jump
-and says so; when it goes, a line says it completed.
+by itself after 2 seconds. It says so once, with the number of seconds. Any key
+in that time, or switching to another tab, stops the jump and says so; when it
+goes, a line says it completed. To change the wait, set
+"prefs": {"find_autojump_seconds": 10} in the config (a whole number from 1 to
+600). To turn the jump off for good, set "prefs": {"find_autojump": "off"}: a
+single match is then listed and asked about like several.
 
 Running sessions are the ones in a hat's pane registry (see provision) whose
 tmux window is still open.
