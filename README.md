@@ -26,7 +26,7 @@ Four nouns, and one of them is the idea:
 
 | Term | Meaning |
 |---|---|
-| **hat** | a login — one `user@host`, one ssh connection, one tmux server, one terminal window. "I'm wearing my work hat." |
+| **hat** | a login: one `user@host`, one ssh connection, one tmux server, one terminal window. "I'm wearing my work hat." |
 | **group** | a project or area inside one hat |
 | **workspace** | a tmux session, named as you type it (`hatter help new`) |
 | **tab** | a tmux window inside that session |
@@ -43,7 +43,7 @@ session the config does not record finds its hat.
 runs in remote tmux. `hatter sync` records the live layout, in the order cmux
 shows it (`hatter help sync`), into `~/.config/hatter/config.json`;
 `hatter restore` rebuilds the client from it.
-Reboot your laptop, reinstall the OS, switch machines — clone the config and
+Reboot your laptop, reinstall the OS, switch machines: clone the config and
 restore. Closing a workspace in the client does not forget it: sync keeps any
 session still running on its server, and `hatter rm` ends one for good
 (`hatter help sync` has the details).
@@ -62,10 +62,10 @@ session still running on its server, and `hatter rm` ends one for good
   OS keychain, Codex logins in one `~/.codex-<name>` home each, and either is
   pushed to a hat over ssh when that server needs one.
   Nothing is written to disk on either side, and no shell server is ever asked
-  to log in. One login can sit on as many hats as you like — `creds push a
-  --all` puts it on every one — while a hat holds exactly one at a time,
+  to log in. One login can sit on as many hats as you like (`creds push a
+  --all` puts it on every one), while a hat holds exactly one at a time,
   because Claude Code reads a single credentials file. Above, `dev` and `ops`
-  draw on the same pool of five work logins while `personal` keeps its own —
+  draw on the same pool of five work logins while `personal` keeps its own;
   the `->` column says which hats hold what right now.
 - **Autosave and backup.** Rolling snapshots of the config plus one frozen
   checkpoint per 8 hours; `hatter backup` is a real git commit to a remote you
@@ -77,8 +77,8 @@ session still running on its server, and `hatter rm` ends one for good
 ## Status
 
 Working bash implementation, in daily use, macOS client. `bin/hatter` is that
-tool. The plan for what comes next — a typed port, a client-adapter interface so
-it is not tied to one terminal, Windows and Linux clients — is in
+tool. The plan for what comes next (a typed port, a client-adapter interface so
+it is not tied to one terminal, Windows and Linux clients) is in
 [EPIC.md](EPIC.md) and [issues/](issues/).
 
 Client support today is [cmux](https://cmux.com) for the full layout, and
@@ -100,13 +100,13 @@ wmux and a headless mode too.
 
 Three guides, depending on which terminal you have:
 
-- **[macOS with cmux](docs/install-cmux-macos.md)** — the full-feature path.
+- **[macOS with cmux](docs/install-cmux-macos.md)**: the full-feature path.
   cmux is the only client hatter drives end-to-end today, and it is macOS-only.
-- **[Windows, macOS or Linux with WezTerm](docs/install-wezterm.md)** —
+- **[Windows, macOS or Linux with WezTerm](docs/install-wezterm.md)**:
   installing WezTerm, ssh and your config, then a picker that opens any
   workspace on any hat. On Windows it needs no WSL. `restore` and `sync` for
   WezTerm are [#4](https://github.com/smcd-personal/hatter/issues/4).
-- **[Android, in Termux](docs/install-android.md)** — one installer, then
+- **[Android, in Termux](docs/install-android.md)**: one installer, then
   `hatter` opens a picker of your hats and their workspaces. Home-screen
   shortcuts, a tmux-friendly key row, and mosh if you want it.
 
@@ -136,7 +136,7 @@ hatter restore
 
 Pull requests are welcome. Small fixes can go straight to a PR; for anything
 bigger, open an issue first. The contribution that matters most is a new
-client adapter — see [CONTRIBUTING.md](CONTRIBUTING.md). Report security
+client adapter; see [CONTRIBUTING.md](CONTRIBUTING.md). Report security
 problems privately, as described in [SECURITY.md](SECURITY.md).
 
 ## Licence

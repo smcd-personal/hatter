@@ -11,13 +11,13 @@ single JSON config, so that a set of remote tmux servers can be projected into a
 desktop workspace and rebuilt from scratch after any failure.
 
 This epic is about deciding whether it becomes a real, open, cross-platform
-project — and if so, doing it in the order that keeps the idea honest.
+project, and if so, doing it in the order that keeps the idea sound.
 
 ## The idea worth keeping: hats
 
 A **hat** is the top-level unit: one unique `(user, host)` pair. One ssh
 connection, one tmux server, one client window. "Which hat am I wearing right
-now" — work, a side project, personal, a client.
+now": work, a side project, personal, a client.
 
 Under a hat sit **groups** (projects/areas), and under those, **workspaces**
 (tmux sessions named `<hat>-<subproject>`) whose **tabs** are tmux windows.
@@ -29,7 +29,7 @@ Two properties fall out of this, and they are the whole pitch:
 2. **The config is portable.** One small JSON file rebuilds the entire layout on
    any machine, against any client that has an adapter.
 
-That combination — multi-host, client-as-projection, rebuild-from-config — does
+That combination (multi-host, client-as-projection, rebuild-from-config) does
 not appear to exist elsewhere (see Prior Art below).
 
 ## Why this might not be worth it
@@ -60,19 +60,19 @@ Nothing found occupies the same niche, but the neighbourhood is busy.
 | Session pickers | sesh, twm, tmux-fzf | Local switching, no state model. |
 | Agent orchestrators | NTM, Paneflow, wmux, cmux, dmux | Coordinate agents within one machine. |
 
-Closest relative: [workmux](https://github.com/raine/workmux) — already
+Closest relative: [workmux](https://github.com/raine/workmux), already
 client-agnostic across kitty/WezTerm/Zellij, but local and git-worktree-shaped.
 
 ## Sequencing
 
 The order matters. Do **not** start with the rewrite.
 
-1. **#9 Naming** — cheap, blocks the public artifacts, and the name is load-bearing.
-2. **#2 Adapter interface** — extract the seam *in bash first*. If this is
+1. **#9 Naming**: cheap, blocks the public artifacts, and the name is load-bearing.
+2. **#2 Adapter interface**: extract the seam *in bash first*. If this is
    painful, the idea is thinner than it looks and we stop here.
-3. **#4 WezTerm adapter** — the second adapter is the real proof. Also unlocks
+3. **#4 WezTerm adapter**: the second adapter is the real proof. Also unlocks
    Windows and Linux without a native app.
-4. **#1 Port to Go** — only once the interface has survived two implementations.
+4. **#1 Port to Go**: only once the interface has survived two implementations.
 5. Everything else.
 
 **Gate:** run the current bash version daily across several hats for at least
@@ -84,8 +84,8 @@ what the abstraction needs than designing it now will.
 - #1 Port from bash to a single typed binary
 - #2 Define the client adapter interface
 - #3 cmux adapter (extract from current bash)
-- #4 WezTerm adapter — the portability proof
-- #5 wmux adapter — native Windows
+- #4 WezTerm adapter: the portability proof
+- #5 wmux adapter: native Windows
 - #6 Headless / tmux-only adapter
 - #7 Config schema v1 and migration policy
 - #8 Test suite and reliability
