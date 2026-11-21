@@ -132,6 +132,17 @@ layout "$(jq -c '(.windows[0].groups) = [{"id":"g-u","name":"Unassigned","member
 [[ "$(win_of alpha)" == W1 && "$(win_of beta)" == W2 ]] \
     || fail "only Unassigned in alpha's window: alpha='$(win_of alpha)' beta='$(win_of beta)', want W1 and W2"
 
+# A stray group of the same name elsewhere does not beat the window holding a
+# hat's own sessions: not for a hat alone (as before #244), nor between
+# siblings when nothing of the sibling's is in that window.
+layout '{"windows":[{"id":"W1","workspaces":[{"id":"x","title":"notes"}],"groups":[{"id":"gx","name":"Solo","members":["x"]}]},
+  {"id":"W2","workspaces":[{"id":"s1","title":"solo-main"}],"groups":[]}]}'
+[[ "$(win_of solo)" == W2 ]] || fail "solo beside a stray 'Solo' group: got '$(win_of solo)', want W2"
+layout '{"windows":[{"id":"W1","workspaces":[{"id":"x","title":"notes"}],"groups":[{"id":"gx","name":"Lab","members":["x"]}]},
+  {"id":"W2","workspaces":[{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],"groups":[]},
+  {"id":"W3","workspaces":[{"id":"a1","title":"ops-1"}],"groups":[{"id":"g1","name":"Ops","members":["a1"]}]}]}'
+[[ "$(win_of beta)" == W2 ]] || fail "beta beside a stray 'Lab' group: got '$(win_of beta)', want W2"
+
 # As many groups each: the better score wins, then the first hat by name.
 layout '{"windows":[{"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],
   "groups":[{"id":"g1","name":"Ops","members":["a1"]},{"id":"g2","name":"Lab","members":["b1","b2"]}]}]}'

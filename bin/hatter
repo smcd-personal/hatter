@@ -1799,14 +1799,21 @@ find_hat_window() {
               for (k in named) { split(k, p, SUBSEP)
                   groups[p[1], p[2]]++
                   if (named[k] == 1) score[p[1], p[2]] += 1 }
-              # First a window with groups of this hat in it that is not a
-              # sibling'\''s: one with more of the sibling'\''s groups, or as
-              # many and a better score, then the first hat by name. Only then
-              # a window this hat has sessions in but no hat has groups in:
-              # sessions alone say little, as a mirror puts them anywhere, so
-              # they never outrank a window of the hat'\''s own groups, nor
-              # take a window from a sibling with groups there.
+              # A hat with no sibling: the window it scores highest in.
               best = ""; bs = 0
+              if (nh == 1) {
+                  for (i = 1; i <= n; i++) if (score[me, order[i]] + 0 > bs) { bs = score[me, order[i]]; best = order[i] }
+                  printf "%s", best; exit
+              }
+              # Between siblings, first a window with groups of this hat in it
+              # that is not a sibling'\''s: one with more of the sibling'\''s
+              # groups, or as many and a better score, then the first hat by
+              # name. Loose sessions say little, as a mirror puts them
+              # anywhere, so a window of them is taken instead only when no
+              # sibling has anything in it and it scores higher (the hat'\''s
+              # own sessions, beside a stray group of the same name
+              # elsewhere), or when the hat has no group anywhere and no
+              # sibling has groups in it.
               for (i = 1; i <= n; i++) {
                   w = order[i]; mg = groups[me, w] + 0; ms = score[me, w] + 0
                   if (mg == 0 || ms <= bs) continue
@@ -1818,13 +1825,22 @@ find_hat_window() {
                   }
                   if (!taken) { bs = ms; best = w }
               }
-              if (best == "") for (i = 1; i <= n; i++) {
+              loose = ""; ls = 0; only = ""; os = 0
+              for (i = 1; i <= n; i++) {
                   w = order[i]; ms = score[me, w] + 0
-                  if (ms <= bs) continue
-                  taken = 0
-                  for (j = 1; j <= nh; j++) if (hats[j] != me && groups[hats[j], w] + 0 > 0) { taken = 1; break }
-                  if (!taken) { bs = ms; best = w }
+                  if (ms == 0) continue
+                  grouped = 0; other = 0
+                  for (j = 1; j <= nh; j++) { h = hats[j]
+                      if (h == me) continue
+                      if (groups[h, w] + 0 > 0) grouped = 1
+                      if (score[h, w] + 0 > 0) other = 1
+                  }
+                  if (grouped) continue
+                  if (ms > ls) { ls = ms; loose = w }
+                  if (!other && ms > os) { os = ms; only = w }
               }
+              if (best == "") best = loose
+              else if (only != "" && os > bs) best = only
               printf "%s", best }'
 }
 
