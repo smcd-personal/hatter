@@ -36,6 +36,7 @@ case "\$1 \${2:-}" in
         jq -c --arg w "\$win" '{groups: [.windows[] | select(.id == \$w) | .groups[]?
                                  | {id, name, member_workspace_ids: .members}]}' "\$lay" ;;
     "move-workspace-to-window "*)
+        [[ -z "\${STUB_MOVE_FAIL:-}" ]] || exit 1
         # A moved workspace leaves its group, and arrives loose.
         jq --arg ws "\$ws" --arg w "\$win" '
             (first(.windows[].workspaces[] | select(.id == \$ws))) as \$x
@@ -43,6 +44,11 @@ case "\$1 \${2:-}" in
                               | .groups = [.groups[]? | .members |= map(select(. != \$ws))])
             | .windows |= map(if .id == \$w then .workspaces += [\$x] else . end)' \
             "\$lay" > "\$lay.new" && mv "\$lay.new" "\$lay" ;;
+    "workspace-group add")
+        g=""; for ((i = 1; i <= \$#; i++)); do j=\$((i + 1)); [[ "\${!i}" == --group ]] && g="\${!j}"; done
+        jq --arg g "\$g" --arg ws "\$ws" '(.windows[].groups[]? | select(.id == \$g) | .members) += [\$ws]' \
+            "\$lay" > "\$lay.new" && mv "\$lay.new" "\$lay" ;;
+    "workspace-group set-color"|"workspace-group set-icon"|"workspace-group pin"|"workspace-group collapse") ;;
     *) echo "stub cmux: unexpected: \$*" >&2; exit 1 ;;
 esac
 EOF
@@ -103,6 +109,26 @@ layout "$(jq -c '(.windows[] | select(.id == "W1") | .groups) += [{"id":"g-lab1"
                  | .windows |= map(select(.id != "W2"))' <<<"$AFTER_RESTART")"
 [[ "$(win_of beta)" == "" ]] || fail "beta's group in alpha's window: got '$(win_of beta)', want none"
 
+# A hat with no sibling is not drawn to a window by a workspace named like one
+# of its groups: alone, that is too weak (unchanged from before #244).
+layout '{"windows":[{"id":"W9","workspaces":[{"id":"x","title":"Solo"}],"groups":[]}]}'
+[[ "$(win_of solo)" == "" ]] || fail "solo and a stray 'Solo' title: got '$(win_of solo)', want none"
+
+# Where neither sibling has a group yet, sessions decide nothing: beta, with
+# more of them there, does not take alpha's window from it.
+layout '{"windows":[{"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],"groups":[]}]}'
+[[ "$(win_of alpha)" == W1 ]] || fail "no groups yet: alpha got '$(win_of alpha)', want W1"
+
+# As many groups each: the better score wins, then the first hat by name.
+layout '{"windows":[{"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"},{"id":"b2","title":"lab-2"}],
+  "groups":[{"id":"g1","name":"Ops","members":["a1"]},{"id":"g2","name":"Lab","members":["b1","b2"]}]}]}'
+[[ "$(win_of beta)" == W1 && "$(win_of alpha)" == "" ]] \
+    || fail "one group each, beta scores higher: alpha='$(win_of alpha)' beta='$(win_of beta)', want alpha none, beta W1"
+layout '{"windows":[{"id":"W1","workspaces":[{"id":"a1","title":"ops-1"},{"id":"b1","title":"lab-1"}],
+  "groups":[{"id":"g1","name":"Ops","members":["a1"]},{"id":"g2","name":"Lab","members":["b1"]}]}]}'
+[[ "$(win_of alpha)" == W1 && "$(win_of beta)" == "" ]] \
+    || fail "a full tie: alpha='$(win_of alpha)' beta='$(win_of beta)', want alpha W1 (first by name), beta none"
+
 # --- sync moves a workspace home ---------------------------------------------
 live=$'ops-1\nops-2\nweb\nlab-1\nlab-2'
 layout "$AFTER_RESTART"
@@ -112,21 +138,38 @@ layout "$(jq -c '(.windows[] | select(.id == "W1") | .workspaces) |= map(select(
                  | (.windows[] | select(.id == "W2") | .workspaces) += [{"id":"a3","title":"web"}]
                  | (.windows[] | select(.id == "W1") | .groups[] | select(.id == "g-ops") | .members) += ["b2"]' \
                  <<<"$AFTER_RESTART")"
-n=$(run "settle_siblings beta W2 '$live' 2>/dev/null")
+n=$(run "settle_siblings beta W2 '$live' 2>/dev/null; echo \$SIBLINGS_MOVED")
 [[ "$n" == 2 ]] || { cat "$work/calls" >&2; fail "settle_siblings: moved $n, want 2"; }
 [[ "$(in_window W2)" == "Lab,lab-1" ]] || fail "beta's window holds '$(in_window W2)', want Lab,lab-1"
 [[ "$(in_window W1)" == "lab-2,ops-1,ops-2,web" ]] || fail "alpha's window holds '$(in_window W1)', want lab-2 kept"
 
 # Settled: nothing more to move.
-n=$(run "settle_siblings alpha W1 '$live' 2>/dev/null")
+n=$(run "settle_siblings alpha W1 '$live' 2>/dev/null; echo \$SIBLINGS_MOVED")
 [[ "$n" == 0 ]] || fail "settled: moved $n, want 0"
 
 # A session no longer running is left alone, as is a hat with no sibling.
 layout "$AFTER_RESTART"
-n=$(run "settle_siblings beta W2 'ops-1' 2>/dev/null")
+n=$(run "settle_siblings beta W2 'ops-1' 2>/dev/null; echo \$SIBLINGS_MOVED")
 [[ "$n" == 0 ]] || fail "lab sessions not running: moved $n, want 0"
-n=$(run "settle_siblings solo W3 'solo-main' 2>/dev/null")
+n=$(run "settle_siblings solo W3 'solo-main' 2>/dev/null; echo \$SIBLINGS_MOVED")
 [[ "$n" == 0 ]] || fail "solo: moved $n, want 0"
 grep -q move-workspace "$work/calls" && fail "solo: a move was sent"
+
+# Within one sync: alpha's settle moves beta's sessions into beta's window, so
+# what sync read of beta's window before is stale. beta's settle must read it
+# again and put them in their group, not leave them loose until the next sync.
+layout "$AFTER_RESTART"
+g2=$(jq -c '{groups: [.windows[] | select(.id == "W2") | .groups[] | {id, name, member_workspace_ids: .members}]}' "$work/layout.json")
+w2=$(jq -c '{workspaces: [.windows[] | select(.id == "W2") | .workspaces[]]}' "$work/layout.json")
+run "settle_ungrouped alpha W1 '$live' '{}' '' '' 2>/dev/null
+     settle_ungrouped beta W2 '$live' '{}' '$g2' '$w2' 2>/dev/null" >/dev/null
+lab=$(jq -r '[.windows[] | select(.id == "W2") | .groups[] | select(.name == "Lab") | .members[]] | sort | join(",")' "$work/layout.json")
+[[ "$lab" == "b1,b2,h1" ]] || fail "after one sync pass beta's Lab holds '$lab', want b1,b2,h1"
+
+# A failed move is said, not counted.
+layout "$AFTER_RESTART"
+out=$(STUB_MOVE_FAIL=1 run "settle_siblings beta W2 '$live'; echo moved=\$SIBLINGS_MOVED" 2>&1)
+grep -q 'moved=0' <<<"$out" || fail "a failed move was counted: $out"
+grep -q "could not move 'lab-1'" <<<"$out" || fail "a failed move was not reported: $out"
 
 echo "PASS sibling-hats"

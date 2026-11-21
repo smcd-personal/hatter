@@ -1783,23 +1783,34 @@ find_hat_window() {
         $1 == "title" { for (i = 1; i <= nh; i++) { h = hats[i]
                             if (index($3, h "-") == 1) score[h, $2] += 5
                             if ((h, $3) in want) score[h, $2] += 10
-                            # A header workspace cmux kept, as after a restart.
-                            if ((h, $3) in mine) { score[h, $2] += 1; groups[h, $2]++ } }
+                            # Between siblings only: a header workspace cmux
+                            # kept for one of the hat'\''s groups, as after a
+                            # restart. Alone, a title is too weak to claim a
+                            # window with, so a hat with no sibling ignores it.
+                            if (nh > 1 && (h, $3) in mine) named[h, $2, $3] = 1 }
                         next }
         $1 == "group" { for (i = 1; i <= nh; i++) { h = hats[i]
-                            if ((h, $3) in mine) { score[h, $2] += 1; groups[h, $2]++ } }
+                            if ((h, $3) in mine) { score[h, $2] += 1; named[h, $2, $3] = 2 } }
                         next }
-        END { best = ""; bs = 0
+        END { # Each of a hat'\''s groups counts once per window, as a group or
+              # as a header; a header alone adds the point its group would.
+              for (k in named) { split(k, p, SUBSEP)
+                  groups[p[1], p[2]]++
+                  if (named[k] == 1) score[p[1], p[2]] += 1 }
+              best = ""; bs = 0
               for (i = 1; i <= n; i++) {
                   w = order[i]
                   if (score[me, w] + 0 <= bs) continue
-                  # The window is a sibling'\''s if one beats this hat on it.
+                  # The window is a sibling'\''s if it has more of the
+                  # sibling'\''s groups, or as many and a better score. With
+                  # no group of either there, sessions alone decide nothing:
+                  # a mirror puts them anywhere.
                   taken = 0
                   for (j = 1; j <= nh; j++) { h = hats[j]
                       if (h == me) continue
                       g = groups[h, w] + 0; mg = groups[me, w] + 0
                       s = score[h, w] + 0;  ms = score[me, w] + 0
-                      if (g > mg || (g == mg && (s > ms || (s == ms && h < me)))) { taken = 1; break }
+                      if (g > mg || (g == mg && g > 0 && (s > ms || (s == ms && h < me)))) { taken = 1; break }
                   }
                   if (!taken) { bs = score[me, w]; best = w }
               }
@@ -10010,7 +10021,7 @@ cmd_group() {
     esac
 }
 
-# settle_siblings <hat> <window> <live sessions> - prints how many it moved
+# settle_siblings <hat> <window> <live sessions>
 #
 # Hats on one ssh destination share its tmux server, and `cmux ssh-tmux`
 # mirrors every session on it into the window it runs from. So one hat's
@@ -10018,52 +10029,68 @@ cmd_group() {
 # restore (#244), or a new one made on the server. Between this hat's window
 # and each sibling's, a running session's workspace goes to the window of the
 # hat the config records it under, when it is loose or in a group of that hat.
-# One in a group of the hat whose window it is in was put there on purpose (a
-# drag), and stays. Never fails; the moved workspaces arrive loose, for the
+# One in a real group of the hat whose window it is in was put there on
+# purpose (a drag), and stays. The moved workspaces arrive loose, for the
 # grouping step after to place.
+#
+# Sets SIBLINGS_MOVED to how many it moved, and adds each window it moved one
+# into to SIBLINGS_TOUCHED, one per line: what a caller read of those windows
+# is stale. Never fails. A hat with no sibling costs one config read.
+SIBLINGS_MOVED=0
+SIBLINGS_TOUCHED=""
 settle_siblings() {
-    local hat="$1" win="$2" live="$3" host sib sw moved=0
-    host=$(hat_ssh "$hat")
+    local hat="$1" win="$2" live="$3" host sibs sib sw took=0 plan="" id title to owner there
+    SIBLINGS_MOVED=0
+    host=$(hat_ssh "$hat" 2>/dev/null) || return 0
+    sibs=$(cfg --arg h "$host" --arg l "$hat" '.hats | to_entries[]
+              | select(.key != $l and .value.ssh == $h and (.value.disabled | not)) | .key')
+    [[ -n "$sibs" && -n "$win" ]] || return 0
+
+    # Plan from one look at cmux, then let go of it before changing anything.
+    if [[ "$CMUX_SNAP" != 1 ]]; then cmux_snapshot; took=1; fi
     while IFS= read -r sib; do
         [[ -n "$sib" ]] || continue
         sw=$(find_hat_window "$sib" 2>/dev/null) || sw=""
         [[ -n "$sw" && "$sw" != "$win" ]] || continue
-        moved=$((moved + $(sibling_move "$sw" "$win" "$hat" "$sib" "$live")))
-        moved=$((moved + $(sibling_move "$win" "$sw" "$sib" "$hat" "$live")))
-    done < <(cfg --arg h "$host" --arg l "$hat" '.hats | to_entries[]
-                | select(.key != $l and .value.ssh == $h and (.value.disabled | not)) | .key')
-    printf '%s' "$moved"
-    return 0
-}
+        plan+="$(sibling_plan "$sw" "$win" "$hat" "$sib" "$live")"$'\n'
+        plan+="$(sibling_plan "$win" "$sw" "$sib" "$hat" "$live")"$'\n'
+    done <<<"$sibs"
+    [[ "$took" == 1 ]] && cmux_snapshot_drop
 
-# sibling_move <from window> <to window> <owner hat> <from hat> <live sessions>
-# Moves <owner hat>'s running sessions out of <from hat>'s window, as above;
-# prints how many.
-sibling_move() {
-    local from="$1" to="$2" owner="$3" there="$4" live="$5" ws gs id title n=0
-    ws=$(cmux_json workspace list --window "$from" 2>/dev/null) || { printf 0; return 0; }
-    gs=$(cmux_json workspace-group list --window "$from" 2>/dev/null) || { printf 0; return 0; }
-    while IFS=$'\x1f' read -r id title; do
+    while IFS=$'\x1f' read -r id title to owner there; do
         [[ -n "$id" ]] || continue
-        if cmux_change move-workspace-to-window --workspace "$id" --window "$to" >/dev/null 2>&1; then
+        if cmux_change move-workspace-to-window --workspace "$id" --window "$to" >/dev/null 2>&1 </dev/null; then
             echo "  $owner / $title: moved from $there's window to its own" >&2
-            n=$((n + 1))
+            SIBLINGS_MOVED=$((SIBLINGS_MOVED + 1))
+            grep -qxF -- "$to" <<<"$SIBLINGS_TOUCHED" || SIBLINGS_TOUCHED+="$to"$'\n'
         else
             warn "could not move '$title' from $there's window to $owner's"
         fi
-    done < <(jq -r --argjson g "$gs" --arg live "$live" \
-                --argjson own "$(cfg -c --arg l "$owner" '[.groups | to_entries[] | select(.value.hat == $l)
-                                   | .value.sessions | keys_unsorted[]?]')" \
-                --argjson theirs "$(cfg -c --arg l "$there" '[.groups | to_entries[] | select(.value.hat == $l)
-                                   | (.value.name // .key)]')" '
+    done <<<"$plan"
+    return 0
+}
+
+# sibling_plan <from window> <to window> <owner hat> <from hat> <live sessions>
+# The workspaces of <owner hat>'s running sessions that are out of place in
+# <from hat>'s window, as settle_siblings moves them: one line each,
+# "<workspace>\x1f<title>\x1f<to window>\x1f<owner hat>\x1f<from hat>".
+sibling_plan() {
+    local from="$1" to="$2" owner="$3" there="$4" live="$5" ws gs
+    ws=$(window_ws_json "$from" 2>/dev/null) || return 0
+    gs=$(window_groups_json "$from" 2>/dev/null) || return 0
+    jq -r --argjson g "$gs" --arg live "$live" --arg to "$to" --arg o "$owner" --arg t "$there" \
+          --argjson own "$(cfg -c --arg l "$owner" '[.groups | to_entries[] | select(.value.hat == $l)
+                             | .value.sessions | keys_unsorted[]?]')" \
+          --argjson theirs "$(cfg -c --arg l "$there" '[.groups | to_entries[]
+                             | select(.value.hat == $l and (.value.managed | not))
+                             | (.value.name // .key)]')" '
         ($live | split("\n")) as $l
-        # Each workspace in a group of the hat whose window this is.
+        # Each workspace in a real group of the hat whose window this is.
         | ([$g.groups[]? | select(.name as $n | $theirs | index($n)) | .member_workspace_ids[]?]) as $kept
         | .workspaces[]?
-        | select((.title // "") as $t | ($own | index($t)) and ($l | index($t)))
+        | select((.title // "") as $x | ($own | index($x)) and ($l | index($x)))
         | select(.id as $i | $kept | index($i) | not)
-        | [.id, .title] | join("\u001f")' <<<"$ws")
-    printf '%s' "$n"
+        | [.id, .title, $to, $o, $t] | join("\u001f")' <<<"$ws" 2>/dev/null || true
     return 0
 }
 
@@ -10079,7 +10106,10 @@ sibling_move() {
 # map sync builds from tmux, and the window's groups and workspaces. Any left
 # empty is read here; "-" for the groups means the caller could not read them,
 # and then cmux is not touched at all. In steady state, with all three given,
-# it makes no cmux call and no extra ssh call.
+# it makes no cmux call and no extra ssh call, except that a hat sharing its
+# server with another takes one cmux snapshot to look for strays
+# (settle_siblings). A window settle_siblings moved a workspace into, this
+# call's or a later one's, is read afresh.
 settle_ungrouped() {
     local hat="$1" win="$2" live="$3" wjson="${4:-}" groups_json="${5:-}" ws_json="${6:-}"
     local key host s windows entries='{}' fresh un
@@ -10126,7 +10156,8 @@ settle_ungrouped() {
     [[ -n "$win" && "$groups_json" != "-" ]] || return 0
     # 1b. Hats on one server: a workspace in the other hat's window goes home
     # (#244). What the caller read of this window is stale once one has moved.
-    if [[ "$(settle_siblings "$hat" "$win" "$live")" != 0 ]]; then
+    settle_siblings "$hat" "$win" "$live"
+    if [[ "$SIBLINGS_MOVED" != 0 ]] || grep -qxF -- "$win" <<<"$SIBLINGS_TOUCHED"; then
         groups_json="" ws_json=""
     fi
     [[ -n "$groups_json" ]] || groups_json=$(window_groups_json "$win" 2>/dev/null) || return 0
@@ -10620,8 +10651,14 @@ sync_once() {
 
     # Now that the config holds what this pass found, every running session in
     # no group goes into its hat's Unassigned, and an empty Unassigned goes.
+    # A sibling hat's settle may have moved workspaces into this hat's window
+    # (#244), and then what was read of it above is stale.
+    SIBLINGS_TOUCHED=""
     for ((i = 0; i < n; i++)); do
         [[ -n "${lives[$i]}" ]] || continue
+        if [[ "${gjsons[$i]}" != "-" ]] && grep -qxF -- "${wins[$i]}" <<<"$SIBLINGS_TOUCHED"; then
+            gjsons[$i]="" wsjsons[$i]=""
+        fi
         settle_ungrouped "${hats[$i]}" "${wins[$i]}" "${lives[$i]}" \
             "${wjsons[$i]}" "${gjsons[$i]}" "${wsjsons[$i]}"
     done
