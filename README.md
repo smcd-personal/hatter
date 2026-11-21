@@ -73,6 +73,9 @@ session still running on its server, and `hatter rm` ends one for good
 - **The hat rack.** `hatter` on its own opens an interactive walk down
   hat › group › workspace › tab, naming each level as you go, so the
   vocabulary is learned by looking around.
+- **Plain text when you need it.** Colour can be turned off with `NO_COLOR`,
+  and the symbols a screen reader would read out one by one with plain mode;
+  `hatter help plain` says how.
 
 ## Status
 
