@@ -14281,6 +14281,7 @@ colour_setup() {
 }
 
 edit_cleanup() {
+    edit_frame_abandon || true
     [[ -n "$EDIT_CACHE" ]] && rm -rf "$EDIT_CACHE"
     printf '\033[?25h'                       # cursor back on
 }
@@ -14307,7 +14308,9 @@ edit_read_pending() {
     # bash restores the tty itself after each `read -s -n1`, so the mode to go
     # back to is the same every time and is worth asking for only once.
     [[ -n "$EDIT_TTY_MODE" ]] || EDIT_TTY_MODE=$(stty -g < /dev/tty)
-    stty -icanon min 0 time 1 < /dev/tty
+    # -echo: the rest of an arrow key would otherwise be echoed where the
+    # cursor is, which in the rack is the selected row (#296).
+    stty -icanon -echo min 0 time 1 < /dev/tty
     out=$(dd bs=1 count="$1" 2>/dev/null < /dev/tty)
     stty "$EDIT_TTY_MODE" < /dev/tty
     printf '%s' "$out"
@@ -14315,6 +14318,8 @@ edit_read_pending() {
 
 edit_readkey() {
     local k rest
+    # A screen is drawn when it is complete, which is when it asks for a key.
+    edit_frame_show
     # The rack runs for as long as it is open. Each action it ran is over by the
     # time it waits for a key, so focus goes back now, not when the rack closes:
     # the rack's own terminal has to have it for the key to arrive at all.
@@ -14371,7 +14376,7 @@ ask_line() {
             *) EDIT_REPLY+="$k"; printf '%s' "$k" >&2 ;;
         esac
     done
-    printf '\033[?25l' >&2
+    # The cursor stays on: a magnifier or screen reader follows it (#296).
     if [[ $rc -ne 0 ]]; then
         EDIT_REPLY=""
         printf ' %s(cancelled)%s\n' "${C_DIM:-}" "${C_R:-}" >&2
@@ -14495,6 +14500,17 @@ term_cols() {
     printf '%s' "$c"
 }
 
+# term_rows: the terminal's height, asked the way term_cols asks for the width.
+# With no tty, LINES, then 24.
+term_rows() {
+    local r
+    r=$(stty size < "${HATTER_TTY:-/dev/tty}" 2>/dev/null) || r=""
+    r="${r%% *}"
+    [[ "$r" =~ ^[0-9]+$ && "$r" -gt 0 ]] || r="${LINES:-}"
+    [[ "$r" =~ ^[0-9]+$ && "$r" -gt 0 ]] || r=24
+    printf '%s' "$r"
+}
+
 edit_trunc() {
     local v="$1" w="$2"
     if [[ ${#v} -le $w ]]; then printf '%s' "$v"; else printf '%s…' "${v:0:$((w-1))}"; fi
@@ -14516,10 +14532,103 @@ edit_short_path() {
     printf '%s' "$v"
 }
 
+# --- frames -----------------------------------------------------------------
+#
+# A rack screen is drawn as one frame (#296). What a screen prints from
+# edit_header up to the key it waits for is caught in a file, then written over
+# the screen before it in one go: home, each line followed by clear to the end of
+# the line, then clear to the end of the screen. Nothing is erased first, so the
+# screen does not flash and a screen reader sees only the lines that changed.
+#
+# edit_row marks the selected row with EDIT_SEL_MARK, and the cursor is left on
+# that row's marker, visible, for magnifiers and screen readers that follow the
+# cursor. A screen with no selection leaves it after its last line. Finding the
+# row means knowing how many terminal rows each line above it took, so the frame
+# works out each line's width: escapes count nothing, wide characters (emoji,
+# CJK) two columns. Then whatever an action prints next goes below the screen,
+# not over the selection: each screen calls edit_below once a key is not a move.
+
+EDIT_FRAME=0            # 1 while a screen's output is going to the frame file
+EDIT_FRAME_END=""       # the terminal row just below the last frame shown
+EDIT_SEL_MARK=$'\001'
+
+edit_frame_begin() {
+    [[ "$EDIT_FRAME" == 0 && -n "$EDIT_CACHE" && -d "$EDIT_CACHE" ]] || return 0
+    exec 8>&1 1>"$EDIT_CACHE/frame"
+    EDIT_FRAME=1
+}
+
+# Put stdout back on the terminal, dropping whatever the frame held.
+edit_frame_abandon() {
+    [[ "$EDIT_FRAME" == 1 ]] || return 0
+    exec 1>&8 8>&-
+    EDIT_FRAME=0
+}
+
+# Write the frame to the terminal and leave the cursor on the selection.
+edit_frame_show() {
+    [[ "$EDIT_FRAME" == 1 ]] || return 0
+    edit_frame_abandon
+    LC_ALL=C awk -v mark="$EDIT_SEL_MARK" -v cols="$(term_cols)" -v rows="$(term_rows)" \
+        -v endfile="$EDIT_CACHE/frame.end" '
+        # Columns a line takes: escapes none, each character one, wide ones
+        # two. Read as bytes, so the locale does not matter: a character is
+        # a byte that does not continue one. Four-byte characters (emoji) and
+        # U+3000-U+DFFF (CJK, Hangul) are wide; a U+FE0F after an emoji is
+        # counted as one more, which is the column its emoji form adds.
+        function width(s,   t, w) {
+            gsub(/\033\[[0-9;?]*[A-Za-z]/, "", s)
+            t = s; gsub(/[\200-\277]/, "", t); w = length(t)
+            t = s; w += gsub(/[\360-\364]/, "", t)
+            t = s; w += gsub(/[\343-\355]/, "", t)
+            return w
+        }
+        BEGIN { printf "\033[?25l\033[H"; row = 0; selrow = 0 }
+        {
+            line = $0
+            p = index(line, mark)
+            if (p) {
+                pre = width(substr(line, 1, p - 1))
+                line = substr(line, 1, p - 1) substr(line, p + 1)
+                selrow = row + 1 + int(pre / cols); selcol = pre % cols + 1
+            }
+            w = width(line)
+            printf "%s", line
+            # A line that ends on the last column leaves the cursor there, and
+            # clearing from it would take that last character with it.
+            if (w == 0 || w % cols != 0) printf "\033[K"
+            printf "\n"
+            row += (w == 0) ? 1 : int((w + cols - 1) / cols)
+        }
+        END {
+            printf "\033[J"
+            # A frame taller than the terminal scrolled it by the difference.
+            end = row + 1; scroll = (end > rows) ? end - rows : 0; end -= scroll
+            if (selrow) {
+                selrow -= scroll; if (selrow < 1) selrow = 1
+                printf "\033[%d;%dH", selrow, selcol
+            }
+            printf "\033[?25h"
+            print end > endfile
+        }' "$EDIT_CACHE/frame"
+    EDIT_FRAME_END=""
+    read -r EDIT_FRAME_END < "$EDIT_CACHE/frame.end" 2>/dev/null || true
+    return 0
+}
+
+# Move to just below the screen, where an action's prompts and output belong.
+edit_below() {
+    [[ -n "$EDIT_FRAME_END" ]] || return 0
+    printf '\033[%d;1H' "$EDIT_FRAME_END"
+    EDIT_FRAME_END=""
+}
+
 # edit_header <where> <title> <caption> [line] [line] [banner]: the banner is
-# a warning that belongs above everything else on the screen.
+# a warning that belongs above everything else on the screen. It starts the
+# screen's frame.
 edit_header() {
-    printf '\033[?25l\033[H\033[2J'
+    edit_frame_begin
+    [[ "$EDIT_FRAME" == 1 ]] || printf '\033[H\033[2J'
     printf '%s──── hatter rack ──────────────────────────────────────────%s\n' "$C_DIM" "$C_R"
     printf '  %s%s%s\n' "$C_CY" "${1:-all hats}" "$C_R"
     [[ -n "${6:-}" ]] && printf '  %s%s%s\n' "$C_YL" "$6" "$C_R"
@@ -14544,6 +14653,8 @@ edit_row() {
     label=$(printf '%2s' "${ROW_LABEL:-$i}")
     if [[ "$i" == "$sel" ]]; then
         marker="${C_CY}▸${C_R} "; open="$C_SEL"; close="$C_R"
+        # Where the frame leaves the cursor (#296).
+        [[ "$EDIT_FRAME" != 1 ]] || marker="$EDIT_SEL_MARK$marker"
     fi
     printf ' %s%s%s%s %s%s%-*s%s %s\n' \
         "$marker" "$C_B" "$label" "$C_R" "$ROW_ICON " \
@@ -14799,6 +14910,8 @@ edit_top() {
         edit_nav "$KEY" "$nt" && continue
 
         # Past here the key is an action, and an action can change anything.
+        # What it prints goes below the screen.
+        edit_below
         dirty=1
         idx=$((SEL-1))
         if [[ $idx -lt $nh ]]; then hat="${HATS[$idx]:-}"; else hat=""; fi
@@ -14867,15 +14980,20 @@ edit_top() {
 #
 # Every command runs in a subshell: cmd_sync and cmd_restore both die on a dead
 # cmux socket, and a die inside the rack would drop the whole UI mid-screen.
+edit_sync_header() {
+    edit_header "${1:-all hats}" "SYNC / RESTORE" \
+        "sync records the live layout into the config;" \
+        "restore rebuilds the live layout from the config."
+}
+
 edit_sync_restore() {
     local hat="${1:-}" gaps="" probed=0 h line what why n
     while :; do
-        edit_header "${hat:-all hats}" "SYNC / RESTORE" \
-            "sync records the live layout into the config;" \
-            "restore rebuilds the live layout from the config."
-
         if [[ "$probed" == 0 ]]; then
-            printf '   %sprobing...%s' "$C_DIM" "$C_R"
+            # Shown while the probe runs, then drawn over by the whole screen.
+            edit_sync_header "$hat"
+            printf '   %sprobing...%s\n' "$C_DIM" "$C_R"
+            edit_frame_show
             gaps=""
             # hat_missing finds each hat's window, which reads every window:
             # one snapshot for the whole probe, gone before anything restores.
@@ -14888,8 +15006,8 @@ edit_sync_restore() {
             done
             cmux_snapshot_drop
             probed=1
-            printf '\r\033[K'
         fi
+        edit_sync_header "$hat"
 
         n=0
         if [[ -n "$gaps" ]]; then
@@ -14918,6 +15036,7 @@ edit_sync_restore() {
 
         edit_keys "s sync   r restore   f force   ! re-probe   q back"
         edit_readkey
+        edit_below
         case "$KEY" in
             q|Q|quit|left|esc|back|h) return 0 ;;
             !) probed=0 ;;
@@ -15008,6 +15127,7 @@ edit_credential() {
         printf '  %sA push to every hat   X clear this hat   q quit%s\n' "$C_DIM" "$C_R"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
+        edit_below
         hat="${HATS[$((SEL-1))]:-}"
         case "$KEY" in
             q|Q|quit) return 1 ;;
@@ -15104,6 +15224,7 @@ edit_groups() {
         edit_keys "a add   r rename   d forget   q quit"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
+        edit_below
         g="${GRPS[$((SEL-1))]:-}"
         case "$KEY" in
             q|Q|quit) return 1 ;;
@@ -15211,6 +15332,7 @@ edit_workspaces() {
         edit_keys "a add   r rename   f fix blank   d delete   ! refresh   q quit"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
+        edit_below
         ws="${WSS[$((SEL-1))]:-}"
         short="${SHORTS[$((SEL-1))]:-}"
         case "$KEY" in
@@ -15311,6 +15433,7 @@ edit_tabs() {
         edit_keys "a add   r rename   p pin/unpin   d close   ! refresh   q quit"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
+        edit_below
         idx="${IDXS[$((SEL-1))]:-}"
         case "$KEY" in
             q|Q|quit) return 1 ;;
