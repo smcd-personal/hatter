@@ -156,17 +156,20 @@ grep -q 'and 1 more' <<<"$out" || fail "find --limit 2: no count of the rest:
 $out"
 grep -q 'more:' <<<"$(find_ --all parser)" && fail "find --all parser: under the limit, still says there are more"
 
-# --- one live match jumps by itself after 2s; any key aborts (#231) ---------
+# --- one live match jumps by itself after 2s; any key aborts (#231, #294) --
 # At a terminal (a pty), with no cmux so the jump is an attach. "billing" is one
 # running session. No key: the countdown runs out and it goes (the stub tmux
 # cannot attach, which is enough to show it tried). A key: it says it aborted
 # and does not go. Several matches never auto-jump.
+# PTY_WAIT_FOR (default "jumping to") is the text to wait for before sending
+# the keys, PTY_DELAY (default 0.5) the seconds after it, PTY_CFG the config
+# directory.
 pty_find() {   # pty_find <keys or ""> <term>...: print the whole terminal output
     local keys="$1"; shift
-    PATH="${PTY_PATH:-$work/bin:$nocmux}" XDG_CONFIG_HOME="$work/cfg" NO_COLOR=1 HATTER_BIN="$root/bin/hatter" \
-        python3 -I - "$keys" "$@" <<'PY'
+    PATH="${PTY_PATH:-$work/bin:$nocmux}" XDG_CONFIG_HOME="${PTY_CFG:-$work/cfg}" NO_COLOR=1 HATTER_BIN="$root/bin/hatter" \
+        python3 -I - "$keys" "${PTY_WAIT_FOR:-jumping to}" "${PTY_DELAY:-0.5}" "$@" <<'PY'
 import os, pty, select, sys, time
-keys, terms = sys.argv[1].encode(), sys.argv[2:]
+keys, wait_for, delay, terms = sys.argv[1].encode(), sys.argv[2].encode(), float(sys.argv[3]), sys.argv[4:]
 pid, fd = pty.fork()
 if pid == 0:
     os.execv(os.environ['HATTER_BIN'], [os.environ['HATTER_BIN'], 'find'] + terms)
@@ -180,8 +183,22 @@ while time.time() - start < 15:
         if not chunk:
             break
         out += chunk
-    if not sent and b'jumping to' in out:
-        time.sleep(0.5); os.write(fd, keys); sent = True
+    if not sent and wait_for in out:
+        # Keep reading while waiting, so the output shows what came before the key.
+        until = time.time() + delay
+        while time.time() < until:
+            if select.select([fd], [], [], 0.05)[0]:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                out += chunk
+        out += b'\n@@key-sent\n'
+        try:
+            os.write(fd, keys)
+        except OSError:   # hatter has already exited
+            pass
+        sent = True
 sys.stdout.write(out.decode(errors='replace'))
 PY
 }
@@ -202,6 +219,60 @@ grep -q 'new-session' <<<"$out" && fail "aborted jump went anyway:
 $out"
 out=$(pty_find "" parser </dev/null)
 grep -q 'jumping to' <<<"$out" && fail "two matches auto-jumped:
+$out"
+
+# The notice is printed once with the whole wait, not redrawn each second (#294).
+out=$(pty_find "" billing)
+grep -q 'jumping to dev-a:1 (main) in 2s' <<<"$out" || fail "default wait: notice does not say 2s:
+$out"
+grep -q 'in 1s' <<<"$out" && fail "default wait: the countdown was redrawn:
+$out"
+case "$out" in *$'\r\033[K'*) fail "default wait: the notice clears and redraws its line:
+$out" ;; esac
+
+# prefs.find_autojump "off", or --no-go: a single match is listed and asked
+# about, never jumped to (#294). Esc at the prompt skips.
+cfg_with() {   # cfg_with <dir> <jq filter>: a copy of the config, changed
+    mkdir -p "$work/$1/hatter"
+    jq "$2" "$work/cfg/hatter/config.json" > "$work/$1/hatter/config.json"
+}
+cfg_with cfg-off '.prefs.find_autojump = "off"'
+out=$(PTY_CFG="$work/cfg-off" PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' billing)
+grep -q 'jumping to' <<<"$out" && fail "find_autojump off: still counted down:
+$out"
+grep -q 'open which (1-1)' <<<"$out" || fail "find_autojump off: did not ask:
+$out"
+grep -q 'new-session' <<<"$out" && fail "find_autojump off: jumped anyway:
+$out"
+out=$(PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' --no-go billing)
+grep -q 'jumping to' <<<"$out" && fail "--no-go: still counted down:
+$out"
+grep -q 'open which (1-1)' <<<"$out" || fail "--no-go: did not ask:
+$out"
+grep -q 'new-session' <<<"$out" && fail "--no-go: jumped anyway:
+$out"
+
+# prefs.find_autojump_seconds 10: still waiting at 3 seconds, and a key then
+# still stops it.
+cfg_with cfg-10s '.prefs.find_autojump_seconds = 10'
+out=$(PTY_CFG="$work/cfg-10s" PTY_DELAY=3 pty_find "x" billing)
+grep -q 'jumping to dev-a:1 (main) in 10s' <<<"$out" || fail "find_autojump_seconds 10: notice does not say 10s:
+$out"
+sed '/@@key-sent/,$d' <<<"$out" | grep -q 'new-session' && fail "find_autojump_seconds 10: jumped within 3 seconds:
+$out"
+grep -q 'Auto-jump to dev-a:1 (main) aborted (key pressed)' <<<"$out" || fail "find_autojump_seconds 10: was not still waiting at 3 seconds:
+$out"
+grep -q 'new-session' <<<"$out" && fail "find_autojump_seconds 10: jumped after the key:
+$out"
+
+# A bad value warns and falls back to 2 seconds.
+cfg_with cfg-bad '.prefs.find_autojump_seconds = "soon"'
+out=$(PTY_CFG="$work/cfg-bad" pty_find "" billing)
+grep -q "prefs.find_autojump_seconds is 'soon'" <<<"$out" || fail "bad find_autojump_seconds: no warning:
+$out"
+grep -q 'jumping to dev-a:1 (main) in 2s' <<<"$out" || fail "bad find_autojump_seconds: did not fall back to 2s:
+$out"
+grep -q 'new-session' <<<"$out" || fail "bad find_autojump_seconds: did not jump after 2s:
 $out"
 
 # Under cmux, switching to another tab during the countdown aborts it. A stub
