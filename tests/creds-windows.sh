@@ -102,9 +102,9 @@ expect "...in the width of a real gauge, so 7d lines up" \
 expect "a present 5h window draws its bar" "$(yes_if has "$out2" " 70%")"
 dot() { run "C_RD=R; C_YL=Y; C_GR=G; C_DIM=D; C_R=; creds_dot $1 $2"; }
 expect "a dot ignores a missing window" "$(yes_if [ "$(dot - 80)" = "G●" ])"
-expect "...and still turns red on a spent one" "$(yes_if [ "$(dot - 0)" = "R●" ])"
-expect "with both windows the worse one wins" "$(yes_if [ "$(dot 20 90)" = "Y●" ])"
-expect "with no window known the dot is dim" "$(yes_if [ "$(dot - -)" = "D●" ])"
+expect "...and still turns red, and hollow, on a spent one" "$(yes_if [ "$(dot - 0)" = "R○" ])"
+expect "with both windows the worse one wins, half full" "$(yes_if [ "$(dot 20 90)" = "Y◐" ])"
+expect "with no window known the dot is a dim ?" "$(yes_if [ "$(dot - -)" = "D?" ])"
 
 # --- one email, two organizations ----------------------------------------------
 out=$(run 'creds_resolve b@example.com' || true)
