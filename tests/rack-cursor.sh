@@ -67,11 +67,14 @@ case "$a" in
 esac
 exit 0
 STUB
-chmod +x "$work/bin/cmux" "$work/bin/cswap" "$work/bin/ssh"
+# No tmux for the rack itself: one it found on the PATH would be the real one.
+printf '#!/bin/sh\nexit 1\n' > "$work/bin/tmux"
+ln -s "$(command -v jq)" "$work/bin/jq"
+chmod +x "$work/bin/cmux" "$work/bin/cswap" "$work/bin/ssh" "$work/bin/tmux"
 
 # A UTF-8 locale, so the rack's own text comes out as it does for a person.
 loc=$(locale -a 2>/dev/null | grep -i -m1 -E '^(en_US|C)\.utf-?8$' || true)
-path="$work/bin:$(dirname "$(command -v jq)"):/usr/bin:/bin"
+path="$work/bin:/usr/bin:/bin"
 
 T() { tmux -L "$sock" "$@"; }
 T -f /dev/null new-session -d -x 100 -y 30 -s rack \
@@ -101,7 +104,16 @@ wait_for() {
     done
     fail "never saw '$1'"; screen >&2
 }
-key() { T send-keys -t rack "$@"; settle; }
+# key <key>: send it, wait for the screen or the cursor to change, then settle.
+key() {
+    local before n=0
+    before="$(cursor)$(screen)"
+    T send-keys -t rack "$@"
+    while [[ $n -lt 50 && "$(cursor)$(screen)" == "$before" ]]; do
+        sleep 0.1; n=$((n + 1))
+    done
+    settle
+}
 
 # on <what> <text>: the cursor is shown, on the screen's one ▸ marker, and that
 # row holds <text>.
@@ -123,16 +135,23 @@ key Down;  on "down again" "gamma"
 key Down;  on "down into the logins" "one@example.com"
 key Down;  on "second login" "two@example.com"
 key Up;    on "up" "one@example.com"
-key a;     on "a jumps to the first login" "one@example.com"
 key 3;     on "3 jumps to the third hat" "gamma"
+key a;     on "a jumps to the first login" "one@example.com"
 
 # Narrow: the rows above wrap onto two lines each, and the screen is taller
 # than the terminal, so it scrolls. The cursor still finds the row.
 T resize-window -t rack -x 60 -y 24
-key Up;    on "narrow, up" "beta"
-key Down;  on "narrow, down" "gamma"
+key Up;    on "narrow, up" "gamma"
+key Up;    on "narrow, up again" "beta"
 key b;     on "narrow, a login below wrapped rows" "two@example.com"
 T resize-window -t rack -x 100 -y 30
+
+# A login opens the screen that pushes it to a hat.
+key a; key Enter
+wait_for "PUSH TO A HAT"; on "push" "alpha"
+key Down;  on "push, down" "beta"
+key Escape
+wait_for "HATS"
 
 # The redraw writes over the old screen, and an arrow key's tail is not echoed
 # onto the selected row first.

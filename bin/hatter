@@ -14554,6 +14554,9 @@ EDIT_SEL_MARK=$'\001'
 
 edit_frame_begin() {
     [[ "$EDIT_FRAME" == 0 && -n "$EDIT_CACHE" && -d "$EDIT_CACHE" ]] || return 0
+    # A redirection exec cannot open ends the script, so try the file first;
+    # without it the screen is drawn straight to the terminal as before.
+    { : > "$EDIT_CACHE/frame"; } 2>/dev/null || return 0
     exec 8>&1 1>"$EDIT_CACHE/frame"
     EDIT_FRAME=1
 }
@@ -14571,16 +14574,21 @@ edit_frame_show() {
     edit_frame_abandon
     LC_ALL=C awk -v mark="$EDIT_SEL_MARK" -v cols="$(term_cols)" -v rows="$(term_rows)" \
         -v endfile="$EDIT_CACHE/frame.end" '
-        # Columns a line takes: escapes none, each character one, wide ones
-        # two. Read as bytes, so the locale does not matter: a character is
-        # a byte that does not continue one. Four-byte characters (emoji) and
-        # U+3000-U+DFFF (CJK, Hangul) are wide; a U+FE0F after an emoji is
-        # counted as one more, which is the column its emoji form adds.
+        # Columns a line takes, as an estimate: escapes none, each character
+        # one, wide ones two. Read as bytes, so the locale does not matter: a
+        # character is a byte that does not continue one. Wide: four-byte
+        # characters (emoji), U+2E80-U+DFFF (CJK, Hangul) and the fullwidth
+        # forms. None: combining accents and the zero-width joiner. A U+FE0F
+        # after an emoji counts one, the column its emoji form adds. A symbol
+        # drawn wider than this says matters only on a line above the
+        # selection that comes within a column or two of the width.
         function width(s,   t, w) {
             gsub(/\033\[[0-9;?]*[A-Za-z]/, "", s)
+            gsub(/\314[\200-\277]|\315[\200-\257]|\342\200\215/, "", s)
             t = s; gsub(/[\200-\277]/, "", t); w = length(t)
             t = s; w += gsub(/[\360-\364]/, "", t)
-            t = s; w += gsub(/[\343-\355]/, "", t)
+            t = s; w += gsub(/\342[\272-\277]|[\343-\355]/, "", t)
+            t = s; w += gsub(/\357\274[\201-\277]|\357\275[\200-\240]/, "", t)
             return w
         }
         BEGIN { printf "\033[?25l\033[H"; row = 0; selrow = 0 }
@@ -14610,7 +14618,7 @@ edit_frame_show() {
             }
             printf "\033[?25h"
             print end > endfile
-        }' "$EDIT_CACHE/frame"
+        }' "$EDIT_CACHE/frame" || true
     EDIT_FRAME_END=""
     read -r EDIT_FRAME_END < "$EDIT_CACHE/frame.end" 2>/dev/null || true
     return 0
