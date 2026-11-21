@@ -176,11 +176,28 @@ RUN
     nested_hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
     [[ -z "$(waiting)" && "$(osc_count)" == 8 ]] || fail "a nested agent's prompt notified (waiting='$(waiting)')"
 
+    # @hatter-working (#288): the time the turn opened, set by UserPromptSubmit
+    # and cleared by Stop. A wait on the human keeps the turn open (the
+    # watcher tells quiet from busy). A nested agent neither opens nor ends it.
+    working() { tmux -L "$k" show-options -wqv -t "$pane" @hatter-working; }
+    hook '{"hook_event_name":"Stop"}'; settle
+    [[ -z "$(working)" ]] || fail "Stop left @hatter-working as '$(working)'"
+    nested_hook '{"hook_event_name":"UserPromptSubmit"}'; settle
+    [[ -z "$(working)" ]] || fail "a nested agent's prompt opened the turn: '$(working)'"
+    hook '{"hook_event_name":"UserPromptSubmit"}'; settle
+    [[ "$(working)" =~ ^[0-9]+$ ]] || fail "UserPromptSubmit: @hatter-working is '$(working)', want a time"
+    hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
+    [[ -n "$(working)" ]] || fail "a permission prompt ended the turn"
+    nested_hook '{"hook_event_name":"Stop"}'; settle
+    [[ -n "$(working)" ]] || fail "a nested agent's Stop ended the outer turn"
+    hook '{"hook_event_name":"Stop"}'; settle
+    [[ -z "$(working)" ]] || fail "Stop after a prompt left @hatter-working as '$(working)'"
+
     # A snoozed tab keeps the flag but is not announced.
     tmux -L "$k" set-option -w -t "$pane" @hatter-snooze-until 9999999999
     hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
     [[ "$(waiting)" == approval ]] || fail "snoozed: @hatter-waiting is '$(waiting)'"
-    [[ "$(osc_count)" == 8 ]] || fail "a snoozed tab was announced"
+    [[ "$(osc_count)" == 9 ]] || fail "a snoozed tab was announced"
     tmux -L "$k" set-option -wu -t "$pane" @hatter-snooze-until
 
     # Control bytes in a tab name cannot end the notification early.

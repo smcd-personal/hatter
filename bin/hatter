@@ -1527,7 +1527,8 @@ cmux_change() {
         # new verb is covered until someone shows it does not.
         "workspace-group set-color"|"workspace-group set-icon"|"workspace-group pin"|\
         "workspace-group collapse"|"workspace-group rename"|"workspace-group add"|\
-        "rename-workspace "*|"reorder-workspace "*|"reload-config "|"notify "*) ;;
+        "rename-workspace "*|"reorder-workspace "*|"reload-config "|"notify "*|\
+        "set-status "*|"clear-status "*) ;;
         *) focus_save ;;
     esac
     cmux "$@"
@@ -3550,6 +3551,10 @@ cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #   done             any other Stop (the turn ended): @hatter-waiting only, no ring
 #   (cleared)        UserPromptSubmit
 #
+# It also keeps @hatter-working, the time the agent's turn opened (#288): set
+# on UserPromptSubmit, cleared on Stop. The watcher counts a tab as working
+# while that is set and the pane is still printing (see working_tabs).
+#
 # A plain Stop sets the option but does not ring (#246): every turn ends in
 # one, so ringing on it would ring every agent tab after every turn and bury
 # the rings that mean the agent cannot go on without you.
@@ -3625,9 +3630,7 @@ case "${ev:-}" in
                 | any($ms[]; . as $x | any($ls[]; startswith($x)))' >/dev/null 2>&1; then
             kind=question
         fi ;;
-    UserPromptSubmit)
-        tmux set-option -wu -t "$TMUX_PANE" @hatter-waiting 2>/dev/null
-        exit 0 ;;
+    UserPromptSubmit) ;;
     *) exit 0 ;;
 esac
 
@@ -3635,6 +3638,7 @@ esac
 # shares the pane and fires the same hooks; its turns are not the human's
 # business. Walk up from the hook: a second agent above the first means this
 # one is nested. Any doubt (no ps, odd process names) counts as not nested.
+# A nested agent's Stop must not end the outer agent's turn either.
 agents=0 pid=$PPID n=0
 while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$n" -lt 40 ]; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
@@ -3643,6 +3647,14 @@ while [ "${pid:-0}" -gt 1 ] 2>/dev/null && [ "$n" -lt 40 ]; do
     pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || break
     n=$((n + 1))
 done
+
+case "$ev" in
+    UserPromptSubmit)
+        tmux set-option -wu -t "$TMUX_PANE" @hatter-waiting 2>/dev/null
+        tmux set-option -w -t "$TMUX_PANE" @hatter-working "$(date +%s)" 2>/dev/null
+        exit 0 ;;
+    Stop) tmux set-option -wu -t "$TMUX_PANE" @hatter-working 2>/dev/null ;;
+esac
 
 tmux set-option -w -t "$TMUX_PANE" @hatter-waiting "$kind" 2>/dev/null
 
@@ -12153,6 +12165,176 @@ watch_probe() {
     return 0
 }
 
+# Which workspaces have a busy agent (#288), as a status in cmux's sidebar,
+# next to the unread badge hat-attn's rings leave. cmux cannot mark a single
+# mirrored tab: it draws no OSC 9;4 progress, and the tab title is the tmux
+# window name, which hatter needs as it is. So the mark is per workspace and
+# names the busy tabs: "working: api, docs".
+#
+# hat-attn sets @hatter-working when a turn opens and clears it at Stop. A turn
+# stays open while the agent waits on a permission prompt or a question, and
+# an Esc interrupt fires no Stop, so an open turn alone is not "working". A
+# working agent redraws its spinner many times a second; one that waits, or
+# was interrupted, prints nothing. So a tab is working while its turn is open
+# and its window printed something in the last WORKING_QUIET seconds.
+#
+# The watcher looks every WATCH_WORKING_EVERY seconds: one ssh round trip per
+# destination (over hatter's control master), and a cmux call only when a
+# workspace's status changes. "prefs": {"working_status": "off"} turns it off
+# and clears what it set.
+WORKING_KEY=hatter_working
+WORKING_QUIET=10
+WORKING_COLOR='#ff453a'
+WORKING_ICON=bolt.fill
+WATCH_WORKING_EVERY=5
+WATCH_WORKING_CAP=8
+WATCH_WORKING_LAST=0
+WATCH_WORKING_SHOWN=""   # "<workspace id> TAB <label>": what the watcher set
+WATCH_WORKING_KNOWN=0    # 0 until a round since the stream opened has run
+
+# What runs on a server: its clock, then every window with its open turn and
+# last output.
+WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_name}	#{@hatter-working}	#{window_activity}" 2>/dev/null || true'
+
+# working_tabs: WORKING_SH's output on stdin; prints "<session> TAB <tab>" for
+# each working tab. Without the clock line nothing counts.
+working_tabs() {
+    awk -F '\t' -v q="$WORKING_QUIET" '
+        $1 == "N" && $2 ~ /^[0-9]+$/ { now = $2; next }
+        $1 == "W" && now != "" && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ && now - $5 <= q { print $2 "\t" $3 }'
+}
+
+# working_labels <recorded> <tabs> <workspaces>: one "<id> TAB <label>" for each
+# workspace it can place, the label empty when nothing in it is working.
+#   recorded    "<dest> TAB <session>", every session the config records
+#   tabs        "<dest> TAB <session> TAB <tab>", every working tab
+#   workspaces  "<id> TAB <title>", every workspace cmux shows
+# A workspace is placed by its title, the session it mirrors. A title recorded
+# on two destinations could be either, so it is left alone. A destination that
+# did not answer has no tabs, so its workspaces are cleared.
+working_labels() {
+    AWK_R="$1" AWK_T="$2" awk -F '\t' '
+        BEGIN {
+            n = split(ENVIRON["AWK_R"], r, "\n")
+            for (i = 1; i <= n; i++) {
+                if (split(r[i], f, "\t") < 2) continue
+                if (!((f[2], f[1]) in seen)) { seen[f[2], f[1]] = 1; dests[f[2]]++ }
+            }
+            n = split(ENVIRON["AWK_T"], t, "\n")
+            for (i = 1; i <= n; i++) {
+                if (split(t[i], f, "\t") < 3) continue
+                names[f[1], f[2]] = (names[f[1], f[2]] == "" ? "" : names[f[1], f[2]] "\037") f[3]
+            }
+            for (k in seen) { split(k, f, SUBSEP); dest[f[1]] = f[2] }
+        }
+        NF >= 2 && dests[$2] == 1 {
+            m = split(names[dest[$2], $2], a, "\037"); out = ""; more = 0
+            for (i = 1; i <= m; i++) {
+                if (out == "") out = a[i]
+                else if (length(out) + length(a[i]) <= 32) out = out ", " a[i]
+                else more++
+            }
+            if (more > 0) out = out " +" more
+            print $1 "\t" (out == "" ? "" : "working: " out)
+        }' <<<"$3"
+}
+
+# watch_working_query <dest> <out>: WORKING_SH's output from <dest> into <out>,
+# or <out> left missing when it did not answer.
+watch_working_query() {
+    local dest="$1" out="$2" bin
+    rm -f "$out"
+    # A lapsed sign-in is said by watch_signin; here it is just no answer.
+    access_gate "$dest" >/dev/null 2>&1 || return 0
+    bin=$(type -P ssh) || return 0
+    # The binary through wall_cap: the ssh function cannot be timed out, and
+    # access_gate above has done its part.
+    wall_cap "$WATCH_WORKING_CAP" "$bin" -n "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 \
+        "$dest" "$(posix_sh "$WORKING_SH")" > "$out.tmp" 2>/dev/null </dev/null \
+        && mv "$out.tmp" "$out"
+    rm -f "$out.tmp"
+    return 0
+}
+
+# watch_working_apply <wanted>: bring cmux's statuses in line with <wanted>
+# ("<id> TAB <label>", empty label for none), calling cmux only for changes.
+# Before the first round of a stream what cmux shows is unknown (a watcher
+# restarted, or cmux did), so every placed workspace is set or cleared once.
+watch_working_apply() {
+    local wanted="$1" id label shown="" had
+    while IFS=$'\t' read -r id label; do
+        [[ -n "$id" ]] || continue
+        had=$(AWK_I="$id" awk -F '\t' '$1 == ENVIRON["AWK_I"] { print "y\t" $2; exit }' <<<"$WATCH_WORKING_SHOWN")
+        if [[ -n "$label" ]]; then
+            if [[ "$WATCH_WORKING_KNOWN" == 0 || "$had" != "y"$'\t'"$label" ]]; then
+                cmux_change set-status "$WORKING_KEY" "$label" --workspace "$id" \
+                    --icon "$WORKING_ICON" --color "$WORKING_COLOR" >/dev/null 2>&1 || continue
+            fi
+            shown+="$id"$'\t'"$label"$'\n'
+        elif [[ -n "$had" || "$WATCH_WORKING_KNOWN" == 0 ]]; then
+            # Forgotten even if it fails: a workspace that is gone cannot be
+            # cleared, and the next stream clears everything once anyway.
+            cmux_change clear-status "$WORKING_KEY" --workspace "$id" >/dev/null 2>&1 || true
+        fi
+    done <<<"$wanted"
+    WATCH_WORKING_SHOWN=$shown
+    WATCH_WORKING_KNOWN=1
+    return 0
+}
+
+# watch_working: one round, at most every WATCH_WORKING_EVERY seconds.
+watch_working() {
+    local now tree wss rec dests dest i=0 started="" tabs="" f line wanted
+    now=$(date +%s)
+    (( now - WATCH_WORKING_LAST >= WATCH_WORKING_EVERY )) || return 0
+    WATCH_WORKING_LAST=$now
+    if [[ "$(cfg '.prefs.working_status // "on"' 2>/dev/null)" == off ]]; then
+        [[ -z "$WATCH_WORKING_SHOWN" ]] || watch_working_apply "$(cut -f1 <<<"$WATCH_WORKING_SHOWN")"
+        return 0
+    fi
+    [[ "$WATCH_WAKE_PENDING" == 0 ]] || return 0
+    mac_dark_wake && return 0
+    tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    wss=$(jq -r '.windows[]?.workspaces[]? | select(.id != null and .title != null)
+                 | "\(.id)\t\(.title | tostring | gsub("[\t\n]"; " "))"' <<<"$tree" 2>/dev/null) || return 0
+    rec=$(cfg '.hats as $h | .groups[]? | select($h[.hat] != null and ($h[.hat].disabled | not))
+               | ($h[.hat].ssh // "") as $d | select($d != "" and ($d | startswith("-") | not))
+               | .sessions | keys_unsorted[]? | "\($d)\t\(.)"' 2>/dev/null | awk '!seen[$0]++') || rec=""
+    # Only destinations with a recorded session cmux shows.
+    dests=$(awk -F '\t' 'NR == FNR { shown[$2] = 1; next } ($2 in shown) && !seen[$1]++ { print $1 }' \
+        <(printf '%s\n' "$wss") <(printf '%s\n' "$rec"))
+    mkdir -p "$AUTOSAVE_DIR" 2>/dev/null || true
+    while IFS= read -r dest; do
+        [[ -n "$dest" ]] || continue
+        i=$((i + 1))
+        watch_working_query "$dest" "$AUTOSAVE_DIR/.working-$i" &
+        started+="$! "
+    done <<<"$dests"
+    # shellcheck disable=SC2086
+    [[ -z "$started" ]] || wait_all $started
+    i=0
+    while IFS= read -r dest; do
+        [[ -n "$dest" ]] || continue
+        i=$((i + 1))
+        f="$AUTOSAVE_DIR/.working-$i"
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+            [[ -z "$line" ]] || tabs+="$dest"$'\t'"$line"$'\n'
+        done < <(working_tabs < "$f")
+        rm -f "$f"
+    done <<<"$dests"
+    wanted=$(working_labels "$rec" "$tabs" "$wss")
+    # A workspace the watcher marked that is gone, or no longer placed, is
+    # cleared too.
+    while IFS=$'\t' read -r line _; do
+        [[ -n "$line" ]] || continue
+        AWK_I="$line" awk -F '\t' '$1 == ENVIRON["AWK_I"] { f = 1 } END { exit !f }' <<<"$wanted" \
+            || wanted+=$'\n'"$line"$'\t'
+    done <<<"$WATCH_WORKING_SHOWN"
+    watch_working_apply "$wanted"
+    return 0
+}
+
 # watch_ready_look: one look at how far the recovery is. Prints
 #   back TAB <n>                      sessions that are back and connected
 #   signin TAB <dest> TAB <surface>   a hat's sign-in workspace is open
@@ -12700,6 +12882,7 @@ watch_act() {
     heals=""; heal_all=0
     watch_signin
     watch_ready
+    watch_working
     # A reattach that is due again (#229) is a close to look at, like one
     # that just came in.
     local retry=0
@@ -12737,6 +12920,9 @@ watch_stream() {
     # only once this stream can run, so a failed start keeps them.
     if [[ -n "$WATCH_CARRY_CLOSES" ]]; then closes=$WATCH_CARRY_CLOSES; sync=1; fi
     WATCH_CARRY_CLOSES=""
+    # cmux may have restarted, so what it shows is unknown again.
+    WATCH_WORKING_KNOWN=0
+    WATCH_WORKING_LAST=0
     watch_journal_prune
     cmux events --category workspace --category surface --category window \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
@@ -15160,6 +15346,15 @@ workspace closed in the last 5 minutes before the sleep can still be waited
 for, and named at the cap. A dark wake does not count. Turn it off with "prefs": {"wake_notify": "off"} in the
 config.
 
+The watcher also marks each workspace whose agent is busy, with a status in
+cmux's sidebar next to the unread badge: "working: api, docs" names the busy
+tabs. A tab is busy while its agent's turn is open (hat-attn's
+@hatter-working) and the tab printed something in the last 10 seconds, so a
+turn waiting on a permission prompt or a question, or one you interrupted,
+does not count. It looks every 5 seconds, one ssh round trip per server. cmux
+cannot mark a single mirrored tab, so the mark is per workspace. Turn it off
+with "prefs": {"working_status": "off"}.
+
 The log also says when the event stream resumes, from which event, and
 whether cmux had already dropped some of what happened while the watcher was
 not listening (cmux keeps a few thousand events, in memory). When it had, a
@@ -16100,6 +16295,8 @@ the Mac being involved at all:
                  and badges its workspace until you look. It also sets the tmux
                  window option @hatter-waiting until the next prompt, for a
                  turn that ended too, but any other finished turn does not ring.
+                 While a turn is open it keeps @hatter-working, which the
+                 watcher's "working" mark reads (see: hatter help autosave).
                  Quiet for an agent started by another agent, and for a
                  snoozed tab. Goes in Codex's hooks.json where codex is
                  installed.
