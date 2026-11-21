@@ -38,7 +38,7 @@ cat > "$work/list.json" <<EOF
 {"accounts": [
  {"number": 1, "email": "one@example.com", "organizationUuid": "o1", "active": true,
   "plan": {"organizationType": "claude_max"},
-  "usage": {"fiveHour": {"pct": 20, "resetsAt": "$(at 5400)"}, "sevenDay": {"pct": 30, "resetsAt": "$(at 200000)"}}},
+  "usage": {"fiveHour": {"pct": 20, "resetsAt": "$(at 5000)"}, "sevenDay": {"pct": 30, "resetsAt": "$(at 200000)"}}},
  {"number": 2, "email": "two@example.com", "organizationUuid": "o2", "active": false,
   "plan": {"organizationType": "claude_team"},
   "usage": {"fiveHour": {"pct": 70, "resetsAt": "$(at 7200)"}, "sevenDay": {"pct": 60, "resetsAt": "$(at 400000)"}}},
@@ -95,7 +95,7 @@ for line in sys.stdin.read().split("\n"):
     line = line.replace("/_\\ ", "")
     for icon in ("📂 ", "📁 ", "⌨️ "):
         line = line.replace(icon, "")
-    line = re.sub(r"📌 (\S+)", r"\1 (pinned)", line)
+    line = line.replace("📌 ", "pinned ")
     line = re.sub(r"(^|\s)[●◐○✕✗✓?] ", r"\1", line)
     line = re.sub(r"\s○(\s|$)", r"\1", line)
     line = line.replace("<- ", "").replace("-> ", "held by ")
@@ -122,6 +122,12 @@ mode() {  # mode <pref on|off> <env...>: "plain" or "full"
 [[ $(mode on HATTER_PLAIN=0) == full ]] || fail "HATTER_PLAIN=0 wins over the pref"
 [[ $(mode off NO_COLOR=1) == full ]] || fail "NO_COLOR alone is not plain"
 
+# The holders are shown only with room for a name after "held by": no
+# "held …" with nothing in it.
+tail_at() { bash -c "source '$work/lib.sh'; NO_COLOR=1; PLAIN=1; colour_setup; creds_tail $1 alpha ''"; }
+[[ -z "$(tail_at 12)" ]] || fail "plain tail at 12: want nothing, got '$(tail_at 12)'"
+[[ "$(tail_at 16)" == "  held by alpha" ]] || fail "plain tail at 16: got '$(tail_at 16)'"
+
 # --- hatter creds list ----------------------------------------------------------
 list() {
     env -i HOME="$work/home" PATH="$path" LANG="${loc:-C}" XDG_CONFIG_HOME="$work/cfg" \
@@ -131,7 +137,9 @@ list() {
 full=$(list); plain=$(list HATTER_PLAIN=1)
 [[ "$full" == *█* && "$full" == *●* ]] || fail "creds list full: no bars or dots
 $full"
-if printf '%s' "$plain" | grep -q "$ornaments"; then fail "creds list plain: ornaments left
+# Here-strings, not pipes, into grep -q: under pipefail, grep leaving early
+# can fail the writer and so turn a match into a miss.
+if LC_ALL="${loc:-C}" grep -q "$ornaments" <<< "$plain"; then fail "creds list plain: ornaments left
 $plain"; fi
 want=$(printf '%s\n' "$full" | grep -E '^  [a-z] ' | full_to_plain)
 got=$(printf '%s\n' "$plain" | grep -E '^  [a-z] ' | squeeze)
@@ -150,7 +158,7 @@ for w in 80 60; do
 $out"
 done
 for w in ok low spent; do
-    printf '%s\n' "$got" | grep -q "^[a-z] $w " || fail "creds list plain: no login says '$w'"
+    grep -q "^[a-z] $w " <<< "$got" || fail "creds list plain: no login says '$w'"
 done
 
 # --- the rack ---------------------------------------------------------------------
@@ -169,7 +177,7 @@ else
     wait_for() {  # wait_for <session> <text>
         local n=0
         while [[ $n -lt 75 ]]; do
-            screen "$1" | grep -qF "$2" && { sleep 0.5; return 0; }
+            grep -qF "$2" <<< "$(screen "$1")" && { sleep 0.5; return 0; }
             sleep 0.2; n=$((n + 1))
         done
         fail "$1: never saw '$2'"; screen "$1" >&2
@@ -182,7 +190,7 @@ else
     compare() {  # compare <what>
         local f p want got
         f=$(screen full); p=$(screen plain)
-        if printf '%s' "$p" | grep -q "$ornaments" || [[ "$p" == *'/_\'* ]]; then
+        if LC_ALL="${loc:-C}" grep -q "$ornaments" <<< "$p" || [[ "$p" == *'/_\'* ]]; then
             fail "rack $1 plain: ornaments left
 $p"
         fi
@@ -200,7 +208,7 @@ $got"
         for s in full plain; do T send-keys -t "$s" Enter; wait_for "$s" "$step"; done
         compare "$step"
     done
-    printf '%s\n' "$(screen plain)" | grep -q 'logs.*(pinned)' || fail "rack plain: the pinned tab does not say so"
+    grep -q 'pinned logs' <<< "$(screen plain)" || fail "rack plain: the pinned tab does not say so"
 fi
 
 [[ $fails -eq 0 ]] || { echo "plain-mode: $fails failure(s)" >&2; exit 1; }
