@@ -25,8 +25,9 @@ uses=$(grep -n 'C_RULE' "$hatter" | grep -v 'C_RULE=' | grep -v '^[0-9]*:[[:spac
 [[ -n "$uses" ]] || fail "C_RULE is never used"
 while IFS= read -r line; do
     # A use is either a rule line itself or the argument line just after one.
+    # A rule is drawn literally, or by edit_rule to fit the width (#293).
     n=${line%%:*}
-    sed -n "$((n - 1)),${n}p" "$hatter" | grep -q '────' \
+    sed -n "$((n - 1)),${n}p" "$hatter" | grep -q '────\|edit_rule' \
         || fail "C_RULE on a line that is not a rule: $line"
 done <<<"$uses"
 

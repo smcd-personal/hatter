@@ -138,12 +138,14 @@ key Up;    on "up" "one@example.com"
 key 3;     on "3 jumps to the third hat" "gamma"
 key a;     on "a jumps to the first login" "one@example.com"
 
-# Narrow: the rows above wrap onto two lines each, and the screen is taller
-# than the terminal, so it scrolls. The cursor still finds the row.
-T resize-window -t rack -x 60 -y 24
+# Narrow: so narrow that the rows above wrap even once they have given up
+# what they can (#293), and the screen is taller than the terminal, so it
+# scrolls. The cursor still finds the row.
+T resize-window -t rack -x 30 -y 36
 key Up;    on "narrow, up" "gamma"
 key Up;    on "narrow, up again" "beta"
-key b;     on "narrow, a login below wrapped rows" "two@example.com"
+key b;     on "narrow, a login below wrapped rows" "two@"
+[[ $(T display-message -p -t rack '#{history_size}') -gt 0 ]] || fail "narrow: the screen did not scroll, so that case went untested"
 T resize-window -t rack -x 100 -y 30
 
 # A login opens the screen that pushes it to a hat.

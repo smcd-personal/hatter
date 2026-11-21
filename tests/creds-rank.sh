@@ -115,9 +115,15 @@ write_list \
     "$(acct 8 edge@example.com claude_team 90 $H 98 $((6*D)))"
 
 # A narrow row keeps the active mark when both will not fit.
-tail=$(RUN='colour_setup; creds_tail 31 "a, b" best,active' run)
+tail=$(RUN='colour_setup; creds_tail 27 "a, b" best,active' run)
 expect "a narrow row keeps the active mark" "$(yes_if has "$tail" "active on this Mac")"
 expect "...and drops next first" "$(yes_if [ "${tail#*next}" = "$tail" ])"
+# With a little more room, next comes back in its short form (#293).
+tail=$(RUN='colour_setup; creds_tail 31 "a, b" best,active' run)
+expect "a row with room for a short next shows it" "$(has "$tail" "active on this Mac" && has "$tail" "  next" && echo y || echo n)"
+# Narrower still, active is said in its short form rather than not at all.
+tail=$(RUN='colour_setup; creds_tail 10 "a, b" best,active' run)
+expect "a very narrow row says active briefly" "$(has "$tail" "  active" && [ "${tail#*on this Mac}" = "$tail" ] && echo y || echo n)"
 
 letters=$(RUN='creds_rows' run | awk -F$'\x1f' '{print $1 $2}' | paste -sd' ' -)
 expect "letters stay with their account, whatever the order" \
