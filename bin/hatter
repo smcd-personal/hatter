@@ -325,6 +325,30 @@ migrate_config() {
 tmux_session_name() { printf '%s' "${1//[.:]/_}"; }
 
 hat_exists() { [[ -n "$(cfg --arg l "$1" '.hats[$l] // empty')" ]]; }
+# hat_key <name>: the hat a typed name means. Hat names match without regard
+# to case, so "Work" finds the hat "work"; every command that takes a hat runs
+# what was typed through here and works on the stored name. An exact match
+# wins, which keeps a config that already holds two names differing only in
+# case working. No match, or an ambiguous one, prints the name as given, so the
+# caller's own "unknown hat" check still fires.
+hat_key() {
+    cfg --arg l "$1" '(.hats // {}) as $h
+        | if $h | has($l) then $l
+          else ([$h | keys[] | select(ascii_downcase == ($l | ascii_downcase))]
+                | if length == 1 then .[0] else $l end) end'
+}
+# hat_case_clash <name> [<except>]: an existing hat whose name differs from
+# <name> only in case, other than <except>. A new hat may not be one: the two
+# would be the same hat to every command.
+hat_case_clash() {
+    cfg --arg l "$1" --arg x "${2:-}" '[(.hats // {}) | keys[]
+        | select(. != $l and . != $x and ascii_downcase == ($l | ascii_downcase))] | .[0] // empty'
+}
+# has_hat_prefix <name> <hat>: the name starts "<hat>-", in any case.
+has_hat_prefix() {
+    [[ "$1" == *-* ]] || return 1
+    [[ "$(printf '%s' "${1%%-*}" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ]]
+}
 # "-oProxyCommand=..." is a valid ssh argument and would run whatever it says.
 # A destination is never an option, so anything that looks like one is refused
 # rather than handed to ssh.
@@ -726,7 +750,8 @@ PRUNE_UNASSIGNED='.groups |= with_entries(select((.value.managed == true
 # session-name prefix decides. Two hats can each record a session of the same
 # name; then the one its prefix names wins.
 session_hat() {
-    local session="$1" found prefix="${1%%-*}"
+    local session="$1" found prefix
+    prefix=$(hat_key "${1%%-*}")
     found=$(cfg --arg s "$session" --arg p "$prefix" '
         [.groups | to_entries[] | select(.value.sessions[$s]) | .value.hat]
         | if index($p) then $p else .[0] // empty end')
@@ -778,7 +803,7 @@ session_group() {
 # made by rename or plain tmux); then "<hat>-<name>" if that is running.
 hat_existing_session() {
     local hat="$1" name="$2" host
-    if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
+    if has_hat_prefix "$name" "$hat"; then printf '%s' "$name"; return 0; fi
     if [[ -n "$(session_group "$name" "$hat")" ]]; then
         printf '%s' "$name"; return 0
     fi
@@ -831,7 +856,7 @@ name_recorded_by_hats() {
 # instead. A name that already carries the prefix is kept as given.
 hat_new_name() {
     local hat="$1" name="$2" host
-    if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
+    if has_hat_prefix "$name" "$hat"; then printf '%s' "$name"; return 0; fi
     host=$(hat_ssh "$hat")
     if [[ -n "$host" ]] && { name_recorded_on_server "$hat" "$name" \
             || remote_session_exists "$host" "$name"; }; then
@@ -867,8 +892,10 @@ hat_short_name() { printf '%s\n' "$2" | hat_short_names "$1"; }
 # --------------------------------------------------------------- config writes
 
 register_hat() {
-    local hat="$1" ssh_dest="${2:-}" dir="${3:-}" defgroup="${4:-}"
+    local hat="$1" ssh_dest="${2:-}" dir="${3:-}" defgroup="${4:-}" clash
 
+    clash=$(hat_case_clash "$hat")
+    [[ -z "$clash" ]] || die "there is already a hat '$clash'; hat names ignore case, so use '$clash'"
     if [[ -z "$ssh_dest" ]]; then
         [[ -t 0 ]] || die "unknown hat '$hat' and no --ssh given (not a tty, cannot prompt)"
         echo
@@ -5861,7 +5888,7 @@ cmd_new() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --group) group="$2"; shift 2 ;;
-            --hat) hat="$2"; shift 2 ;;
+            --hat) hat=$(hat_key "$2"); shift 2 ;;
             --ssh|--host) ssh_dest="$2"; shift 2 ;;
             --dir) dir="$2"; shift 2 ;;
             # Land on the new workspace, rather than going back to where this
@@ -5890,7 +5917,7 @@ cmd_new() {
     fi
 
     if [[ -z "$hat" ]]; then
-        hat="${session%%-*}"
+        hat=$(hat_key "${session%%-*}")
         if [[ "$hat" == "$session" ]]; then
             # No prefix to read. If this hatter was started inside a cmux
             # window, that window names the hat - which is the whole point of
@@ -6022,7 +6049,7 @@ cmd_tab() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --hat) [[ $# -ge 2 && -n "$2" ]] || die "usage: hatter tab <session> [tab-name] [--hat <hat>]"
-                   want="$2"; shift 2 ;;
+                   want=$(hat_key "$2"); shift 2 ;;
             # Everything after -- is a name, even one that starts with -.
             --) shift; args+=("$@"); break ;;
             -*) die "unknown flag: $1  (try: hatter help tab)" ;;
@@ -6205,7 +6232,7 @@ cmd_snooze() {
     local want="" args=() rc=0 until
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want=$(hat_key "$2"); shift 2 ;;
             --) shift; args+=("$@"); break ;;
             -*) die "unknown flag: $1  (try: hatter help snooze)" ;;
             *) args+=("$1"); shift ;;
@@ -6244,7 +6271,7 @@ cmd_unsnooze() {
     local want="" args=() hat which rc=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want=$(hat_key "$2"); shift 2 ;;
             --) shift; args+=("$@"); break ;;
             -*) die "unknown flag: $1  (try: hatter help unsnooze)" ;;
             *) args+=("$1"); shift ;;
@@ -6268,8 +6295,9 @@ cmd_unsnooze() {
 cmd_snoozed() {
     local hats=() asked=() hat host i n tmp t found=0 seen=$'\n' pids=()
     if [[ $# -gt 0 ]]; then
-        hat_exists "$1" || die "unknown hat: $1"
-        hats=("$1")
+        hat=$(hat_key "$1")
+        hat_exists "$hat" || die "unknown hat: $1"
+        hats=("$hat")
     else
         while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
     fi
@@ -6365,7 +6393,7 @@ cmd_hibernate() {
     local want="" idle="" auto="" dry="" args=() rc=0 host h out
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hat)  [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --hat)  [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want=$(hat_key "$2"); shift 2 ;;
             --idle) [[ $# -ge 2 && -n "$2" ]] || die "--idle needs an age, like 2d"; idle="$2"; shift 2 ;;
             --auto) [[ $# -ge 2 && -n "$2" ]] || die "--auto needs an age, like 2d, or off"; auto="$2"; shift 2 ;;
             --dry-run) dry=1; shift ;;
@@ -6422,8 +6450,9 @@ cmd_hibernate() {
 cmd_hibernated() {
     local hats=() asked=() hat host i n tmp t found=0 seen=$'\n'
     if [[ $# -gt 0 ]]; then
-        hat_exists "$1" || die "unknown hat: $1"
-        hats=("$1")
+        hat=$(hat_key "$1")
+        hat_exists "$hat" || die "unknown hat: $1"
+        hats=("$hat")
     else
         while IFS= read -r hat; do [[ -n "$hat" ]] && hats+=("$hat"); done < <(hat_names)
     fi
@@ -6467,7 +6496,7 @@ cmd_wake() {
     local want="" args=() hat which rc=0 out session idx wid made win
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want="$2"; shift 2 ;;
+            --hat) [[ $# -ge 2 && -n "$2" ]] || die "--hat needs a hat"; want=$(hat_key "$2"); shift 2 ;;
             --) shift; args+=("$@"); break ;;
             -*) die "unknown flag: $1  (try: hatter help wake)" ;;
             *) args+=("$1"); shift ;;
@@ -6590,8 +6619,9 @@ tab_target() {
 
     # A hat is not a workspace. Catch the confusion explicitly rather than
     # failing later with advice that cannot help.
-    if hat_exists "$session"; then
+    if hat_exists "$(hat_key "$session")"; then
         local listing
+        session=$(hat_key "$session")
         listing=$(cfg --arg l "$session" '
             .groups | to_entries[] | select(.value.hat == $l)
             | .key as $g | .value.sessions | keys_unsorted[]? | "  \($g) / \(.)"')
@@ -7391,7 +7421,8 @@ drag_local_refuse() {
 cmd_resize() {
     local target="$1" hat session="" host
     shift
-    if hat_exists "$target"; then
+    if hat_exists "$(hat_key "$target")"; then
+        target=$(hat_key "$target")
         hat="$target"
     else
         session=$(tmux_session_name "$target")
@@ -7503,7 +7534,7 @@ cmd_repair() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --hat) [[ $# -ge 2 && -n "$2" ]] || die "usage: hatter repair <session> [--hat <hat>]"
-                   want="$2"; shift 2 ;;
+                   want=$(hat_key "$2"); shift 2 ;;
             -*) die "unknown flag: $1  (try: hatter help repair)" ;;
             *)  [[ -z "$session" ]] || die "usage: hatter repair <session> [--hat <hat>]"
                 session="$1"; shift ;;
@@ -7663,7 +7694,9 @@ cmd_attach() {
     local target="$1" hat session
     target=$(tmux_session_name "$target")
 
-    # A recorded session, or one whose prefix names a hat.
+    # A hat, whatever its case; else a recorded session, or one whose prefix
+    # names a hat.
+    hat_exists "$(hat_key "$target")" && target=$(hat_key "$target")
     if ! hat_exists "$target"; then
         hat=$(session_hat_typed "$target" "hatter attach <hat>, and pick it there" here) || exit 1
         [[ -n "$hat" ]] || die "'$target' is neither a hat nor a workspace of one.
@@ -8101,8 +8134,9 @@ cmd_find() {
             --limit) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "--limit needs a number (0 for all)"
                     limit="$2"; shift 2 ;;
             --hat)  [[ -n "${2:-}" ]] || die "--hat needs a hat name"
-                    hat_exists "$2" || die "no hat named '$2'"
-                    only="$2"; shift 2 ;;
+                    only=$(hat_key "$2")
+                    hat_exists "$only" || die "no hat named '$2'"
+                    shift 2 ;;
             --)     shift; terms+=("$@"); break ;;
             -*)     die "unknown option: $1  (try: hatter help find)" ;;
             *)      terms+=("$1"); shift ;;
@@ -8514,7 +8548,9 @@ def ps_where($c): [$c.groups // {} | to_entries[] as $g | ($g.value.sessions // 
 # prefixed with; else the first.
 def ps_owner($where): ($where[.ws] // null) as $w | (.ws | split("-")[0]) as $pre
     | if $w != null and (.hats | index($w.hat)) then $w.hat
-      elif (.hats | index($pre)) then $pre else .hats[0] end;
+      elif (.hats | index($pre)) then $pre
+      else ((.hats | map(ascii_downcase) | index($pre | ascii_downcase)) as $i
+            | if $i != null then .hats[$i] else .hats[0] end) end;
 
 def ps_rows($c; $now; $idle; $busy):
   ps_where($c) as $where
@@ -8835,8 +8871,9 @@ cmd_ps() {
                      f_match="$2"; shift 2 ;;
             -*)     die "unknown option: $1  (try: hatter help ps)" ;;
             *)      [[ -z "$only" ]] || die "one hat at a time (or --all)"
-                    hat_exists "$1" || die "no hat named '$1'"
-                    only="$1"; shift ;;
+                    only=$(hat_key "$1")
+                    hat_exists "$only" || die "no hat named '$1'"
+                    shift ;;
         esac
     done
     [[ -z "$only" || "$all" == 0 ]] || die "a hat or --all, not both"
@@ -8997,8 +9034,9 @@ cmd_state() {
         case "$1" in
             --json) json=1; shift ;;
             --hat)  [[ -n "${2:-}" ]] || die "--hat needs a hat"
-                    hat_exists "$2" || die "no hat named '$2'"
-                    only="$2"; shift 2 ;;
+                    only=$(hat_key "$2")
+                    hat_exists "$only" || die "no hat named '$2'"
+                    shift 2 ;;
             -h|--help) usage_cmd state; return 0 ;;
             *) die "unknown argument: $1  (try: hatter help state)" ;;
         esac
@@ -9114,7 +9152,7 @@ cmd_login() {
             -h|--help) usage_cmd login; return 0 ;;
             -*) die "unknown option '$1' (see: hatter help login)" ;;
             *) [[ -z "$want" ]] || die "one hat at most (see: hatter help login)"
-               want="$1"; shift ;;
+               want=$(hat_key "$1"); shift ;;
         esac
     done
     [[ -z "$want" ]] || hat_exists "$want" || die "no hat named '$want'"
@@ -9215,7 +9253,7 @@ cmd_key() {
         case "$1" in
             --all) all=1 ;;
             -*) die "unknown flag: $1" ;;
-            *) hat_exists "$1" || die "unknown hat: $1"; hats+=("$1") ;;
+            *) hat_exists "$(hat_key "$1")" || die "unknown hat: $1"; hats+=("$(hat_key "$1")") ;;
         esac
         shift
     done
@@ -9332,7 +9370,7 @@ cmd_rm() {
         case "$1" in
             --keep-running) keep=1; shift ;;
             --hat) [[ $# -ge 2 && -n "$2" ]] || die "$usage"
-                   want="$2"; shift 2 ;;
+                   want=$(hat_key "$2"); shift 2 ;;
             -*) die "unknown flag: $1  (try: hatter help rm)" ;;
             *)  [[ -z "$session" ]] || die "$usage"
                 session="$1"; shift ;;
@@ -9411,7 +9449,7 @@ cmd_rename() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --hat) [[ $# -ge 2 && -n "$2" ]] || die "$usage"
-                   want="$2"; shift 2 ;;
+                   want=$(hat_key "$2"); shift 2 ;;
             -*) die "unknown flag: $1  (try: hatter help rename)" ;;
             *)  if [[ -z "$old" ]]; then old="$1"
                 elif [[ -z "$new" ]]; then new="$1"
@@ -9691,7 +9729,7 @@ hat_disable() {
             --no-sync) nosync=1; shift ;;
             --keep-running) keep=1; shift ;;
             -*) die "unknown flag: $1  ($usage)" ;;
-            *) [[ -z "$hat" ]] || die "$usage"; hat="$1"; shift ;;
+            *) [[ -z "$hat" ]] || die "$usage"; hat=$(hat_key "$1"); shift ;;
         esac
     done
     [[ -n "$hat" ]] || die "$usage"
@@ -9813,7 +9851,7 @@ hat_enable() {
         case "$1" in
             --no-restore) norestore=1; shift ;;
             -*) die "unknown flag: $1  ($usage)" ;;
-            *) [[ -z "$hat" ]] || die "$usage"; hat="$1"; shift ;;
+            *) [[ -z "$hat" ]] || die "$usage"; hat=$(hat_key "$1"); shift ;;
         esac
     done
     [[ -n "$hat" ]] || die "$usage"
@@ -9878,6 +9916,10 @@ cmd_hat() {
                 esac
             done
             [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh] [--kind <kind>] [--args <kind>=<args>]"
+            # set changes the hat the name means, whatever its case; add makes
+            # one, and register_hat refuses a name that differs from an
+            # existing hat's only in case.
+            [[ "$sub" == set ]] && name=$(hat_key "$name")
             # Before anything is written: a default group may not be hatter's own.
             [[ -n "$defgroup" ]] && group_name_reserved "$defgroup" && \
                 die "'$UNASSIGNED' is hatter's own group, kept for workspaces in no group - pick another default group"
@@ -9923,8 +9965,15 @@ cmd_hat() {
         rename|mv)
             local old="${1:-}" new="${2:-}"
             [[ -n "$old" && -n "$new" ]] || die "usage: hatter hat rename <old> <new>"
+            old=$(hat_key "$old")
             hat_exists "$old" || die "unknown hat: $old"
+            [[ "$new" != "$old" ]] || die "hat '$old' is already called that"
             hat_exists "$new" && die "hat '$new' already exists"
+            # Changing only the case of the old name is a rename; matching
+            # another hat but for case is not.
+            local clash
+            clash=$(hat_case_clash "$new" "$old")
+            [[ -z "$clash" ]] || die "there is already a hat '$clash'; hat names ignore case"
 
             local host
             host=$(hat_ssh "$old")
@@ -9960,7 +10009,8 @@ cmd_hat() {
             info "Renamed hat '$old' -> '$new'"
             ;;
         rm|remove)
-            local name="${1:-}"
+            local name
+            name=$(hat_key "${1:-}")
             [[ -n "$name" ]] || die "usage: hatter hat rm <prefix>"
             backup_config
             jq_write --arg l "$name" 'del(.hats[$l])'
@@ -9984,7 +10034,7 @@ cmd_group() {
             shift || true
             while [[ $# -gt 0 ]]; do
                 case "$1" in
-                    --hat|--login|--prefix) hat="$2"; shift 2 ;;
+                    --hat|--login|--prefix) hat=$(hat_key "$2"); shift 2 ;;
                     *) die "unknown flag: $1" ;;
                 esac
             done
@@ -9994,6 +10044,7 @@ cmd_group() {
             if [[ -z "$hat" ]]; then
                 [[ -t 0 ]] || die "--hat is required"
                 read -r -p "  hat prefix for '$name': " hat
+                hat=$(hat_key "$hat")
             fi
             hat_exists "$hat" || register_hat "$hat" "" ""
             register_group "$name" "$hat"
@@ -10881,8 +10932,8 @@ cmd_restore() {
     if [[ $# -gt 0 ]]; then
         local tok resolved=() l
         for tok in "$@"; do
-            if hat_exists "$tok"; then
-                l="$tok"
+            if hat_exists "$(hat_key "$tok")"; then
+                l=$(hat_key "$tok")
             elif group_exists "$tok"; then
                 l=$(group_hat "$tok")
             else
@@ -11065,8 +11116,8 @@ cmd_provision() {
     local host
     if [[ "$token" == *@* ]]; then
         host="$token"
-    elif hat_exists "$token"; then
-        host=$(hat_ssh "$token")
+    elif hat_exists "$(hat_key "$token")"; then
+        host=$(hat_ssh "$(hat_key "$token")")
     elif group_exists "$token"; then
         host=$(hat_ssh "$(group_hat "$token")")
     else
@@ -13650,7 +13701,7 @@ cmd_creds() {
                 while IFS= read -r hat; do [[ -n "$hat" ]] && targets+=("$hat"); done < <(hat_names)
             else
                 [[ $# -gt 0 ]] || die "which hat? usage: hatter creds push $sel <hat...|--all>"
-                targets=("$@")
+                for hat in "$@"; do targets+=("$(hat_key "$hat")"); done
             fi
             [[ "$sel" == best ]] && info "Best Claude login now: $email"
             # Hats on one ssh destination share one credentials file: push it
@@ -13727,7 +13778,8 @@ cmd_creds() {
             done < <(hat_names)
             ;;
         clear)
-            local hat="${1:-}" which="${2:-claude}"
+            local hat which="${2:-claude}"
+            hat=$(hat_key "${1:-}")
             [[ -n "$hat" ]] || die "usage: hatter creds clear <hat> [claude|codex|all]"
             hat_exists "$hat" || die "unknown hat: $hat"
             case "$which" in claude|codex|all) ;; *) die "clear what? claude, codex or all" ;; esac
@@ -14318,6 +14370,12 @@ edit_top() {
                 edit_ask "new hat name (the session prefix)" || continue
                 local nh_name="$EDIT_REPLY"
                 [[ -z "$nh_name" ]] && continue
+                # register_hat would refuse it too, but by ending the rack.
+                local nh_clash
+                nh_clash=$(hat_case_clash "$nh_name")
+                if [[ -n "$nh_clash" ]]; then
+                    warn "there is already a hat '$nh_clash'; hat names ignore case"; edit_pause; continue
+                fi
                 edit_ask "ssh destination (user@host)" || continue; local nhost="$EDIT_REPLY"
                 edit_ask "remote dir [\$HOME]" || continue; local dir="${EDIT_REPLY:-\$HOME}"
                 edit_ask "default group for new workspaces" || continue; local g="$EDIT_REPLY"
@@ -15646,6 +15704,9 @@ hatter hat <subcommand>
 
 A hat is a login: one user@host, one ssh connection, one tmux server, and one
 cmux window. The hat name is the prefix on every session that belongs to it.
+Hat names ignore case: every command finds the hat dev from Dev or DEV, and
+no new hat (add, rename, the rack) may differ from an existing one only in
+case. `hat rename dev Dev` changes a hat's own case.
 
 Subcommands:
   list                                    Hats and their destinations
