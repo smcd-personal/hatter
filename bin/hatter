@@ -12219,34 +12219,42 @@ WORKING_KEYS_RE='^hatter_(tab_[0-9]+|working)$'
 
 # What runs on a server: its clock, then every window with its index, name,
 # open turn, last output, what hat-attn says it waits for, whether tmux names
-# it, what runs in its active pane, and that pane's title (last, in case it
-# holds a tab).
-WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_index}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}	#{?automatic-rename,1,0}	#{pane_current_command}	#{pane_title}" 2>/dev/null || true'
+# it, what runs in its active pane, its pane count, and the active pane's
+# title (last, in case it holds a tab).
+WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_index}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}	#{?automatic-rename,1,0}	#{pane_current_command}	#{window_panes}	#{pane_title}" 2>/dev/null || true'
 
 # tab_states: WORKING_SH's output on stdin; prints
 # "<session> TAB <index> TAB <name> TAB <state>" for every window, the state
 # one of working, approval, question, idle. Without the clock line nothing
-# is working. A shell in front means the agent has exited: hat-attn's flag
-# stays until the next prompt, so it is stale, and the tab is idle.
+# is working. A shell in front of a one-pane window with no open turn means
+# the agent has exited: hat-attn's flag stays until the next prompt, so it is
+# stale, and the tab is idle. (A window with more panes may have its agent in
+# one the shell is not; an open turn is an agent at work. An agent hat-launch
+# started under bash 3.2 shares its process group, and tmux names the group
+# leader, bash, so a flag on such a host after the turn reads as stale too.)
 #
 # The name is the window's, unless tmux names the window itself (after the
 # program running, "claude" or "bash") or it has none: then an agent's own
 # title for the session, which Claude Code sets as the pane title behind a
 # status glyph ("<glyph> Fix the login page"), is the better name. A pane
-# title without that glyph is the host name, tmux's default, and is not used.
+# title without that glyph is the host name, tmux's default, and is not used;
+# nor is the title once the agent has exited, as it stays behind.
 tab_states() {
     LC_ALL=C awk -F '\t' -v q="$WORKING_QUIET" -v wq="$WORKING_WAIT_QUIET" '
         $1 == "N" && $2 ~ /^[0-9]+$/ { now = $2; next }
         $1 == "W" && NF >= 7 && $3 ~ /^[0-9]+$/ {
-            shell = ($9 ~ /^-?(ba|z|da|k|tc|c|fi)?sh$/)
+            shell = ($9 ~ /^-?(ba|z|da|k|tc|c|fi)?sh$/ && $10 == "1" && $5 == "")
             ask = ($7 == "approval" || $7 == "question") && !shell
             if (shell) st = "idle"
             else if (now != "" && $5 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && now - $6 <= (ask ? wq : q)) st = "working"
             else if (ask) st = $7
             else st = "idle"
-            name = $4; title = $10
-            for (i = 11; i <= NF; i++) title = title " " $i
-            if (($8 == "1" || name == "") && title ~ /^[^ -~]+ [ -~]/) { sub(/^[^ -~]+ +/, "", title); name = title }
+            name = $4; title = $11
+            for (i = 12; i <= NF; i++) title = title " " $i
+            # The glyph: one three-byte character, U+2000 to U+2FFF.
+            if (($8 == "1" || name == "") && !shell && title ~ /^\342[\200-\277][\200-\277] +[^ ]/) {
+                sub(/^\342[\200-\277][\200-\277] +/, "", title); name = title
+            }
             print $2 "\t" $3 "\t" name "\t" st
         }'
 }
@@ -12283,11 +12291,14 @@ tab_lines() {
                 if (split(t[i], f, "\t") < 5 || f[3] !~ /^[0-9]+$/) continue
                 st = (f[5] in icon) ? f[5] : "idle"
                 name = f[4]; if (name == "") name = "window " f[3]
+                # cmux reads a value starting "--" as an option: start it
+                # with a hyphen character instead.
+                if (name ~ /^--/) name = "\342\200\220" substr(name, 2)
                 if (length(name) > max) {
                     # Bytes, so a cut can split a character: drop a
-                    # trailing partial one.
+                    # trailing incomplete one.
                     name = substr(name, 1, max - 1)
-                    if (name ~ /[\200-\377]$/) sub(/[\300-\367]?[\200-\277]*$/, "", name)
+                    sub(/([\300-\367]|[\340-\367][\200-\277]|[\360-\367][\200-\277][\200-\277])$/, "", name)
                     name = name "…"
                 }
                 k = f[1] SUBSEP f[2]
@@ -12386,7 +12397,7 @@ watch_working_apply() {
 # watch_working: one round, at most every WATCH_WORKING_EVERY seconds.
 watch_working() {
     local now tree wss rec dests dest i=0 started="" tabs="" f line wanted held="" misses="" m off=0
-    local placed unread ids
+    local placed unread gone
     now=$(date +%s)
     (( now - WATCH_WORKING_LAST >= WATCH_WORKING_EVERY )) || return 0
     WATCH_WORKING_LAST=$now
@@ -12408,14 +12419,23 @@ watch_working() {
         <(printf '%s\n' "$wss") <(printf '%s\n' "$WATCH_WORKING_SHOWN"))
     WATCH_WORKING_SEEN=$(awk -F '\t' 'NR == FNR { here[$1] = 1; next } NF && ($1 in here)' \
         <(printf '%s\n' "$wss") <(printf '%s\n' "$WATCH_WORKING_SEEN"))
+    # $( ) drops the last newline, and the next id is appended after one.
+    [[ -z "$WATCH_WORKING_SEEN" ]] || WATCH_WORKING_SEEN+=$'\n'
     # Every placed workspace's lines are read once per stream, before the
     # first change to it.
     placed=$(tab_lines "$rec" "" "$wss" | awk -F '\t' 'NF == 1')
     watch_working_seen "$placed"
     unread=$WATCH_WORKING_UNREAD
+    # A workspace with lines that is no longer placed (its title now recorded
+    # on two destinations, or not at all) is to be cleared, on or off.
+    gone=""
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        grep -qxF -- "$line" <<<"$placed" || gone+="$line"$'\n'
+    done < <(awk -F '\t' 'NF >= 2 && !seen[$1]++ { print $1 }' <<<"$WATCH_WORKING_SHOWN")
     if [[ "$off" == 1 ]]; then
         # Clear every placed workspace's lines.
-        watch_working_apply "$(grep -vxF -f <(printf '%s\n' "$unread") <<<"$placed")"
+        watch_working_apply "$(grep -vxF -f <(printf '%s\n' "$unread") <<<"$placed")"$'\n'"$gone"
         [[ -n "$unread" ]] || WATCH_WORKING_KNOWN=1
         return 0
     fi
@@ -12455,15 +12475,8 @@ watch_working() {
     # A workspace not read yet is left out, as a held one is.
     wanted=$(tab_lines "$rec" "$tabs" "$wss" "$held" \
         | AWK_U="$unread" awk -F '\t' 'BEGIN { n = split(ENVIRON["AWK_U"], u, "\n"); for (i = 1; i <= n; i++) skip[u[i]] = 1 } !($1 in skip)')
-    # A workspace with lines that is no longer placed (its title now recorded
-    # on two destinations, or not at all) is cleared; a placed one that was
-    # held or not read is not in <placed>'s complement, so it keeps its lines.
-    ids=$(awk -F '\t' 'NF >= 2 && !seen[$1]++ { print $1 }' <<<"$WATCH_WORKING_SHOWN")
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        grep -qxF -- "$line" <<<"$placed" || wanted+=$'\n'"$line"
-    done <<<"$ids"
-    watch_working_apply "$wanted"
+    # A placed workspace that was held or not read keeps its lines.
+    watch_working_apply "$wanted"$'\n'"$gone"
     return 0
 }
 

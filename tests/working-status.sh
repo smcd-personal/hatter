@@ -56,14 +56,15 @@ expect "tab_states: a quiet prompt is approval or question, a resumed one workin
 out=$(printf 'W\ts\t1\tbusy\t990\t998\t\n' | tab_states)
 expect "tab_states: no server clock, nothing is working" "$(is "$out" "s${T}1${T}busy${T}idle")"
 # A shell in front: the agent exited, so its flag is stale.
-out=$(printf 'N\t1000\nW\ts\t1\tq\t\t900\tquestion\t0\tzsh\t\nW\ts\t2\tq2\t\t900\tquestion\t0\tclaude\t\nW\ts\t3\tb\t990\t998\t\t0\t-bash\t\n' | tab_states)
-expect "tab_states: a shell in front is idle whatever the flags say" \
-    "$(is "$out" "s${T}1${T}q${T}idle"$'\n'"s${T}2${T}q2${T}question"$'\n'"s${T}3${T}b${T}idle")"
+# Not when the window has another pane, nor while a turn is open.
+out=$(printf 'N\t1000\nW\ts\t1\tq\t\t900\tquestion\t0\tzsh\t1\t\nW\ts\t2\tq2\t\t900\tquestion\t0\tclaude\t1\t\nW\ts\t3\tb\t\t998\t\t0\t-bash\t1\t\nW\ts\t4\tsplit\t\t900\tapproval\t0\tzsh\t2\t\nW\ts\t5\topen\t990\t998\t\t0\tbash\t1\t\n' | tab_states)
+expect "tab_states: a shell alone in front is idle; split or mid-turn it is not" \
+    "$(is "$out" "s${T}1${T}q${T}idle"$'\n'"s${T}2${T}q2${T}question"$'\n'"s${T}3${T}b${T}idle"$'\n'"s${T}4${T}split${T}approval"$'\n'"s${T}5${T}open${T}working")"
 # Names: tmux's own name or none gives way to an agent's titled pane; a
 # name set by hand, or a pane title without a glyph (the host name), does not.
-out=$(printf 'N\t1000\nW\ts\t1\tclaude\t\t900\t\t1\tclaude\t\342\234\263 Fix the login page\nW\ts\t2\t\t\t900\t\t0\tclaude\t\342\240\202 Tab\tin title\nW\ts\t3\tAPI\t\t900\t\t0\tclaude\t\342\234\263 Other\nW\ts\t4\tbash\t\t900\t\t1\tbash\tbox1\n' | tab_states | cut -f3)
-expect "tab_states: an agent's title names a tab tmux named, not one named by hand" \
-    "$(is "$out" "Fix the login page"$'\n'"Tab in title"$'\n'"API"$'\n'"bash")"
+out=$(printf 'N\t1000\nW\ts\t1\tclaude\t\t900\t\t1\tclaude\t1\t\342\234\263 Fix the login page\nW\ts\t2\t\t\t900\t\t0\tclaude\t1\t\342\240\202 Tab\tin title\nW\ts\t3\tAPI\t\t900\t\t0\tclaude\t1\t\342\234\263 Other\nW\ts\t4\tbash\t\t900\t\t1\tbash\t1\tbox1\nW\ts\t5\tzsh\t\t900\t\t1\tzsh\t1\t\342\234\263 Old task\nW\ts\t6\tnode\t\t900\t\t1\tnode\t1\t\342\234\263 \346\227\245\346\234\254\nW\ts\t7\tnode\t\t900\t\t1\tnode\t1\t\303\251t\303\251 x\n' | tab_states | cut -f3)
+expect "tab_states: an agent's title names a tab tmux named, not one named by hand, nor after it exits" \
+    "$(is "$out" "Fix the login page"$'\n'"Tab in title"$'\n'"API"$'\n'"bash"$'\n'"zsh"$'\n'$'\346\227\245\346\234\254'$'\n'"node")"
 
 # --- tab_lines -------------------------------------------------------------------
 rec="a.example.com${T}api"$'\n'"a.example.com${T}docs"$'\n'"b.example.com${T}ops"$'\n'"a.example.com${T}both"$'\n'"b.example.com${T}both"
@@ -80,6 +81,10 @@ expect "tab_lines: a long name is cut" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0
 long=$(printf 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\303\251\303\251\303\251')
 out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}${long}${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
 expect "tab_lines: a cut never splits a character" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ…")"
+# A cut on a character boundary keeps the whole character.
+long=$(printf 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI\303\251\303\251\303\251')
+out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}${long}${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
+expect "tab_lines: a cut on a boundary keeps the last character" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI$(printf '\303\251')…")"
 COLORBLIND_SAFE=on
 out=$(tab_lines "$rec" "a.example.com${T}api${T}1${T}one${T}working" "W1${T}api" | sed -n 2p | cut -f5)
 expect "tab_lines: colour-blind safe shades" "$(is "$out" "#d55e00")"
@@ -158,6 +163,8 @@ expect "first round: one ssh, to the enabled hat only" \
 
 round
 expect "no change: no cmux call, no second read" "$(is "$(calls)$(lists)" "")"
+round; round
+expect "no change over more rounds: still no read" "$(is "$(calls)$(lists)" "")"
 
 server "W${T}dev-api${T}1${T}main${T}${T}999${T}question"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
 round
@@ -201,10 +208,68 @@ round
 expect "unreadable: read and set once it can be" \
     "$(is "$(lists)|$(calls)" "W-api"$'\n'"W-docs|$(set1 1 main W-api bolt.fill "$R" 2998)")"
 
+# A renamed tab gets its line set again; a name starting "--" is not an option.
+server "W${T}dev-api${T}1${T}--main${T}990${T}999${T}"$'\n'
+round
+expect "renamed tab: set again, a leading -- made safe" \
+    "$(is "$(calls)" "$(set1 1 $'\342\200\220-main' W-api bolt.fill "$R" 2998)")"
+server "W${T}dev-api${T}1${T}main${T}990${T}999${T}"$'\n'
+round; calls >/dev/null
+
+# The colours follow the pref each round, not as the watcher started.
+write_config '"prefs": {"colorblind_safe": "on"}, '
+COLORBLIND_SAFE=off
+round
+expect "colour-blind pref: read again each round" "$(is "$(calls)" "$(set1 1 main W-api bolt.fill '#d55e00' 2998)")"
+write_config
+round; calls >/dev/null
+
+# One workspace unreadable, the other not: the readable one is still set.
+WATCH_WORKING_KNOWN=0 WATCH_WORKING_SEEN="" WATCH_WORKING_SHOWN=""
+server "W${T}dev-api${T}1${T}main${T}990${T}999${T}"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}"$'\n'
+cmux() {
+    if [[ "$*" == *list-status* ]]; then
+        local all="$*"; local id="${all##*--workspace }"
+        echo "$id" >> "$work/list.log"
+        [[ "$id" != W-docs || ! -f "$work/list-fail" ]] || return 1
+        cat "$work/status-$id" 2>/dev/null
+        return 0
+    fi
+    echo "$*" >> "$work/cmux.log"; [[ ! -f "$work/cmux-fail" ]]
+}
+touch "$work/list-fail"; round; rm -f "$work/list-fail"; lists >/dev/null
+expect "partly unreadable: the readable workspace is set, the other left alone" \
+    "$(is "$(calls)" "$(set1 1 main W-api bolt.fill "$R" 2998)")"
+round; lists >/dev/null
+expect "partly unreadable: the other is set once read" \
+    "$(is "$(calls)" "$(set1 1 main W-docs circle "$G" 1998)")"
+
+# A workspace that is no longer placed (its session no longer recorded) is
+# cleared, with the pref on or off.
+cat > "$CONFIG" <<CFG
+{ "hats": { "dev": { "ssh": "me@dev.example.com" } },
+  "groups": { "a": { "hat": "dev", "sessions": { "dev-api": {} } } } }
+CFG
+round
+expect "no longer placed: its lines are cleared" "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-docs")"
+write_config
+round; calls >/dev/null; lists >/dev/null
+cat > "$CONFIG" <<CFG
+{ "prefs": {"working_status": "off"}, "hats": { "dev": { "ssh": "me@dev.example.com" } },
+  "groups": { "a": { "hat": "dev", "sessions": { "dev-api": {} } } } }
+CFG
+round
+expect "no longer placed, pref off: both cleared" \
+    "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api"$'\n'"clear-status hatter_tab_1 --workspace W-docs")"
+round
+expect "no longer placed, pref off: then quiet" "$(is "$(calls)" "")"
+write_config
+round; calls >/dev/null; lists >/dev/null
+
 write_config '"prefs": {"working_status": "off"}, '
 round
 expect "pref off: clears what it set, then stays quiet" \
-    "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api")"
+    "$(is "$(calls)" "clear-status hatter_tab_1 --workspace W-api"$'\n'"clear-status hatter_tab_1 --workspace W-docs")"
 round
 expect "pref off: second round quiet" "$(is "$(calls)$(lists)" "")"
 
