@@ -126,11 +126,16 @@ def readme_roff(md):
             out.append(".SS " + esc(s[4:].strip()))
         elif t.startswith("|"):
             flush()
+            rows = []
             while i < len(lines) and lines[i].strip().startswith("|"):
-                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                rows.append([c.strip() for c in lines[i].strip().strip("|").split("|")])
                 i += 1
-                if all(re.fullmatch(r":?-*:?", c) for c in cells):
-                    continue        # the |---| rule, or an empty header
+            rule = lambda cells: all(re.fullmatch(r":?-+:?", c) for c in cells)
+            # The row above the |---| rule is the header. A .TP list is
+            # already term then meaning, so the header has no place in it.
+            if len(rows) > 1 and rule(rows[1]):
+                rows = rows[2:]
+            for cells in rows:
                 out += [".TP", line(inline(cells[0])),
                         line(inline(" ".join(cells[1:])))]
             continue

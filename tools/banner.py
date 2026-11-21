@@ -8,6 +8,17 @@ escapes from markdown, so it is the only way to show the art in colour, and it
 is still the characters, one <tspan> per colour run pinned to an exact column,
 not a picture of them."""
 
+def readme_alt(src):
+    """The README's alt text for <src>. The SVG's <desc> is the same text, so
+    the image is described when opened on its own, and the README stays the
+    one place that text is written (tests/svg-a11y.sh checks they agree)."""
+    import html, os, re
+    readme = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "README.md")
+    m = re.search(r'<img src="%s" alt="([^"]+)"' % re.escape(src), open(readme, encoding="utf-8").read())
+    assert m, "README.md has no alt text for " + src
+    return html.unescape(m.group(1))
+
+
 COLS, ROWS = 70, 32
 
 FRONT  = (179, "#d7af5f")   # the hat you are wearing
@@ -116,7 +127,10 @@ w, h = COLS * CW + 2 * PAD, ROWS * LH + 2 * PAD
 esc = lambda t: t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w:.0f}" height="{h:.0f}" '
-       f'viewBox="0 0 {w:.0f} {h:.0f}" role="img" aria-label="hatter">',
+       f'viewBox="0 0 {w:.0f} {h:.0f}" role="img" '
+       'aria-labelledby="banner-title banner-desc">',
+       '<title id="banner-title">hatter banner</title>',
+       f'<desc id="banner-desc">{esc(readme_alt("banner.svg"))}</desc>',
        f'<rect width="{w:.0f}" height="{h:.0f}" rx="10" fill="#0d1117"/>',
        '<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'
        '&quot;Liberation Mono&quot;,monospace" '

@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="952" height="450" viewBox="0 0 952 450" role="img" aria-label="hatter rack">
+<svg xmlns="http://www.w3.org/2000/svg" width="952" height="450" viewBox="0 0 952 450" role="img" aria-labelledby="rack-title rack-desc">
+<title id="rack-title">hatter rack screen</title>
+<desc id="rack-desc">The hatter rack: three hats - dev, ops and personal - each with its ssh destination, whether its tmux server is up, and the Claude login it holds; below them six logins with coloured 5h and 7d capacity bars and the hats holding each.</desc>
 <rect width="952" height="450" rx="10" fill="#0d1117"/>
 <rect x="102.0" y="127.5" width="92.4" height="16.0" fill="#c9d1d9"/>
 <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,&quot;Liberation Mono&quot;,monospace" font-size="14" xml:space="preserve">
