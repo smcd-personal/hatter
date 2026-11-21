@@ -12204,7 +12204,7 @@ watch_probe() {
 # "prefs": {"working_status": "off"} turns it off and clears what it set.
 WORKING_QUIET=30
 WORKING_WAIT_QUIET=8
-WORKING_TAB_MAX=40       # characters of a window name a line shows
+WORKING_TAB_MAX=48       # bytes of a tab name a line shows
 WATCH_WORKING_EVERY=5
 WATCH_WORKING_CAP=8
 WATCH_WORKING_LAST=0
@@ -12218,22 +12218,36 @@ WATCH_WORKING_HOLD=3     # rounds a silent destination keeps its lines
 WORKING_KEYS_RE='^hatter_(tab_[0-9]+|working)$'
 
 # What runs on a server: its clock, then every window with its index, name,
-# open turn, last output and what hat-attn says it waits for.
-WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_index}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}" 2>/dev/null || true'
+# open turn, last output, what hat-attn says it waits for, whether tmux names
+# it, what runs in its active pane, and that pane's title (last, in case it
+# holds a tab).
+WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_index}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}	#{?automatic-rename,1,0}	#{pane_current_command}	#{pane_title}" 2>/dev/null || true'
 
 # tab_states: WORKING_SH's output on stdin; prints
 # "<session> TAB <index> TAB <name> TAB <state>" for every window, the state
 # one of working, approval, question, idle. Without the clock line nothing
-# is working.
+# is working. A shell in front means the agent has exited: hat-attn's flag
+# stays until the next prompt, so it is stale, and the tab is idle.
+#
+# The name is the window's, unless tmux names the window itself (after the
+# program running, "claude" or "bash") or it has none: then an agent's own
+# title for the session, which Claude Code sets as the pane title behind a
+# status glyph ("<glyph> Fix the login page"), is the better name. A pane
+# title without that glyph is the host name, tmux's default, and is not used.
 tab_states() {
-    awk -F '\t' -v q="$WORKING_QUIET" -v wq="$WORKING_WAIT_QUIET" '
+    LC_ALL=C awk -F '\t' -v q="$WORKING_QUIET" -v wq="$WORKING_WAIT_QUIET" '
         $1 == "N" && $2 ~ /^[0-9]+$/ { now = $2; next }
         $1 == "W" && NF >= 7 && $3 ~ /^[0-9]+$/ {
-            ask = ($7 == "approval" || $7 == "question")
-            if (now != "" && $5 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && now - $6 <= (ask ? wq : q)) st = "working"
+            shell = ($9 ~ /^-?(ba|z|da|k|tc|c|fi)?sh$/)
+            ask = ($7 == "approval" || $7 == "question") && !shell
+            if (shell) st = "idle"
+            else if (now != "" && $5 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && now - $6 <= (ask ? wq : q)) st = "working"
             else if (ask) st = $7
             else st = "idle"
-            print $2 "\t" $3 "\t" $4 "\t" st
+            name = $4; title = $10
+            for (i = 11; i <= NF; i++) title = title " " $i
+            if (($8 == "1" || name == "") && title ~ /^[^ -~]+ [ -~]/) { sub(/^[^ -~]+ +/, "", title); name = title }
+            print $2 "\t" $3 "\t" name "\t" st
         }'
 }
 
@@ -12250,7 +12264,7 @@ tab_states() {
 tab_lines() {
     local red='#ff453a' blue='#0a84ff' grey='#8e8e93'
     if colorblind_safe; then red='#d55e00' blue='#56b4e9' grey='#999999'; fi
-    AWK_R="$1" AWK_T="$2" AWK_H="${4:-}" awk -F '\t' -v max="$WORKING_TAB_MAX" \
+    AWK_R="$1" AWK_T="$2" AWK_H="${4:-}" LC_ALL=C awk -F '\t' -v max="$WORKING_TAB_MAX" \
         -v red="$red" -v blue="$blue" -v grey="$grey" '
         BEGIN {
             icon["working"] = "bolt.fill"; colour["working"] = red; rank["working"] = 2
@@ -12269,7 +12283,13 @@ tab_lines() {
                 if (split(t[i], f, "\t") < 5 || f[3] !~ /^[0-9]+$/) continue
                 st = (f[5] in icon) ? f[5] : "idle"
                 name = f[4]; if (name == "") name = "window " f[3]
-                if (length(name) > max) name = substr(name, 1, max - 1) "…"
+                if (length(name) > max) {
+                    # Bytes, so a cut can split a character: drop a
+                    # trailing partial one.
+                    name = substr(name, 1, max - 1)
+                    if (name ~ /[\200-\377]$/) sub(/[\300-\367]?[\200-\277]*$/, "", name)
+                    name = name "…"
+                }
                 k = f[1] SUBSEP f[2]
                 tabs[k] = tabs[k] "\t" "hatter_tab_" f[3] "\t" name "\t" icon[st] "\t" colour[st] "\t" \
                     (rank[st] * 1000 + 999 - (f[3] > 999 ? 999 : f[3])) "\n"
@@ -15465,7 +15485,9 @@ status line per tab: its name, and its agent's state as the icon. A red bolt
 is busy, a blue hand is waiting on a permission prompt, a blue speech mark is
 waiting on an answer, and a grey circle is anything else. cmux shows three
 lines and folds the rest under "Show more", so tabs waiting on you come first,
-then busy ones, then the rest, each in window order. A tab is busy while its
+then busy ones, then the rest, each in window order. A tab whose name tmux set
+itself (after the program, "claude" or "bash") shows its agent's title for the
+session instead, and a tab where the agent has exited to a shell is grey. A tab is busy while its
 agent's turn is open (hat-attn's @hatter-working) and the tab printed
 something in the last 30 seconds, or 8 seconds once hat-attn has flagged a
 permission prompt or a question. So a turn waiting on you stops counting as

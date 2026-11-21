@@ -6,11 +6,12 @@
 #     and its window printed something in the last WORKING_QUIET seconds, or
 #     WORKING_WAIT_QUIET once hat-attn flagged approval or a question; a quiet
 #     flagged tab is approval or question; anything else is idle, and with no
-#     server clock nothing is working
+#     server clock nothing is working; a shell in front is idle; an agent's
+#     pane title names a tab tmux named itself
 #   - tab_lines: workspaces are placed by title on the one destination
 #     recording them; a title on two destinations is left alone; one line per
 #     tab keyed by window index, waiting first, then working, then idle;
-#     long names cut; colour-blind shades from the pref
+#     long names cut, never inside a character; colour-blind shades from the pref
 #   - watch_working, end to end with an ssh stub on PATH and cmux stubbed:
 #     reads each placed workspace's lines once per stream and clears the old
 #     hatter_working and stale tab keys, sets lines once and again only on a
@@ -54,6 +55,15 @@ expect "tab_states: a quiet prompt is approval or question, a resumed one workin
     "$(is "$out" "s${T}1${T}appr${T}approval"$'\n'"s${T}2${T}ques${T}question"$'\n'"s${T}3${T}none${T}working"$'\n'"s${T}4${T}resumed${T}working")"
 out=$(printf 'W\ts\t1\tbusy\t990\t998\t\n' | tab_states)
 expect "tab_states: no server clock, nothing is working" "$(is "$out" "s${T}1${T}busy${T}idle")"
+# A shell in front: the agent exited, so its flag is stale.
+out=$(printf 'N\t1000\nW\ts\t1\tq\t\t900\tquestion\t0\tzsh\t\nW\ts\t2\tq2\t\t900\tquestion\t0\tclaude\t\nW\ts\t3\tb\t990\t998\t\t0\t-bash\t\n' | tab_states)
+expect "tab_states: a shell in front is idle whatever the flags say" \
+    "$(is "$out" "s${T}1${T}q${T}idle"$'\n'"s${T}2${T}q2${T}question"$'\n'"s${T}3${T}b${T}idle")"
+# Names: tmux's own name or none gives way to an agent's titled pane; a
+# name set by hand, or a pane title without a glyph (the host name), does not.
+out=$(printf 'N\t1000\nW\ts\t1\tclaude\t\t900\t\t1\tclaude\t\342\234\263 Fix the login page\nW\ts\t2\t\t\t900\t\t0\tclaude\t\342\240\202 Tab\tin title\nW\ts\t3\tAPI\t\t900\t\t0\tclaude\t\342\234\263 Other\nW\ts\t4\tbash\t\t900\t\t1\tbash\tbox1\n' | tab_states | cut -f3)
+expect "tab_states: an agent's title names a tab tmux named, not one named by hand" \
+    "$(is "$out" "Fix the login page"$'\n'"Tab in title"$'\n'"API"$'\n'"bash")"
 
 # --- tab_lines -------------------------------------------------------------------
 rec="a.example.com${T}api"$'\n'"a.example.com${T}docs"$'\n'"b.example.com${T}ops"$'\n'"a.example.com${T}both"$'\n'"b.example.com${T}both"
@@ -64,8 +74,12 @@ expect "tab_lines: a line per tab with its state, skips ambiguous and unrecorded
     "$(is "$out" "W1"$'\n'"W1${T}hatter_tab_1${T}one${T}circle${T}${G}${T}1998"$'\n'"W1${T}hatter_tab_2${T}two${T}bolt.fill${T}${R}${T}2997"$'\n'"W1${T}hatter_tab_3${T}three${T}hand.raised.fill${T}${B}${T}3996"$'\n'"W1${T}hatter_tab_4${T}window 4${T}questionmark.bubble.fill${T}${B}${T}3995"$'\n'"W2"$'\n'"W3")"
 out=$(tab_lines "$rec" "$tabs" "$wss" "a.example.com")
 expect "tab_lines: a held destination's workspaces are left out" "$(is "$out" "W3")"
-out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
-expect "tab_lines: a long name is cut" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABC…")"
+out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
+expect "tab_lines: a long name is cut" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJK…")"
+# A cut through a character drops the part of it left over.
+long=$(printf 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ\303\251\303\251\303\251')
+out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}${long}${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
+expect "tab_lines: a cut never splits a character" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ…")"
 COLORBLIND_SAFE=on
 out=$(tab_lines "$rec" "a.example.com${T}api${T}1${T}one${T}working" "W1${T}api" | sed -n 2p | cut -f5)
 expect "tab_lines: colour-blind safe shades" "$(is "$out" "#d55e00")"
