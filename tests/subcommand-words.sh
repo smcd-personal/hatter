@@ -5,6 +5,7 @@
 # <hat>-disable workspace there. Refused words change nothing and reach no
 # server or cmux; other words, and `hatter new <word>`, still reach new.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

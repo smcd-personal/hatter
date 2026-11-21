@@ -19,6 +19,7 @@
 #
 # Needs bash, jq and tmux; skipped without them.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 command -v jq   >/dev/null 2>&1 || { echo "skip: no jq here for hat-snooze"; exit 0; }

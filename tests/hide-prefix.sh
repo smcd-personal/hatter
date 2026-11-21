@@ -6,6 +6,7 @@
 # name typed into the rack's rename is resolved the way add's is (#276): kept
 # as typed unless the server already has it.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

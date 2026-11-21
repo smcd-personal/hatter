@@ -4,6 +4,7 @@
 # saved order rather than sorting, and nothing in bin/hatter walks groups or
 # sessions with jq's sorting `keys`. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

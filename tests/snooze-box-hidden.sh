@@ -5,6 +5,7 @@
 # sync runs it, so a box cmux brings back by itself goes again. cmux, the
 # config and sync are stubbed as functions. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

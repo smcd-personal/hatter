@@ -7,6 +7,7 @@
 # UTF-8 locale, which turns tabs and non-ASCII characters into "_" unless it is
 # run as `tmux -u` (#109).
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

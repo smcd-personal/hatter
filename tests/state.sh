@@ -6,6 +6,7 @@
 # cannot be read (refused, hung, no tmux, no ssh) with their saved layout and
 # reachable or live false, without failing or hanging the command.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

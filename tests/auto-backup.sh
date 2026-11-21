@@ -4,6 +4,7 @@
 # anything has sat unpushed for AUTO_BACKUP_DAYS; nothing otherwise; and an
 # hour's wait after a failed push.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

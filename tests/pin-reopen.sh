@@ -8,6 +8,7 @@
 #     sync drops its pin from the config;
 #   - `hatter tab pin` / `unpin` clear the mark.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

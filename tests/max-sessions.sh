@@ -4,6 +4,7 @@
 # server has more tmux sessions than sshd lets a connection hold. Needs bash,
 # sh and jq; no ssh.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

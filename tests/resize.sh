@@ -2,6 +2,7 @@
 # Window size after a restore (#67): the .tmux.conf line that starts a server
 # at the recorded size, hat-resize, and `hatter resize` driving it over ssh.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 # Run from inside tmux, $TMUX would point every tmux call below - and
 # hat-resize's own - at the live server, whatever TMUX_TMPDIR says.
 unset TMUX

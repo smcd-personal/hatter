@@ -4,6 +4,7 @@
 # shell reaches never returns (#269). hatter waits with wait_all <pid>...
 # instead. Needs bash.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

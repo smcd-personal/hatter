@@ -2,6 +2,7 @@
 # hat-save against a stub tmux and a stub save.sh (#62): a snapshot is taken
 # only while there are sessions, and `last` never ends up on an empty one.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

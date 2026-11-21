@@ -5,6 +5,7 @@
 # with no terminal to ask at, the current order is kept. Stub cmux; the server
 # side of restore is stubbed out as functions. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

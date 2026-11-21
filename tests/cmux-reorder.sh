@@ -5,6 +5,7 @@
 # it is absent and leaves a value the user set alone. Needs bash and jq; the
 # cmux CLI is a stub that records what it was asked.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

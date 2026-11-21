@@ -3,6 +3,7 @@
 # it last ran, the default workspace follows that history or the session's
 # directory, and the tab it opens runs hat-launch --resume.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

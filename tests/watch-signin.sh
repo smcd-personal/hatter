@@ -4,6 +4,7 @@
 # hat once <dest> answers ssh. Needs bash and jq; cmux and ssh are stubs, and
 # HATTER_WATCH_DRY makes it print the restore instead of running one.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

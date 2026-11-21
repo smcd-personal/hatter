@@ -3,6 +3,7 @@
 # limits from a fake `codex app-server`, pushed down a stubbed ssh. Needs bash,
 # jq and python3; no network, no real Codex.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

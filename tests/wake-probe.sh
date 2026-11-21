@@ -5,6 +5,7 @@
 # master has answered. Needs bash, jq and perl; ssh is a stub on PATH, cmux
 # and ps are stubbed functions.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

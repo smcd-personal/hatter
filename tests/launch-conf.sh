@@ -5,6 +5,7 @@
 # its own, where it would race hat-restore. Needs bash and jq; the .tmux.conf
 # checks also need tmux, and are skipped without it.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

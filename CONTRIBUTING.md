@@ -95,6 +95,13 @@ You need `ssh`, `jq` and a server running `tmux`. The cmux commands need
   print a marker such as `HATCFG<...>` first and read only what follows it.
   Guard the read with `|| true` or a fallback: a failing rc file must not
   abort a script under `set -e`. `tests/login-shell-noise.sh` checks it.
+- **A test starts by sourcing `tests/clean-env.sh`**, on the line straight
+  after `set -euo pipefail`. It clears the variables that point hatter at a
+  real home or real dotfiles (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, the XDG
+  directories, `ZDOTDIR`, `TMUX`); one
+  inherited from your shell wins over the test's temp HOME and the test
+  writes your real config. A new such variable goes in that file, not in
+  each test. `tests/test-isolation.sh` checks every test (#302).
 - **No secrets, ever.** Credentials go through the OS keychain and an ssh
   pipe; nothing is written to disk. Keep it that way.
 - **Examples use `example.com`.** No real hostnames or usernames in code,

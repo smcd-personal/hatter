@@ -6,6 +6,7 @@
 # jq, which then found no agents at all. Each case runs with a quiet shell and
 # with a noisy one.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")
