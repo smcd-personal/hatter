@@ -4,6 +4,7 @@
 # way, a group colour that is a hat colour (as sync records an inherited one)
 # follows the hat, and one the user picked is kept.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 command -v jq >/dev/null 2>&1 || { echo "skip: no jq here for colorblind-safe"; exit 0; }
