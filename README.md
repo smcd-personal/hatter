@@ -16,7 +16,7 @@ hatter
 ```
 
 <p align="center">
-  <img src="rack.svg" alt="The hatter rack: three hats - dev, ops and personal - each with its ssh destination, whether its tmux server is up, and the Claude login it holds; below them six logins with coloured 5h and 7d capacity bars and the hats holding each." width="900">
+  <img src="rack.svg" alt="The hatter rack: three hats - dev, ops and personal - each with its ssh destination, whether its tmux server is up, and the Claude login it holds, with its health (ok, low or spent); below them six logins with 5h and 7d capacity bars, percentages and reset times, and the hats holding each." width="900">
 </p>
 
 

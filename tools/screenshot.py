@@ -18,8 +18,9 @@ def readme_alt(src):
     return html.unescape(m.group(1))
 
 
-# DIM is secondary text, so it needs 4.5:1 on BG like any text (#291):
-# #8b949e is 6.15:1 on #0d1117 (FG is 12.26:1).
+# The rack draws faint only for its header rules (#291), and colour only on
+# marks (#292): a symbol, a bar, the selection arrow. DIM is the rules' colour,
+# still 6.15:1 on BG; FG is 12.26:1. Everything a reader needs is FG or BOLD.
 BG, FG, DIM, BOLD = "#0d1117", "#c9d1d9", "#8b949e", "#f0f6fc"
 GREEN, YELLOW, RED, CYAN = "#7ee787", "#e3b341", "#ff7b72", "#56d4dd"
 SEL_BG, SEL_FG = "#c9d1d9", "#0d1117"
@@ -28,90 +29,88 @@ SEL_BG, SEL_FG = "#c9d1d9", "#0d1117"
 HAT = {"dev": "#d7af5f", "ops": "#5fafaf", "personal": "#af87d7"}
 
 
+def level(pct):
+    """ok above half a window, low under half, spent at none: creds_level."""
+    return "spent" if pct <= 0 else ("low" if pct < 50 else "ok")
+
+
+# The symbol and colour for each level, as creds_dot draws them.
+MARK = {"ok": ("●", GREEN), "low": ("◐", YELLOW), "spent": ("○", RED)}
+
+
+def t(text, fg=FG, bold=False):
+    return (text, fg, None, bold)
+
+
 def bar(pct, w=6):
-    """Filled blocks in the colour for what is left, on the same thresholds as
-    the dot: green above half a window, amber below, red once spent."""
+    """The whole bar in the colour for what is left (creds_bar)."""
     filled = (pct * w + 50) // 100
-    col = RED if pct <= 0 else (YELLOW if pct < 50 else GREEN)
-    return [("█" * filled, col, None, False), ("░" * (w - filled), DIM, None, False)]
-
-
-def dot(*pcts):
-    worst = min(pcts)
-    return (RED if worst <= 0 else (YELLOW if worst < 50 else GREEN))
+    return [t("█" * filled + "░" * (w - filled), MARK[level(pct)][1])]
 
 
 def gauges(p5, e5, p7, e7):
-    return ([("5h ", DIM, None, False)] + bar(p5)
-            + [(" %3d%% %4s   " % (p5, e5), FG, None, False), ("7d ", DIM, None, False)]
-            + bar(p7) + [(" %3d%% %4s" % (p7, e7), FG, None, False)])
+    return ([t("5h ")] + bar(p5) + [t(" %3d%% %4s   7d " % (p5, e5))]
+            + bar(p7) + [t(" %3d%% %4s" % (p7, e7))])
 
 
-HATS = [("1", "dev",      "you@shell.work.com",   "● up 3 ws", GREEN,  "claude-1"),
-        ("2", "ops",      "you@ops.work.com",     "○ no tmux", YELLOW, "claude-3"),
-        ("3", "personal", "you@box.personal.com", "● up 1 ws", GREEN,  "you.example")]
+# hat, ssh destination, state mark and colour, state words, the login it holds
+HATS = [("dev",      "you@shell.example.com", "●", GREEN,  "up 3 ws", "claude-1@example.com"),
+        ("ops",      "you@ops.example.com",   "○", YELLOW, "no tmux", "claude-3@example.com"),
+        ("personal", "you@box.example.org",   "●", GREEN,  "up 1 ws", "you@example.org")]
 
-CREDS = [("a", "claude-1@work.com",     0, "2h",  87, "19h", "dev"),
-         ("b", "claude-2@work.com",    34, "1h",  66,  "2d", ""),
-         ("c", "claude-3@work.com",   100, "4h",  82,  "2d", "ops"),
-         ("d", "claude-4@work.com",    71, "40m", 95,  "3d", ""),
-         ("e", "claude-5@work.com",   100, "5h", 100,  "5d", ""),
-         ("f", "you.example@gmail.com", 46, "1h", 71,  "2d", "personal")]
+# letter, login, role, 5h left and reset, 7d left and reset, hat holding it, marks
+CREDS = [("a", "claude-1@example.com", "team",       0, "2h",  87, "19h", "dev",      ""),
+         ("b", "claude-2@example.com", "team",      34, "1h",  66,  "2d", "",         ""),
+         ("c", "claude-3@example.com", "team",     100, "4h",  82,  "2d", "ops",      "  <- active on this Mac"),
+         ("d", "claude-4@example.com", "team",      71, "40m", 95,  "3d", "",         "  <- next"),
+         ("e", "claude-5@example.com", "team",     100, "5h", 100,  "5d", "",         ""),
+         ("f", "you@example.org",      "personal",  46, "1h",  71,  "2d", "personal", "")]
+HEALTH = {c[1]: level(min(c[3], c[5])) for c in CREDS}
 
+RULE = 58
 lines = [
-    [("──── hatter rack ──────────────────────────────────────────", DIM, None, False)],
-    [("  all hats", CYAN, None, False)],
-    [("──────────────────────────────────────────────────────────", DIM, None, False)],
-    [("  HATS", FG, None, True),
-     ("  ·  a hat is a login (user@host): one ssh connection,", DIM, None, False)],
-    [("     one tmux server, one cmux window.", DIM, None, False)],
+    [t("────", DIM), t(" hatter rack "), t("─" * (RULE - 17), DIM)],
+    [t("  all hats")],
+    [t("─" * RULE, DIM)],
+    [t("  HATS", BOLD, True), t("  ·  a hat is a login (user@host): one ssh connection,")],
+    [t("     one tmux server, one cmux window.")],
     [],
 ]
-for n, (num, name, host, state, scol, cred) in enumerate(HATS):
+nw = max(len(h[0]) for h in HATS)
+hw = max(len(h[1]) for h in HATS)
+sw = max(len(h[4]) for h in HATS)
+for n, (name, host, smark, scol, words, login) in enumerate(HATS):
     sel = n == 0
-    row = [(" ", FG, None, False),
-           ("▸ ", CYAN, None, False) if sel else ("  ", FG, None, False),
-           ("%2s" % num, BOLD, None, True),
-           (" ", FG, None, False),
-           ("/_\\", HAT[name], None, False),
-           (" ", FG, None, False),
-           ("%-11s" % name, SEL_FG if sel else FG, SEL_BG if sel else None, False),
-           (" ", FG, None, False),
-           ("%-24s" % host, DIM, None, False),
-           (" ", FG, None, False),
-           ("%-11s" % state, scol, None, False),
-           (" ", FG, None, False),
-           ("●", GREEN, None, False), (" ", FG, None, False),
-           (cred, DIM, None, False)]
-    lines.append(row)
+    health = HEALTH[login]
+    lines.append([t(" "), t("▸ ", CYAN) if sel else t("  "),
+                  t("%2d" % (n + 1), BOLD, True), t(" "), t("/_\\", HAT[name]), t(" "),
+                  ("%-*s" % (nw, name), SEL_FG, SEL_BG, False) if sel else t("%-*s" % (nw, name)),
+                  t(" %-*s " % (hw, host)),
+                  t(smark, scol), t(" %-*s " % (sw, words)),
+                  t(*MARK[health]), t(" %s %s" % (login.split("@")[0], health))])
 
+lw = max(len(c[1]) for c in CREDS)
 lines += [
     [],
-    [("  CREDENTIALS", FG, None, True),
-     ("  ·  one Claude login each. Bars are capacity left,", DIM, None, False)],
-    [("     then time to reset; red is spent, amber under half a session.", DIM, None, False)],
+    [t("  CREDENTIALS", BOLD, True), t("  ·  Claude and Codex logins. Bars are capacity left,")],
+    [t("     then time to reset. ● ok over half a session, ◐ low, ○ spent.")],
     [],
-    [("        %-28s %-19s   %-19s  %s" % ("LOGIN", "5H WINDOW", "7D WINDOW", "HELD BY"),
-      DIM, None, False)],
+    [t("        "), t("%-*s %-8s %-19s   %-19s  HELD BY" % (lw, "LOGIN", "ROLE", "5H WINDOW", "7D WINDOW"), BOLD, True)],
 ]
-for letter, email, p5, e5, p7, e7, held in CREDS:
-    row = [("   ", FG, None, False),
-           (" %s" % letter, BOLD, None, True),
-           (" ", FG, None, False),
-           ("●", dot(p5, p7), None, False),
-           (" ", FG, None, False),
-           ("%-28s" % email, FG, None, False),
-           (" ", FG, None, False)] + gauges(p5, e5, p7, e7)
+for letter, login, role, p5, e5, p7, e7, held, marks in CREDS:
+    row = [t("   "), t(" %s" % letter, BOLD, True), t(" "), t(*MARK[HEALTH[login]]),
+           t(" %-*s %-8s " % (lw, login, role))] + gauges(p5, e5, p7, e7)
     if held:
-        row.append(("  -> %s" % held, DIM, None, False))
-    if letter == "c":
-        row.append(("  <- active on this Mac", CYAN, None, False))
+        row.append(t("  -> %s" % held))
+    if marks:
+        row.append(t(marks, BOLD, True))
     lines.append(row)
 
 lines += [
     [],
-    [("  ↑↓ move   1-9 hat   a-z credential   → enter open   q quit", DIM, None, False)],
-    [("  A add hat   R rename   D forget   P provision   ! refresh", DIM, None, False)],
+    [t("  ↑↓ move   1-9 hat   a-z credential   → enter open   q quit")],
+    [t("  A add hat   R rename   D forget   P provision   ! refresh")],
+    [t("  S sync / restore")],
 ]
 
 CW, LH, FS, PAD = 8.4, 18.0, 14.0, 18.0
