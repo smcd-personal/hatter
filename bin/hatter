@@ -1725,20 +1725,44 @@ workspace_ref_by_title() {
 # inside it. Group names are not unique across windows, so score each window:
 # a workspace whose title is one of this hat's sessions, or which carries the
 # hat prefix, is much stronger evidence than a matching group name.
+#
+# Hats on one ssh destination share a tmux server, and `cmux ssh-tmux` mirrors
+# every session on it into whichever window runs it. So a sibling hat's
+# sessions say little about whose window it is: after one hat's restore, the
+# other's sessions are all in its window too (#244). Their windows are shared
+# out together instead. Each window goes to the sibling with the most of its
+# groups there (a group, or the workspace cmux keeps for a group's header, that
+# hatter made in that hat's window), then the highest score, then the first by
+# name; a hat never takes a window a sibling owns. With no window of its own,
+# a hat gets none, and ensure_hat_window opens one.
 find_hat_window() {
-    local hat="$1" w t
+    local hat="$1" host w t hats
+    host=$(cfg --arg l "$hat" '.hats[$l].ssh // empty')
+    # The hat itself, and every enabled hat on its destination, sorted.
+    if [[ -n "$host" ]]; then
+        hats=$(cfg --arg h "$host" --arg l "$hat" '
+            [.hats | to_entries[] | select(.key == $l
+                or (.value.ssh == $h and (.value.disabled | not))) | .key] | sort[]')
+    else
+        hats="$hat"
+    fi
 
     # One awk scores every window: hundreds of greps, one per title per window,
     # were most of the time a sync spent finding its windows. Ties go to the
     # first window, as cmux lists them.
     {
-        cfg --arg l "$hat" '
-            .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys_unsorted[]?' \
-            | sed 's/^/want	/'
-        # By the name cmux shows. Every window has an Unassigned, so it is no
-        # evidence either way.
-        cfg --arg l "$hat" '.groups | to_entries[]
-            | select(.value.hat == $l and (.value.managed | not)) | .key' | sed 's/^/mine	/'
+        while IFS= read -r t; do
+            [[ -n "$t" ]] || continue
+            printf 'hat\t%s\n' "$t"
+            cfg --arg l "$t" '
+                .groups | to_entries[] | select(.value.hat == $l) | .value.sessions | keys_unsorted[]?' \
+                | while IFS= read -r w; do printf 'want\t%s\t%s\n' "$t" "$w"; done
+            # By the name cmux shows. Every window has an Unassigned, so it is no
+            # evidence either way.
+            cfg --arg l "$t" '.groups | to_entries[]
+                | select(.value.hat == $l and (.value.managed | not)) | (.value.name // .key)' \
+                | while IFS= read -r w; do printf 'mine\t%s\t%s\n' "$t" "$w"; done
+        done <<<"$hats"
         for w in $(window_ids); do
             printf 'win\t%s\n' "$w"
             while IFS= read -r t; do
@@ -1751,15 +1775,72 @@ find_hat_window() {
             done <<<"$(groups_in_window "$w")"
         done
     } | AWK_HAT="$hat" awk -F '\t' '
-        BEGIN { hat = ENVIRON["AWK_HAT"] "" }
-        $1 == "want"  { want[$2] = 1; next }
-        $1 == "mine"  { mine[$2] = 1; next }
-        $1 == "win"   { order[++n] = $2; score[$2] = 0; next }
-        $1 == "title" { if (index($3, hat "-") == 1) score[$2] += 5
-                        if ($3 in want) score[$2] += 10; next }
-        $1 == "group" { if ($3 in mine) score[$2] += 1; next }
-        END { best = ""; bs = 0
-              for (i = 1; i <= n; i++) if (score[order[i]] > bs) { bs = score[order[i]]; best = order[i] }
+        BEGIN { me = ENVIRON["AWK_HAT"] "" }
+        $1 == "hat"   { hats[++nh] = $2; next }
+        $1 == "want"  { want[$2, $3] = 1; next }
+        $1 == "mine"  { mine[$2, $3] = 1; next }
+        $1 == "win"   { order[++n] = $2; next }
+        $1 == "title" { for (i = 1; i <= nh; i++) { h = hats[i]
+                            if (index($3, h "-") == 1) score[h, $2] += 5
+                            if ((h, $3) in want) score[h, $2] += 10
+                            # Between siblings only: a header workspace cmux
+                            # kept for one of the hat'\''s groups, as after a
+                            # restart. Alone, a title is too weak to claim a
+                            # window with, so a hat with no sibling ignores it.
+                            if (nh > 1 && (h, $3) in mine) named[h, $2, $3] = 1 }
+                        next }
+        $1 == "group" { for (i = 1; i <= nh; i++) { h = hats[i]
+                            if ((h, $3) in mine) { score[h, $2] += 1; named[h, $2, $3] = 2 } }
+                        next }
+        END { # Each of a hat'\''s groups counts once per window, as a group or
+              # as a header; a header alone adds the point its group would.
+              # (A window'\''s titles come before its groups, so a group
+              # overwrites its header'\''s 1 with 2.)
+              for (k in named) { split(k, p, SUBSEP)
+                  groups[p[1], p[2]]++
+                  if (named[k] == 1) score[p[1], p[2]] += 1 }
+              # A hat with no sibling: the window it scores highest in.
+              best = ""; bs = 0
+              if (nh == 1) {
+                  for (i = 1; i <= n; i++) if (score[me, order[i]] + 0 > bs) { bs = score[me, order[i]]; best = order[i] }
+                  printf "%s", best; exit
+              }
+              # Between siblings, first a window with groups of this hat in it
+              # that is not a sibling'\''s: one with more of the sibling'\''s
+              # groups, or as many and a better score, then the first hat by
+              # name. Loose sessions say little, as a mirror puts them
+              # anywhere, so a window of them is taken instead only when no
+              # sibling has anything in it and it scores higher (the hat'\''s
+              # own sessions, beside a stray group of the same name
+              # elsewhere), or when the hat has no group anywhere and no
+              # sibling has groups in it.
+              for (i = 1; i <= n; i++) {
+                  w = order[i]; mg = groups[me, w] + 0; ms = score[me, w] + 0
+                  if (mg == 0 || ms <= bs) continue
+                  taken = 0
+                  for (j = 1; j <= nh; j++) { h = hats[j]
+                      if (h == me) continue
+                      g = groups[h, w] + 0; s = score[h, w] + 0
+                      if (g > mg || (g == mg && (s > ms || (s == ms && h < me)))) { taken = 1; break }
+                  }
+                  if (!taken) { bs = ms; best = w }
+              }
+              loose = ""; ls = 0; only = ""; os = 0
+              for (i = 1; i <= n; i++) {
+                  w = order[i]; ms = score[me, w] + 0
+                  if (ms == 0) continue
+                  grouped = 0; other = 0
+                  for (j = 1; j <= nh; j++) { h = hats[j]
+                      if (h == me) continue
+                      if (groups[h, w] + 0 > 0) grouped = 1
+                      if (score[h, w] + 0 > 0) other = 1
+                  }
+                  if (grouped) continue
+                  if (ms > ls) { ls = ms; loose = w }
+                  if (!other && ms > os) { os = ms; only = w }
+              }
+              if (best == "") best = loose
+              else if (only != "" && os > bs) best = only
               printf "%s", best }'
 }
 
@@ -9967,6 +10048,79 @@ cmd_group() {
     esac
 }
 
+# settle_siblings <hat> <window> <live sessions>
+#
+# Hats on one ssh destination share its tmux server, and `cmux ssh-tmux`
+# mirrors every session on it into the window it runs from. So one hat's
+# sessions turn up in a sibling hat's window: all of them after the sibling's
+# restore (#244), or a new one made on the server. Between this hat's window
+# and each sibling's, a running session's workspace goes to the window of the
+# hat the config records it under, when it is loose or in a group of that hat.
+# One in a real group of the hat whose window it is in was put there on
+# purpose (a drag), and stays. The moved workspaces arrive loose, for the
+# grouping step after to place.
+#
+# Sets SIBLINGS_MOVED to how many it moved, and adds each window it moved one
+# into to SIBLINGS_TOUCHED, one per line: what a caller read of those windows
+# is stale. Never fails. A hat with no sibling costs one config read.
+SIBLINGS_MOVED=0
+SIBLINGS_TOUCHED=""
+settle_siblings() {
+    local hat="$1" win="$2" live="$3" host sibs sib sw took=0 plan="" id title to owner there
+    SIBLINGS_MOVED=0
+    host=$(hat_ssh "$hat" 2>/dev/null) || return 0
+    sibs=$(cfg --arg h "$host" --arg l "$hat" '.hats | to_entries[]
+              | select(.key != $l and .value.ssh == $h and (.value.disabled | not)) | .key')
+    [[ -n "$sibs" && -n "$win" ]] || return 0
+
+    # Plan from one look at cmux, then let go of it before changing anything.
+    if [[ "$CMUX_SNAP" != 1 ]]; then cmux_snapshot; took=1; fi
+    while IFS= read -r sib; do
+        [[ -n "$sib" ]] || continue
+        sw=$(find_hat_window "$sib" 2>/dev/null) || sw=""
+        [[ -n "$sw" && "$sw" != "$win" ]] || continue
+        plan+="$(sibling_plan "$sw" "$win" "$hat" "$sib" "$live")"$'\n'
+        plan+="$(sibling_plan "$win" "$sw" "$sib" "$hat" "$live")"$'\n'
+    done <<<"$sibs"
+    [[ "$took" == 1 ]] && cmux_snapshot_drop
+
+    while IFS=$'\x1f' read -r id title to owner there; do
+        [[ -n "$id" ]] || continue
+        if cmux_change move-workspace-to-window --workspace "$id" --window "$to" >/dev/null 2>&1 </dev/null; then
+            echo "  $owner / $title: moved from $there's window to its own" >&2
+            SIBLINGS_MOVED=$((SIBLINGS_MOVED + 1))
+            grep -qxF -- "$to" <<<"$SIBLINGS_TOUCHED" || SIBLINGS_TOUCHED+="$to"$'\n'
+        else
+            warn "could not move '$title' from $there's window to $owner's"
+        fi
+    done <<<"$plan"
+    return 0
+}
+
+# sibling_plan <from window> <to window> <owner hat> <from hat> <live sessions>
+# The workspaces of <owner hat>'s running sessions that are out of place in
+# <from hat>'s window, as settle_siblings moves them: one line each,
+# "<workspace>\x1f<title>\x1f<to window>\x1f<owner hat>\x1f<from hat>".
+sibling_plan() {
+    local from="$1" to="$2" owner="$3" there="$4" live="$5" ws gs
+    ws=$(window_ws_json "$from" 2>/dev/null) || return 0
+    gs=$(window_groups_json "$from" 2>/dev/null) || return 0
+    jq -r --argjson g "$gs" --arg live "$live" --arg to "$to" --arg o "$owner" --arg t "$there" \
+          --argjson own "$(cfg -c --arg l "$owner" '[.groups | to_entries[] | select(.value.hat == $l)
+                             | .value.sessions | keys_unsorted[]?]')" \
+          --argjson theirs "$(cfg -c --arg l "$there" '[.groups | to_entries[]
+                             | select(.value.hat == $l and (.value.managed | not))
+                             | (.value.name // .key)]')" '
+        ($live | split("\n")) as $l
+        # Each workspace in a real group of the hat whose window this is.
+        | ([$g.groups[]? | select(.name as $n | $theirs | index($n)) | .member_workspace_ids[]?]) as $kept
+        | .workspaces[]?
+        | select((.title // "") as $x | ($own | index($x)) and ($l | index($x)))
+        | select(.id as $i | $kept | index($i) | not)
+        | [.id, .title, $to, $o, $t] | join("\u001f")' <<<"$ws" 2>/dev/null || true
+    return 0
+}
+
 # settle_ungrouped <hat> <window> <live sessions> [windows] [groups] [workspaces]
 #
 # No session runs outside a group. A running session of <hat> that no group
@@ -9979,7 +10133,10 @@ cmd_group() {
 # map sync builds from tmux, and the window's groups and workspaces. Any left
 # empty is read here; "-" for the groups means the caller could not read them,
 # and then cmux is not touched at all. In steady state, with all three given,
-# it makes no cmux call and no extra ssh call.
+# it makes no cmux call and no extra ssh call, except that a hat sharing its
+# server with another takes one cmux snapshot to look for strays
+# (settle_siblings). A window settle_siblings moved a workspace into, this
+# call's or a later one's, is read afresh.
 settle_ungrouped() {
     local hat="$1" win="$2" live="$3" wjson="${4:-}" groups_json="${5:-}" ws_json="${6:-}"
     local key host s windows entries='{}' fresh un
@@ -10024,6 +10181,12 @@ settle_ungrouped() {
     fi
 
     [[ -n "$win" && "$groups_json" != "-" ]] || return 0
+    # 1b. Hats on one server: a workspace in the other hat's window goes home
+    # (#244). What the caller read of this window is stale once one has moved.
+    settle_siblings "$hat" "$win" "$live"
+    if [[ "$SIBLINGS_MOVED" != 0 ]] || grep -qxF -- "$win" <<<"$SIBLINGS_TOUCHED"; then
+        groups_json="" ws_json=""
+    fi
     [[ -n "$groups_json" ]] || groups_json=$(window_groups_json "$win" 2>/dev/null) || return 0
     [[ -n "$ws_json" ]] || ws_json=$(window_ws_json "$win" 2>/dev/null) || return 0
 
@@ -10515,8 +10678,14 @@ sync_once() {
 
     # Now that the config holds what this pass found, every running session in
     # no group goes into its hat's Unassigned, and an empty Unassigned goes.
+    # A sibling hat's settle may have moved workspaces into this hat's window
+    # (#244), and then what was read of it above is stale.
+    SIBLINGS_TOUCHED=""
     for ((i = 0; i < n; i++)); do
         [[ -n "${lives[$i]}" ]] || continue
+        if [[ -n "${wins[$i]}" && "${gjsons[$i]}" != "-" ]] && grep -qxF -- "${wins[$i]}" <<<"$SIBLINGS_TOUCHED"; then
+            gjsons[$i]="" wsjsons[$i]=""
+        fi
         settle_ungrouped "${hats[$i]}" "${wins[$i]}" "${lives[$i]}" \
             "${wjsons[$i]}" "${gjsons[$i]}" "${wsjsons[$i]}"
     done
@@ -15513,7 +15682,13 @@ Subcommands:
   hatter hat status
 
 Hats that share an ssh destination share one tmux server, so they must agree
-on --kind and on each kind's --args; provision refuses if they do not.
+on --kind and on each kind's --args; provision refuses if they do not. Each
+still gets a cmux window of its own. cmux mirrors every session on a server
+into the window it mirrors from, so one hat's workspaces can turn up in the
+other's window; restore and sync move them back to their own hat's window.
+One you drag into a group of the other hat stays there. A hat whose sessions
+are all in the other's window, as after `hat add` takes over some of its
+groups, gets a new window at its next restore.
 
 Disabling a hat keeps its shape and ends what runs in it. It syncs first, so
 the config holds the hat's groups, workspaces and tabs as they are now; asks
