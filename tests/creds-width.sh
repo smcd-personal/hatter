@@ -158,7 +158,6 @@ else
             "env -i HOME='$work/home' PATH='$path' TERM=xterm-256color LANG='${loc:-C}' \
              XDG_CONFIG_HOME='$work/cfg' HATTER_CSWAP='$work/bin/cswap' HATTER_CODEX=no-such-codex \
              bash '$root/bin/hatter' rack; sleep 60"
-        [[ -n "$sockpath" ]] || sockpath=$(T display-message -p '#{socket_path}')
         while [[ $n -lt 75 ]] && ! screen "w$1" | grep -qF "S sync"; do
             sleep 0.2; n=$((n + 1))
         done
@@ -166,6 +165,8 @@ else
         screen "w$1"
     }
     full=$(rack_at 200)
+    # Here, not in rack_at: that runs in a subshell, and cleanup needs it.
+    sockpath=$(T display-message -p '#{socket_path}')
     [[ "$full" == *"ci@build-01.example.com"* ]] || fail "rack wide: the host went
 $full"
     [[ "$full" == *"someone.with.a.long.name@ex"* && "$full" == *personal* \
