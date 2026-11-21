@@ -61,6 +61,7 @@ screen() {
         creds_hats_holding() { echo dev; }; codex_hats_holding() { :; }
         cmux_alive() { return 1; }; current_hat() { return 1; }
         term_cols() { echo 120; }
+        edit_frame_begin() { :; }   # draw straight to stdout, not via a frame (#296)
         edit_readkey() { KEY=q; }
         edit_top
         for s in idle snoozed asleep shell; do printf '%s%s%s\n' \"\$(ps_status_colour \$s)\" \$s \"\$C_R\"; done
