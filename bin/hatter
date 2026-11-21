@@ -13590,15 +13590,29 @@ creds_rows() {
         | map(. // "" | tostring) | join("\u001f")' 2>/dev/null || true
 }
 
+# How much of a window is left, in a word: ok above half, low under half, spent
+# at none. The one place the thresholds live; the colour, the symbol and the
+# word all come from it. Sets CREDS_LEVEL rather than printing, so a bar can ask
+# without a subshell per call.
+creds_level() {
+    if   [[ "$1" -le 0 ]];  then CREDS_LEVEL=spent
+    elif [[ "$1" -lt 50 ]]; then CREDS_LEVEL=low
+    else                         CREDS_LEVEL=ok
+    fi
+}
+
 # Neither Anthropic nor OpenAI publishes a colour convention for these windows,
 # so this is hatter's own and it is the one already used by the dot: green above
 # half a window, amber below it, red once it is spent. Dot and bar agreeing
-# matters more than matching some other tool.
+# matters more than matching some other tool. Colour is only a supplement: the
+# symbol (creds_dot) and the word (creds_health) carry the same thing.
 creds_colour() {
-    if   [[ "$1" -le 0 ]];  then printf '%s' "$C_RD"
-    elif [[ "$1" -lt 50 ]]; then printf '%s' "$C_YL"
-    else                         printf '%s' "$C_GR"
-    fi
+    creds_level "$1"
+    case "$CREDS_LEVEL" in
+        spent) printf '%s' "$C_RD" ;;
+        low)   printf '%s' "$C_YL" ;;
+        *)     printf '%s' "$C_GR" ;;
+    esac
 }
 
 # Everything before the tail is fixed width: 8 columns of marker, label and
@@ -13664,16 +13678,40 @@ creds_eta() {
     fi
 }
 
-# Red when a window is spent, amber under half a 5-hour session, green above it.
-# Only the windows the plan has count; with none known the dot is dim.
-creds_dot() {
+# creds_worst <rem>...: the lowest remaining percentage among the windows the
+# plan has, or nothing when none is known.
+creds_worst() {
     local r worst=""
     for r in "$@"; do
         [[ "$r" =~ ^-?[0-9]+$ ]] || continue
         [[ -z "$worst" || "$r" -lt "$worst" ]] && worst="$r"
     done
-    if [[ -z "$worst" ]]; then printf '%s●%s' "$C_DIM" "$C_R"; return 0; fi
-    printf '%s●%s' "$(creds_colour "$worst")" "$C_R"
+    printf '%s' "$worst"
+}
+
+# A login's health as one symbol, worst window first: ● ok, ◐ low, ○ spent,
+# ? when no window is known. The shape says it without colour (#299); the
+# colour (creds_colour) is a supplement.
+creds_dot() {
+    local worst
+    worst=$(creds_worst "$@")
+    if [[ -z "$worst" ]]; then printf '%s?%s' "$C_DIM" "$C_R"; return 0; fi
+    creds_level "$worst"
+    case "$CREDS_LEVEL" in
+        spent) printf '%s○%s' "$C_RD" "$C_R" ;;
+        low)   printf '%s◐%s' "$C_YL" "$C_R" ;;
+        *)     printf '%s●%s' "$C_GR" "$C_R" ;;
+    esac
+}
+
+# The same health as a word, for places with no gauge beside the symbol (a hat
+# row): ok, low, spent, or unknown.
+creds_health() {
+    local worst
+    worst=$(creds_worst "$@")
+    if [[ -z "$worst" ]]; then printf 'unknown'; return 0; fi
+    creds_level "$worst"
+    printf '%s' "$CREDS_LEVEL"
 }
 
 # One window: bar + percent + time to reset, 16 columns. A window the plan does
@@ -14549,7 +14587,7 @@ edit_detached_banner() {
 # through both; a letter or a digit jumps straight into either one.
 
 edit_top() {
-    local SEL=1 nc nh nt i idx hat host state scol sess cred credorg credstate dot dirty=1
+    local SEL=1 nc nh nt i idx hat host state scol sess cred credorg credstate dot word dirty=1
     local preselect=1 ch=""
     local cols lastcols="" hdrtail
     local agent letter slot email org role label r5 r7 e5 e7 active holders detached=""
@@ -14563,7 +14601,7 @@ edit_top() {
         [[ "$cols" != "$lastcols" ]] && { dirty=1; lastcols="$cols"; }
         if [[ "$dirty" == 1 ]]; then
             CLETTER=(); CEMAIL=(); CSLOT=(); CORG=(); CAGENT=(); CNAME=()
-            CMETA=(); CICON=(); nc=0
+            CMETA=(); CICON=(); CHEALTH=(); nc=0
             while IFS=$'\x1f' read -r agent letter slot email org role label r5 r7 e5 e7 active; do
                 [[ -z "$email" ]] && continue
                 CLETTER[$nc]="$letter"; CEMAIL[$nc]="$email"
@@ -14572,6 +14610,7 @@ edit_top() {
                 CNAME[$nc]="$email"
                 [[ "$agent" == codex ]] && CNAME[$nc]="codex: $slot"
                 CICON[$nc]=$(creds_dot "$r5" "$r7")
+                CHEALTH[$nc]=$(creds_health "$r5" "$r7")
                 # Which hats hold this login. A login is not tied to one hat -
                 # push it to as many as you want - and this is the only place
                 # the many side of that is visible.
@@ -14603,18 +14642,21 @@ edit_top() {
                 cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
                 credorg=$(edit_hat_cred_org "$hat")
                 # Reuse the credential's own dot so a hat shows the health of
-                # the account it is actually holding.
-                dot=""
+                # the account it is actually holding. A hat row has no gauge
+                # beside the dot, so the health is also said in a word (#299).
+                dot=""; word=""
                 idx=0
                 while [[ $idx -lt $nc ]]; do
                     [[ "${CAGENT[$idx]}" == claude ]] &&
                     cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cred" "$credorg" &&
-                        { dot="${CICON[$idx]} "; break; }
+                        { dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
                     idx=$((idx+1))
                 done
                 case "$credstate" in
-                    ok|stale) cred=$(printf '%s%s%s%s' "$dot" "$C_DIM" "${cred%%@*}" "$C_R") ;;
-                    dead)     cred=$(printf '%s%s%s dead%s' "$dot" "$C_RD" "${cred%%@*}" "$C_R") ;;
+                    ok|stale) cred=$(printf '%s%s%s%s%s' "$dot" "$C_DIM" "${cred%%@*}" "$C_R" "$word") ;;
+                    # Dead on the hat whatever the account has left: the copy
+                    # there cannot refresh, so the mark and word say that.
+                    dead)     cred=$(printf '%s✕%s %s%s%s dead' "$C_RD" "$C_R" "$C_DIM" "${cred%%@*}" "$C_R") ;;
                     none)     cred=$(printf '%sno credential%s' "$C_DIM" "$C_R") ;;
                     *)        cred=$(printf '%snot provisioned%s' "$C_YL" "$C_R") ;;
                 esac
@@ -14622,14 +14664,14 @@ edit_top() {
                 cx=$(edit_hat_codex "$hat")
                 if [[ -n "$cx" ]]; then
                     IFS=$'\x1f' read -r cxemail cxws <<< "$cx"
-                    dot=""; idx=0
+                    dot=""; word=""; idx=0
                     while [[ $idx -lt $nc ]]; do
                         [[ "${CAGENT[$idx]}" == codex ]] &&
                         cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cxemail" "$cxws" &&
-                            { dot="${CICON[$idx]} "; break; }
+                            { dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
                         idx=$((idx+1))
                     done
-                    cred=$(printf '%s  %s%scodex %s%s' "$cred" "$dot" "$C_DIM" "${cxemail%%@*}" "$C_R")
+                    cred=$(printf '%s  %s%scodex %s%s%s' "$cred" "$dot" "$C_DIM" "${cxemail%%@*}" "$C_R" "$word")
                 fi
                 HATS[$nh]="$hat"
                 HICON[$nh]=$(printf '%b' "$(hat_icon "$hat")")
@@ -14686,7 +14728,7 @@ edit_top() {
 
         printf '\n  %sCREDENTIALS%s  %s·  Claude and Codex logins. Bars are capacity left,%s\n' \
             "$C_B" "$C_R" "$C_DIM" "$C_R"
-        printf '     %sthen time to reset; red is spent, amber under half a session.%s\n\n' \
+        printf '     %sthen time to reset. ● ok over half a session, ◐ low, ○ spent.%s\n\n' \
             "$C_DIM" "$C_R"
         # The header is 87 columns before "HELD BY", which is exactly where the
         # tail starts - so it only earns its place when the tail can show.
@@ -15391,6 +15433,12 @@ Each login shows its role, personal or team, and its usage windows: bars are
 capacity left, then time to reset. "none" is a window the plan does not have
 (some plans have no 5-hour window); "unknown" is a reading that failed. Codex
 usage is read from Codex itself (`codex app-server`) and cached for 2 minutes.
+
+The symbol before each login sums up its lowest window by shape, so it reads
+the same without colour: ● ok (over half left), ◐ low (under half), ○ spent,
+? no window known. In the rack, each hat row shows the login it holds with the
+same symbol followed by the word (ok, low, spent, unknown), or ✕ and "dead"
+when the hat's copy has expired with no refresh token (push it again).
 
 One credential per hat is the arrangement to aim for. Sharing one account
 across machines works, but each machine refreshes the OAuth token on its own
@@ -16234,7 +16282,8 @@ Every screen names the level it is showing and says what that level is, so the
 vocabulary is learned by looking around. Add, rename and remove are available at
 each one, and live status is shown where it exists:
 
-  hats        up / no tmux server, and how many workspaces
+  hats        up / no tmux server, how many workspaces, and the health of
+              the login each holds (see: hatter help creds)
   groups      running sessions that no group records
   workspaces  running / not running, tab count, whether a client is attached,
               and running but not in cmux
