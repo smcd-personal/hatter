@@ -9,6 +9,7 @@
 # must not, so a watcher that reports nothing fails every case, and one that
 # reports everything fails the case whose check it lacks.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

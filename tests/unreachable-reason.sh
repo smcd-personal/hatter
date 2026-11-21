@@ -4,6 +4,7 @@
 # and a hat that answers says nothing of the kind. Stub ssh; functions are
 # sourced from bin/hatter. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

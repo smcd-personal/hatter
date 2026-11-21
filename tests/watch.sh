@@ -4,6 +4,7 @@
 # HATTER_WATCH_DRY makes the watcher print what it would do; the healer and
 # sync it calls have their own tests. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)

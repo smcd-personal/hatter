@@ -2,6 +2,7 @@
 # The dragged-tab healer end to end, against stub cmux and ssh: a tab is only
 # moved and closed when cmux reads it as blank. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

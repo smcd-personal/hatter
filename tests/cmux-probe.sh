@@ -5,6 +5,7 @@
 # each case checks the message the user sees. No real cmux, ssh or config is
 # touched: XDG_CONFIG_HOME points at a throwaway directory.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

@@ -3,6 +3,7 @@
 # local "Terminal" tab in a mirrored workspace is closed only while it shows an
 # idle shell, never by force. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

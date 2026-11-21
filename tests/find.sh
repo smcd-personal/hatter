@@ -3,6 +3,7 @@
 # sessions match, in what order, and that closed and subagent transcripts are
 # only searched when they should be.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

@@ -6,6 +6,7 @@
 # the tmux server already has it, running or recorded by a hat sharing the
 # server; then it takes the prefix (#276).
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

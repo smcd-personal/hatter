@@ -10,6 +10,7 @@
 #   - the client reading @hatter-was: sync does not keep a renamed pinned tab
 #     as a closed one, and restore does not reopen it under its old name.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

@@ -3,6 +3,7 @@
 # (#125), driven through `hatter _leftover-plan` with cmux and tmux as they look
 # after a reboot. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

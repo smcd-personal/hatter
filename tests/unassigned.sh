@@ -4,6 +4,7 @@
 # cmux, at the top of the window; an empty Unassigned is removed; and the
 # group commands leave it to hatter. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

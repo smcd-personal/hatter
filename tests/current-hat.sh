@@ -7,6 +7,7 @@
 # that was hats x (1 + 2 x windows) calls; from a snapshot it is the tree plus
 # one group list per window, whatever the number of hats.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

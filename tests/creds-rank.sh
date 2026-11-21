@@ -5,6 +5,7 @@
 # `creds push` sends the best one to every hat, once per ssh destination. Fake
 # cswap and ssh. Needs bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

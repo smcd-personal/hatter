@@ -3,6 +3,7 @@
 # README.md, so check it carries both - every README section, every command -
 # and that it renders without a warning where a formatter is installed.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

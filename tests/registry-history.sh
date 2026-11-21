@@ -6,6 +6,7 @@
 # hat-registry, hat-record, hat-launch and hat-restore exactly as provision
 # writes them. Needs bash, jq and tmux; skipped without tmux.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 command -v tmux >/dev/null 2>&1 || { echo "skip: no tmux here for registry-history"; exit 0; }

@@ -6,6 +6,7 @@
 # The remote halves that decide what is running, and that end a session, run
 # for real under /bin/sh, against a stub tmux and a throwaway remote $HOME.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

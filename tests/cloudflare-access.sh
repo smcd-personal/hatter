@@ -5,6 +5,7 @@
 # token. Needs bash and jq; no ssh, cloudflared or network: a fake ssh answers
 # -G and records connects, and a fake cloudflared writes a token.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

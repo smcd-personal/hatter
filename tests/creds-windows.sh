@@ -3,6 +3,7 @@
 # organizations (#264). A fake cswap prints a fixed `list --json` and records
 # what `export` was asked for; ssh is stubbed. Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

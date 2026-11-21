@@ -4,6 +4,7 @@
 # cmux waits on one, or a "not all back" one at the cap. Needs bash and jq;
 # cmux, ssh and the notification are stubs.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

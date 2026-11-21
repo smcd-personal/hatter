@@ -3,6 +3,7 @@
 # _drag-plan` with cmux and tmux as they look after each kind of drag.
 # Needs only bash and jq.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 here=$(cd "$(dirname "$0")" && pwd)
 hatter="$here/../bin/hatter"

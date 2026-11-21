@@ -3,6 +3,7 @@
 # each status, the model and context read from the transcript, the age kept
 # across a resume, the filters, --go, and that the table fits the width.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

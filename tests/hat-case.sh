@@ -4,6 +4,7 @@
 # a new hat, by any path, may not differ from an existing one only in case.
 # Needs only bash and jq: ssh and tmux are stubs.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

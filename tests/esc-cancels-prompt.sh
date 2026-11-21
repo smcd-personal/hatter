@@ -6,6 +6,7 @@
 # and the attach picker's workspace name and menu go through ask_line. The keys
 # are fed through a pty, because ask_line reads /dev/tty. Needs bash and python3.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/hatter-test.XXXXXX")

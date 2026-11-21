@@ -4,6 +4,7 @@
 # provision writes it. The agent is a stand-in that stops itself the way Claude
 # Code does on ctrl+z. Needs bash and tmux; skipped without tmux.
 set -euo pipefail
+. "$(dirname "$0")/clean-env.sh"
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 command -v tmux >/dev/null 2>&1 || { echo "skip: no tmux here for launch-suspend"; exit 0; }
