@@ -34,6 +34,7 @@ expect "off: hex"  "$(run '{}' 'hat_colour_hex green' '')" '#87d787'
 expect "on: ansi"  "$(run '{"colorblind_safe":"on"}' 'hat_colour_ansi green' '')" 36
 expect "on: hex"   "$(run '{"colorblind_safe":"on"}' 'hat_colour_hex green' '')" '#009e73'
 expect "off value: ansi" "$(run '{"colorblind_safe":"off"}' 'hat_colour_ansi green' '')" 114
+expect "env cannot override" "$(COLORBLIND_SAFE=on run '{}' 'hat_colour_ansi green' '')" 114
 
 # status "good": colour_setup wants a terminal, so its -t 1 test is dropped
 sed -n '/^colour_setup() {/,/^}/p' "$root/bin/hatter" | sed 's/-t 1 && //' > "$work/cs.sh"

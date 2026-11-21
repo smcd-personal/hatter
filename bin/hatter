@@ -647,6 +647,9 @@ hat_launch_conf() {
 # changes. The terminal gets the nearest xterm-256 colour, cmux the exact hex.
 # Okabe-Ito has no teal, so teal takes its yellow.
 HAT_COLOURS='amber green cyan blue violet rose teal slate'
+# Read once per process. Cleared here so a COLORBLIND_SAFE in the
+# environment can't stand in for the config.
+COLORBLIND_SAFE=""
 colorblind_safe() {
     if [[ -z "${COLORBLIND_SAFE:-}" ]]; then
         COLORBLIND_SAFE=$(cfg '.prefs.colorblind_safe // "off"' 2>/dev/null) || COLORBLIND_SAFE=off
@@ -15733,7 +15736,8 @@ Subcommands:
 Each hat has a colour, shown on its rack icon and on its cmux group headers:
 one of amber, green, cyan, blue, violet, rose, teal or slate, set with
 "color" in the hat's config entry or else picked from its name. A group with
-a "color" of its own keeps it. "prefs": {"colorblind_safe": "on"} in the
+a "color" of its own keeps it, unless that colour is one of the hat colours
+themselves: those follow the hat. "prefs": {"colorblind_safe": "on"} in the
 config switches to colours that stay apart under colour blindness: each hat
 colour becomes one of the Okabe-Ito palette, and green status text (up,
 active, capacity left) becomes blue. cmux group colours follow at the next
