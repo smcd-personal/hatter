@@ -8814,7 +8814,7 @@ ps_render() {
         if [[ "$k" == "$last_on" ]]; then hdr+="$sep$c"; else hdr+="$sep$c$(printf '%*s' $(( w[k] - ${#c} )) '')"; fi
         sep="  "
     done
-    printf '%s%s%s\n' "$C_DIM" "$hdr" "$C_R"
+    printf '%s%s%s\n' "$C_B" "$hdr" "$C_R"
 
     local row
     while IFS= read -r line; do
@@ -14884,7 +14884,7 @@ edit_top() {
         hdrtail=""
         [[ $cols -ge $((CREDS_TAIL_COL + 9)) ]] && hdrtail="  HELD BY"
         printf '        %s%-28s %-8s %-19s   %-19s%s%s\n' \
-            "$C_DIM" "LOGIN" "ROLE" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
+            "$C_B" "LOGIN" "ROLE" "5H WINDOW" "7D WINDOW" "$hdrtail" "$C_R"
 
         i=0
         while [[ $i -lt $nc ]]; do
