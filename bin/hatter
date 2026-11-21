@@ -17164,8 +17164,9 @@ a time:
   - a symbol in front of a word that says the same (up, running, dead)
   - the arrows in key lists, which become words
 A login's health symbol becomes its word: ok, low, spent or unknown. The
-selected row is marked with > instead. Every row says the same things in
-both modes.
+selected row is marked with > instead. The ! before a warning and the ?
+before a question stay: they say which a line is. Every row says the same
+things in both modes.
 
 Plain mode is on when any of these says so:
   HATTER_PLAIN=1 (or on)     in the environment
@@ -17174,8 +17175,8 @@ Plain mode is on when any of these says so:
 HATTER_PLAIN=0 (or off) turns it off whatever the other two say.
 
 The two are separate: NO_COLOR alone keeps the symbols, and plain mode alone
-keeps the colour. Set both for plain text with no colour. Using the rack with
-a screen reader: see hatter help rack.
+does not turn colour off. Set both for plain text with no colour. Using the
+rack with a screen reader: see hatter help rack.
 USAGE
     ;;
     *) usage_main ;;
