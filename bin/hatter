@@ -11598,6 +11598,7 @@ WATCH_WAKE_SEEN=""
 WATCH_WAKE_PENDING=0
 WATCH_WAKE_AT=0
 WATCH_WAKE_FROM=0           # the wake's own time, for what is reported
+WATCH_WAKE_DARK_AT=0        # the last tick a pending wake was still dark
 WATCH_READY_LAST=0
 WATCH_READY_PREV=""
 WATCH_MIRRORED_AT=0
@@ -11682,8 +11683,11 @@ watch_wake_tick() {
     WATCH_WAKE_SEEN=$woke
     WATCH_TICK=$now
     [[ "$WATCH_WAKE_PENDING" == 1 ]] || return 0
-    mac_dark_wake && return 0
+    # Held by a dark wake: the real one comes after the last tick seen dark.
+    if mac_dark_wake; then WATCH_WAKE_DARK_AT=$now; return 0; fi
     WATCH_WAKE_PENDING=0
+    (( WATCH_WAKE_DARK_AT <= WATCH_WAKE_FROM )) || WATCH_WAKE_FROM=$WATCH_WAKE_DARK_AT
+    WATCH_WAKE_DARK_AT=0
     watch_probe_arm "$now"
     [[ "$(cfg '.prefs.wake_notify // "on"' 2>/dev/null)" != off ]] || return 0
     WATCH_WAKE_AT=$now; WATCH_READY_LAST=0; WATCH_READY_PREV=""
@@ -11953,7 +11957,7 @@ watch_ready() {
     (( took >= WATCH_READY_MIN )) || return 0
     (( now - WATCH_READY_LAST >= WATCH_READY_EVERY )) || return 0
     if (( took >= 2 * WATCH_READY_CAP )); then
-        WATCH_WAKE_AT=0; WATCH_READY_PREV=""; WATCH_MIRRORED_AT=0
+        WATCH_WAKE_AT=0; WATCH_WAKE_FROM=0; WATCH_READY_PREV=""; WATCH_MIRRORED_AT=0
         watch_log "after the wake, could not look at cmux for $(watch_took "$took"); stopped watching for everything to come back"
         return 0
     fi
@@ -11985,7 +11989,7 @@ watch_ready() {
         WATCH_READY_PREV=""
         return 0
     fi
-    WATCH_WAKE_AT=0; WATCH_READY_PREV=""
+    WATCH_WAKE_AT=0; WATCH_WAKE_FROM=0; WATCH_READY_PREV=""
     # What is connected now is the new "before".
     WATCH_MIRRORED_AT=0
     if [[ "$state" == ready && "$n" == 0 ]]; then
