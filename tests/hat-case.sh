@@ -126,4 +126,31 @@ run 'cmd_group add Beta --hat DEV' >/dev/null || true
 [[ "$(hats)" == dev && "$(jq -r '.groups.Beta.hat' "$conf")" == dev ]] \
     || fail "group add --hat DEV: hats '$(hats)', group hat '$(jq -r '.groups.Beta.hat' "$conf")'"
 
+# More commands that take a hat act on the stored one. remote_sh is stubbed:
+# these check the name resolution, not the server side.
+setup '.hats.dev.credential = "a@example.com" | .hats.dev.disabled = true'
+out=$(run 'remote_sh() { :; }; cmd_creds clear DEV') || fail "creds clear DEV: $out"
+grep -q "on 'dev'" <<<"$out" || fail "creds clear DEV: $out"
+[[ "$(jq -r '.hats.dev.credential // "gone"' "$conf")" == gone ]] || fail "creds clear DEV kept the credential"
+run 'cmd_hat enable DEV --no-restore' >/dev/null || fail "hat enable DEV failed"
+[[ "$(jq -r '.hats.dev.disabled // false' "$conf")" == false && "$(hats)" == dev ]] \
+    || fail "hat enable DEV: not enabled on dev ($(hats))"
+
+# A session name's prefix counts in any case: kept as typed, not re-prefixed.
+setup
+[[ "$(run 'hat_new_name dev DEV-x')" == DEV-x ]] || fail "hat_new_name dev DEV-x: want DEV-x"
+run 'has_hat_prefix DEV-x dev' >/dev/null || fail "has_hat_prefix DEV-x dev: want yes"
+run 'has_hat_prefix devx dev' >/dev/null && fail "has_hat_prefix devx dev: want no"
+# ps gives a workspace to the hat its prefix names, in any case.
+owner=$(run 'jq -rn "$PS_JQ_LIB"'"'"' {hats: ["ops", "dev"], ws: "DEV-x"} | ps_owner({})'"'")
+[[ "$owner" == dev ]] || fail "ps_owner DEV-x: want dev, got '$owner'"
+
+# A config already holding dev and Dev: each still clashes with the other's
+# variants, and a rename between them is refused.
+setup '.hats.Dev = {"ssh":"u@other.example.com"}'
+[[ -n "$(run 'hat_case_clash DEV')" ]] || fail "hat_case_clash DEV with dev and Dev: want a clash"
+[[ "$(run 'hat_case_clash dev Dev')" == "" ]] || fail "hat_case_clash dev except Dev: want none"
+out=$(run 'cmd_hat rename Dev DEV') && fail "hat rename Dev DEV with dev present: should be refused"
+grep -q "already a hat 'dev'" <<<"$out" || fail "hat rename Dev DEV: $out"
+
 echo "ok   hat-case"

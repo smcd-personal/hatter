@@ -341,8 +341,13 @@ hat_key() {
 # <name> only in case, other than <except>. A new hat may not be one: the two
 # would be the same hat to every command.
 hat_case_clash() {
-    cfg --arg l "$1" --arg x "${2:-}" '(.hats // {}) | keys[]
-        | select(. != $l and . != $x and ascii_downcase == ($l | ascii_downcase))' | head -1
+    cfg --arg l "$1" --arg x "${2:-}" '[(.hats // {}) | keys[]
+        | select(. != $l and . != $x and ascii_downcase == ($l | ascii_downcase))] | .[0] // empty'
+}
+# has_hat_prefix <name> <hat>: the name starts "<hat>-", in any case.
+has_hat_prefix() {
+    [[ "$1" == *-* ]] || return 1
+    [[ "$(printf '%s' "${1%%-*}" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" ]]
 }
 # "-oProxyCommand=..." is a valid ssh argument and would run whatever it says.
 # A destination is never an option, so anything that looks like one is refused
@@ -798,7 +803,7 @@ session_group() {
 # made by rename or plain tmux); then "<hat>-<name>" if that is running.
 hat_existing_session() {
     local hat="$1" name="$2" host
-    if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
+    if has_hat_prefix "$name" "$hat"; then printf '%s' "$name"; return 0; fi
     if [[ -n "$(session_group "$name" "$hat")" ]]; then
         printf '%s' "$name"; return 0
     fi
@@ -851,7 +856,7 @@ name_recorded_by_hats() {
 # instead. A name that already carries the prefix is kept as given.
 hat_new_name() {
     local hat="$1" name="$2" host
-    if [[ "$name" == "$hat"-* ]]; then printf '%s' "$name"; return 0; fi
+    if has_hat_prefix "$name" "$hat"; then printf '%s' "$name"; return 0; fi
     host=$(hat_ssh "$hat")
     if [[ -n "$host" ]] && { name_recorded_on_server "$hat" "$name" \
             || remote_session_exists "$host" "$name"; }; then
@@ -5912,7 +5917,7 @@ cmd_new() {
     fi
 
     if [[ -z "$hat" ]]; then
-        hat="${session%%-*}"
+        hat=$(hat_key "${session%%-*}")
         if [[ "$hat" == "$session" ]]; then
             # No prefix to read. If this hatter was started inside a cmux
             # window, that window names the hat - which is the whole point of
@@ -8543,7 +8548,9 @@ def ps_where($c): [$c.groups // {} | to_entries[] as $g | ($g.value.sessions // 
 # prefixed with; else the first.
 def ps_owner($where): ($where[.ws] // null) as $w | (.ws | split("-")[0]) as $pre
     | if $w != null and (.hats | index($w.hat)) then $w.hat
-      elif (.hats | index($pre)) then $pre else .hats[0] end;
+      elif (.hats | index($pre)) then $pre
+      else ((.hats | map(ascii_downcase) | index($pre | ascii_downcase)) as $i
+            | if $i != null then .hats[$i] else .hats[0] end) end;
 
 def ps_rows($c; $now; $idle; $busy):
   ps_where($c) as $where
