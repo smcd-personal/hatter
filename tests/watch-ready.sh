@@ -73,7 +73,7 @@ healthy() {
 }
 reset() {
     healthy; rm -f "$work/notes" "$work/dark" "$work/log"; rmdir "$LOCK_DIR" 2>/dev/null
-    WATCH_TICK=0; WATCH_WAKE_SEEN=""; WATCH_WAKE_PENDING=0; BOOT=1; WAKE=1; WATCH_WAKE_AT=0; WATCH_READY_LAST=0; WATCH_READY_PREV=""
+    WATCH_TICK=0; WATCH_WAKE_SEEN=""; WATCH_WAKE_PENDING=0; BOOT=1; WAKE=1; WATCH_WAKE_AT=0; WATCH_WAKE_FROM=0; WATCH_READY_LAST=0; WATCH_READY_PREV=""
     WATCH_MIRRORED_AT=$(date +%s)
 }
 # arm <seconds since the wake>
@@ -197,6 +197,33 @@ cmux_json() {
     jq -R . < "$work/titles" \
         | jq -s '{windows: [{workspaces: map({title: ., panes: [{surfaces: [{id: ("SF-" + .)}]}]})}]}'
 }
+
+# --- the time reported runs from the wake, the caps from the watching (#282) -
+# A watcher started 100s after the wake (a restart for an update).
+reset; WAKE=$(( $(date +%s) - 100 )); watch_wake_tick > /dev/null
+WATCH_WAKE_AT=$(( $(date +%s) - 20 )); look; look
+expect "started after a wake: ready reports the time since the wake" \
+    "$(notes | grep -qE '^hatter: ready\|All 3 workspaces are back \(1m(4[0-9]|5[0-9])s after waking\)' && echo y || echo n)"
+expect "...in the log too" "$(grep -qE 'everything is back: 3 workspace\(s\) in 1m(4[0-9]|5[0-9])s' "$work/log" && echo y || echo n)"
+
+# Started 300s after the wake: past twice the cap from the wake, but the
+# watch has only just begun, so it is not dropped.
+reset; WAKE=$(( $(date +%s) - 300 )); watch_wake_tick > /dev/null
+WATCH_WAKE_AT=$(( $(date +%s) - 20 )); printf '%s\n' dev-api ops-main > "$work/titles"; look
+expect "...and the caps still run from the watching, not the wake" \
+    "$([[ "$WATCH_WAKE_AT" != 0 && $(nnotes) == 0 ]] && ! grep -q 'stopped watching' "$work/log" && echo y || echo n)"
+
+# A wake seen mid-run, a round after it happened.
+reset; watch_wake_tick > /dev/null; WAKE=$(( $(date +%s) - 30 )); watch_wake_tick > /dev/null
+WATCH_WAKE_AT=$(( $(date +%s) - 20 )); look; look
+expect "a wake seen late in a run reports from the wake" \
+    "$(notes | grep -qE 'back \((3[0-9]|4[0-9])s after waking\)' && echo y || echo n)"
+
+# No wake time to read (a clock jump): from when the watching began.
+reset; WAKE=""; watch_wake_tick > /dev/null; WATCH_TICK=$(( $(date +%s) - 400 )); watch_wake_tick > /dev/null
+WATCH_WAKE_AT=$(( $(date +%s) - 20 )); look; look
+expect "no wake time: reports from when the watching began" \
+    "$(notes | grep -qE 'back \(2[0-9]s after waking\)' && echo y || echo n)"
 
 # --- the record of what is connected -----------------------------------------
 reset; rm -f "$AUTOSAVE_DIR/mirrored"; WATCH_MIRRORED_AT=0
