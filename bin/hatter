@@ -8193,7 +8193,7 @@ find_autojump_wait() {
         fi
     done
     if [[ -n "$why" ]]; then
-        printf '  %sAuto-jump to %s aborted (%s). Go there with: hatter find --go ...%s\n' "$C_YL" "$where" "$why" "$C_R" >&2
+        printf '  %s!%s Auto-jump to %s aborted (%s). Go there with: hatter find --go ...\n' "$C_YL" "$C_R" "$where" "$why" >&2
         return 1
     fi
     return 0
@@ -13735,7 +13735,7 @@ creds_tail() {
     fi
     printf '%s%s' \
         "${hold:+${C_DIM}${hold}${C_R}}" \
-        "${act:+${C_CY}${act}${C_R}}"
+        "${act:+${C_B}${act}${C_R}}"
 }
 
 # A short bar of remaining capacity, filled in that colour.
@@ -13814,7 +13814,7 @@ creds_gauge() {
     # "?": the reading failed, which is not the same as a full or empty window.
     if [[ "$r" == "?" ]]; then
         out="unknown"; [[ ${#out} -le $w ]] || out="?"
-        printf '%s%-*s%s' "$C_YL" "$w" "$out" "$C_R"; return 0
+        printf '%s%-*s%s' "$C_B" "$w" "$out" "$C_R"; return 0
     fi
     # "h": a Codex login out on a hat, deliberately not read from here.
     if [[ "$r" == "h" ]]; then
@@ -14175,7 +14175,7 @@ creds_list_row() {
     # other out. Claude tolerates it better, so only Codex gets the warning.
     if [[ "$agent" == codex && "$holders" == *", "* ]]; then
         n=$(( $(printf '%s' "$holders" | tr -cd ',' | wc -c) + 1 ))
-        printf '      %s! held by %s hats: Codex logs all but one of them out%s\n' "$C_YL" "$n" "$C_R"
+        printf '      %s!%s held by %s hats: Codex logs all but one of them out\n' "$C_YL" "$C_R" "$n"
     fi
 }
 
@@ -14397,6 +14397,13 @@ ICON_TAB="⌨️"
 # (#291). So secondary text is in the default foreground, told apart by its
 # place and its words, and only C_RULE, for the rack's header rules, is faint.
 # The name stays so secondary text is still marked in one place.
+#
+# The four status colours go on marks only: a symbol (● ○ ◐ ✕ ✗ ✓ ! ?), a bar,
+# the selection arrow. Words stay in the default foreground, or bold when they
+# need attention (#292). ANSI green, yellow and cyan text misses 4.5:1 on light
+# themes and red misses it on dark ones, and the theme, not hatter, picks the
+# shade; a mark needs 3:1 and carries no words, and the words beside it say
+# the same thing without colour.
 colour_setup() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
         C_DIM=""; C_RULE=$'\033[2m'
@@ -14520,7 +14527,7 @@ ask_line() {
 edit_ask() { focus_restore; ask_line "$1"; }
 edit_pause() { printf '\n  %spress any key%s ' "$C_DIM" "$C_R" >&2; edit_readkey; }
 edit_confirm() {
-    printf '  %s%s%s [y/N] ' "$C_YL" "$1" "$C_R" >&2
+    printf '  %s?%s %s%s%s [y/N] ' "$C_YL" "$C_R" "$C_B" "$1" "$C_R" >&2
     edit_readkey
     case "$KEY" in y|Y) printf 'yes\n' >&2; return 0 ;; *) printf 'no\n' >&2; return 1 ;; esac
 }
@@ -14777,8 +14784,9 @@ edit_header() {
     w=$(term_cols); [[ $w -le 58 ]] || w=58
     printf '%s────%s hatter rack %s%s%s\n' \
         "$C_RULE" "$C_R" "$C_RULE" "$(edit_rule $((w - 17)))" "$C_R"
-    printf '  %s%s%s\n' "$C_CY" "$(edit_trunc_left "${1:-all hats}" $((w - 2)))" "$C_R"
-    [[ -n "${6:-}" ]] && printf '  %s%s%s\n' "$C_YL" "$6" "$C_R"
+    printf '  %s\n' "$(edit_trunc_left "${1:-all hats}" $((w - 2)))"
+    # A banner is a warning: its leading "!" takes the colour, the words bold.
+    [[ -n "${6:-}" ]] && edit_warn_line "$6"
     printf '%s%s%s\n' "$C_RULE" "$(edit_rule "$w")" "$C_R"
     edit_caption "$2" "$3" "${4:-}" "${5:-}"
     printf '\n'
@@ -14907,6 +14915,16 @@ edit_detached() {
     return 0
 }
 
+# edit_warn_line <text>: a warning on a line of its own. A leading "! " is the
+# mark and takes the warning colour; the words are bold, never coloured (#292).
+edit_warn_line() {
+    if [[ "$1" == "! "* ]]; then
+        printf '  %s!%s %s%s%s\n' "$C_YL" "$C_R" "$C_B" "${1#! }" "$C_R"
+    else
+        printf '  %s%s%s\n' "$C_B" "$1" "$C_R"
+    fi
+}
+
 # The banner line for edit_detached's sessions, cut to the screen's width.
 edit_detached_banner() {
     local list
@@ -14924,7 +14942,7 @@ edit_detached_banner() {
 # state, and each login's mark and health word, always stay.
 HNAME_W=11
 edit_hat_rows() {
-    local width="$1" n="$2" i hw=4 sw=1 lw=4 credw used step kind dot name word
+    local width="$1" n="$2" i hw=4 sw=1 lw=4 credw used step kind dot name word sym
     local xdot xname xword out host=1
     HNAME_W=4
     for ((i = 0; i < n; i++)); do
@@ -14958,7 +14976,10 @@ edit_hat_rows() {
     for ((i = 0; i < n; i++)); do
         out=""
         [[ $host == 0 ]] || out=$(printf '%s%-*s%s ' "$C_DIM" "$hw" "$(edit_trunc "${HHOST[$i]}" "$hw")" "$C_R")
-        out="$out$(printf '%s%-*s%s ' "${HSCOL[$i]}" "$sw" "${HSTATE[$i]}" "$C_R")"
+        # The state's symbol takes its colour; the words after it do not.
+        sym="${HSTATE[$i]%% *}"
+        out="$out$(printf '%s%s%s%-*s ' "${HSCOL[$i]}" "$sym" "$C_R" \
+            $((sw - ${#sym})) "${HSTATE[$i]#"$sym"}")"
         IFS=$'\x1f' read -r kind dot name word <<< "${HCRED[$i]}"
         name=$(edit_trunc "$name" "$lw")
         case "$kind" in
@@ -14967,7 +14988,7 @@ edit_hat_rows() {
             # cannot refresh, so the mark and word say that.
             dead) out="$out$(printf '%s✕%s %s%s%s dead' "$C_RD" "$C_R" "$C_DIM" "$name" "$C_R")" ;;
             none) out="$out$(printf '%sno credential%s' "$C_DIM" "$C_R")" ;;
-            *)    out="$out$(printf '%snot provisioned%s' "$C_YL" "$C_R")" ;;
+            *)    out="$out$(printf '%s!%s not provisioned' "$C_YL" "$C_R")" ;;
         esac
         if [[ -n "${HCODEX[$i]}" ]]; then
             IFS=$'\x1f' read -r xdot xname xword <<< "${HCODEX[$i]}"
@@ -14987,7 +15008,7 @@ edit_hat_cred_cols() {
         ok)   c=$(( ${dot:+2} + 0 + ${#name} + ${#word} )) ;;
         dead) c=$(( 2 + ${#name} + 5 )) ;;
         none) c=13 ;;
-        *)    c=15 ;;
+        *)    c=17 ;;
     esac
     if [[ -n "${HCODEX[$i]}" ]]; then
         IFS=$'\x1f' read -r xdot xname xword <<< "${HCODEX[$i]}"
@@ -15300,22 +15321,22 @@ edit_sync_restore() {
 
         n=0
         if [[ -n "$gaps" ]]; then
-            printf '  %sMISSING%s\n' "$C_YL" "$C_R"
+            printf '  %s!%s %sMISSING%s\n' "$C_YL" "$C_R" "$C_B" "$C_R"
             while IFS=$'\x1f' read -r h what why; do
                 [[ -z "$h" ]] && continue
                 n=$((n+1))
-                printf '     %s%-11s%s %-22s %s%s%s\n' \
-                    "$C_DIM" "$h" "$C_R" "${what:-(the hat itself)}" "$C_YL" "$why" "$C_R"
+                printf '     %s%-11s%s %-22s %s\n' \
+                    "$C_DIM" "$h" "$C_R" "${what:-(the hat itself)}" "$why"
             done <<<"$gaps"
         else
-            printf '  %s● nothing missing - every recorded session is running and mirrored%s\n' \
+            printf '  %s●%s nothing missing - every recorded session is running and mirrored\n' \
                 "$C_GR" "$C_R"
         fi
 
         printf '\n  %ss%s  sync      write the live layout into the config\n' "$C_B" "$C_R"
         if [[ $n -gt 0 ]]; then
             printf '  %sr%s  restore   rebuild just the %s%s missing%s\n' \
-                "$C_B" "$C_R" "$C_YL" "$n" "$C_R"
+                "$C_B" "$C_R" "$C_B" "$n" "$C_R"
         else
             printf '  %s%sr%s  restore   nothing missing to rebuild%s\n' \
                 "$C_DIM" "$C_B" "$C_R" "$C_DIM$C_R"
@@ -15333,8 +15354,8 @@ edit_sync_restore() {
                 if ! ( cmd_sync ); then
                     warn "sync did not finish"
                 elif backup_ask_wanted; then
-                    printf '  %sback up the config to git now?%s [Y]es / [n]o / ne[v]er ask ' \
-                        "$C_YL" "$C_R" >&2
+                    printf '  %s?%s %sback up the config to git now?%s [Y]es / [n]o / ne[v]er ask ' \
+                        "$C_YL" "$C_R" "$C_B" "$C_R" >&2
                     edit_readkey
                     case "$KEY" in
                         enter|y|Y) printf 'yes\n' >&2; ( backup_commit_push ) || warn "backup did not finish" ;;
@@ -15393,13 +15414,13 @@ edit_credential() {
                 fi
             fi
             if [[ -z "$credstate" ]]; then
-                held=$(printf '%snot provisioned - press P on the hats screen%s' "$C_YL" "$C_R")
+                held=$(printf '%s!%s not provisioned - press P on the hats screen' "$C_YL" "$C_R")
             elif [[ "$credstate" == old ]]; then
-                held=$(printf '%shat-creds predates Codex - press P on the hats screen%s' "$C_YL" "$C_R")
+                held=$(printf '%s!%s hat-creds predates Codex - press P on the hats screen' "$C_YL" "$C_R")
             elif [[ "$agent" == codex ]] && cred_is "$email" "$org" "$cxemail" "$cxws"; then
-                held=$(printf '%s✓ holds this one%s' "$C_GR" "$C_R")
+                held=$(printf '%s✓%s holds this one' "$C_GR" "$C_R")
             elif [[ "$agent" == claude ]] && cred_is "$email" "$org" "$cred" "$(edit_hat_cred_org "$hat")"; then
-                held=$(printf '%s✓ holds this one%s' "$C_GR" "$C_R")
+                held=$(printf '%s✓%s holds this one' "$C_GR" "$C_R")
             elif [[ "$credstate" == "none" ]]; then
                 held=$(printf '%sno credential%s' "$C_DIM" "$C_R")
             else
@@ -15492,7 +15513,7 @@ edit_groups() {
             g="${GRPS[$i]}"
             count=$(cfg --arg g "$g" '.groups[$g].sessions | length')
             dg=""
-            [[ "$(hat_default_group "$hat")" == "$g" ]] && dg="  ${C_CY}(default)${C_R}"
+            [[ "$(hat_default_group "$hat")" == "$g" ]] && dg="  ${C_B}(default)${C_R}"
             group_managed "$g" && dg="$dg  ${C_DIM}(hatter's own: workspaces in no group)${C_R}"
             ROW_LABEL=""; ROW_ICON="$ICON_GROUP"
             edit_row $((i+1)) "$SEL" "$(group_display "$g")" 28 \
@@ -15505,7 +15526,7 @@ edit_groups() {
         local un
         un=$(hat_unrecorded "$hat" "$(cut -f1 "$(edit_sessions_file "$hat")" 2>/dev/null || true)")
         if [[ -n "$un" ]]; then
-            printf '\n  %srunning, in no group:%s %s\n' "$C_YL" "$C_R" "$(paste -sd ' ' - <<<"$un")"
+            printf '\n  %s!%s %srunning, in no group:%s %s\n' "$C_YL" "$C_R" "$C_B" "$C_R" "$(paste -sd ' ' - <<<"$un")"
             printf '     %sto keep one, hatter new <session> --group <name>; to end it, hatter rm%s\n' \
                 "$C_DIM" "$C_R"
         fi
@@ -15599,17 +15620,17 @@ edit_workspaces() {
             tabs=$(edit_session_field "$hat" "$ws" 2)
             att=$(edit_session_field "$hat" "$ws" 3)
             if [[ -n "$tabs" ]]; then
-                state=$(printf '%s● running%s  %s tab(s)' "$C_GR" "$C_R" "$tabs")
+                state=$(printf '%s●%s running  %s tab(s)' "$C_GR" "$C_R" "$tabs")
                 [[ "$att" == "1" ]] && state="$state  ${C_DIM}attached${C_R}"
                 place=$(session_place "$ws" "$ws" "$EDIT_SHOWN" "$EDIT_GROUPED")
                 case "$place" in
                     "running, not in cmux")
-                        state="$state  ${C_YL}not in cmux${C_R} ${C_DIM}restore --missing mirrors it${C_R}" ;;
+                        state="$state  ${C_YL}!${C_R} not in cmux, ${C_DIM}restore --missing mirrors it${C_R}" ;;
                     "running, in no cmux group")
-                        state="$state  ${C_YL}in no cmux group${C_R} ${C_DIM}sync puts it back${C_R}" ;;
+                        state="$state  ${C_YL}!${C_R} in no cmux group, ${C_DIM}sync puts it back${C_R}" ;;
                 esac
             else
-                state=$(printf '%s✗ not running%s  %sre-create with restore%s' \
+                state=$(printf '%s✗%s not running  %sre-create with restore%s' \
                         "$C_RD" "$C_R" "$C_DIM" "$C_R")
             fi
             ROW_LABEL=""; ROW_ICON="$ICON_WORKSPACE"
@@ -15660,8 +15681,8 @@ edit_workspaces() {
                 [[ $n -eq 0 ]] && continue
                 # Ending it is the usual case; forgetting only is for an entry
                 # whose server is gone, or a session to keep but stop tracking.
-                printf '  %sremove %s:%s [k]ill it and forget it / [f]orget only, leave it running / [N]o ' \
-                    "$C_YL" "$short" "$C_R" >&2
+                printf '  %s?%s %sremove %s:%s [k]ill it and forget it / [f]orget only, leave it running / [N]o ' \
+                    "$C_YL" "$C_R" "$C_B" "$short" "$C_R" >&2
                 edit_readkey
                 # A subshell: rm dies on whatever it could not do, and says what
                 # that was - including when it ended the session but could not
@@ -15688,8 +15709,8 @@ edit_tabs() {
         IDXS=(); NAMES=(); METAS=(); PINS=(); n=0
         while IFS=$'\x1f' read -r idx nm active panes cmd cwd dead pin; do
             [[ -z "$idx" ]] && continue
-            if [[ "$dead" == "1" ]]; then mark="${C_RD}✗ dead${C_R}   "
-            elif [[ "$active" == "1" ]]; then mark="${C_GR}● active${C_R} "
+            if [[ "$dead" == "1" ]]; then mark="${C_RD}✗${C_R} dead   "
+            elif [[ "$active" == "1" ]]; then mark="${C_GR}●${C_R} active "
             else mark="${C_DIM}○${C_R}        "
             fi
             short=$(edit_trunc_left "$(edit_short_path "$cwd")" 30)
@@ -15698,8 +15719,8 @@ edit_tabs() {
             PINS[$n]="${pin:-}"
             NAMES[$n]="${nm:-(unnamed)}"
             [[ "$pin" == "1" ]] && NAMES[$n]="📌 ${NAMES[$n]}"
-            METAS[$n]=$(printf '%s %s%-10s%s %s%s pane%s  %s%s' \
-                "$mark" "$C_CY" "$(edit_trunc "$cmd" 10)" "$C_R" \
+            METAS[$n]=$(printf '%s %-10s %s%s pane%s  %s%s' \
+                "$mark" "$(edit_trunc "$cmd" 10)" \
                 "$C_DIM" "$panes" "$plural" "$short" "$C_R")
             n=$((n+1))
         done < <(edit_windows "$hat" "$ws")
@@ -15717,7 +15738,7 @@ edit_tabs() {
             i=$((i+1))
         done
         [[ $n -eq 0 ]] && \
-            printf '   %s(workspace is not running - go back and use restore)%s\n' "$C_YL" "$C_R"
+            printf '   %s!%s (workspace is not running - go back and use restore)\n' "$C_YL" "$C_R"
 
         edit_keys "a add   r rename   p pin/unpin   d close   ! refresh   q quit"
         edit_readkey
@@ -16646,8 +16667,8 @@ one of amber, green, cyan, blue, violet, rose, teal or slate, set with
 a "color" of its own keeps it, unless that colour is one of the hat colours
 themselves: those follow the hat. "prefs": {"colorblind_safe": "on"} in the
 config switches to colours that stay apart under colour blindness: each hat
-colour becomes one of the Okabe-Ito palette, and green status text (up,
-active, capacity left) becomes blue. cmux group colours follow at the next
+colour becomes one of the Okabe-Ito palette, and the green status marks (up,
+active, capacity left) become blue. cmux group colours follow at the next
 `hatter restore`.
 
 Hats that share an ssh destination share one tmux server, so they must agree
@@ -16736,6 +16757,12 @@ each one, and live status is shown where it exists:
   workspaces  running / not running, tab count, whether a client is attached,
               and running but not in cmux
   tabs        active, dead, running command, pane count, working directory
+
+Each status is a symbol and words: ● up, running or active; ○ no tmux;
+✕ or ✗ down, not running or dead; ! needs a look (not in cmux, not
+provisioned, missing); ? not known yet (unprobed), or a question waiting for a
+key. Colour is only on the symbol and the words are never coloured, so a
+status reads the same in any terminal theme and with NO_COLOR set.
 
 Keys are shown at the bottom of each screen. `!` re-probes the servers, `b`
 goes back a level, `q` quits from anywhere. Esc at a question cancels the whole
