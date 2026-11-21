@@ -10,9 +10,10 @@
 #     destination that did not answer clears its workspaces; long lists cut
 #   - watch_working, end to end with an ssh stub on PATH and cmux stubbed:
 #     sets a status once, calls cmux again only on a change, clears it when
-#     the turn ends or the server stops answering, sets it again after the
-#     stream restarts (cmux may have restarted), and clears what it set when
-#     "prefs.working_status" is "off"
+#     the turn ends, holds it while a server misses up to two rounds and
+#     clears it at the third, retries a set or clear that failed, sets it
+#     again after the stream restarts (cmux may have restarted), and clears
+#     what it set when "prefs.working_status" is "off", also after a restart
 #
 # Needs bash, jq and perl.
 set -euo pipefail
@@ -96,7 +97,8 @@ cmux_json() {
     jq -n '{windows: [{workspaces: [{id: "W-api", title: "dev-api"}, {id: "W-docs", title: "dev-docs"},
                                     {id: "W-x", title: "off-x"}, {id: "W-local", title: "Personal"}]}]}'
 }
-cmux() { echo "$*" >> "$work/cmux.log"; }
+# A change fails while $work/cmux-fail exists (logged all the same).
+cmux() { echo "$*" >> "$work/cmux.log"; [[ ! -f "$work/cmux-fail" ]]; }
 mac_dark_wake() { return 1; }
 WATCH_WAKE_PENDING=0
 calls() { cat "$work/cmux.log" 2>/dev/null; : > "$work/cmux.log"; }
@@ -126,7 +128,28 @@ server "W${T}dev-api${T}main${T}990${T}999"$'\n'
 round; calls >/dev/null
 rm -f "$work/server"
 round
-expect "server stops answering: cleared" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+expect "server misses a round: status held" "$(is "$(calls)" "")"
+round
+expect "server misses two: still held" "$(is "$(calls)" "")"
+round
+expect "server misses three: cleared" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+
+# A failed change is tried again next round, from what cmux was last told.
+server "W${T}dev-api${T}main${T}990${T}999"$'\n'
+round; calls >/dev/null
+server "W${T}dev-api${T}main${T}990${T}999"$'\n'"W${T}dev-api${T}two${T}990${T}999"$'\n'
+touch "$work/cmux-fail"; round; calls >/dev/null; rm -f "$work/cmux-fail"
+# The new label never landed, so cmux still shows the old one: going idle
+# must clear it.
+server "W${T}dev-api${T}main${T}${T}999"$'\n'
+round
+expect "failed set, then idle: the old label is cleared" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
+server "W${T}dev-api${T}main${T}990${T}999"$'\n'
+round; calls >/dev/null
+server "W${T}dev-api${T}main${T}${T}999"$'\n'
+touch "$work/cmux-fail"; round; calls >/dev/null; rm -f "$work/cmux-fail"
+round
+expect "failed clear: tried again next round" "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
 
 server "W${T}dev-api${T}main${T}990${T}999"$'\n'
 round; calls >/dev/null
@@ -142,6 +165,16 @@ expect "pref off: clears what it set, then stays quiet" \
     "$(is "$(calls)" "clear-status hatter_working --workspace W-api")"
 round
 expect "pref off: second round quiet" "$(is "$(calls)" "")"
+
+# Off after a restart: what an earlier watcher set is unknown, so every placed
+# workspace is cleared once.
+WATCH_WORKING_SHOWN=""; WATCH_WORKING_KNOWN=0
+round
+out=$(calls)
+expect "pref off after a restart: sweeps the placed workspaces once" \
+    "$(is "$(sort <<<"$out")" "clear-status hatter_working --workspace W-api"$'\n'"clear-status hatter_working --workspace W-docs")"
+round
+expect "pref off after a restart: then quiet" "$(is "$(calls)" "")"
 
 echo
 if [[ "$fails" -gt 0 ]]; then echo "$fails failed"; exit 1; fi

@@ -12196,6 +12196,8 @@ WATCH_WORKING_CAP=8
 WATCH_WORKING_LAST=0
 WATCH_WORKING_SHOWN=""   # "<workspace id> TAB <label>": what the watcher set
 WATCH_WORKING_KNOWN=0    # 0 until a round since the stream opened has run
+WATCH_WORKING_MISSES=""  # "<dest> TAB <rounds in a row it did not answer>"
+WATCH_WORKING_HOLD=3     # rounds a silent destination keeps its statuses
 
 # What runs on a server: its clock, then every window with its open turn, last
 # output and what hat-attn says it waits for.
@@ -12210,17 +12212,21 @@ working_tabs() {
             && now - $5 <= (($6 == "approval" || $6 == "question") ? wq : q) { print $2 "\t" $3 }'
 }
 
-# working_labels <recorded> <tabs> <workspaces>: one "<id> TAB <label>" for each
-# workspace it can place, the label empty when nothing in it is working.
+# working_labels <recorded> <tabs> <workspaces> [held]: one "<id> TAB <label>"
+# for each workspace it can place, the label empty when nothing in it is
+# working.
 #   recorded    "<dest> TAB <session>", every session the config records
 #   tabs        "<dest> TAB <session> TAB <tab>", every working tab
 #   workspaces  "<id> TAB <title>", every workspace cmux shows
+#   held        destinations, one a line, whose workspaces are left out: they
+#               missed this round, and keep what they show for now
 # A workspace is placed by its title, the session it mirrors. A title recorded
-# on two destinations could be either, so it is left alone. A destination that
-# did not answer has no tabs, so its workspaces are cleared.
+# on two destinations could be either, so it is left alone.
 working_labels() {
-    AWK_R="$1" AWK_T="$2" awk -F '\t' '
+    AWK_R="$1" AWK_T="$2" AWK_H="${4:-}" awk -F '\t' '
         BEGIN {
+            n = split(ENVIRON["AWK_H"], h, "\n")
+            for (i = 1; i <= n; i++) if (h[i] != "") held[h[i]] = 1
             n = split(ENVIRON["AWK_R"], r, "\n")
             for (i = 1; i <= n; i++) {
                 if (split(r[i], f, "\t") < 2) continue
@@ -12233,7 +12239,7 @@ working_labels() {
             }
             for (k in seen) { split(k, f, SUBSEP); dest[f[1]] = f[2] }
         }
-        NF >= 2 && dests[$2] == 1 {
+        NF >= 2 && dests[$2] == 1 && !(dest[$2] in held) {
             m = split(names[dest[$2], $2], a, "\037"); out = ""; more = 0
             for (i = 1; i <= m; i++) {
                 if (out == "") out = a[i]
@@ -12266,38 +12272,44 @@ watch_working_query() {
 # ("<id> TAB <label>", empty label for none), calling cmux only for changes.
 # Before the first round of a stream what cmux shows is unknown (a watcher
 # restarted, or cmux did), so every placed workspace is set or cleared once.
+# A call that fails keeps what cmux was last told, so the next round tries
+# again; a workspace <wanted> does not name keeps its entry as it is.
 watch_working_apply() {
     local wanted="$1" id label shown="" had
     while IFS=$'\t' read -r id label; do
         [[ -n "$id" ]] || continue
         had=$(AWK_I="$id" awk -F '\t' '$1 == ENVIRON["AWK_I"] { print "y\t" $2; exit }' <<<"$WATCH_WORKING_SHOWN")
         if [[ -n "$label" ]]; then
-            if [[ "$WATCH_WORKING_KNOWN" == 0 || "$had" != "y"$'\t'"$label" ]]; then
-                cmux_change set-status "$WORKING_KEY" "$label" --workspace "$id" \
-                    --icon "$WORKING_ICON" --color "$WORKING_COLOR" >/dev/null 2>&1 || continue
+            if [[ "$WATCH_WORKING_KNOWN" == 0 || "$had" != "y"$'\t'"$label" ]] \
+               && ! cmux_change set-status "$WORKING_KEY" "$label" --workspace "$id" \
+                    --icon "$WORKING_ICON" --color "$WORKING_COLOR" >/dev/null 2>&1; then
+                [[ -z "$had" ]] || shown+="$id"$'\t'"${had#y?}"$'\n'
+                continue
             fi
             shown+="$id"$'\t'"$label"$'\n'
         elif [[ -n "$had" || "$WATCH_WORKING_KNOWN" == 0 ]]; then
-            # Forgotten even if it fails: a workspace that is gone cannot be
-            # cleared, and the next stream clears everything once anyway.
-            cmux_change clear-status "$WORKING_KEY" --workspace "$id" >/dev/null 2>&1 || true
+            cmux_change clear-status "$WORKING_KEY" --workspace "$id" >/dev/null 2>&1 \
+                || { [[ -z "$had" ]] || shown+="$id"$'\t'"${had#y?}"$'\n'; }
         fi
     done <<<"$wanted"
-    WATCH_WORKING_SHOWN=$shown
+    # Entries for workspaces <wanted> leaves out (a destination held this round).
+    shown+=$(AWK_W="$wanted" awk -F '\t' '
+        BEGIN { n = split(ENVIRON["AWK_W"], w, "\n"); for (i = 1; i <= n; i++) { split(w[i], f, "\t"); named[f[1]] = 1 } }
+        NF >= 2 && !($1 in named) { print }' <<<"$WATCH_WORKING_SHOWN")
+    WATCH_WORKING_SHOWN=$(printf '%s' "$shown" | awk 'NF')
     WATCH_WORKING_KNOWN=1
     return 0
 }
 
 # watch_working: one round, at most every WATCH_WORKING_EVERY seconds.
 watch_working() {
-    local now tree wss rec dests dest i=0 started="" tabs="" f line wanted
+    local now tree wss rec dests dest i=0 started="" tabs="" f line wanted held="" misses="" m off=0
     now=$(date +%s)
     (( now - WATCH_WORKING_LAST >= WATCH_WORKING_EVERY )) || return 0
     WATCH_WORKING_LAST=$now
-    if [[ "$(cfg '.prefs.working_status // "on"' 2>/dev/null)" == off ]]; then
-        [[ -z "$WATCH_WORKING_SHOWN" ]] || watch_working_apply "$(cut -f1 <<<"$WATCH_WORKING_SHOWN")"
-        return 0
-    fi
+    [[ "$(cfg '.prefs.working_status // "on"' 2>/dev/null)" != off ]] || off=1
+    # Off, with nothing set and nothing unknown: nothing to do.
+    [[ "$off" == 0 || -n "$WATCH_WORKING_SHOWN" || "$WATCH_WORKING_KNOWN" == 0 ]] || return 0
     [[ "$WATCH_WAKE_PENDING" == 0 ]] || return 0
     mac_dark_wake && return 0
     tree=$(cmux_json tree --all 2>/dev/null) || return 0
@@ -12306,6 +12318,15 @@ watch_working() {
     rec=$(cfg '.hats as $h | .groups[]? | select($h[.hat] != null and ($h[.hat].disabled | not))
                | ($h[.hat].ssh // "") as $d | select($d != "" and ($d | startswith("-") | not))
                | .sessions | keys_unsorted[]? | "\($d)\t\(.)"' 2>/dev/null | awk '!seen[$0]++') || rec=""
+    # A workspace that is gone has nothing left to clear.
+    WATCH_WORKING_SHOWN=$(awk -F '\t' 'NR == FNR { here[$1] = 1; next } NF >= 2 && ($1 in here)' \
+        <(printf '%s\n' "$wss") <(printf '%s\n' "$WATCH_WORKING_SHOWN"))
+    if [[ "$off" == 1 ]]; then
+        # Clear every placed workspace this watcher (or one before it) marked.
+        watch_working_apply "$(working_labels "$rec" "" "$wss")"
+        WATCH_WORKING_SHOWN=""
+        return 0
+    fi
     # Only destinations with a recorded session cmux shows.
     dests=$(awk -F '\t' 'NR == FNR { shown[$2] = 1; next } ($2 in shown) && !seen[$1]++ { print $1 }' \
         <(printf '%s\n' "$wss") <(printf '%s\n' "$rec"))
@@ -12323,18 +12344,30 @@ watch_working() {
         [[ -n "$dest" ]] || continue
         i=$((i + 1))
         f="$AUTOSAVE_DIR/.working-$i"
-        [[ -f "$f" ]] || continue
+        if [[ ! -f "$f" ]]; then
+            # Silent: hold what it shows for a few rounds (one slow ssh is not
+            # a reason to flicker), then take it as having nothing working.
+            m=$(AWK_D="$dest" awk -F '\t' '$1 == ENVIRON["AWK_D"] { print $2; exit }' <<<"$WATCH_WORKING_MISSES")
+            m=$(( ${m:-0} + 1 ))
+            misses+="$dest"$'\t'"$m"$'\n'
+            (( m >= WATCH_WORKING_HOLD )) || held+="$dest"$'\n'
+            continue
+        fi
         while IFS= read -r line; do
             [[ -z "$line" ]] || tabs+="$dest"$'\t'"$line"$'\n'
         done < <(working_tabs < "$f")
         rm -f "$f"
     done <<<"$dests"
-    wanted=$(working_labels "$rec" "$tabs" "$wss")
-    # A workspace the watcher marked that is gone, or no longer placed, is
-    # cleared too.
+    WATCH_WORKING_MISSES=$misses
+    wanted=$(working_labels "$rec" "$tabs" "$wss" "$held")
+    # A workspace the watcher marked that is no longer placed (its title now
+    # recorded on two destinations, or not at all) is cleared, unless its
+    # destination is held.
     while IFS=$'\t' read -r line _; do
         [[ -n "$line" ]] || continue
         AWK_I="$line" awk -F '\t' '$1 == ENVIRON["AWK_I"] { f = 1 } END { exit !f }' <<<"$wanted" \
+            && continue
+        [[ -n "$(working_labels "$rec" "" "$(AWK_I="$line" awk -F '\t' '$1 == ENVIRON["AWK_I"]' <<<"$wss")")" ]] \
             || wanted+=$'\n'"$line"$'\t'
     done <<<"$WATCH_WORKING_SHOWN"
     watch_working_apply "$wanted"
@@ -12929,6 +12962,7 @@ watch_stream() {
     # cmux may have restarted, so what it shows is unknown again.
     WATCH_WORKING_KNOWN=0
     WATCH_WORKING_LAST=0
+    WATCH_WORKING_MISSES=""
     watch_journal_prune
     cmux events --category workspace --category surface --category window \
             --cursor-file "$AUTOSAVE_DIR/watch.seq" 2>"$dir/err" </dev/null \
