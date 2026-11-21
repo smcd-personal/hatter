@@ -61,7 +61,10 @@ needed for `hatter backup`, but you want that.
 ```sh
 git clone https://github.com/smcd-personal/hatter ~/src/hatter
 install -m 755 ~/src/hatter/bin/hatter ~/.local/bin/hatter
+~/src/hatter/tools/manpage.py -o ~/.local/share/man/man1/hatter.1
 ```
+
+The second line is optional: it is what makes `man hatter` work.
 
 Make sure `~/.local/bin` is on your PATH:
 

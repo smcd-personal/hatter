@@ -38,6 +38,7 @@ syntax error. Install only from `main`, after a merge:
 ```sh
 git -C ~/dev/hatter pull --ff-only
 install -m 755 ~/dev/hatter/bin/hatter ~/.local/bin/hatter
+~/dev/hatter/tools/manpage.py -o ~/.local/share/man/man1/hatter.1
 ```
 
 `install` replaces the file rather than rewriting it, so running copies keep
