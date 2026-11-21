@@ -90,13 +90,15 @@ chmod +x "$work/bin/cswap" "$work/bin/ssh" "$work/bin/cmux" "$work/bin/tmux"
 loc=$(locale -a 2>/dev/null | grep -i -m1 -E '^(en_US|C)\.utf-?8$' || true)
 path="$work/bin:/usr/bin:/bin"
 
+# col_of <line> <text>: the column <text> starts at, in characters.
+col_of() { python3 -I -c 'import sys; print(sys.argv[1].find(sys.argv[2]))' "$1" "$2"; }
 # The longest line, in characters.
 widest() { python3 -I -c 'import sys; print(max((len(l) for l in sys.stdin.read().split("\n")), default=0))'; }
 
 # --- hatter creds list ----------------------------------------------------------
 list() {
     env -i HOME="$work/home" PATH="$path" LANG="${loc:-C}" XDG_CONFIG_HOME="$work/cfg" \
-        HATTER_CSWAP="$work/bin/cswap" HATTER_TTY=/dev/null NO_COLOR=1 COLUMNS="$1" \
+        HATTER_CSWAP="$work/bin/cswap" HATTER_CODEX=no-such-codex HATTER_TTY=/dev/null NO_COLOR=1 COLUMNS="$1" \
         bash "$root/bin/hatter" creds list 2>&1
 }
 wide=$(list 200)
@@ -128,6 +130,18 @@ $out"
 [[ "$out" == *"7d "*"%"* ]] || fail "creds list at 60: the 7d percent went
 $out"
 
+# --- creds_fit: a login already short is not widened to make room -----------------
+sed '/^# -* main$/,$d' "$root/bin/hatter" > "$work/lib.sh"
+fit() { bash -c "source '$work/lib.sh'; creds_fit $*; echo \$CF_NAME \$CF_ROLE \$CF_ETA5 \$CF_ETA7 \$CF_BAR"; }
+got=$(fit 71 6 6 8 2>&1 || true)
+[[ "$got" == "6 1 1 1 1" ]] || fail "creds_fit 71 for a 6 column login: want '6 1 1 1 1' (nothing dropped), got '$got'"
+# One column short: only the 7d reset goes. The login stays 6, not widened to
+# the 16 a long one is cut to, which would cost the role as well.
+got=$(fit 70 6 6 8 2>&1 || true)
+[[ "$got" == "6 1 1 0 1" ]] || fail "creds_fit 70 for a 6 column login: want '6 1 1 0 1', got '$got'"
+got=$(fit 200 6 36 8 2>&1 || true)
+[[ "$got" == "28 1 1 1 1" ]] || fail "creds_fit 200: want '28 1 1 1 1', got '$got'"
+
 # --- the rack's top screen --------------------------------------------------------
 if ! command -v tmux >/dev/null 2>&1; then
     echo "skip: no tmux for the rack half"
@@ -142,7 +156,7 @@ else
         local n=0
         T -f /dev/null new-session -d -x "$1" -y 40 -s "w$1" \
             "env -i HOME='$work/home' PATH='$path' TERM=xterm-256color LANG='${loc:-C}' \
-             XDG_CONFIG_HOME='$work/cfg' HATTER_CSWAP='$work/bin/cswap' \
+             XDG_CONFIG_HOME='$work/cfg' HATTER_CSWAP='$work/bin/cswap' HATTER_CODEX=no-such-codex \
              bash '$root/bin/hatter' rack; sleep 60"
         [[ -n "$sockpath" ]] || sockpath=$(T display-message -p '#{socket_path}')
         while [[ $n -lt 75 ]] && ! screen "w$1" | grep -qF "S sync"; do
@@ -172,6 +186,13 @@ $out"
 $out"
         printf '%s\n' "$out" | grep ' a .*someone' | grep -q ' active' || fail "rack at $w: the active mark went
 $out"
+        # The column names sit over their columns.
+        hdr=$(printf '%s\n' "$out" | grep 'LOGIN')
+        row=$(printf '%s\n' "$out" | grep ' a .*someone')
+        [[ $(col_of "$hdr" "5H") == $(col_of "$row" "5h ") && \
+           $(col_of "$hdr" "7D") == $(col_of "$row" "7d ") ]] || fail "rack at $w: header and row disagree
+$hdr
+$row"
     done
 fi
 

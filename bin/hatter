@@ -13662,7 +13662,9 @@ creds_fit() {
         [[ $CF_USED -gt $width ]] || break
         case "$step" in
             name:*)
+                # Shortened only: a login already under the floor keeps its width.
                 min=${step#name:}
+                [[ $CF_NAME -gt $min ]] || continue
                 CF_NAME=$(( CF_NAME - (CF_USED - width) ))
                 [[ $CF_NAME -ge $min ]] || CF_NAME=$min ;;
             eta7) CF_ETA7=0 ;;
@@ -14234,6 +14236,12 @@ cmd_creds() {
             [[ $sw -le 26 ]] || sw=26
             [[ $(( 2 + hw + 1 + sw + 1 + rw )) -le $cols ]] || sw=0
             for ((i = 0; i < ${#lh[@]}; i++)); do
+                # A long Codex home name is cut too, so the line still fits.
+                room=$(( cols - 2 - hw - 1 - 8 ))
+                [[ $sw -eq 0 ]] || room=$(( room - sw - 1 ))
+                if [[ ${#lcx[$i]} -gt $room ]]; then
+                    if [[ $room -ge 4 ]]; then lcx[$i]=$(edit_trunc "${lcx[$i]}" "$room"); else lcx[$i]=""; fi
+                fi
                 room=$(( cols - 2 - hw - 1 - ${#lcx[$i]} ))
                 [[ $sw -eq 0 ]] || room=$(( room - sw - 1 ))
                 [[ $room -ge 8 ]] || room=8
@@ -14617,7 +14625,9 @@ edit_windows() {
 # COLUMNS, then 100. HATTER_TTY is for the tests.
 term_cols() {
     local c
-    c=$(stty size < "${HATTER_TTY:-/dev/tty}" 2>/dev/null) || c=""
+    # Braced: with no controlling tty, opening it is what fails, and a bare
+    # 2>/dev/null after that redirection comes too late to hide the message.
+    c=$( { stty size < "${HATTER_TTY:-/dev/tty}"; } 2>/dev/null ) || c=""
     c="${c##* }"
     [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] || c="${COLUMNS:-}"
     [[ "$c" =~ ^[0-9]+$ && "$c" -gt 0 ]] || c=100
@@ -14628,7 +14638,7 @@ term_cols() {
 # With no tty, LINES, then 24.
 term_rows() {
     local r
-    r=$(stty size < "${HATTER_TTY:-/dev/tty}" 2>/dev/null) || r=""
+    r=$( { stty size < "${HATTER_TTY:-/dev/tty}"; } 2>/dev/null ) || r=""
     r="${r%% *}"
     [[ "$r" =~ ^[0-9]+$ && "$r" -gt 0 ]] || r="${LINES:-}"
     [[ "$r" =~ ^[0-9]+$ && "$r" -gt 0 ]] || r=24
