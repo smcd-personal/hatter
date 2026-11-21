@@ -18,7 +18,9 @@ def readme_alt(src):
     return html.unescape(m.group(1))
 
 
-BG, FG, DIM, BOLD = "#0d1117", "#c9d1d9", "#6e7681", "#f0f6fc"
+# DIM is secondary text, so it needs 4.5:1 on BG like any text (#291):
+# #8b949e is 6.15:1 on #0d1117 (FG is 12.26:1).
+BG, FG, DIM, BOLD = "#0d1117", "#c9d1d9", "#8b949e", "#f0f6fc"
 GREEN, YELLOW, RED, CYAN = "#7ee787", "#e3b341", "#ff7b72", "#56d4dd"
 SEL_BG, SEL_FG = "#c9d1d9", "#0d1117"
 
