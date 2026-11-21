@@ -97,7 +97,8 @@ You need `ssh`, `jq` and a server running `tmux`. The cmux commands need
   abort a script under `set -e`. `tests/login-shell-noise.sh` checks it.
 - **A test starts by sourcing `tests/clean-env.sh`**, on the line straight
   after `set -euo pipefail`. It clears the variables that point hatter at a
-  real home (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, the XDG directories); one
+  real home or real dotfiles (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`, the XDG
+  directories, `ZDOTDIR`, `TMUX`); one
   inherited from your shell wins over the test's temp HOME and the test
   writes your real config. A new such variable goes in that file, not in
   each test. `tests/test-isolation.sh` checks every test (#302).

@@ -23,17 +23,27 @@ chk() { awk '/XDG_CONFIG_HOME=/ && /HOME=/ { ok = 1 } $0 == "source \"$lib\"" { 
 if chk "$d/bad.sh"; then echo "FAIL the check passes a script that sources first"; fails=$((fails + 1)); fi
 if ! chk "$d/good.sh"; then echo "FAIL the check fails a script that isolates first"; fails=$((fails + 1)); fi
 
+# cechk <script>: the line straight after `set -euo pipefail` sources it.
+cechk() { awk 'p { c = 1; ok = ($0 == ". \"$(dirname \"$0\")/clean-env.sh\""); exit }
+               /^set -euo pipefail$/ { p = 1 } END { exit !(c && ok) }' "$1"; }
 # Every test clears the developer's home variables (CODEX_HOME and the rest)
 # before it runs anything: the line straight after `set -euo pipefail` sources
 # clean-env.sh (#302).
 for t in "$here"/*.sh; do
     [[ "$(basename "$t")" == clean-env.sh ]] && continue
-    if ! awk 'p { exit !($0 == ". \"$(dirname \"$0\")/clean-env.sh\"") }
-              /^set -euo pipefail$/ { p = 1 } END { if (!p) exit 1 }' "$t"; then
+    if ! cechk "$t"; then
         echo "FAIL $(basename "$t"): does not source clean-env.sh straight after set -euo pipefail"
         fails=$((fails + 1))
     fi
 done
+
+# The check itself: a test that sources it late, or not at all, is caught.
+printf '%s\n' 'set -euo pipefail' '. "$(dirname "$0")/clean-env.sh"' > "$d/ce-good.sh"
+printf '%s\n' 'set -euo pipefail' 'x=1' '. "$(dirname "$0")/clean-env.sh"' > "$d/ce-late.sh"
+printf '%s\n' 'set -euo pipefail' > "$d/ce-none.sh"
+cechk "$d/ce-good.sh" || { echo "FAIL the clean-env check fails a script that sources it"; fails=$((fails + 1)); }
+cechk "$d/ce-late.sh" && { echo "FAIL the clean-env check passes a script that sources it late"; fails=$((fails + 1)); }
+cechk "$d/ce-none.sh" && { echo "FAIL the clean-env check passes a script that never sources it"; fails=$((fails + 1)); }
 
 # And it works: hat-attn.sh runs provision's Claude and Codex wiring, which
 # wrote the developer's real Codex hooks when CODEX_HOME was inherited. With
