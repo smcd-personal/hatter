@@ -738,9 +738,12 @@ hat_colour() {
 }
 
 # The hat icon in its own colour. A tiny silhouette - crown and brim - which at
-# three characters is as close to a hat as a terminal gets.
+# three characters is as close to a hat as a terminal gets. None in plain mode
+# (#297): a screen reader reads it as slash, underscore, backslash.
 hat_icon() {
-    if [[ -n "${C_R:-}" ]]; then
+    if [[ "${PLAIN:-}" == 1 ]]; then
+        return 0
+    elif [[ -n "${C_R:-}" ]]; then
         printf '\033[38;5;%sm/_\\\033[0m' "$(hat_colour_ansi "$(hat_colour "$1")")"
     else
         printf '/_\\'
@@ -13654,6 +13657,8 @@ CF_NAME=28 CF_ROLE=1 CF_BAR=1 CF_ETA5=1 CF_ETA7=1 CF_USED=87 CF_WIDTH=200
 creds_fit() {
     local width="$1" lead="$2" step min
     CF_WIDTH="$width" CF_NAME="$3" CF_ROLE=1 CF_BAR=1 CF_ETA5=1 CF_ETA7=1
+    # No bars in plain mode (#297): the percentage beside one says it.
+    [[ "${PLAIN:-}" != 1 ]] || CF_BAR=0
     width=$(( width - ${4:-0} ))
     [[ $CF_NAME -le 28 ]] || CF_NAME=28
     [[ $CF_NAME -ge 5 ]] || CF_NAME=5            # as wide as LOGIN
@@ -13705,8 +13710,8 @@ creds_marks() {
         case ",$1," in *,active,*) printf '  active' ;; esac
         return 0
     fi
-    case ",$1," in *,best,*) printf '  <- next' ;; esac
-    case ",$1," in *,active,*) printf '  <- active on this Mac' ;; esac
+    case ",$1," in *,best,*) printf '  %s' "$G_NEXT" ;; esac
+    case ",$1," in *,active,*) printf '  %s' "$G_ACTIVE" ;; esac
     return 0
 }
 
@@ -13721,7 +13726,7 @@ creds_tail() {
     local avail="$1" holders="$2" active="$3" act="" hold="" m
     # Each mark is fitted on its own, active first, so a narrow row loses
     # "next" before it loses both.
-    local short
+    local short lead
     for m in active best; do
         case ",$active," in *,"$m",*)
             short=$(creds_marks "$m" 1); m=$(creds_marks "$m")
@@ -13729,8 +13734,10 @@ creds_tail() {
             [[ ${#m} -le $avail ]] && { act="$act$m"; avail=$((avail - ${#m})); } ;;
         esac
     done
-    if [[ -n "$holders" && $avail -gt 4 ]]; then
-        hold="  -> $holders"
+    # Only with room for a name or two after the words that lead in.
+    lead="  $G_HELD"
+    if [[ -n "$holders" && $avail -ge $(( ${#lead} + 3 )) ]]; then
+        hold="$lead$holders"
         [[ ${#hold} -gt $avail ]] && hold="${hold:0:$((avail-1))}…"
     fi
     printf '%s%s' \
@@ -13781,6 +13788,13 @@ creds_worst() {
 creds_dot() {
     local worst
     worst=$(creds_worst "$@")
+    # Plain mode (#297) says it in the word, padded so the logins line up.
+    if [[ "${PLAIN:-}" == 1 ]]; then
+        if [[ -z "$worst" ]]; then printf '%s%-7s%s' "$C_DIM" unknown "$C_R"; return 0; fi
+        creds_level "$worst"
+        printf '%s%-7s%s' "$(creds_colour "$worst")" "$CREDS_LEVEL" "$C_R"
+        return 0
+    fi
     if [[ -z "$worst" ]]; then printf '%s?%s' "$C_DIM" "$C_R"; return 0; fi
     creds_level "$worst"
     case "$CREDS_LEVEL" in
@@ -14160,8 +14174,8 @@ codex_push_to() {
 
 # creds_list_row <agent> <letter> <email> <org> <role> <r5> <r7> <e5> <e7> <active> [shown]
 # <shown> is what the row prints where the email goes; it defaults to the email.
-# Laid out by creds_fit, with CREDS_LIST_LEAD columns before the login.
-CREDS_LIST_LEAD=6
+# Laid out by creds_fit, with CREDS_LIST_LEAD columns before the login (set by
+# glyph_setup).
 creds_list_row() {
     local agent="$1" letter="$2" email="$3" org="$4" role="$5"
     local r5="$6" r7="$7" e5="$8" e7="$9" active="${10}" shown="${11:-$3}" holders n
@@ -14213,7 +14227,11 @@ cmd_creds() {
                     "$r5" "$r7" "$e5" "$e7" "$active" "$shown"
             done <<< "$rows"
             [[ -z "$seen" ]] && echo "No logins found: none in cswap, no ~/.codex-<name> homes."
-            echo "  bars are capacity left, then time to the window reset;"
+            if plain_mode; then
+                echo "  capacity left in each window, then time to its reset;"
+            else
+                echo "  bars are capacity left, then time to the window reset;"
+            fi
             echo "  'none' is a window the plan does not have"
             echo
             echo "Hats and the logins each one holds:"
@@ -14383,13 +14401,9 @@ cmd_creds() {
 EDIT_CACHE=""
 KEY=""
 
-# Row icons, kept together so the set can be changed in one place. The hat is a
-# plain caret - at one character a silhouette reads better than a detailed
-# emoji, and ^ needs no font support anywhere.
-ICON_HAT="/_\\"   # replaced per row by hat_icon, which colours it
-ICON_GROUP="📂"
-ICON_WORKSPACE="📁"
-ICON_TAB="⌨️"
+# Row icons (ICON_GROUP, ICON_WORKSPACE, ICON_TAB) are set with the other
+# glyphs in glyph_setup, so plain mode can leave them out. The hat's is
+# hat_icon.
 
 # C_DIM marks secondary text: hosts, hints, key lists, quiet statuses. It used
 # to be faint (SGR 2), but a terminal draws faint by blending the text into the
@@ -14417,6 +14431,72 @@ colour_setup() {
         C_DIM=""; C_RULE=""; C_B=""; C_R=""; C_SEL=""
         C_CY=""; C_GR=""; C_YL=""; C_RD=""
     fi
+    glyph_setup
+}
+
+# Plain mode (#297): no decoration a screen reader would read out one symbol
+# at a time. No header rules, no row icons, no hat glyph, no capacity bars, no
+# symbol in front of a word that already says the same, and words for arrows.
+# A login's health symbol becomes its word. What each row says is the same in
+# both modes; only the ornaments go. On with HATTER_PLAIN=1, or TERM=dumb, or
+# "prefs": {"plain": "on"} in the config; HATTER_PLAIN=0 turns it off whatever
+# the other two say. NO_COLOR is separate: it drops colour, not glyphs.
+PLAIN=""
+plain_mode() {
+    if [[ -z "$PLAIN" ]]; then
+        case "${HATTER_PLAIN:-}" in
+            1|on|yes|true)   PLAIN=1 ;;
+            0|off|no|false)  PLAIN=0 ;;
+            *)
+                # Asked of the environment: bash sets TERM=dumb for itself when
+                # none was passed, and no TERM at all is not a dumb terminal.
+                if [[ "$(printenv TERM 2>/dev/null || true)" == dumb ]]; then PLAIN=1
+                elif [[ "$(cfg '.prefs.plain // "off"' 2>/dev/null || true)" == on ]]; then PLAIN=1
+                else PLAIN=0
+                fi ;;
+        esac
+    fi
+    [[ "$PLAIN" == 1 ]]
+}
+
+# The glyphs a screen draws, and what plain mode puts in their place. A state
+# symbol (G_UP and the rest) is the symbol and its space, so in plain mode the
+# word after it is all that is left.
+glyph_setup() {
+    if plain_mode; then
+        G_SEL=">" G_SEP=": " G_PATH=" / " G_PIN="pinned " G_PINNOTE=""
+        G_UP="" G_DOWN="" G_NOTMUX="" G_UNPROBED="" G_YES="" G_NO=""
+        G_UPDOWN="up or down" G_RIGHT="right or" G_LEFT="left or"
+        G_NEXT="next" G_ACTIVE="active on this Mac" G_HELD="held by "
+        ICON_GROUP="" ICON_WORKSPACE="" ICON_TAB=""
+        CREDS_DOT_W=7
+    else
+        G_SEL="▸" G_SEP="  ·  " G_PATH=" › " G_PIN="📌 " G_PINNOTE="📌 "
+        G_UP="● " G_DOWN="✕ " G_NOTMUX="○ " G_UNPROBED="?  " G_YES="✓ " G_NO="✗ "
+        G_UPDOWN="↑↓" G_RIGHT="→" G_LEFT="←"
+        G_NEXT="<- next" G_ACTIVE="<- active on this Mac" G_HELD="-> "
+        ICON_GROUP="📂" ICON_WORKSPACE="📁" ICON_TAB="⌨️"
+        CREDS_DOT_W=1
+    fi
+    # The columns before a row's name: a space, the marker and a space, the
+    # label and a space, then the icon and a space when there is one. A
+    # credential's icon is its health, a symbol or, plain, a word; a hat's is
+    # its three-column glyph, or nothing.
+    EDIT_ROW_LEAD=$(( 6 + CREDS_DOT_W + 1 ))
+    if [[ "$PLAIN" == 1 ]]; then EDIT_HAT_LEAD=6; else EDIT_HAT_LEAD=10; fi
+    CREDS_LIST_LEAD=$(( 5 + CREDS_DOT_W ))
+    return 0
+}
+# The full glyphs until colour_setup asks which mode: PLAIN=0 answers without
+# reading the config, and the empty PLAIN after it lets the real question be
+# asked.
+PLAIN=0; glyph_setup; PLAIN=""
+
+# glyph_mark <colour> <glyph>: a state's symbol in its colour and the space
+# after it, as words follow it (#319), or nothing when plain mode has none.
+glyph_mark() {
+    [[ -z "$2" ]] || printf '%s%s%s ' "$1" "${2% }" "$C_R"
+    return 0
 }
 
 edit_cleanup() {
@@ -14781,13 +14861,18 @@ edit_header() {
     [[ "$EDIT_FRAME" == 1 ]] || printf '\033[H\033[2J'
     # The rules are 58 columns, or the terminal's width when that is less, and
     # a long path keeps its end, the level being shown (#293).
+    # Plain mode has no rules (#297), only the title.
     w=$(term_cols); [[ $w -le 58 ]] || w=58
-    printf '%s────%s hatter rack %s%s%s\n' \
-        "$C_RULE" "$C_R" "$C_RULE" "$(edit_rule $((w - 17)))" "$C_R"
+    if [[ "${PLAIN:-}" == 1 ]]; then
+        printf 'hatter rack\n'
+    else
+        printf '%s────%s hatter rack %s%s%s\n' \
+            "$C_RULE" "$C_R" "$C_RULE" "$(edit_rule $((w - 17)))" "$C_R"
+    fi
     printf '  %s\n' "$(edit_trunc_left "${1:-all hats}" $((w - 2)))"
     # A banner is a warning: its leading "!" takes the colour, the words bold.
     [[ -n "${6:-}" ]] && edit_warn_line "$6"
-    printf '%s%s%s\n' "$C_RULE" "$(edit_rule "$w")" "$C_R"
+    [[ "${PLAIN:-}" == 1 ]] || printf '%s%s%s\n' "$C_RULE" "$(edit_rule "$w")" "$C_R"
     edit_caption "$2" "$3" "${4:-}" "${5:-}"
     printf '\n'
 }
@@ -14799,13 +14884,13 @@ edit_caption() {
     local title="$1" cols lead l fits=1 line="" room w
     local -a words
     shift
-    cols=$(term_cols); lead="  $title  ·  "
+    cols=$(term_cols); lead="  $title$G_SEP"
     [[ $(( ${#lead} + ${#1} )) -le $cols ]] || fits=0
     for l in "${@:2}"; do
         [[ -z "$l" || $(( 5 + ${#l} )) -le $cols ]] || fits=0
     done
     if [[ $fits == 1 ]]; then
-        printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$title" "$C_R" "$C_DIM" "$1" "$C_R"
+        printf '  %s%s%s%s%s%s%s\n' "$C_B" "$title" "$C_R" "$C_DIM" "$G_SEP" "$1" "$C_R"
         for l in "${@:2}"; do
             [[ -z "$l" ]] || printf '     %s%s%s\n' "$C_DIM" "$l" "$C_R"
         done
@@ -14827,7 +14912,7 @@ edit_caption() {
 # One line of a wrapped caption: the first carries the title.
 edit_caption_line() {
     if [[ -n "$1" ]]; then
-        printf '  %s%s%s  %s·  %s%s\n' "$C_B" "$1" "$C_R" "$C_DIM" "$2" "$C_R"
+        printf '  %s%s%s%s%s%s%s\n' "$C_B" "$1" "$C_R" "$C_DIM" "$G_SEP" "$2" "$C_R"
     else
         printf '     %s%s%s\n' "$C_DIM" "$2" "$C_R"
     fi
@@ -14840,32 +14925,35 @@ edit_caption_line() {
 # passed, so the four call sites stay readable.
 ROW_LABEL=""
 ROW_ICON=""
-# The columns before the name: a space, the marker and a space, the label, a
-# space, a one-column icon and a space. The hat icon is two columns wider.
-EDIT_ROW_LEAD=8
 
 edit_row() {
     local i="$1" sel="$2" name="$3" w="$4"; shift 4
     local marker="  " open="" close="" label
     label=$(printf '%2s' "${ROW_LABEL:-$i}")
     if [[ "$i" == "$sel" ]]; then
-        marker="${C_CY}▸${C_R} "; open="$C_SEL"; close="$C_R"
+        marker="${C_CY}${G_SEL}${C_R} "; open="$C_SEL"; close="$C_R"
         # Where the frame leaves the cursor (#296).
         [[ "$EDIT_FRAME" != 1 ]] || marker="$EDIT_SEL_MARK$marker"
     fi
     printf ' %s%s%s%s %s%s%-*s%s %s\n' \
-        "$marker" "$C_B" "$label" "$C_R" "$ROW_ICON " \
+        "$marker" "$C_B" "$label" "$C_R" "${ROW_ICON:+$ROW_ICON }" \
         "$open" "$w" "$(edit_trunc "$name" "$w")" "$close" "$*"
 }
 
 # The keys every level shares, then the screen's own: on one line when they
 # fit the terminal, on two when they do not (#293).
 edit_keys() {
-    local common="↑↓ move   → enter open   ← esc back   1-9 jump"
-    if [[ $(( 2 + ${#common} + 3 + ${#1} )) -le $(term_cols) ]]; then
-        printf '\n  %s%s   %s%s\n' "$C_DIM" "$common" "$1" "$C_R"
+    printf '\n'
+    edit_key_line "$G_UPDOWN move   $G_RIGHT enter open   $G_LEFT esc back   1-9 jump" "$1"
+}
+
+# edit_key_line <keys> <more keys>: one line of keys, or two when one would not
+# fit the terminal (#293); in plain mode the arrows are words, and longer.
+edit_key_line() {
+    if [[ $(( 2 + ${#1} + 3 + ${#2} )) -le $(term_cols) ]]; then
+        printf '  %s%s   %s%s\n' "$C_DIM" "$1" "$2" "$C_R"
     else
-        printf '\n  %s%s%s\n  %s%s%s\n' "$C_DIM" "$common" "$C_R" "$C_DIM" "$1" "$C_R"
+        printf '  %s%s%s\n  %s%s%s\n' "$C_DIM" "$1" "$C_R" "$C_DIM" "$2" "$C_R"
     fi
 }
 
@@ -14970,14 +15058,15 @@ edit_hat_rows() {
             credw=$(edit_hat_cred_cols "$i" "$lw")
             [[ $credw -le $used ]] || used=$credw
         done
-        used=$(( EDIT_ROW_LEAD + 2 + HNAME_W + 1 + host * (hw + 1) + sw + 1 + used ))
+        used=$(( EDIT_HAT_LEAD + HNAME_W + 1 + host * (hw + 1) + sw + 1 + used ))
         [[ $used -gt $width ]] || break
     done
     for ((i = 0; i < n; i++)); do
         out=""
         [[ $host == 0 ]] || out=$(printf '%s%-*s%s ' "$C_DIM" "$hw" "$(edit_trunc "${HHOST[$i]}" "$hw")" "$C_R")
         # The state's symbol takes its colour; the words after it do not.
-        sym="${HSTATE[$i]%% *}"
+        # The symbol takes the colour (#319); plain mode has none (#297).
+        sym=""; plain_mode || sym="${HSTATE[$i]%% *}"
         out="$out$(printf '%s%s%s%-*s ' "${HSCOL[$i]}" "$sym" "$C_R" \
             $((sw - ${#sym})) "${HSTATE[$i]#"$sym"}")"
         IFS=$'\x1f' read -r kind dot name word <<< "${HCRED[$i]}"
@@ -14986,7 +15075,7 @@ edit_hat_rows() {
             ok)   out="$out$(printf '%s%s%s%s%s' "$dot" "$C_DIM" "$name" "$C_R" "$word")" ;;
             # Dead on the hat whatever the account has left: the copy there
             # cannot refresh, so the mark and word say that.
-            dead) out="$out$(printf '%s✕%s %s%s%s dead' "$C_RD" "$C_R" "$C_DIM" "$name" "$C_R")" ;;
+            dead) out="$out$(printf '%s%s%s%s%s%s%s dead' "$C_RD" "${G_DOWN% }" "$C_R" "${G_DOWN:+ }" "$C_DIM" "$name" "$C_R")" ;;
             none) out="$out$(printf '%sno credential%s' "$C_DIM" "$C_R")" ;;
             *)    out="$out$(printf '%s!%s not provisioned' "$C_YL" "$C_R")" ;;
         esac
@@ -15006,7 +15095,7 @@ edit_hat_cred_cols() {
     [[ ${#name} -le $lw ]] || name="${name:0:$lw}"
     case "$kind" in
         ok)   c=$(( ${dot:+2} + 0 + ${#name} + ${#word} )) ;;
-        dead) c=$(( 2 + ${#name} + 5 )) ;;
+        dead) c=$(( ${#G_DOWN} + ${#name} + 5 )) ;;
         none) c=13 ;;
         *)    c=17 ;;
     esac
@@ -15080,13 +15169,13 @@ edit_top() {
                 # escapes too, so one down hat knocked every column out.
                 if [[ -s "$(edit_sessions_file "$hat")" ]]; then
                     sess=$(wc -l < "$(edit_sessions_file "$hat")" | tr -d ' ')
-                    state="● up $sess ws"; scol="$C_GR"
+                    state="${G_UP}up $sess ws"; scol="$C_GR"
                 elif [[ -s "$(edit_sessions_file "$hat").down" ]]; then
-                    state="✕ $(cat "$(edit_sessions_file "$hat").down")"; scol="$C_RD"
+                    state="$G_DOWN$(cat "$(edit_sessions_file "$hat").down")"; scol="$C_RD"
                 elif [[ -f "$(edit_sessions_file "$hat")" ]]; then
-                    state="○ no tmux"; scol="$C_YL"
+                    state="${G_NOTMUX}no tmux"; scol="$C_YL"
                 else
-                    state="?  unprobed"; scol="$C_DIM"
+                    state="${G_UNPROBED}unprobed"; scol="$C_DIM"
                 fi
                 cred=$(edit_hat_cred "$hat"); credstate=$(edit_hat_cred_state "$hat")
                 credorg=$(edit_hat_cred_org "$hat")
@@ -15098,7 +15187,7 @@ edit_top() {
                 while [[ $idx -lt $nc ]]; do
                     [[ "${CAGENT[$idx]}" == claude ]] &&
                     cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cred" "$credorg" &&
-                        { dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
+                        { plain_mode || dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
                     idx=$((idx+1))
                 done
                 # Kept as parts, laid out below once every hat is in (#293).
@@ -15113,7 +15202,7 @@ edit_top() {
                     while [[ $idx -lt $nc ]]; do
                         [[ "${CAGENT[$idx]}" == codex ]] &&
                         cred_is "${CEMAIL[$idx]}" "${CORG[$idx]}" "$cxemail" "$cxws" &&
-                            { dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
+                            { plain_mode || dot="${CICON[$idx]} "; word=" ${CHEALTH[$idx]}"; break; }
                         idx=$((idx+1))
                     done
                     HCODEX[$nh]="$dot$US${cxemail%%@*}$US$word"
@@ -15171,8 +15260,13 @@ edit_top() {
         [[ $nh -eq 0 ]] && printf '   %s(no hats yet - press A to add one)%s\n' "$C_DIM" "$C_R"
 
         printf '\n'
-        edit_caption CREDENTIALS "Claude and Codex logins. Bars are capacity left," \
-            "then time to reset. ● ok over half a session, ◐ low, ○ spent."
+        if plain_mode; then
+            edit_caption CREDENTIALS "Claude and Codex logins: capacity left, then" \
+                "time to reset. ok is over half a session left, then low, then spent."
+        else
+            edit_caption CREDENTIALS "Claude and Codex logins. Bars are capacity left," \
+                "then time to reset. ● ok over half a session, ◐ low, ○ spent."
+        fi
         printf '\n'
         # HELD BY heads the tail, so it only earns its place when the tail can
         # show.
@@ -15189,8 +15283,8 @@ edit_top() {
         [[ $nc -eq 0 ]] && \
             printf '   %s(no logins - is cswap installed? any ~/.codex-<name> homes?)%s\n' "$C_DIM" "$C_R"
 
-        printf '\n  %s↑↓ move   1-9 hat   a-z credential   → enter open   q quit%s\n' \
-            "$C_DIM" "$C_R"
+        printf '\n'
+        edit_key_line "$G_UPDOWN move   1-9 hat   a-z credential" "$G_RIGHT enter open   q quit"
         printf '  %sA add hat   R rename   D forget   P provision   ! refresh%s\n' \
             "$C_DIM" "$C_R"
         printf '  %sS sync / restore%s\n' "$C_DIM" "$C_R"
@@ -15329,8 +15423,8 @@ edit_sync_restore() {
                     "$C_DIM" "$h" "$C_R" "${what:-(the hat itself)}" "$why"
             done <<<"$gaps"
         else
-            printf '  %s●%s nothing missing - every recorded session is running and mirrored\n' \
-                "$C_GR" "$C_R"
+            printf '  %snothing missing - every recorded session is running and mirrored\n' \
+                "$(glyph_mark "$C_GR" "$G_UP")"
         fi
 
         printf '\n  %ss%s  sync      write the live layout into the config\n' "$C_B" "$C_R"
@@ -15418,9 +15512,9 @@ edit_credential() {
             elif [[ "$credstate" == old ]]; then
                 held=$(printf '%s!%s hat-creds predates Codex - press P on the hats screen' "$C_YL" "$C_R")
             elif [[ "$agent" == codex ]] && cred_is "$email" "$org" "$cxemail" "$cxws"; then
-                held=$(printf '%s✓%s holds this one' "$C_GR" "$C_R")
+                held=$(printf '%sholds this one' "$(glyph_mark "$C_GR" "$G_YES")")
             elif [[ "$agent" == claude ]] && cred_is "$email" "$org" "$cred" "$(edit_hat_cred_org "$hat")"; then
-                held=$(printf '%s✓%s holds this one' "$C_GR" "$C_R")
+                held=$(printf '%sholds this one' "$(glyph_mark "$C_GR" "$G_YES")")
             elif [[ "$credstate" == "none" ]]; then
                 held=$(printf '%sno credential%s' "$C_DIM" "$C_R")
             else
@@ -15433,7 +15527,8 @@ edit_credential() {
         done
         ROW_ICON=""
 
-        printf '\n  %s↑↓ move   1-9 jump   → enter push here   ← esc back%s\n' "$C_DIM" "$C_R"
+        printf '\n'
+        edit_key_line "$G_UPDOWN move   1-9 jump" "$G_RIGHT enter push here   $G_LEFT esc back"
         printf '  %sA push to every hat   X clear this hat   q quit%s\n' "$C_DIM" "$C_R"
         edit_readkey
         edit_nav "$KEY" "$n" && continue
@@ -15610,7 +15705,7 @@ edit_workspaces() {
         done < <([[ $n -gt 0 ]] && printf '%s\n' "${WSS[@]}" | hat_short_names "$hat")
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$hat › $(group_display "$group")" "WORKSPACES" \
+        edit_header "$hat$G_PATH$(group_display "$group")" "WORKSPACES" \
             "a workspace is a tmux session, shown as one entry in the cmux" \
             "sidebar. Its tabs are the tmux windows inside it."
 
@@ -15620,7 +15715,7 @@ edit_workspaces() {
             tabs=$(edit_session_field "$hat" "$ws" 2)
             att=$(edit_session_field "$hat" "$ws" 3)
             if [[ -n "$tabs" ]]; then
-                state=$(printf '%s●%s running  %s tab(s)' "$C_GR" "$C_R" "$tabs")
+                state=$(printf '%srunning  %s tab(s)' "$(glyph_mark "$C_GR" "$G_UP")" "$tabs")
                 [[ "$att" == "1" ]] && state="$state  ${C_DIM}attached${C_R}"
                 place=$(session_place "$ws" "$ws" "$EDIT_SHOWN" "$EDIT_GROUPED")
                 case "$place" in
@@ -15630,8 +15725,8 @@ edit_workspaces() {
                         state="$state  ${C_YL}!${C_R} in no cmux group, ${C_DIM}sync puts it back${C_R}" ;;
                 esac
             else
-                state=$(printf '%s✗%s not running  %sre-create with restore%s' \
-                        "$C_RD" "$C_R" "$C_DIM" "$C_R")
+                state=$(printf '%snot running  %sre-create with restore%s' \
+                        "$(glyph_mark "$C_RD" "$G_NO")" "$C_DIM" "$C_R")
             fi
             ROW_LABEL=""; ROW_ICON="$ICON_WORKSPACE"
             edit_row $((i+1)) "$SEL" "${SHORTS[$i]}" 26 "$state"
@@ -15709,7 +15804,13 @@ edit_tabs() {
         IDXS=(); NAMES=(); METAS=(); PINS=(); n=0
         while IFS=$'\x1f' read -r idx nm active panes cmd cwd dead pin; do
             [[ -z "$idx" ]] && continue
-            if [[ "$dead" == "1" ]]; then mark="${C_RD}✗${C_R} dead   "
+            if plain_mode; then
+                # Words only (#297), padded to the same nine columns.
+                if [[ "$dead" == "1" ]]; then mark="dead     "
+                elif [[ "$active" == "1" ]]; then mark="active   "
+                else mark="         "
+                fi
+            elif [[ "$dead" == "1" ]]; then mark="${C_RD}✗${C_R} dead   "
             elif [[ "$active" == "1" ]]; then mark="${C_GR}●${C_R} active "
             else mark="${C_DIM}○${C_R}        "
             fi
@@ -15718,7 +15819,7 @@ edit_tabs() {
             IDXS[$n]="$idx"
             PINS[$n]="${pin:-}"
             NAMES[$n]="${nm:-(unnamed)}"
-            [[ "$pin" == "1" ]] && NAMES[$n]="📌 ${NAMES[$n]}"
+            [[ "$pin" == "1" ]] && NAMES[$n]="$G_PIN${NAMES[$n]}"
             METAS[$n]=$(printf '%s %-10s %s%s pane%s  %s%s' \
                 "$mark" "$(edit_trunc "$cmd" 10)" \
                 "$C_DIM" "$panes" "$plural" "$short" "$C_R")
@@ -15726,10 +15827,10 @@ edit_tabs() {
         done < <(edit_windows "$hat" "$ws")
         [[ $SEL -gt $n ]] && SEL=$n; [[ $SEL -lt 1 ]] && SEL=1
 
-        edit_header "$hat › $(group_display "$group") › $wslabel" "TABS" \
+        edit_header "$hat$G_PATH$(group_display "$group")$G_PATH$wslabel" "TABS" \
             "a tab is a tmux window inside the workspace. It survives losing the" \
             "client, and closing it here closes it everywhere." \
-            "A pinned tab 📌 comes back first on restore; closed twice, it is unpinned."
+            "A pinned tab ${G_PINNOTE}comes back first on restore; closed twice, it is unpinned."
 
         i=0
         while [[ $i -lt $n ]]; do
@@ -15834,6 +15935,7 @@ Commands:
 Run `hatter` with no arguments to open the rack, or without cmux, to attach.
 Run `hatter <command>` or `hatter help <command>` for a command's options.
 A command that changes cmux puts focus back where it found it when it is done.
+Colour and symbols: NO_COLOR and HATTER_PLAIN (see: hatter help plain).
 
 Config: ~/.config/hatter/config.json
 USAGE
@@ -15900,7 +16002,8 @@ The symbol before each login sums up its lowest window by shape, so it reads
 the same without colour: ● ok (over half left), ◐ low (under half), ○ spent,
 ? no window known. In the rack, each hat row shows the login it holds with the
 same symbol followed by the word (ok, low, spent, unknown), or ✕ and "dead"
-when the hat's copy has expired with no refresh token (push it again).
+when the hat's copy has expired with no refresh token (push it again). Plain
+mode shows the word alone (see: hatter help plain).
 
 One credential per hat is the arrangement to aim for. Sharing one account
 across machines works, but each machine refreshes the OAuth token on its own
@@ -16779,6 +16882,8 @@ With a screen reader, have it follow the cursor, and read the cursor's line
 after each move: that line is the row's number, name and status. The keys for
 the screen are its last lines. A number jumps straight to a row (on the top
 screen, a letter jumps to a credential), so a long list need not be walked.
+Plain mode leaves out the rules, icons and bars a screen reader would read
+out symbol by symbol (see: hatter help plain).
 
 `hatter` on its own opens the rack. `hatter edit` is the old name and still
 works.
@@ -17040,6 +17145,38 @@ the name sorts early) and reload sshd.
 
 Rewrites its managed block in ~/.tmux.conf on every run, then self-tests that a
 shell which exits comes back usable. Takes no options.
+USAGE
+    ;;
+    plain|colour|color|no-color|accessibility) cat <<'USAGE'
+hatter help plain
+
+How hatter draws its screens, and how to make them plainer.
+
+NO_COLOR, set to any value but the empty one, turns colour off everywhere
+hatter draws. So does output that is not a terminal, a pipe or a file.
+Symbols and layout stay.
+
+Plain mode drops the decoration a screen reader would read out one symbol at
+a time:
+  - the rack's header rules
+  - the row icons, and the hat glyph /_\
+  - the capacity bars; the percentage and the time to reset stay
+  - a symbol in front of a word that says the same (up, running, dead)
+  - the arrows in key lists, which become words
+A login's health symbol becomes its word: ok, low, spent or unknown. The
+selected row is marked with > instead. The ! before a warning and the ?
+before a question stay: they say which a line is. Every row says the same
+things in both modes.
+
+Plain mode is on when any of these says so:
+  HATTER_PLAIN=1 (or on)     in the environment
+  TERM=dumb                  in the environment
+  "prefs": {"plain": "on"}   in the config
+HATTER_PLAIN=0 (or off) turns it off whatever the other two say.
+
+The two are separate: NO_COLOR alone keeps the symbols, and plain mode alone
+does not turn colour off. Set both for plain text with no colour. Using the
+rack with a screen reader: see hatter help rack.
 USAGE
     ;;
     *) usage_main ;;
