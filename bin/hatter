@@ -1531,7 +1531,7 @@ cmux_change() {
         "workspace-group set-color"|"workspace-group set-icon"|"workspace-group pin"|\
         "workspace-group collapse"|"workspace-group rename"|"workspace-group add"|\
         "rename-workspace "*|"reorder-workspace "*|"reload-config "|"notify "*|\
-        "set-status "*|"clear-status "*) ;;
+        "set-status "*|"clear-status "*|"rpc remote.tmux.mirror") ;;
         *) focus_save ;;
     esac
     cmux "$@"
@@ -2103,14 +2103,40 @@ cmux_group_to_top() {
 }
 
 mirror_hat() {
-    # mirror_hat <hat> <window> - mirrors into the (focused) target window
-    local hat="$1" win="$2" host
+    # mirror_hat <hat> <window> [session] - mirrors the hat's host into <window>
+    local hat="$1" win="$2" session="${3:-}" host
     host=$(hat_ssh "$hat")
-    cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
     # cmux runs its own ssh, which the ssh() gate never sees.
     access_gate "$host" || die "not mirroring hat '$hat' until the Cloudflare Access login is renewed"
     info "Mirroring $host into the '$hat' window"
+    # One session, on a host cmux already mirrors: the remote.tmux.mirror RPC
+    # takes a window, so focus stays where it is (#324). Only then: with no
+    # live connection, cmux may need to ask for a password or a key touch, and
+    # only ssh-tmux has a terminal to ask in.
+    if [[ -n "$session" ]] && host_mirrored "$hat" "$host" \
+        && cmux_change rpc remote.tmux.mirror \
+            "$(jq -nc --arg h "$host" --arg s "$session" --arg w "$win" \
+                '{host: $h, session: $s, window_id: $w}')" 2>/dev/null \
+            | jq -e '.mirrored == true and ((.workspace_ids // []) | length > 0)' >/dev/null 2>&1; then
+        return 0
+    fi
+    # ssh-tmux has no --window: it mirrors into the focused window.
+    cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
     cmux_change ssh-tmux "$host" --no-focus >/dev/null
+}
+
+# host_mirrored <hat> <host>: cmux has a live mirror of one of the hat's
+# sessions on <host>, so its connection is up and needs no new sign-in.
+host_mirrored() {
+    local g s
+    while IFS= read -r g; do
+        [[ -n "$g" ]] || continue
+        while IFS= read -r s; do
+            [[ -n "$s" ]] || continue
+            cmux_attached "$2" "$s" && return 0
+        done < <(cfg --arg g "$g" '.groups[$g].sessions | keys_unsorted[]?' 2>/dev/null)
+    done < <(groups_of_hat "$1")
+    return 1
 }
 
 # hat-snooze hides a tab by moving its tmux window into the session
@@ -6061,7 +6087,7 @@ cmd_new() {
     local win gref wref
     win=$(ensure_hat_window "$hat")
     gref=$(ensure_cmux_group "$group" "$win")
-    mirror_hat "$hat" "$win"
+    mirror_hat "$hat" "$win" "$session"
 
     wref=$(wait_for_workspace "$session" "$win")
     if [[ -z "$wref" ]]; then
