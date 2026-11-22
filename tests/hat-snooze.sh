@@ -235,7 +235,8 @@ now=$(date +%s)   # near() measures from here: the run is well past its start
 [[ "$(names s)" == "a c" && "$(names hatter-snooze)" == "b" ]] \
     || fail "tick should wake c only: s='$(names s)' box='$(names hatter-snooze)'"
 near "$(opt "$C" @hatter-woke-at)" 0 || fail "tick did not stamp c's wake time: '$(opt "$C" @hatter-woke-at)'"
-[[ -z "$(opt "$B" @hatter-woke-at)" ]] || fail "a tab snoozed again kept its old wake time"
+[[ -z "$(opt "$B" @hatter-woke-at)$(opt "$B" @hatter-waiting)" ]] \
+    || fail "a tab snoozed again kept its old wake: '$(opt "$B" @hatter-woke-at)' '$(opt "$B" @hatter-waiting)'"
 
 # A reboot loses window options; the registry has the time, and tick puts it back.
 T set-option -wu -t "$B" @hatter-snooze-until

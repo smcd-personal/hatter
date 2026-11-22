@@ -105,7 +105,7 @@ tabs="a.example.com${T}api${T}1${T}one${T}idle"$'\n'"a.example.com${T}api${T}2${
 wss="W1${T}api"$'\n'"W2${T}docs"$'\n'"W3${T}ops"$'\n'"W4${T}both"$'\n'"W5${T}notes"
 out=$(tab_lines "$rec" "$tabs" "$wss")
 expect "tab_lines: a line per tab with its state, skips ambiguous and unrecorded" \
-    "$(is "$out" "W1"$'\n'"W1${T}hatter_tab_1${T}one${T}circle${T}${G}${T}1998"$'\n'"W1${T}hatter_tab_2${T}two${T}bolt.fill${T}${R}${T}2997"$'\n'"W1${T}hatter_tab_3${T}three${T}hand.raised.fill${T}${B}${T}3996"$'\n'"W1${T}hatter_tab_4${T}window 4${T}questionmark.bubble.fill${T}${B}${T}3995"$'\n'"W2"$'\n'"W3")"
+    "$(is "$out" "W1"$'\n'"W1${T}hatter_tab_1${T}one${T}circle${T}${G}${T}1998"$'\n'"W1${T}hatter_tab_2${T}two${T}bolt.fill${T}${R}${T}2997"$'\n'"W1${T}hatter_tab_3${T}three${T}hand.raised.fill${T}${B}${T}4996"$'\n'"W1${T}hatter_tab_4${T}window 4${T}questionmark.bubble.fill${T}${B}${T}4995"$'\n'"W2"$'\n'"W3")"
 out=$(tab_lines "$rec" "$tabs" "$wss" "a.example.com")
 expect "tab_lines: a held destination's workspaces are left out" "$(is "$out" "W3")"
 out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
@@ -121,6 +121,10 @@ expect "tab_lines: a cut on a boundary keeps the last character" "$(is "$out" "a
 out=$(tab_lines "$rec" "a.example.com${T}api${T}5${T}nap${T}woken${T}14:05"$'\n'"a.example.com${T}api${T}6${T}${T}woken${T}" "W1${T}api" | sed 1d)
 expect "tab_lines: a woken tab says when, in front, with an alarm, among the waiting" \
     "$(is "$out" "W1${T}hatter_tab_5${T}woke 14:05 · nap${T}alarm.fill${T}${B}${T}3994"$'\n'"W1${T}hatter_tab_6${T}woke · window 6${T}alarm.fill${T}${B}${T}3993")"
+# Woken can sit for days: a prompt at a higher index still comes first.
+out=$(tab_lines "$rec" "a.example.com${T}api${T}1${T}nap${T}woken${T}9:00"$'\n'"a.example.com${T}api${T}9${T}ask${T}approval"$'\n'"a.example.com${T}api${T}2${T}busy${T}working" "W1${T}api" \
+    | sed 1d | sort -t "$T" -k6,6nr | cut -f3)
+expect "tab_lines: waiting, then woken, then working" "$(is "$out" "ask"$'\n'"woke 9:00 · nap"$'\n'"busy")"
 out=$(tab_lines "$rec" "a.example.com${T}api${T}5${T}abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP${T}woken${T}Tue 14:05" "W1${T}api" | sed -n 2p | cut -f3)
 expect "tab_lines: a long woken name keeps its time" "$(is "${out:0:15}" "woke Tue 14:05 ")"
 COLORBLIND_SAFE=on
@@ -207,7 +211,7 @@ expect "no change over more rounds: still no read" "$(is "$(calls)$(lists)" "")"
 server "W${T}dev-api${T}1${T}main${T}${T}999${T}question"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
 round
 expect "turn ends on a question, a tab closes: one set, one clear" \
-    "$(is "$(calls)" "clear-status hatter_tab_2 --workspace W-api"$'\n'"$(set1 1 main W-api questionmark.bubble.fill "$B" 3998)")"
+    "$(is "$(calls)" "clear-status hatter_tab_2 --workspace W-api"$'\n'"$(set1 1 main W-api questionmark.bubble.fill "$B" 4998)")"
 
 # A snoozed tab woke: its line says when, on this machine's clock.
 wk=$(( $(date +%s) - 60 ))
@@ -219,7 +223,7 @@ expect "a woken tab: its line says when it woke" \
 server "W${T}dev-api${T}1${T}main${T}${T}999${T}question"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
 round
 expect "a woken tab moves on: the line follows" \
-    "$(is "$(calls)" "$(set1 1 main W-api questionmark.bubble.fill "$B" 3998)")"
+    "$(is "$(calls)" "$(set1 1 main W-api questionmark.bubble.fill "$B" 4998)")"
 
 rm -f "$work/server"
 round

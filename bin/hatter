@@ -4043,6 +4043,8 @@ mark() {  # mark <window id> <until>
     tmux set-option -w -t "$1" @hatter-snooze-until "$2" 2>/dev/null
     # Snoozed again: its last wake is old news, and the next sets its own.
     tmux set-option -wu -t "$1" @hatter-woke-at 2>/dev/null
+    [ "$(tmux show-options -wqv -t "$1" @hatter-waiting 2>/dev/null)" != woken ] \
+        || tmux set-option -wu -t "$1" @hatter-waiting 2>/dev/null
     # Hidden, it belongs to no client's view, and tmux would shrink it to the
     # box's size; it keeps the size it had until it is back.
     tmux set-option -w -t "$1" window-size manual 2>/dev/null
@@ -12222,8 +12224,9 @@ watch_probe() {
 # Shapes differ, so the state reads without colour; "prefs":
 # {"colorblind_safe": "on"} picks Okabe-Ito shades all the same. cmux shows
 # a workspace's first three lines and folds the rest under "Show more", so
-# the order puts what needs the human first: waiting, then working, then idle,
-# each in window order.
+# the order puts what needs the human first: waiting, then woken (it can sit
+# for days, and must not push a prompt out of sight), then working, then
+# idle, each in window order.
 #
 # hat-attn sets @hatter-working when a turn opens and clears it at Stop. A turn
 # stays open while the agent waits on a permission prompt or a question, and
@@ -12342,8 +12345,8 @@ tab_lines() {
         -v red="$red" -v blue="$blue" -v grey="$grey" '
         BEGIN {
             icon["working"] = "bolt.fill"; colour["working"] = red; rank["working"] = 2
-            icon["approval"] = "hand.raised.fill"; colour["approval"] = blue; rank["approval"] = 3
-            icon["question"] = "questionmark.bubble.fill"; colour["question"] = blue; rank["question"] = 3
+            icon["approval"] = "hand.raised.fill"; colour["approval"] = blue; rank["approval"] = 4
+            icon["question"] = "questionmark.bubble.fill"; colour["question"] = blue; rank["question"] = 4
             icon["woken"] = "alarm.fill"; colour["woken"] = blue; rank["woken"] = 3
             icon["idle"] = "circle"; colour["idle"] = grey; rank["idle"] = 1
             n = split(ENVIRON["AWK_H"], h, "\n")
@@ -16163,7 +16166,7 @@ is busy, a blue hand is waiting on a permission prompt, a blue speech mark is
 waiting on an answer, a blue alarm clock is a snoozed tab that has woken
 (see `hatter help snooze`), and a grey circle is anything else. cmux shows three
 lines and folds the rest under "Show more", so tabs waiting on you come first,
-then busy ones, then the rest, each in window order. A tab whose name tmux set
+then woken ones, then busy ones, then the rest, each in window order. A tab whose name tmux set
 itself (after the program, "claude" or "bash") shows its agent's title for the
 session instead, and a tab where the agent has exited to a shell is grey. A tab is busy while its
 agent's turn is open (hat-attn's @hatter-working) and the tab printed
