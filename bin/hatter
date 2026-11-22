@@ -7596,7 +7596,7 @@ remirror_session() {
     # From here the workspace is closed, so every way out says how to get it back.
     local back="The session is safe on $host. Bring it back with:
     cmux ssh-tmux $host"
-    mirror_hat "$hat" "$win" || die "re-mirroring failed. $back"
+    mirror_hat "$hat" "$win" "$session" || die "re-mirroring failed. $back"
     local new
     new=$(wait_for_workspace "$session" "$win")
     [[ -n "$new" ]] || die "'$session' did not come back into cmux. $back"

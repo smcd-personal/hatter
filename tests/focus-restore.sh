@@ -93,7 +93,9 @@ case "$verb" in
         if [[ -n "${STUB_ATTACHED:-}" && "$s" == dev-main ]]; then echo '{"attached":true}'
         else echo '{"attached":false}'; fi ;;
     "rpc remote.tmux.mirror")
-        # Mirrors into the window it names; focus does not move.
+        # Mirrors the session it names into the window it names; focus does
+        # not move.
+        [[ "$(jq -r .session <<<"$3")" == "$STUB_MIRROR" ]] || { echo "stub cmux: mirror of the wrong session" >&2; exit 1; }
         w=$(jq -r .window_id <<<"$3")
         jq --arg w "$w" --arg t "$STUB_MIRROR" '
             .windows |= map(if .id == $w then .workspaces += [{id: "S-new", title: $t}] else . end)' \
