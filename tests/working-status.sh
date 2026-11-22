@@ -5,7 +5,9 @@
 #   - tab_states: a tab is working while its turn is open (@hatter-working)
 #     and its window printed something in the last WORKING_QUIET seconds, or
 #     WORKING_WAIT_QUIET once hat-attn flagged approval or a question; a quiet
-#     flagged tab is approval or question; anything else is idle, and with no
+#     flagged tab is approval or question; a snoozed tab that woke is woken,
+#     with its wake time; every @hatter-waiting value bin/hatter writes is one
+#     it knows; anything else is idle, and with no
 #     server clock nothing is working; a shell in front is idle; an agent's
 #     pane title names a tab tmux named itself
 #   - tab_lines: workspaces are placed by title on the one destination
@@ -47,24 +49,55 @@ T=$'\t'
 R='#ff453a' B='#0a84ff' G='#8e8e93'
 
 # --- tab_states ------------------------------------------------------------------
-out=$(printf 'N\t1000\nW\ts\t1\tbusy\t990\t998\t\nW\ts\t2\tquiet\t900\t950\t\nW\ts\t3\tdone\t\t1000\tdone\nW\ts\t4\tedge\t1\t970\t\nW\ts\tx\tbad\t1\t1000\t\n' | tab_states)
+out=$(printf 'N\t1000\nW\ts\t1\tbusy\t990\t998\t\nW\ts\t2\tquiet\t900\t950\t\nW\ts\t3\tdone\t\t1000\tdone\nW\ts\t4\tedge\t1\t970\t\nW\ts\tx\tbad\t1\t1000\t\n' | tab_states | cut -f1-4)
 expect "tab_states: open and printing is working, quiet or closed is idle" \
     "$(is "$out" "s${T}1${T}busy${T}working"$'\n'"s${T}2${T}quiet${T}idle"$'\n'"s${T}3${T}done${T}idle"$'\n'"s${T}4${T}edge${T}working")"
-out=$(printf 'N\t1000\nW\ts\t1\tappr\t1\t990\tapproval\nW\ts\t2\tques\t\t990\tquestion\nW\ts\t3\tnone\t1\t990\t\nW\ts\t4\tresumed\t1\t998\tapproval\n' | tab_states)
+out=$(printf 'N\t1000\nW\ts\t1\tappr\t1\t990\tapproval\nW\ts\t2\tques\t\t990\tquestion\nW\ts\t3\tnone\t1\t990\t\nW\ts\t4\tresumed\t1\t998\tapproval\n' | tab_states | cut -f1-4)
 expect "tab_states: a quiet prompt is approval or question, a resumed one working" \
     "$(is "$out" "s${T}1${T}appr${T}approval"$'\n'"s${T}2${T}ques${T}question"$'\n'"s${T}3${T}none${T}working"$'\n'"s${T}4${T}resumed${T}working")"
-out=$(printf 'W\ts\t1\tbusy\t990\t998\t\n' | tab_states)
+out=$(printf 'W\ts\t1\tbusy\t990\t998\t\n' | tab_states | cut -f1-4)
 expect "tab_states: no server clock, nothing is working" "$(is "$out" "s${T}1${T}busy${T}idle")"
 # A shell in front: the agent exited, so its flag is stale.
 # Not when the window has another pane, nor while a turn is open.
-out=$(printf 'N\t1000\nW\ts\t1\tq\t\t900\tquestion\t0\tzsh\t1\t\nW\ts\t2\tq2\t\t900\tquestion\t0\tclaude\t1\t\nW\ts\t3\tb\t\t998\t\t0\t-bash\t1\t\nW\ts\t4\tsplit\t\t900\tapproval\t0\tzsh\t2\t\nW\ts\t5\topen\t990\t998\t\t0\tbash\t1\t\n' | tab_states)
+out=$(printf 'N\t1000\nW\ts\t1\tq\t\t900\tquestion\t0\tzsh\t1\t\nW\ts\t2\tq2\t\t900\tquestion\t0\tclaude\t1\t\nW\ts\t3\tb\t\t998\t\t0\t-bash\t1\t\nW\ts\t4\tsplit\t\t900\tapproval\t0\tzsh\t2\t\nW\ts\t5\topen\t990\t998\t\t0\tbash\t1\t\n' | tab_states | cut -f1-4)
 expect "tab_states: a shell alone in front is idle; split or mid-turn it is not" \
     "$(is "$out" "s${T}1${T}q${T}idle"$'\n'"s${T}2${T}q2${T}question"$'\n'"s${T}3${T}b${T}idle"$'\n'"s${T}4${T}split${T}approval"$'\n'"s${T}5${T}open${T}working")"
 # Names: tmux's own name or none gives way to an agent's titled pane; a
 # name set by hand, or a pane title without a glyph (the host name), does not.
-out=$(printf 'N\t1000\nW\ts\t1\tclaude\t\t900\t\t1\tclaude\t1\t\342\234\263 Fix the login page\nW\ts\t2\t\t\t900\t\t0\tclaude\t1\t\342\240\202 Tab\tin title\nW\ts\t3\tAPI\t\t900\t\t0\tclaude\t1\t\342\234\263 Other\nW\ts\t4\tbash\t\t900\t\t1\tbash\t1\tbox1\nW\ts\t5\tzsh\t\t900\t\t1\tzsh\t1\t\342\234\263 Old task\nW\ts\t6\tnode\t\t900\t\t1\tnode\t1\t\342\234\263 \346\227\245\346\234\254\nW\ts\t7\tnode\t\t900\t\t1\tnode\t1\t\303\251t\303\251 x\n' | tab_states | cut -f3)
+out=$(printf 'N\t1000\nW\ts\t1\tclaude\t\t900\t\t1\tclaude\t1\t\t\342\234\263 Fix the login page\nW\ts\t2\t\t\t900\t\t0\tclaude\t1\t\t\342\240\202 Tab\tin title\nW\ts\t3\tAPI\t\t900\t\t0\tclaude\t1\t\t\342\234\263 Other\nW\ts\t4\tbash\t\t900\t\t1\tbash\t1\t\tbox1\nW\ts\t5\tzsh\t\t900\t\t1\tzsh\t1\t\t\342\234\263 Old task\nW\ts\t6\tnode\t\t900\t\t1\tnode\t1\t\t\342\234\263 \346\227\245\346\234\254\nW\ts\t7\tnode\t\t900\t\t1\tnode\t1\t\t\303\251t\303\251 x\n' | tab_states | cut -f3)
 expect "tab_states: an agent's title names a tab tmux named, not one named by hand, nor after it exits" \
     "$(is "$out" "Fix the login page"$'\n'"Tab in title"$'\n'"API"$'\n'"bash"$'\n'"zsh"$'\n'$'\346\227\245\346\234\254'$'\n'"node")"
+
+# A snoozed tab that woke (#322): hat-snooze sets @hatter-waiting woken and
+# the time in @hatter-woke-at (field 11). Woken is drawn with its time; with
+# no time it is still woken; a shell in front or a turn at work wins.
+out=$(printf 'N\t1000\nW\ts\t1\ta\t\t900\twoken\t0\tclaude\t1\t950\t\nW\ts\t2\tb\t\t900\twoken\t0\tclaude\t1\t\t\nW\ts\t3\tc\t\t900\twoken\t0\tzsh\t1\t950\t\nW\ts\t4\td\t990\t998\twoken\t0\tclaude\t1\t950\t\nW\ts\t5\te\t\t900\t\t0\tclaude\t1\t950\t\n' | tab_states)
+expect "tab_states: woken carries its wake time; shell or work wins; a stale time alone is nothing" \
+    "$(is "$out" "s${T}1${T}a${T}woken${T}950"$'\n'"s${T}2${T}b${T}woken${T}"$'\n'"s${T}3${T}c${T}idle${T}"$'\n'"s${T}4${T}d${T}working${T}"$'\n'"s${T}5${T}e${T}idle${T}")"
+
+# The class: every value bin/hatter writes to @hatter-waiting is one
+# tab_states knows. "done" (a turn ended) is idle by design; any other
+# value read as idle is a mark the human never sees. A new value fails here.
+attn=$(sed -n "/hat-attn\" <<'HATATTN'/,/^HATATTN$/p" "$root/bin/hatter")
+vals=$( { grep -oE '(^|[^a-z_])kind=[a-z]+' <<<"$attn" | sed 's/.*kind=//'
+          grep -oE 'set-option -w -t [^ ]+ @hatter-waiting [a-z]+' "$root/bin/hatter" | awk '{ print $NF }'; } \
+        | sort -u | tr '\n' ' ')
+expect "hat-attn's kinds are where this test looks" "$(is "$(grep -c '@hatter-waiting "$kind"' <<<"$attn")" 1)"
+expect "every @hatter-waiting value is accounted for" "$(is "$vals" "approval done question woken ")"
+for v in $vals; do
+    st=$(printf 'N\t1000\nW\ts\t1\tx\t\t900\t%s\t0\tclaude\t1\t950\t\n' "$v" | tab_states | cut -f4)
+    if [[ "$v" == done ]]; then want=idle; else want=$v; fi
+    expect "tab_states knows @hatter-waiting $v" "$(is "$st" "$want")"
+done
+
+# woke_label: today a time, this week a day and time, else a date.
+export TZ=UTC
+base=1795000000   # Wed 18 Nov 2026 11:06:40 UTC
+expect "woke_label: today" "$(is "$(woke_label $((base - 3600)) $base)" "10:06")"
+expect "woke_label: this week" "$(is "$(woke_label $((base - 3 * 86400)) $base)" "Sun 11:06")"
+expect "woke_label: older" "$(is "$(woke_label $((base - 30 * 86400)) $base)" "Oct 19 11:06")"
+expect "woke_label: not a time, nothing" "$(is "$(woke_label "" $base)" "")"
+unset TZ
 
 # --- tab_lines -------------------------------------------------------------------
 rec="a.example.com${T}api"$'\n'"a.example.com${T}docs"$'\n'"b.example.com${T}ops"$'\n'"a.example.com${T}both"$'\n'"b.example.com${T}both"
@@ -85,6 +118,11 @@ expect "tab_lines: a cut never splits a character" "$(is "$out" "abcdefghijklmno
 long=$(printf 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI\303\251\303\251\303\251')
 out=$(tab_lines "$rec" "a.example.com${T}api${T}7${T}${long}${T}idle" "W1${T}api" | sed -n 2p | cut -f3)
 expect "tab_lines: a cut on a boundary keeps the last character" "$(is "$out" "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHI$(printf '\303\251')…")"
+out=$(tab_lines "$rec" "a.example.com${T}api${T}5${T}nap${T}woken${T}14:05"$'\n'"a.example.com${T}api${T}6${T}${T}woken${T}" "W1${T}api" | sed 1d)
+expect "tab_lines: a woken tab says when, in front, with an alarm, among the waiting" \
+    "$(is "$out" "W1${T}hatter_tab_5${T}woke 14:05 · nap${T}alarm.fill${T}${B}${T}3994"$'\n'"W1${T}hatter_tab_6${T}woke · window 6${T}alarm.fill${T}${B}${T}3993")"
+out=$(tab_lines "$rec" "a.example.com${T}api${T}5${T}abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOP${T}woken${T}Tue 14:05" "W1${T}api" | sed -n 2p | cut -f3)
+expect "tab_lines: a long woken name keeps its time" "$(is "${out:0:15}" "woke Tue 14:05 ")"
 COLORBLIND_SAFE=on
 out=$(tab_lines "$rec" "a.example.com${T}api${T}1${T}one${T}working" "W1${T}api" | sed -n 2p | cut -f5)
 expect "tab_lines: colour-blind safe shades" "$(is "$out" "#d55e00")"
@@ -170,6 +208,18 @@ server "W${T}dev-api${T}1${T}main${T}${T}999${T}question"$'\n'"W${T}dev-docs${T}
 round
 expect "turn ends on a question, a tab closes: one set, one clear" \
     "$(is "$(calls)" "clear-status hatter_tab_2 --workspace W-api"$'\n'"$(set1 1 main W-api questionmark.bubble.fill "$B" 3998)")"
+
+# A snoozed tab woke: its line says when, on this machine's clock.
+wk=$(( $(date +%s) - 60 ))
+wl=$(date -r "$wk" +%H:%M 2>/dev/null || date -d "@$wk" +%H:%M)
+server "W${T}dev-api${T}1${T}main${T}${T}999${T}woken${T}0${T}claude${T}1${T}${wk}${T}"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
+round
+expect "a woken tab: its line says when it woke" \
+    "$(is "$(calls)" "$(set1 1 "woke $wl · main" W-api alarm.fill "$B" 3998)")"
+server "W${T}dev-api${T}1${T}main${T}${T}999${T}question"$'\n'"W${T}dev-docs${T}1${T}main${T}${T}999${T}done"$'\n'
+round
+expect "a woken tab moves on: the line follows" \
+    "$(is "$(calls)" "$(set1 1 main W-api questionmark.bubble.fill "$B" 3998)")"
 
 rm -f "$work/server"
 round

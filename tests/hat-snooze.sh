@@ -222,6 +222,7 @@ if "$SN" snooze -t "$(wid t only)" 1h >/dev/null 2>&1; then fail "snoozed the on
 T has-session -t '=hatter-snooze' 2>/dev/null && fail "the empty snooze session was left behind"
 [[ -z "$(opt "$B" @hatter-snooze-until)$(opt "$B" window-size)" ]] || fail "options left on a woken tab: [$(opt "$B" @hatter-snooze-until)] [$(opt "$B" window-size)]"
 [[ "$(opt "$B" @hatter-waiting)" == woken ]] || fail "a woken tab is not flagged"
+[[ "$(opt "$B" @hatter-woke-at)" =~ ^[0-9]+$ ]] || fail "a woken tab has no wake time: '$(opt "$B" @hatter-woke-at)'"
 [[ "$(entry "$B" | jq -r '.snooze // "none"')" == none ]] || fail "record left after waking"
 if "$SN" unsnooze s:b >/dev/null 2>&1; then fail "unsnoozed a tab that is not snoozed"; fi
 
@@ -233,6 +234,8 @@ now=$(date +%s)   # near() measures from here: the run is well past its start
 "$SN" tick
 [[ "$(names s)" == "a c" && "$(names hatter-snooze)" == "b" ]] \
     || fail "tick should wake c only: s='$(names s)' box='$(names hatter-snooze)'"
+near "$(opt "$C" @hatter-woke-at)" 0 || fail "tick did not stamp c's wake time: '$(opt "$C" @hatter-woke-at)'"
+[[ -z "$(opt "$B" @hatter-woke-at)" ]] || fail "a tab snoozed again kept its old wake time"
 
 # A reboot loses window options; the registry has the time, and tick puts it back.
 T set-option -wu -t "$B" @hatter-snooze-until
