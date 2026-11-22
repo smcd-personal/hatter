@@ -3557,6 +3557,9 @@ cat > "$HOME/.local/bin/hat-attn" <<'HATATTN'
 #   done             any other Stop (the turn ended): @hatter-waiting only, no ring
 #   (cleared)        UserPromptSubmit
 #
+# hat-snooze sets a fifth value, woken, with the wake time in @hatter-woke-at;
+# any of the above replaces it, and clears the time.
+#
 # It also keeps @hatter-working, the time the agent's turn opened (#288): set
 # on UserPromptSubmit, cleared on Stop. The watcher counts a tab as working
 # while that is set and the pane is still printing (see tab_states).
@@ -3657,12 +3660,15 @@ done
 case "$ev" in
     UserPromptSubmit)
         tmux set-option -wu -t "$TMUX_PANE" @hatter-waiting 2>/dev/null
+        tmux set-option -wu -t "$TMUX_PANE" @hatter-woke-at 2>/dev/null
         tmux set-option -w -t "$TMUX_PANE" @hatter-working "$(date +%s)" 2>/dev/null
         exit 0 ;;
     Stop) tmux set-option -wu -t "$TMUX_PANE" @hatter-working 2>/dev/null ;;
 esac
 
 tmux set-option -w -t "$TMUX_PANE" @hatter-waiting "$kind" 2>/dev/null
+# A snoozed tab's wake (hat-snooze) is news only until the agent moves on.
+tmux set-option -wu -t "$TMUX_PANE" @hatter-woke-at 2>/dev/null
 
 # A finished turn is not blocked on anyone: flagged above, not rung.
 [ "$kind" != done ] || exit 0
@@ -4035,6 +4041,10 @@ label() {  # label <name> <index>
 
 mark() {  # mark <window id> <until>
     tmux set-option -w -t "$1" @hatter-snooze-until "$2" 2>/dev/null
+    # Snoozed again: its last wake is old news, and the next sets its own.
+    tmux set-option -wu -t "$1" @hatter-woke-at 2>/dev/null
+    [ "$(tmux show-options -wqv -t "$1" @hatter-waiting 2>/dev/null)" != woken ] \
+        || tmux set-option -wu -t "$1" @hatter-waiting 2>/dev/null
     # Hidden, it belongs to no client's view, and tmux would shrink it to the
     # box's size; it keeps the size it had until it is back.
     tmux set-option -w -t "$1" window-size manual 2>/dev/null
@@ -4066,9 +4076,13 @@ move_into() {  # move_into <window id> <session> [index]
 }
 
 # The tab is back: say so on it, the way hat-attn says an agent is waiting.
+# The notification goes once it is read; @hatter-waiting woken and the time
+# in @hatter-woke-at stay until the next prompt in the tab (hat-attn clears
+# both), and the watcher draws them in cmux's sidebar as "woke 14:05" (#322).
 flag() {  # flag <window id> <name>
     local tty body
     tmux set-option -w -t "$1" @hatter-waiting woken 2>/dev/null
+    tmux set-option -w -t "$1" @hatter-woke-at "$(date +%s)" 2>/dev/null
     body=$(printf 'Snooze over: %s' "$2" | tr -d '\000-\037\177' | cut -c1-120)
     tty=$(tmux display-message -p -t "$1" '#{pane_tty}' 2>/dev/null) || return 0
     [ -n "$tty" ] && [ -w "$tty" ] || return 0
@@ -12203,13 +12217,16 @@ watch_probe() {
 #   working    red bolt          the agent is busy
 #   approval   blue raised hand  waiting on a permission prompt
 #   question   blue speech mark  waiting on an answer
+#   woken      blue alarm clock  a snoozed tab came back (hat-snooze), with
+#                                its wake time: "woke 14:05 · <name>" (#322)
 #   idle       grey circle       anything else: turn over, a shell
 #
 # Shapes differ, so the state reads without colour; "prefs":
 # {"colorblind_safe": "on"} picks Okabe-Ito shades all the same. cmux shows
 # a workspace's first three lines and folds the rest under "Show more", so
-# the order puts what needs the human first: waiting, then working, then idle,
-# each in window order.
+# the order puts what needs the human first: waiting, then woken (it can sit
+# for days, and must not push a prompt out of sight), then working, then
+# idle, each in window order.
 #
 # hat-attn sets @hatter-working when a turn opens and clears it at Stop. A turn
 # stays open while the agent waits on a permission prompt or a question, and
@@ -12246,14 +12263,16 @@ WORKING_KEYS_RE='^hatter_(tab_[0-9]+|working)$'
 
 # What runs on a server: its clock, then every window with its index, name,
 # open turn, last output, what hat-attn says it waits for, whether tmux names
-# it, what runs in its active pane, its pane count, and the active pane's
-# title (last, in case it holds a tab).
-WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_index}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}	#{?automatic-rename,1,0}	#{pane_current_command}	#{window_panes}	#{pane_title}" 2>/dev/null || true'
+# it, what runs in its active pane, its pane count, when hat-snooze woke it,
+# and the active pane's title (last, in case it holds a tab).
+WORKING_SH='printf "N\t%s\n" "$(date +%s)"; tmux list-windows -a -F "W	#{session_name}	#{window_index}	#{window_name}	#{@hatter-working}	#{window_activity}	#{@hatter-waiting}	#{?automatic-rename,1,0}	#{pane_current_command}	#{window_panes}	#{@hatter-woke-at}	#{pane_title}" 2>/dev/null || true'
 
 # tab_states: WORKING_SH's output on stdin; prints
-# "<session> TAB <index> TAB <name> TAB <state>" for every window, the state
-# one of working, approval, question, idle. Without the clock line nothing
-# is working. A shell in front of a one-pane window with no open turn means
+# "<session> TAB <index> TAB <name> TAB <state> TAB <woke>" for every window,
+# the state one of working, approval, question, woken, idle, and <woke> the
+# epoch hat-snooze woke a woken tab at, else empty. A value of
+# @hatter-waiting it does not know is idle: "done", the end of a turn, is.
+# Without the clock line nothing is working. A shell in front of a one-pane window with no open turn means
 # the agent has exited: hat-attn's flag stays until the next prompt, so it is
 # stale, and the tab is idle. (A window with more panes may have its agent in
 # one the shell is not; an open turn is an agent at work. An agent hat-launch
@@ -12272,25 +12291,48 @@ tab_states() {
         $1 == "W" && NF >= 7 && $3 ~ /^[0-9]+$/ {
             shell = ($9 ~ /^-?(ba|z|da|k|tc|c|fi)?sh$/ && $10 == "1" && $5 == "")
             ask = ($7 == "approval" || $7 == "question") && !shell
+            woke = ""
             if (shell) st = "idle"
             else if (now != "" && $5 ~ /^[0-9]+$/ && $6 ~ /^[0-9]+$/ && now - $6 <= (ask ? wq : q)) st = "working"
             else if (ask) st = $7
+            else if ($7 == "woken") { st = "woken"; if ($11 ~ /^[0-9]+$/) woke = $11 }
             else st = "idle"
-            name = $4; title = $11
-            for (i = 12; i <= NF; i++) title = title " " $i
+            name = $4; title = $12
+            for (i = 13; i <= NF; i++) title = title " " $i
             # The glyph: one three-byte character, U+2000 to U+2FFF.
             if (($8 == "1" || name == "") && !shell && title ~ /^\342[\200-\277][\200-\277] +[^ ]/) {
                 sub(/^\342[\200-\277][\200-\277] +/, "", title); name = title
             }
-            print $2 "\t" $3 "\t" name "\t" st
+            print $2 "\t" $3 "\t" name "\t" st "\t" woke
         }'
+}
+
+# woke_label <epoch> [now]: when a snoozed tab woke, short, on this machine's
+# clock: "14:05" today, "Tue 14:05" in the last week, else "Dec 1 14:05".
+woke_label() {
+    local t="$1" now="${2:-}" day today ago
+    [[ "$t" =~ ^[0-9]+$ ]] || return 0
+    [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+    day=$(date -r "$t" +%Y%m%d 2>/dev/null || date -d "@$t" +%Y%m%d) || return 0
+    today=$(date -r "$now" +%Y%m%d 2>/dev/null || date -d "@$now" +%Y%m%d) || return 0
+    ago=$(( now - t ))
+    if [[ "$day" == "$today" ]]; then
+        date -r "$t" +%H:%M 2>/dev/null || date -d "@$t" +%H:%M
+    elif (( ago >= 0 && ago < 6 * 86400 )); then
+        date -r "$t" '+%a %H:%M' 2>/dev/null || date -d "@$t" '+%a %H:%M'
+    else
+        { date -r "$t" '+%b %e %H:%M' 2>/dev/null || date -d "@$t" '+%b %e %H:%M'; } | tr -s ' '
+    fi
+    return 0
 }
 
 # tab_lines <recorded> <tabs> <workspaces> [held]: for each workspace it can
 # place, a line "<id>", then one "<id> TAB <key> TAB <text> TAB <icon> TAB
 # <colour> TAB <priority>" per tab.
 #   recorded    "<dest> TAB <session>", every session the config records
-#   tabs        "<dest> TAB <session> TAB <index> TAB <name> TAB <state>"
+#   tabs        "<dest> TAB <session> TAB <index> TAB <name> TAB <state>
+#               [TAB <woke>]", <woke> a woken tab's wake time as woke_label
+#               gives it, put in front of the name
 #   workspaces  "<id> TAB <title>", every workspace cmux shows
 #   held        destinations, one a line, whose workspaces are left out: they
 #               missed this round, and keep what they show for now
@@ -12303,8 +12345,9 @@ tab_lines() {
         -v red="$red" -v blue="$blue" -v grey="$grey" '
         BEGIN {
             icon["working"] = "bolt.fill"; colour["working"] = red; rank["working"] = 2
-            icon["approval"] = "hand.raised.fill"; colour["approval"] = blue; rank["approval"] = 3
-            icon["question"] = "questionmark.bubble.fill"; colour["question"] = blue; rank["question"] = 3
+            icon["approval"] = "hand.raised.fill"; colour["approval"] = blue; rank["approval"] = 4
+            icon["question"] = "questionmark.bubble.fill"; colour["question"] = blue; rank["question"] = 4
+            icon["woken"] = "alarm.fill"; colour["woken"] = blue; rank["woken"] = 3
             icon["idle"] = "circle"; colour["idle"] = grey; rank["idle"] = 1
             n = split(ENVIRON["AWK_H"], h, "\n")
             for (i = 1; i <= n; i++) if (h[i] != "") held[h[i]] = 1
@@ -12318,6 +12361,8 @@ tab_lines() {
                 if (split(t[i], f, "\t") < 5 || f[3] !~ /^[0-9]+$/) continue
                 st = (f[5] in icon) ? f[5] : "idle"
                 name = f[4]; if (name == "") name = "window " f[3]
+                # In front, so a cut name never loses it.
+                if (st == "woken") name = "woke " (f[6] != "" ? f[6] " " : "") "\302\267 " name
                 # cmux reads a value starting "--" as an option: start it
                 # with a hyphen character instead.
                 if (name ~ /^--/) name = "\342\200\220" substr(name, 2)
@@ -12424,7 +12469,7 @@ watch_working_apply() {
 # watch_working: one round, at most every WATCH_WORKING_EVERY seconds.
 watch_working() {
     local now tree wss rec dests dest i=0 started="" tabs="" f line wanted held="" misses="" m off=0
-    local placed unread gone
+    local placed unread gone woke
     now=$(date +%s)
     (( now - WATCH_WORKING_LAST >= WATCH_WORKING_EVERY )) || return 0
     WATCH_WORKING_LAST=$now
@@ -12493,8 +12538,14 @@ watch_working() {
             (( m >= WATCH_WORKING_HOLD )) || held+="$dest"$'\n'
             continue
         fi
+        # Not read into fields: a tab is IFS whitespace, and read would fold
+        # an empty name away. The last field is the wake time, the one
+        # before it the state.
         while IFS= read -r line; do
-            [[ -z "$line" ]] || tabs+="$dest"$'\t'"$line"$'\n'
+            [[ -n "$line" ]] || continue
+            woke=${line##*$'\t'} line=${line%$'\t'*}
+            if [[ "${line##*$'\t'}" == woken ]]; then woke=$(woke_label "$woke"); else woke=""; fi
+            tabs+="$dest"$'\t'"$line"$'\t'"$woke"$'\n'
         done < <(tab_states < "$f")
         rm -f "$f"
     done <<<"$dests"
@@ -16112,9 +16163,10 @@ config.
 The watcher also lists each mirrored workspace's tabs in cmux's sidebar, one
 status line per tab: its name, and its agent's state as the icon. A red bolt
 is busy, a blue hand is waiting on a permission prompt, a blue speech mark is
-waiting on an answer, and a grey circle is anything else. cmux shows three
+waiting on an answer, a blue alarm clock is a snoozed tab that has woken
+(see `hatter help snooze`), and a grey circle is anything else. cmux shows three
 lines and folds the rest under "Show more", so tabs waiting on you come first,
-then busy ones, then the rest, each in window order. A tab whose name tmux set
+then woken ones, then busy ones, then the rest, each in window order. A tab whose name tmux set
 itself (after the program, "claude" or "bash") shows its agent's title for the
 session instead, and a tab where the agent has exited to a shell is grey. A tab is busy while its
 agent's turn is open (hat-attn's @hatter-working) and the tab printed
@@ -16245,7 +16297,10 @@ hatter snoozed [hat]
 
 Snooze a tab to get it out of sight until you need it. It disappears from its
 workspace, and at the wake time it comes back to the same place, flagged the
-way a tab whose agent needs your approval is.
+way a tab whose agent needs your approval is. The notification goes once you
+read it; the tab's line in cmux's sidebar keeps saying it woke, and when, with
+an alarm clock: "woke 14:05 · <tab>" (a day or date in front when it was not
+today), until you next type in the tab or its agent next stops or asks.
 
 <tab> is a window index or name. <when> is one of:
   a duration    10m, 5h, 7d, 1w, a mix like 1h30m, or "in 3 days"; up to 400d

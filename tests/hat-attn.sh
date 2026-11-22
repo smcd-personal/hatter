@@ -194,6 +194,27 @@ RUN
     hook '{"hook_event_name":"Stop"}'; settle
     [[ -z "$(working)" ]] || fail "Stop after a prompt left @hatter-working as '$(working)'"
 
+    # A snoozed tab's wake (#322): hat-snooze sets woken and @hatter-woke-at;
+    # the agent's next event replaces the flag and drops the time, and the
+    # human's next prompt clears both.
+    woke() { tmux -L "$k" show-options -wqv -t "$pane" @hatter-woke-at; }
+    tmux -L "$k" set-option -w -t "$pane" @hatter-waiting woken
+    tmux -L "$k" set-option -w -t "$pane" @hatter-woke-at 1000
+    hook '{"hook_event_name":"UserPromptSubmit"}'; settle
+    [[ -z "$(waiting)$(woke)" ]] || fail "UserPromptSubmit left woken: '$(waiting)' '$(woke)'"
+    tmux -L "$k" set-option -w -t "$pane" @hatter-waiting woken
+    tmux -L "$k" set-option -w -t "$pane" @hatter-woke-at 1000
+    # A plain Stop: sets the flag without ringing, so the counts below hold.
+    hook '{"hook_event_name":"Stop"}'; settle
+    [[ "$(waiting)" == done && -z "$(woke)" ]] || fail "a Stop after a wake: '$(waiting)' '$(woke)'"
+    # Untouched by an event that sets nothing.
+    tmux -L "$k" set-option -w -t "$pane" @hatter-waiting woken
+    tmux -L "$k" set-option -w -t "$pane" @hatter-woke-at 1000
+    hook '{"hook_event_name":"Notification","notification_type":"idle_prompt"}'; settle
+    [[ "$(waiting)" == woken && "$(woke)" == 1000 ]] || fail "idle_prompt cleared a wake: '$(waiting)' '$(woke)'"
+    hook '{"hook_event_name":"UserPromptSubmit"}'; settle
+    hook '{"hook_event_name":"Stop"}'; settle
+
     # A snoozed tab keeps the flag but is not announced.
     tmux -L "$k" set-option -w -t "$pane" @hatter-snooze-until 9999999999
     hook '{"hook_event_name":"Notification","notification_type":"permission_prompt"}'; settle
