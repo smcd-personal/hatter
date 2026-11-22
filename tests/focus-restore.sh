@@ -87,6 +87,20 @@ case "$verb" in
             .windows |= map(.workspaces |= map(select(.id != $g))
                 | if .id == $w then .workspaces += [{id: "S-new", title: $t}] else . end)' \
             "$st/tree.json" > "$st/tree.tmp" && mv "$st/tree.tmp" "$st/tree.json" ;;
+    "rpc remote.tmux.state")
+        # STUB_ATTACHED: cmux already mirrors dev-main, so the host is live.
+        s=$(jq -r .session <<<"$3")
+        if [[ -n "${STUB_ATTACHED:-}" && "$s" == dev-main ]]; then echo '{"attached":true}'
+        else echo '{"attached":false}'; fi ;;
+    "rpc remote.tmux.mirror")
+        # Mirrors the session it names into the window it names; focus does
+        # not move.
+        [[ "$(jq -r .session <<<"$3")" == "$STUB_MIRROR" ]] || { echo "stub cmux: mirror of the wrong session" >&2; exit 1; }
+        w=$(jq -r .window_id <<<"$3")
+        jq --arg w "$w" --arg t "$STUB_MIRROR" '
+            .windows |= map(if .id == $w then .workspaces += [{id: "S-new", title: $t}] else . end)' \
+            "$st/tree.json" > "$st/tree.tmp" && mv "$st/tree.tmp" "$st/tree.json"
+        jq -nc --arg w "$w" '{mirrored: true, window_id: $w, workspace_ids: ["S-new"]}' ;;
     "workspace-group "*|"rename-workspace "*|"reorder-workspace "*) ;;
     *) echo "stub cmux: unexpected: $*" >&2; exit 1 ;;
 esac
@@ -139,7 +153,7 @@ hat new dev-new --group Dev >/dev/null 2>&1 || fail "new: exited non-zero"
 grep -qx -- '--id-format both identify --no-caller --json' "$work/st/calls" \
     || { fail "new: focus was never recorded"; show; }
 # The record is taken before the first change.
-first=$(grep -n -v -- 'list\|tree\|identify' "$work/st/calls" | head -1 | cut -d: -f1 || true)
+first=$(grep -n -v -- 'list\|tree\|identify\|rpc remote.tmux.state' "$work/st/calls" | head -1 | cut -d: -f1 || true)
 rec=$(grep -n -- 'identify' "$work/st/calls" | head -1 | cut -d: -f1 || true)
 [[ -n "$rec" && -n "$first" && "$rec" -lt "$first" ]] \
     || { fail "new: focus recorded at call ${rec:-never}, after the first change at ${first:-?}"; show; }
@@ -213,6 +227,32 @@ hat group rename Dev Dev2 >/dev/null 2>&1 || fail "group rename: exited non-zero
 grep -q 'workspace-group rename' "$work/st/calls" || { fail "group rename: the cmux group was not renamed"; show; }
 n=$(grep -c -- 'identify\|focus-window\|focus-pane\|select-workspace' "$work/st/calls" || true)
 [[ "$n" -eq 0 ]] || { fail "group rename: $n focus calls, want 0"; show; }
+
+# --- new on a host cmux already mirrors: no focus hop (#324) --------------------
+# remote.tmux.mirror names the window, so ssh-tmux and its focus-window are not
+# needed, and the run records and restores nothing.
+reset
+STUB_ATTACHED=1 hat new dev-new --group Dev >/dev/null 2>&1 || { fail "new (mirrored host): exited non-zero"; show; }
+grep -q 'rpc remote.tmux.mirror' "$work/st/calls" || { fail "new (mirrored host): did not use remote.tmux.mirror"; show; }
+[[ "$(ncalls 'ssh-tmux')" -eq 0 ]] || { fail "new (mirrored host): still ran ssh-tmux"; show; }
+n=$(grep -c -- 'identify\|focus-window\|focus-pane\|select-workspace' "$work/st/calls" || true)
+[[ "$n" -eq 0 ]] || { fail "new (mirrored host): $n focus calls, want 0"; show; }
+jq -e 'any(.windows[] | select(.id == "W2") | .workspaces[]; .id == "S-new")' "$work/st/tree.json" >/dev/null \
+    || { fail "new (mirrored host): the workspace did not land in W2"; show; }
+
+# The RPC fails: back to focus-window and ssh-tmux, and focus is put back.
+reset
+STUB_ATTACHED=1 STUB_FAIL="rpc remote.tmux.mirror" hat new dev-new --group Dev >/dev/null 2>&1 \
+    || { fail "new (mirror rpc fails): exited non-zero"; show; }
+[[ "$(ncalls 'ssh-tmux')" -eq 1 ]] || { fail "new (mirror rpc fails): did not fall back to ssh-tmux"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "new (mirror rpc fails): focus left at '$(where)'"; show; }
+
+# No live mirror of the host: the RPC is not tried, since only ssh-tmux can ask
+# for a sign-in.
+reset
+hat new dev-new --group Dev >/dev/null 2>&1 || { fail "new (host not mirrored): exited non-zero"; show; }
+[[ "$(ncalls 'rpc remote.tmux.mirror')" -eq 0 ]] || { fail "new (host not mirrored): tried remote.tmux.mirror"; show; }
+[[ "$(ncalls 'ssh-tmux')" -eq 1 ]] || { fail "new (host not mirrored): did not run ssh-tmux"; show; }
 
 # --- a hat window that is already open is not focused for nothing (#323) ------
 # group add for a group cmux already shows in the hat's window names the window
