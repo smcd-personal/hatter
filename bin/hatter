@@ -1985,7 +1985,7 @@ current_hat_find() {
 NEW_WINDOW_STRAY=""
 
 ensure_hat_window() {
-    # ensure_hat_window <hat> -> prints window id, and focuses it
+    # ensure_hat_window <hat> -> prints window id; focuses only a window it opens
     local hat="$1" w
     hat_require_enabled "$hat"
     w=$(find_hat_window "$hat")
@@ -2005,7 +2005,10 @@ ensure_hat_window() {
         NEW_WINDOW_STRAY="$w"
     fi
 
-    cmux_change focus-window --window "$w" >/dev/null 2>&1 || true
+    # No focus-window here. new-window focuses the window it opens, and the
+    # callers that need focus because cmux gives them no target (mirror_hat,
+    # cmux_group_create without members) focus it themselves. Everything else
+    # names the window, so an existing window stays where it is.
     printf '%s' "$w"
 }
 

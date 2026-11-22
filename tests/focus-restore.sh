@@ -52,8 +52,15 @@ case "$verb" in
     "tree "*)         cat "$st/tree.json" ;;
     "workspace list") jq -c --arg w "$win" '{workspaces: [.windows[] | select(.id == $w) | .workspaces[]]}' "$st/tree.json" ;;
     "workspace-group list")
-        if [[ "$win" == W2 ]]; then echo '{"groups":[{"id":"G1","name":"Dev","member_workspace_ids":[]}]}'
+        # Dev, plus any group the run made (as G-<name>), in W2 only.
+        if [[ "$win" == W2 ]]; then
+            { echo Dev; cat "$st/groups" 2>/dev/null; } | jq -Rsc \
+                '{groups: [split("\n")[] | select(. != "")
+                          | {id: (if . == "Dev" then "G1" else "G-" + . end), name: ., member_workspace_ids: []}]}'
         else echo '{"groups":[]}'; fi ;;
+    "workspace-group create")
+        # An anchor-only group lands in the focused window.
+        [[ "$(cat "$st/focus")" == W2 ]] && arg --name "$@" >> "$st/groups" && echo >> "$st/groups" ;;
     "identify "*)
         f=$(cat "$st/focus"); s=$(cat "$st/sel-$f")
         p=$(cat "$st/pane-$s" 2>/dev/null || echo "P-$s")
@@ -206,6 +213,23 @@ hat group rename Dev Dev2 >/dev/null 2>&1 || fail "group rename: exited non-zero
 grep -q 'workspace-group rename' "$work/st/calls" || { fail "group rename: the cmux group was not renamed"; show; }
 n=$(grep -c -- 'identify\|focus-window\|focus-pane\|select-workspace' "$work/st/calls" || true)
 [[ "$n" -eq 0 ]] || { fail "group rename: $n focus calls, want 0"; show; }
+
+# --- a hat window that is already open is not focused for nothing (#323) ------
+# group add for a group cmux already shows in the hat's window names the window
+# in every call, so nothing moves and nothing is recorded.
+reset
+hat group add Dev --hat dev >/dev/null 2>&1 || fail "group add (exists): exited non-zero"
+n=$(grep -c -- 'identify\|focus-window\|focus-pane\|select-workspace' "$work/st/calls" || true)
+[[ "$n" -eq 0 ]] || { fail "group add (exists): $n focus calls, want 0"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "group add (exists): focus left at '$(where)'"; show; }
+
+# A new group has no members, so cmux makes it in the focused window: the run
+# still focuses the hat's window for that, and still puts focus back.
+reset
+hat group add Ops --hat dev >/dev/null 2>&1 || { fail "group add (new): exited non-zero"; show; }
+grep -qx 'Ops' "$work/st/groups" 2>/dev/null || { fail "group add (new): the group was not made in W2"; show; }
+[[ "$(ncalls 'focus-window --window W2')" -ge 1 ]] || { fail "group add (new): never focused W2"; show; }
+[[ "$(where)" == "W1 U1 P1 T1" ]] || { fail "group add (new): focus left at '$(where)'"; show; }
 
 # --- nested: the inner hatter records, the outer one restores, once ------------
 # The outer hatter is a bash that holds the record the way bin/hatter does, runs
