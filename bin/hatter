@@ -512,15 +512,26 @@ cmd_access_proxy() {
 # points that stderr at /dev/null so the master can go to the background, and
 # cmux's "Sign in to <host>" workspace runs just such an ssh (#328); there the
 # person is found through the controlling terminal, which a launchd job or an
-# app's background ssh does not have. Either way, an ssh run with BatchMode=yes
+# app's background ssh does not have. A terminal is not a person, though: a
+# background job in a shell or tmux pane has one too, and each of its retries
+# would open a login tab. So the ssh must also be the terminal's foreground
+# job, as one typed at a prompt is. Either way, an ssh run with BatchMode=yes
 # (cmux's mirrors, hatter's) has said it is not to ask anyone anything.
 access_interactive() {
-    [[ -t 2 ]] || access_ctty || return 1
+    [[ -t 2 ]] || { access_ctty && access_foreground; } || return 1
     ! ssh_args_batch "$(ps -o args= -p "$PPID" 2>/dev/null || true)"
 }
 
 # access_ctty: succeeds when this process has a controlling terminal to write to.
 access_ctty() { { : <>"$HATTER_ACCESS_TTY"; } 2>/dev/null; }
+
+# access_foreground: succeeds when the ssh that started this ProxyCommand is
+# in its terminal's foreground process group.
+access_foreground() {
+    local pg tpg
+    read -r pg tpg < <(ps -o pgid=,tpgid= -p "$PPID" 2>/dev/null || true) || true
+    [[ "$pg" =~ ^[0-9]+$ && "$tpg" =~ ^[0-9]+$ && "$pg" != 0 && "$pg" == "$tpg" ]]
+}
 
 # ssh_args_batch <ssh command line>: succeeds when it sets BatchMode yes. ssh
 # reads option names and values in any case, with = or a space.
