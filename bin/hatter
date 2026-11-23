@@ -389,6 +389,9 @@ hat_require_enabled() {
 HATTER_CF_DIR="${HATTER_CF_DIR:-$HOME/.cloudflared}"
 # A login with less than this many seconds left counts as lapsed.
 ACCESS_MARGIN=60
+# The terminal access-proxy looks for when ssh has hidden its stderr (#328).
+# Tests point it elsewhere.
+HATTER_ACCESS_TTY="${HATTER_ACCESS_TTY:-/dev/tty}"
 
 # access_info <dest>: "<cloudflared binary><TAB><hostname>" when ssh reaches
 # <dest> through `cloudflared access`; nothing otherwise. `ssh -G` resolves the
@@ -490,10 +493,14 @@ cmd_access_proxy() {
     if command -v jq >/dev/null 2>&1 && ai=$(access_words "$@"); then
         name="${ai#*$'\t'}"
         if [[ -n "$name" && "$name" != "%h" ]] \
-           && (( $(access_left "$name") <= ACCESS_MARGIN )) \
-           && ! access_interactive; then
-            echo "hatter: the Cloudflare Access login for $name has lapsed; run: hatter login" >&2
-            return 1
+           && (( $(access_left "$name") <= ACCESS_MARGIN )); then
+            if ! access_interactive; then
+                echo "hatter: the Cloudflare Access login for $name has lapsed; run: hatter login" >&2
+                return 1
+            fi
+            # The person is at the controlling terminal, not on stderr: give
+            # cloudflared that terminal, so its login URL shows there.
+            [[ -t 2 ]] || ! access_ctty || exec 2>"$HATTER_ACCESS_TTY"
         fi
     fi
     exec "$@"
@@ -501,12 +508,19 @@ cmd_access_proxy() {
 
 # access_interactive: succeeds when a person can finish a browser login for the
 # ssh that started this ProxyCommand. ssh hands a ProxyCommand its own stderr,
-# a terminal only when someone is at one; and an ssh run with BatchMode=yes
-# (cmux's, hatter's) has said it is not to ask anyone anything.
+# a terminal only when someone is at one. With ControlPersist, though, ssh
+# points that stderr at /dev/null so the master can go to the background, and
+# cmux's "Sign in to <host>" workspace runs just such an ssh (#328); there the
+# person is found through the controlling terminal, which a launchd job or an
+# app's background ssh does not have. Either way, an ssh run with BatchMode=yes
+# (cmux's mirrors, hatter's) has said it is not to ask anyone anything.
 access_interactive() {
-    [[ -t 2 ]] || return 1
+    [[ -t 2 ]] || access_ctty || return 1
     ! ssh_args_batch "$(ps -o args= -p "$PPID" 2>/dev/null || true)"
 }
+
+# access_ctty: succeeds when this process has a controlling terminal to write to.
+access_ctty() { { : <>"$HATTER_ACCESS_TTY"; } 2>/dev/null; }
 
 # ssh_args_batch <ssh command line>: succeeds when it sets BatchMode yes. ssh
 # reads option names and values in any case, with = or a space.
@@ -16711,9 +16725,10 @@ ProxyCommand:
       ProxyCommand hatter access-proxy cloudflared access ssh --hostname %h
 
 While the login lasts, this runs cloudflared as written. Once it lapses, only an
-ssh typed at a terminal opens the browser. cmux, scripts and anything run with
-BatchMode=yes fail at once with "run: hatter login". Use hatter's full path if
-ssh's PATH may not include it.
+ssh typed at a terminal opens the browser; that includes cmux's own "Sign in to
+<host>" tab, where the login URL shows. cmux's background reconnects, scripts
+and anything run with BatchMode=yes fail at once with "run: hatter login". Use
+hatter's full path if ssh's PATH may not include it.
 
   --status   Only say how long each login has left; exits 1 if one has lapsed
 USAGE

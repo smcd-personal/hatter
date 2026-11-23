@@ -28,6 +28,8 @@ set +e
 
 mkdir -p "$work/bin" "$work/cf"
 HATTER_CF_DIR="$work/cf"
+# No controlling terminal unless a test makes one: a file stands in for it.
+HATTER_ACCESS_TTY="$work/no-tty/tty"
 CONFIG="$work/config.json"
 # The fake cloudflared, named in the ProxyCommands below.
 cf="$work/bin/cloudflared"
@@ -170,7 +172,7 @@ expect "access-proxy runs a command that is not cloudflared access as written" \
     "$([[ $rc != 0 || -z "$out" ]] && echo y || echo n)"
 
 # Run whole, the way ssh runs it: no config read or written, nothing on stdout.
-out=$(XDG_CONFIG_HOME="$work/xdg" HATTER_CF_DIR="$work/cf" bash "$root/bin/hatter" \
+out=$(XDG_CONFIG_HOME="$work/xdg" HATTER_CF_DIR="$work/cf" HATTER_ACCESS_TTY="$HATTER_ACCESS_TTY" bash "$root/bin/hatter" \
       access-proxy "$cf" access ssh --hostname access.example.com 2>"$work/proxy.err" </dev/null); rc=$?
 expect "hatter access-proxy, run whole with stderr not a terminal, fails fast" \
     "$([[ $rc != 0 && -z "$out" && ! -s "$work/proxied" ]] && echo y || echo n)"
@@ -182,8 +184,43 @@ expect "ssh -o batchmode yes is not interactive" "$(yn ssh_args_batch "ssh -o 'b
 expect "plain ssh is interactive" "$(ssh_args_batch "ssh u@h" && echo n || echo y)"
 expect "ssh -o BatchMode=no is interactive" "$(ssh_args_batch "ssh -o BatchMode=no u@h" && echo n || echo y)"
 unset -f access_interactive
-source <(sed -n '/^access_interactive() {/,/^}/p' "$lib")
-expect "stderr that is not a terminal is not interactive" "$(access_interactive 2>/dev/null && echo n || echo y)"
+eval "$(sed -n '/^access_interactive() {/,/^}/p' "$lib")"
+expect "stderr that is not a terminal, and no controlling terminal, is not interactive" \
+    "$(access_interactive 2>/dev/null && echo n || echo y)"
+
+# cmux's "Sign in to <host>" ssh sets ControlPersist, so ssh points the
+# ProxyCommand's stderr at /dev/null; the person is at the controlling
+# terminal instead (#328). A file stands in for that terminal.
+: > "$work/tty"
+expect "stderr hidden but a controlling terminal, from plain ssh, is interactive" \
+    "$( (HATTER_ACCESS_TTY="$work/tty"; ps() { echo "/usr/bin/ssh -o BatchMode=no -n -T u@h"; }
+        access_interactive 2>/dev/null) && echo y || echo n)"
+expect "a controlling terminal from ssh -o BatchMode=yes is not interactive" \
+    "$( (HATTER_ACCESS_TTY="$work/tty"; ps() { echo "/usr/bin/ssh -o BatchMode=yes u@h"; }
+        access_interactive 2>/dev/null) && echo n || echo y)"
+
+# Run whole with stderr hidden and a controlling terminal: cloudflared runs,
+# and what it says (the login URL) goes to that terminal, not to stderr.
+cat > "$cf" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/proxied"
+echo "open this URL to log in" >&2
+echo tunnel
+EOF
+rm -f "$work/proxied"
+out=$(XDG_CONFIG_HOME="$work/xdg" HATTER_CF_DIR="$work/cf" HATTER_ACCESS_TTY="$work/tty" bash "$root/bin/hatter" \
+      access-proxy "$cf" access ssh --hostname access.example.com 2>"$work/proxy.err" </dev/null); rc=$?
+expect "hatter access-proxy with a controlling terminal runs cloudflared on a lapsed login" \
+    "$([[ $rc == 0 && "$out" == tunnel && -s "$work/proxied" ]] && echo y || echo n)"
+expect "and cloudflared's login URL reaches the terminal" "$(yn grep -q 'open this URL' "$work/tty")"
+expect "and not the hidden stderr" "$(grep -q 'open this URL' "$work/proxy.err" && echo n || echo y)"
+: > "$work/tty"; rm -f "$work/proxied"
+token access.example.com-aud1-token 3600
+out=$(XDG_CONFIG_HOME="$work/xdg" HATTER_CF_DIR="$work/cf" HATTER_ACCESS_TTY="$work/tty" bash "$root/bin/hatter" \
+      access-proxy "$cf" access ssh --hostname access.example.com 2>"$work/proxy.err" </dev/null); rc=$?
+expect "a live login leaves cloudflared's stderr where ssh put it" \
+    "$([[ $rc == 0 && ! -s "$work/tty" ]] && grep -q 'open this URL' "$work/proxy.err" && echo y || echo n)"
+rm -f "$work/cf/"*-token "$work/proxied"
 
 # --- hatter login ------------------------------------------------------------
 cat > "$CONFIG" <<'EOF'
