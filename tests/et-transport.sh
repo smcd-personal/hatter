@@ -109,10 +109,12 @@ chmod +x "$work/bin/cmux"
 cat > "$work/bin/ssh" <<'EOF'
 #!/bin/sh
 if [ "$1" = -G ]; then
-    printf '%s\n' 'user dev' 'hostname dev.example.com' 'port 22' 'identityfile ~/.ssh/id_test'
+    printf '%s\n' 'user dev' 'hostname dev.example.com' 'port 22' 'identityfile ~/.ssh/id test' \
+        'userknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2'
     # STUB_PROXY: the host is reached through a ProxyCommand (the broker cases
-    # only; hatter's Access gate reads this too).
-    [ -n "${STUB_PROXY:-}" ] && echo 'proxycommand /usr/local/bin/cloudflared access ssh --hostname %h --port %p --x %%'
+    # only; hatter's Access gate reads this too). STUB_JUMP: through a jump host.
+    [ -n "${STUB_PROXY:-}" ] && echo 'proxycommand /usr/local/bin/cloudflared access ssh --hostname %h --port %p --n %n --x %%'
+    [ -n "${STUB_JUMP:-}" ] && echo 'proxyjump jump@jump.example.com'
 fi
 exit 0
 EOF
@@ -121,11 +123,29 @@ cat > "$work/etbin/et" <<'EOF'
 #!/bin/sh
 for a in "$@"; do printf '%s\n' "$a"; done > "$STUB_DIR/et-args"
 EOF
-# lsof: the listener is already up, so the broker starts no cloudflared.
-printf '#!/bin/sh\nexit 0\n' > "$work/bin/lsof"
-# security: no token in the keychain.
-printf '#!/bin/sh\nexit 44\n' > "$work/bin/security"
-chmod +x "$work/bin/ssh" "$work/etbin/et" "$work/bin/lsof" "$work/bin/security"
+# lsof: with -t, the pid in $STUB_DIR/lsof-pid listens on the port; without,
+# something listens once $STUB_DIR/listening exists (the stub cloudflared
+# makes it).
+cat > "$work/bin/lsof" <<'EOF'
+#!/bin/sh
+case " $* " in
+    *" -t "*) [ -s "$STUB_DIR/lsof-pid" ] && cat "$STUB_DIR/lsof-pid" ;;
+    *) [ -e "$STUB_DIR/listening" ] ;;
+esac
+EOF
+# cloudflared: records its arguments and whether the token came through the
+# environment, then "listens".
+cat > "$work/bin/cloudflared" <<'EOF'
+#!/bin/sh
+{ printf '%s\n' "$@"; echo "env id=${TUNNEL_SERVICE_TOKEN_ID:-} secret=${TUNNEL_SERVICE_TOKEN_SECRET:-}"; } > "$STUB_DIR/cf-args"
+touch "$STUB_DIR/listening"
+EOF
+# security: a service token in the keychain.
+cat > "$work/bin/security" <<'EOF'
+#!/bin/sh
+case " $* " in *" client-id "*) echo tok-id ;; *" client-secret "*) echo tok-secret ;; *) exit 44 ;; esac
+EOF
+chmod +x "$work/bin/ssh" "$work/etbin/et" "$work/bin/lsof" "$work/bin/cloudflared" "$work/bin/security"
 # jq from wherever it is, without the rest of that directory (et may be there).
 ln -s "$(command -v jq)" "$work/bin/jq"
 
@@ -196,6 +216,30 @@ b=$(jq -c '.remoteTmux.brokers["hatter-et"]' "$work/cfg/cmux/cmux.json")
 [[ "$(jq -r '.arguments | join(" ")' <<<"$b")" == et-broker && "$(jq -r .executable <<<"$b")" == /*/bin/hatter ]] \
     || fail "new (et hat): cmux.json broker is $b"
 [[ "$(jq -r .app.reorderOnNotification "$work/cfg/cmux/cmux.json")" == off ]] || fail "new (et hat): lost cmux.json's other settings"
+nbak() { ls "$work/cfg/cmux"/cmux.json.*.hatter.bak 2>/dev/null | wc -l | tr -d ' '; }
+[[ "$(nbak)" -eq 1 ]] || fail "new (et hat): $(nbak) backups of cmux.json, want 1"
+# Again, and again with the entry's keys in another order: nothing to write.
+hat --et new dev-new --group Dev >/dev/null 2>&1 || true
+jq '.remoteTmux.brokers["hatter-et"] |= {arguments, executable}' "$work/cfg/cmux/cmux.json" > "$work/c" && cat "$work/c" > "$work/cfg/cmux/cmux.json"
+hat --et new dev-new --group Dev >/dev/null 2>&1 || true
+[[ "$(nbak)" -eq 1 ]] || fail "new (et hat, again): cmux.json rewritten when the broker was already there ($(nbak) backups)"
+
+# An existing remoteTmux setting and another broker are kept.
+reset
+jq '.hats.dev.transport = "et"' "$work/cfg/hatter/config.json" > "$work/c" && mv "$work/c" "$work/cfg/hatter/config.json"
+echo '{"remoteTmux":{"keep":1,"brokers":{"corp":{"executable":"/x"}}}}' > "$work/cfg/cmux/cmux.json"
+hat --et new dev-new --group Dev >/dev/null 2>&1 || fail "new (et hat, other broker): exited non-zero"
+[[ "$(jq -c '[.remoteTmux.keep, .remoteTmux.brokers.corp.executable, (.remoteTmux.brokers["hatter-et"] | has("executable"))]' "$work/cfg/cmux/cmux.json")" == '[1,"/x",true]' ]] \
+    || fail "new (et hat, other broker): cmux.json is $(jq -c . "$work/cfg/cmux/cmux.json")"
+
+# A cmux.json jq can't read: left alone, no backup, and the mirror goes over ssh.
+reset
+jq '.hats.dev.transport = "et"' "$work/cfg/hatter/config.json" > "$work/c" && mv "$work/c" "$work/cfg/hatter/config.json"
+printf '{ // a comment\n}\n' > "$work/cfg/cmux/cmux.json"
+out=$(hat --et new dev-new --group Dev 2>&1) || fail "new (et hat, unreadable cmux.json): exited non-zero"
+[[ "$(cat "$work/cfg/cmux/cmux.json")" == '{ // a comment
+}' && "$(nbak)" -eq 0 ]] || fail "new (et hat, unreadable cmux.json): the file was touched"
+grep -qx 'ssh-tmux dev@dev.example.com --no-focus' "$work/st/calls" || { fail "new (et hat, unreadable cmux.json): not over ssh"; show; }
 # The RPC shortcut is not taken for et, even with the host live.
 reset
 jq '.hats.dev.transport = "et"' "$work/cfg/hatter/config.json" > "$work/c" && mv "$work/c" "$work/cfg/hatter/config.json"
@@ -213,8 +257,10 @@ grep -q 'et is not installed' <<<"$out" || fail "new (et hat, no et): no warning
 # --- et-broker: cmux's -c becomes --command ----------------------------------
 reset
 jq '.hats.dev.transport = "et"' "$work/cfg/hatter/config.json" > "$work/c" && mv "$work/c" "$work/cfg/hatter/config.json"
-hat --et et-broker dev@dev.example.com -c "exec 'tmux' '-CC' 'attach-session' '-t' 'dev-main'" \
+out=$(hat --et et-broker dev@dev.example.com -c "exec 'tmux' '-CC' 'attach-session' '-t' 'dev-main'" 2>/dev/null) \
     || fail "et-broker (direct): exited non-zero"
+# stdout is cmux's control stream: nothing of the broker's own may reach it.
+[[ -z "$out" ]] || fail "et-broker (direct): wrote to stdout: $out"
 want="--no-persist
 --command
 exec 'tmux' '-CC' 'attach-session' '-t' 'dev-main'
@@ -230,7 +276,8 @@ reset
 jq '.hats.dev.transport = "et" | .hats.dev.et_host = "et.example.com"' "$work/cfg/hatter/config.json" > "$work/c" \
     && mv "$work/c" "$work/cfg/hatter/config.json"
 rm -f "$work/st/et-args"
-STUB_PROXY=1 hat --et et-broker dev@dev.example.com -c "exec tmux -CC" 2>/dev/null || fail "et-broker (et-host): exited non-zero"
+out=$(STUB_PROXY=1 hat --et et-broker dev@dev.example.com -c "exec tmux -CC" 2>/dev/null) || fail "et-broker (et-host): exited non-zero"
+[[ -z "$out" ]] || fail "et-broker (et-host): wrote to stdout: $out"
 args=$(cat "$work/st/et-args" 2>/dev/null || true)
 cf=$(sed -n '2p' <<<"$args"); port=$(sed -n '4p' <<<"$args")
 [[ "$(sed -n '1p' <<<"$args")" == -F && "$(sed -n '3p' <<<"$args")" == --port && "$port" =~ ^22[0-9]{3}$ \
@@ -239,14 +286,59 @@ cf=$(sed -n '2p' <<<"$args"); port=$(sed -n '4p' <<<"$args")
 if [[ -f "$cf" ]]; then
     grep -qx '  HostName 127.0.0.1' "$cf" || fail "et-broker ssh config: HostName is not the listener"
     grep -qx '  HostKeyAlias dev.example.com' "$cf" || fail "et-broker ssh config: no HostKeyAlias for the real host"
-    grep -qx '  ProxyCommand /usr/local/bin/cloudflared access ssh --hostname dev.example.com --port 22 --x %' "$cf" \
+    # ssh expands the tokens again when it reads the file: %% must stay %%.
+    grep -qx '  ProxyCommand /usr/local/bin/cloudflared access ssh --hostname dev.example.com --port 22 --n dev.example.com --x %%' "$cf" \
         || fail "et-broker ssh config: ProxyCommand is $(grep ProxyCommand "$cf")"
-    grep -qx '  IdentityFile ~/.ssh/id_test' "$cf" || fail "et-broker ssh config: lost the identity file"
+    grep -qx '  identityfile "~/.ssh/id test"' "$cf" || fail "et-broker ssh config: identity file is $(grep -i identityfile "$cf")"
+    grep -qx '  userknownhostsfile "~/.ssh/known_hosts" "~/.ssh/known_hosts2"' "$cf" \
+        || fail "et-broker ssh config: known hosts are $(grep -i knownhosts "$cf")"
 else
     fail "et-broker (et-host): no ssh config at '$cf'"
 fi
-# One host, one port: a second call agrees.
-STUB_PROXY=1 hat --et et-broker dev@dev.example.com -c x 2>/dev/null || true
+# The listener was started for this host, with the token in its environment
+# and not on its command line.
+want="access
+tcp
+--hostname
+et.example.com
+--url
+127.0.0.1:$port
+env id=tok-id secret=tok-secret"
+[[ "$(cat "$work/st/cf-args" 2>/dev/null)" == "$want" ]] \
+    || fail "et-broker (et-host): cloudflared got: $(tr '\n' ' ' < "$work/st/cf-args" 2>/dev/null)"
+
+# One host, one port: a second call agrees, and reuses this host's listener.
+( exec -a "cloudflared access tcp --hostname et.example.com --url 127.0.0.1:$port" sleep 120 ) &
+lpid=$!
+sleep 0.3
+echo "$lpid" > "$work/st/lsof-pid"; rm -f "$work/st/cf-args"
+STUB_PROXY=1 hat --et et-broker dev@dev.example.com -c x 2>/dev/null || fail "et-broker (listener up): exited non-zero"
 [[ "$(sed -n '4p' "$work/st/et-args")" == "$port" ]] || fail "et-broker: the listener port changed between calls"
+[[ ! -e "$work/st/cf-args" ]] || fail "et-broker (listener up): started a second listener"
+{ kill "$lpid"; wait "$lpid"; } 2>/dev/null || true
+# The port taken by something else: refused, rather than reaching another server.
+echo "$$" > "$work/st/lsof-pid"; rm -f "$work/st/et-args"
+rc=0; err=$(STUB_PROXY=1 hat --et et-broker dev@dev.example.com -c x 2>&1 >/dev/null) || rc=$?
+[[ "$rc" -ne 0 && ! -e "$work/st/et-args" && "$err" == *"taken by another program"* ]] \
+    || fail "et-broker (port taken): rc=$rc, err=$err"
+rm -f "$work/st/lsof-pid"
+
+# A jump host: et's handshake names the real host to it.
+rm -f "$work/st/et-args"
+STUB_JUMP=1 hat --et et-broker dev@dev.example.com -c x 2>/dev/null || fail "et-broker (jump): exited non-zero"
+grep -qx '  ProxyCommand ssh -W dev.example.com:22 jump@jump.example.com' "$cf" \
+    || fail "et-broker (jump): ProxyCommand is $(grep ProxyCommand "$cf")"
+
+# Two et hats on one destination that disagree on the route: refused.
+jq '.hats.dev2 = {ssh: "dev@dev.example.com", transport: "et"}' "$work/cfg/hatter/config.json" > "$work/c" \
+    && mv "$work/c" "$work/cfg/hatter/config.json"
+rm -f "$work/st/et-args"
+rc=0; err=$(hat --et et-broker dev@dev.example.com -c x 2>&1 >/dev/null) || rc=$?
+[[ "$rc" -ne 0 && ! -e "$work/st/et-args" && "$err" == *"different --et-host"* ]] \
+    || fail "et-broker (mixed routes): rc=$rc, err=$err"
+# A config hatter can't read: refused, not et without its tunnel.
+echo 'not json' > "$work/cfg/hatter/config.json"
+rc=0; err=$(hat --et et-broker dev@dev.example.com -c x 2>&1 >/dev/null) || rc=$?
+[[ "$rc" -ne 0 && ! -e "$work/st/et-args" ]] || fail "et-broker (unreadable config): rc=$rc, err=$err"
 
 [[ "$fails" -eq 0 ]] && echo "et-transport: ok" || { echo "et-transport: $fails failure(s)" >&2; exit 1; }

@@ -534,41 +534,70 @@ et_broker_command() {
 # et's handshake. Its HostName is the local listener, so the real host goes in
 # HostKeyAlias and in the ProxyCommand, where ssh would have put it for %h.
 et_ssh_conf() {
-    local dest="$1" alias="$2" file="$3" g user host port pc hka idf
+    local dest="$1" alias="$2" file="$3" g user host port pc pj hka k v tmp
     g=$(command ssh -G "$dest" 2>/dev/null </dev/null) || return 1
     user=$(awk '$1 == "user" {print $2; exit}' <<< "$g")
     host=$(awk '$1 == "hostname" {print $2; exit}' <<< "$g")
     port=$(awk '$1 == "port" {print $2; exit}' <<< "$g")
     hka=$(awk '$1 == "hostkeyalias" {print $2; exit}' <<< "$g")
     pc=$(sed -n 's/^proxycommand //p' <<< "$g" | head -1)
+    pj=$(sed -n 's/^proxyjump //p' <<< "$g" | head -1)
     [[ -n "$host" && -n "$user" ]] || return 1
-    if [[ -z "$pc" || "$pc" == none ]]; then
-        pc="/usr/bin/nc %h %p"
+    [[ "$pc" == none ]] && pc=""
+    [[ "$pj" == none ]] && pj=""
+    # ssh reads this file again and expands its tokens then, so only the ones
+    # that would now mean the alias are filled in, and %% stays %%.
+    if [[ -n "$pc" ]]; then
+        pc="${pc//%%/$'\001'}"; pc="${pc//%h/$host}"; pc="${pc//%n/$host}"
+        pc="${pc//%p/${port:-22}}"; pc="${pc//%r/$user}"; pc="${pc//$'\001'/%%}"
+    elif [[ -n "$pj" ]]; then
+        # HostName is the listener here, so a ProxyJump would reach the jump
+        # host's own localhost: name the real host to it instead.
+        pc="ssh -W $host:${port:-22} $pj"
+    else
+        pc="/usr/bin/nc $host ${port:-22}"
     fi
-    pc="${pc//%%/$'\001'}"; pc="${pc//%h/$host}"; pc="${pc//%p/${port:-22}}"
-    pc="${pc//%r/$user}"; pc="${pc//$'\001'/%}"
-    mkdir -p "$(dirname "$file")" && ( umask 077
+    mkdir -p "$(dirname "$file")" || return 1
+    # Several mirrors of one host connect at once: each writes its own file
+    # and renames it into place, so none reads another's half-written one.
+    tmp=$(mktemp "$file.XXXXXX") || return 1
     {
         echo "# Written by hatter et-broker for $dest. Rewritten on every connect."
         echo "Host $alias"
         echo "  HostName 127.0.0.1"
         echo "  User $user"
         echo "  Port ${port:-22}"
-        if [[ -n "$hka" ]]; then echo "  HostKeyAlias $hka"; else echo "  HostKeyAlias $host"; fi
+        echo "  HostKeyAlias ${hka:-$host}"
         echo "  ProxyCommand $pc"
         echo "  BatchMode yes"
-        while IFS= read -r idf; do
-            [[ -n "$idf" ]] && echo "  IdentityFile $idf"
-        done < <(awk '$1 == "identityfile" {sub(/^identityfile /, ""); print}' <<< "$g")
-    } > "$file" )
+        # The settings that say who you are and which hosts you trust; -F
+        # means et's ssh reads nothing else.
+        while read -r k v; do
+            [[ -n "$v" ]] || continue
+            case "$k" in
+                identityfile|certificatefile|identityagent)
+                    printf '  %s "%s"\n' "$k" "$v" ;;
+                identitiesonly) printf '  %s %s\n' "$k" "$v" ;;
+                # Lists: ssh -G prints them space-separated.
+                userknownhostsfile|globalknownhostsfile)
+                    printf '  %s' "$k"; printf ' "%s"' $v; echo ;;
+            esac
+        done <<< "$g"
+    } > "$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
 }
 
 # et_listener <et-host> <port>: start the local cloudflared listener for the
 # host unless one is up. It runs in its own session, so cmux tearing down an
 # et process does not take the shared listener with it.
 et_listener() {
-    local eth="$1" port="$2" cf id="" secret="" i
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+    local eth="$1" port="$2" cf id="" secret="" i pid
+    if pid=$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1) && [[ -n "$pid" ]]; then
+        # Someone listens there already: only this host's listener will do,
+        # or et would reach another server through it.
+        ps -o args= -p "$pid" 2>/dev/null | grep -q -- "--hostname $eth --url 127.0.0.1:$port" && return 0
+        echo "hatter et-broker: port $port, kept for $eth, is taken by another program (pid $pid)" >&2
+        return 1
+    fi
     cf=$(et_bin cloudflared) || { echo "hatter et-broker: cloudflared is not installed" >&2; return 1; }
     id=$(security find-generic-password -s "hatter-et:$eth" -a client-id -w 2>/dev/null) || id=""
     secret=$(security find-generic-password -s "hatter-et:$eth" -a client-secret -w 2>/dev/null) || secret=""
@@ -597,13 +626,18 @@ cmd_et_broker() {
         return 2
     fi
     et=$(et_bin et) || { echo "hatter et-broker: et is not installed" >&2; return 1; }
-    eths=$(cfg --arg d "$dest" '[.hats[] | select(.ssh == $d and .transport == "et") | .et_host // ""] | unique | .[]' 2>/dev/null) || eths=""
-    n=$(grep -c . <<< "$eths" || true)
-    if [[ "$n" -gt 1 ]]; then
-        echo "hatter et-broker: the hats on $dest name different --et-host values; give them one" >&2
+    # Every et hat on the destination must agree on the route: a tunnel hat
+    # reached without its tunnel would fail, or reach the wrong place.
+    if ! eths=$(cfg -c --arg d "$dest" '[.hats[] | select(.ssh == $d and .transport == "et") | .et_host // ""] | unique'); then
+        echo "hatter et-broker: could not read hatter's config ($CONFIG)" >&2
         return 1
     fi
-    eth="$eths"
+    n=$(jq -r length <<< "$eths")
+    if [[ "$n" -gt 1 ]]; then
+        echo "hatter et-broker: the et hats on $dest name different --et-host values ($(jq -r 'map(if . == "" then "none" else . end) | join(", ")' <<< "$eths")); give them one" >&2
+        return 1
+    fi
+    eth=$(jq -r '.[0] // ""' <<< "$eths")
     if [[ -z "$eth" ]]; then
         exec "$et" --no-persist --command "$rcmd" -- "$dest"
     fi
@@ -619,15 +653,18 @@ cmd_et_broker() {
 # Fails, saying why, when et is not installed here or cmux.json can't be
 # edited; the caller then mirrors over ssh.
 et_broker_ready() {
-    local f="$CMUX_SETTINGS_FILE" self want tmp
+    local f="$CMUX_SETTINGS_FILE" self want tmp ok
     et_bin et >/dev/null || { warn "et is not installed here (brew install et); mirroring over ssh"; return 1; }
     self=$(cd "$(dirname "$HATTER_SELF")" && pwd)/$(basename "$HATTER_SELF")
     want=$(jq -nc --arg e "$self" --arg a et-broker '{executable: $e, arguments: [$a]}')
     [[ -e "$f" ]] || { mkdir -p "$(dirname "$f")" && echo '{}' > "$f"; } \
         || { warn "could not create $f; mirroring over ssh"; return 1; }
-    if [[ "$(jq -c --arg b "$ET_BROKER" '.remoteTmux.brokers[$b] // null' "$f" 2>/dev/null)" == "$want" ]]; then
-        return 0
-    fi
+    # Read first: a file jq can't read is left alone, not backed up again on
+    # every mirror. Compared as JSON, so a re-saved file in another key order
+    # still matches.
+    ok=$(jq --arg b "$ET_BROKER" --argjson w "$want" '(.remoteTmux.brokers[$b] // null) == $w' "$f" 2>/dev/null) \
+        || { warn "could not read $f as JSON, so cmux has no et broker; mirroring over ssh"; return 1; }
+    [[ "$ok" == true ]] && return 0
     cp -p "$f" "$f.$(date +%Y%m%d-%H%M%S).hatter.bak" 2>/dev/null \
         || { warn "could not back up $f; mirroring over ssh"; return 1; }
     tmp=$(mktemp "${TMPDIR:-/tmp}/hatter-cmux-json.XXXXXX") || return 1
