@@ -113,6 +113,16 @@ expect "running sessions no group records are counted" "$([[ "$got" == *"has 11 
 live_n=4 rec_n=4
 got=$(check_max_sessions u@dev.example.com 2>&1)
 expect "a server within the limit is silent" "$([[ -z "$got" ]] && echo y || echo n)"
+# Over et each mirror has its own connection (#243): a host whose hats all
+# mirror over et is not checked; one ssh hat on it brings the check back.
+live_n=12 rec_n=12
+printf '%s' '{"hats":{"a":{"ssh":"u@dev.example.com","transport":"et"},"b":{"ssh":"u@dev.example.com","transport":"et"}}}' > "$CONFIG"
+got=$(check_max_sessions u@dev.example.com 2>&1)
+expect "a host whose hats all mirror over et is not checked" "$([[ -z "$got" ]] && echo y || echo n)"
+printf '%s' '{"hats":{"a":{"ssh":"u@dev.example.com","transport":"et"},"b":{"ssh":"u@dev.example.com"}}}' > "$CONFIG"
+got=$(check_max_sessions u@dev.example.com 2>&1)
+expect "a host with an ssh hat is still checked" "$([[ "$got" == *"has 12 tmux sessions"* ]] && echo y || echo n)"
+rm -f "$CONFIG"
 remote_sh() { return 255; }
 live_n=11
 got=$(check_max_sessions u@dev.example.com 2>&1)
