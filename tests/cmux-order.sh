@@ -39,8 +39,30 @@ patch='{"Zeta":{"sessions":{"dev-z":{}}},"Alpha":{"sessions":{"dev-b":{},"dev-a"
 got=$(jq -r --argjson p "$patch" "
     reduce (\$p | to_entries[]) as \$e (.; .groups[\$e.key].sessions = \$e.value.sessions)
     | $order_jq | .groups | keys_unsorted | join(\" \")" <<<"$cfg")
-check "sync puts synced groups first, in cmux order; the rest keep theirs" \
-    "Zeta Alpha Beta Gamma" "$got"
+# Alpha and Zeta held places 1 and 4; they swap there, in cmux's order. Beta,
+# which cmux lost, keeps place 2, so remaking it can put it back (#330).
+check "sync orders synced groups as cmux does, in their own places; the rest keep theirs" \
+    "Zeta Beta Gamma Alpha" "$got"
+
+# Places are per hat. dev's saved order is S1 L S2, with L lost in cmux; ops's
+# T sits between them, and the patch lists ops's window first. L must stay
+# between S1 and S2 for dev, whatever the other hat does.
+hcfg='{"hats":{"dev":{},"ops":{}},"groups":{
+  "S1":{"hat":"dev","sessions":{}}, "L":{"hat":"dev","sessions":{}},
+  "T":{"hat":"ops","sessions":{}}, "S2":{"hat":"dev","sessions":{}}}}'
+hpatch='{"T":{"sessions":{}},"S1":{"sessions":{}},"S2":{"sessions":{}}}'
+got=$(jq -r --argjson p "$hpatch" "$order_jq"' | [.groups | to_entries[] | select(.value.hat == "dev") | .key] | join(" ")' <<<"$hcfg")
+check "a lost group keeps its place among its own hat's groups, with two hats" "S1 L S2" "$got"
+got=$(jq -r --argjson p "$hpatch" "$order_jq"' | .groups | keys_unsorted | length' <<<"$hcfg")
+check "...and no group is lost or doubled" "4" "$got"
+
+# A group new to the config (sync appended it last) takes its place as cmux
+# shows it among the hat's synced groups: N first here.
+hcfg='{"hats":{"dev":{}},"groups":{
+  "S1":{"hat":"dev","sessions":{}}, "S2":{"hat":"dev","sessions":{}}, "N":{"hat":"dev","sessions":{}}}}'
+hpatch='{"N":{"sessions":{}},"S1":{"sessions":{}},"S2":{"sessions":{}}}'
+got=$(jq -r --argjson p "$hpatch" "$order_jq"' | .groups | keys_unsorted | join(" ")' <<<"$hcfg")
+check "a new group takes its cmux place among the hat's synced groups" "N S1 S2" "$got"
 
 got=$(jq -r --argjson p "$patch" "
     reduce (\$p | to_entries[]) as \$e (.; .groups[\$e.key].sessions = \$e.value.sessions)
