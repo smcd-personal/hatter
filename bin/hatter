@@ -2134,7 +2134,9 @@ cmux_group_to_top() {
 # window: right after the nearest one saved before it, else right before the
 # nearest one saved after it. cmux puts a new group at the top, so a reattach
 # that remade groups one at a time turned the window's order around, and the
-# next sync saved that (#330). Groups the config does not know stay put.
+# next sync saved that (#330). Groups the config does not know stay put, and
+# an unpinned group goes no higher than below the pinned ones, as cmux keeps
+# them.
 cmux_group_place() {
     local key="$1" ref="$2" win="$3" hat groups names want at
     group_managed "$key" && { cmux_group_to_top "$ref" "$win"; return 0; }
@@ -2145,7 +2147,7 @@ cmux_group_place() {
                 [[ -n "$g" ]] && ! group_managed "$g" && group_display "$g"
             done < <(groups_of_hat "$hat") | jq -R . | jq -sc .) || return 0
     IFS=' ' read -r at want < <(jq -r --arg r "$ref" --arg me "$(group_display "$key")" --argjson c "$names" '
-        [.groups[]? | {id, name}] as $all
+        [.groups[]? | {id, name, pinned: (.is_pinned // false)}] as $all
         | ($all | map(.id) | index($r)) as $at
         | [$all[] | select(.id != $r)] as $rest
         | ($c | index($me)) as $ci
@@ -2155,7 +2157,11 @@ cmux_group_place() {
         | (if $ci == null or $at == null then null
            elif $before != null then $before + 1
            elif $after != null then $after
-           else null end) as $want
+           else null end) as $place
+        | ([$rest[] | select(.pinned)] | length) as $pins
+        | ($all | map(select(.id == $r)) | first | .pinned // false) as $mine
+        | (if $place == null or $mine then $place
+           elif $place < $pins then $pins else $place end) as $want
         | "\($at) \($want)"' <<<"$groups" 2>/dev/null) || return 0
     [[ "$want" != null && "$at" != null && "$at" != "$want" ]] || return 0
     cmux_group_move "$ref" "$want" \
@@ -10654,20 +10660,24 @@ cmd_sync() {
 }
 
 # The patch sync builds holds each window's groups in the order cmux shows
-# them, and each group's sessions likewise. This puts the config's groups in
-# that order, in the places the synced ones already held. The rest (a hat with
-# no window, a group cmux no longer shows) keep their own places: a group cmux
-# lost stays where it was saved, so remaking it can put it back there rather
-# than at the end (#330). A group new to the config takes the last place.
-# Readers only ever list one hat's groups at a time, so how hats interleave
-# does not matter.
+# them, and each group's sessions likewise. This puts each hat's synced groups
+# in that order, in the places that hat's synced groups already held. The rest
+# (a hat with no window, a group cmux no longer shows) keep their own places:
+# a group cmux lost stays where it was saved among its hat's groups, so
+# remaking it can put it back there rather than at the end (#330). A group new
+# to the config takes its place among its hat's synced groups as cmux shows
+# it. Readers only ever list one hat's groups at a time, so how hats
+# interleave does not matter, and the places are per hat.
 SYNC_ORDER_JQ='
     ($p | keys_unsorted) as $order
     | .groups |= (to_entries as $e
-        | [$order[] as $k | $e[] | select(.key == $k)] as $synced
-        | reduce $e[] as $x ({i: 0, out: []};
+        | ($e | map({key, value: (.value.hat // "")}) | from_entries) as $hat
+        | ($e | from_entries) as $m
+        | (reduce ($order[] | select($hat[.] != null)) as $k ({}; .[$hat[$k]] += [$k])) as $q
+        | reduce $e[] as $x ({n: {}, out: []};
             if ($order | index($x.key)) != null
-            then .out += [$synced[.i]] | .i += 1
+            then $hat[$x.key] as $h | (.n[$h] // 0) as $i | $q[$h][$i] as $k
+                 | .out += [{key: $k, value: $m[$k]}] | .n[$h] = $i + 1
             else .out += [$x] end)
         | .out | from_entries)'
 

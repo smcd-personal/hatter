@@ -168,6 +168,15 @@ ensure B
 expect "a group the config does not know stays put, the new one goes after A" \
     "$(yes_if [ "$(order)" = "Z A B" ])"
 
+# A pinned group stays above. By the config B goes before C, but C is pinned,
+# and cmux keeps pinned groups first, so B goes right below it.
+setup pinned '{"groups": [
+    {"id": "g-C", "name": "C", "is_pinned": true, "member_workspace_ids": ["ws-c"]},
+    {"id": "g-D", "name": "D", "member_workspace_ids": ["ws-d"]}]}'
+ensure B
+expect "a new group goes no higher than below a pinned group" \
+    "$(yes_if [ "$(order)" = "C B D" ])"
+
 # sync: B is in the window; A and C are loose workspaces whose groups cmux
 # lost. sync makes both, from their workspaces, and they go around B.
 setup sync '{"groups": [{"id": "g-B", "name": "B", "member_workspace_ids": ["ws-b"]},
