@@ -2040,11 +2040,12 @@ ensure_hat_window() {
 ensure_cmux_group() {
     # ensure_cmux_group <group> <window> -> prints group ref. <group> is the
     # config key; cmux knows the group by the name it shows.
-    local name win="$2" ref
+    local name win="$2" ref made=0
     name=$(group_display "$1")
     ref=$(group_ref_in_window "$win" "$name")
     if [[ -z "$ref" ]]; then
         local err=""
+        made=1
         info "Creating workspace group '$name'" >&2
         err=$(cmux_group_create "$win" "$name" 2>&1 >/dev/null) || true
         sleep 0.4
@@ -2052,7 +2053,8 @@ ensure_cmux_group() {
     fi
     [[ -n "$ref" ]] || die "could not create or find workspace group: $name${err:+
   cmux said: $err}"
-    group_managed "$1" && cmux_group_to_top "$ref" "$win"
+    if [[ "$made" == 1 ]]; then cmux_group_place "$1" "$ref" "$win"
+    elif group_managed "$1"; then cmux_group_to_top "$ref" "$win"; fi
     printf '%s' "$ref"
 }
 
@@ -2124,6 +2126,40 @@ cmux_group_to_top() {
         mkdir -p "${marker%/*}" 2>/dev/null && printf '%s\n' "$order" > "$marker" 2>/dev/null || true
         warn "cmux did not move group '$UNASSIGNED' to the top of the window; leaving it where it is"
     fi
+    return 0
+}
+
+# cmux_group_place <group key> <group ref> <window>: a group hatter has just
+# made goes where the config keeps it among the hat's groups already in the
+# window: right after the nearest one saved before it, else right before the
+# nearest one saved after it. cmux puts a new group at the top, so a reattach
+# that remade groups one at a time turned the window's order around, and the
+# next sync saved that (#330). Groups the config does not know stay put.
+cmux_group_place() {
+    local key="$1" ref="$2" win="$3" hat groups names want at
+    group_managed "$key" && { cmux_group_to_top "$ref" "$win"; return 0; }
+    hat=$(cfg --arg g "$key" '.groups[$g].hat // empty')
+    [[ -n "$hat" ]] || return 0
+    groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || return 0
+    names=$(while IFS= read -r g; do
+                [[ -n "$g" ]] && ! group_managed "$g" && group_display "$g"
+            done < <(groups_of_hat "$hat") | jq -R . | jq -sc .) || return 0
+    IFS=' ' read -r at want < <(jq -r --arg r "$ref" --arg me "$(group_display "$key")" --argjson c "$names" '
+        [.groups[]? | {id, name}] as $all
+        | ($all | map(.id) | index($r)) as $at
+        | [$all[] | select(.id != $r)] as $rest
+        | ($c | index($me)) as $ci
+        | def pos($n): ($rest | map(.name) | index($n));
+          ([$c[:$ci][]? | pos(.) | select(. != null)] | last) as $before
+        | ([$c[$ci + 1:][]? | pos(.) | select(. != null)] | first) as $after
+        | (if $ci == null or $at == null then null
+           elif $before != null then $before + 1
+           elif $after != null then $after
+           else null end) as $want
+        | "\($at) \($want)"' <<<"$groups" 2>/dev/null) || return 0
+    [[ "$want" != null && "$at" != null && "$at" != "$want" ]] || return 0
+    cmux_group_move "$ref" "$want" \
+        || warn "could not put group '$(group_display "$key")' in its saved place"
     return 0
 }
 
@@ -10474,7 +10510,10 @@ settle_ungrouped() {
             if cmux_group_create "$win" "$name" "$(paste -sd , - <<<"$ids")" 2>/dev/null; then
                 groups_json=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups_json='{}'
                 ref=$(jq -r --arg n "$name" 'first(.groups[]? | select(.name == $n) | .id) // empty' <<<"$groups_json")
-                [[ -n "$ref" ]] && done_n=$(wc -l <<<"$ids" | tr -d ' ')
+                if [[ -n "$ref" ]]; then
+                    done_n=$(wc -l <<<"$ids" | tr -d ' ')
+                    group_managed "$g" || cmux_group_place "$g" "$ref" "$win"
+                fi
             fi
             [[ -n "$ref" ]] || warn "could not create group '$name' in $hat's window"
         else
@@ -10616,16 +10655,21 @@ cmd_sync() {
 
 # The patch sync builds holds each window's groups in the order cmux shows
 # them, and each group's sessions likewise. This puts the config's groups in
-# that order: the synced ones first, as the patch has them, then the rest (a hat
-# with no window, a group cmux no longer shows) in the order they already had.
+# that order, in the places the synced ones already held. The rest (a hat with
+# no window, a group cmux no longer shows) keep their own places: a group cmux
+# lost stays where it was saved, so remaking it can put it back there rather
+# than at the end (#330). A group new to the config takes the last place.
 # Readers only ever list one hat's groups at a time, so how hats interleave
 # does not matter.
 SYNC_ORDER_JQ='
     ($p | keys_unsorted) as $order
     | .groups |= (to_entries as $e
-        | [$order[] as $k | $e[] | select(.key == $k)]
-          + [$e[] | select(.key as $k | $order | index($k) | not)]
-        | from_entries)'
+        | [$order[] as $k | $e[] | select(.key == $k)] as $synced
+        | reduce $e[] as $x ({i: 0, out: []};
+            if ($order | index($x.key)) != null
+            then .out += [$synced[.i]] | .i += 1
+            else .out += [$x] end)
+        | .out | from_entries)'
 
 # One pass of sync. Reading cmux and the servers is the slow part, so it runs
 # without the config lock, with the servers and cmux asked all at once; the lock
@@ -16218,7 +16262,9 @@ When cmux closes the workspace of a recorded session and the tmux session
 still runs on its server, the watcher looks at who closed it. cmux closes a
 mirror by itself when the ssh connection under it drops, as can happen after
 the Mac sleeps. A workspace nobody was on, closed that way, is reattached
-into its group, as `hatter new <session>` would, and the log says so. So is
+into its group, as `hatter new <session>` would, and the log says so. A
+group cmux took with it is made again in its saved place (see: hatter help
+sync). So is
 any workspace closed while no cmux window has the keyboard, as when the Mac
 is asleep, even the one selected in its window. A workspace someone closed
 (the one selected in a window that has the keyboard) is left closed:
@@ -17092,6 +17138,12 @@ app.reorderOnNotification in ~/.config/cmux/cmux.json is off. So sync,
 restore and the autosave watcher turn it off when it is not set, keeping a
 copy of the old file next to it and reloading cmux. A value you set yourself
 is left alone; one that reorders gets a warning.
+
+cmux puts a group it makes at the top of the window. So when hatter makes a
+group again (a reattach, `hatter new`, restore, or sync putting a loose
+workspace back), it moves it to its saved place among the hat's groups that
+are in the window. A group cmux no longer shows keeps its place in the saved
+order until then.
 
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.

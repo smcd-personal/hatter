@@ -39,8 +39,10 @@ patch='{"Zeta":{"sessions":{"dev-z":{}}},"Alpha":{"sessions":{"dev-b":{},"dev-a"
 got=$(jq -r --argjson p "$patch" "
     reduce (\$p | to_entries[]) as \$e (.; .groups[\$e.key].sessions = \$e.value.sessions)
     | $order_jq | .groups | keys_unsorted | join(\" \")" <<<"$cfg")
-check "sync puts synced groups first, in cmux order; the rest keep theirs" \
-    "Zeta Alpha Beta Gamma" "$got"
+# Alpha and Zeta held places 1 and 4; they swap there, in cmux's order. Beta,
+# which cmux lost, keeps place 2, so remaking it can put it back (#330).
+check "sync orders synced groups as cmux does, in their own places; the rest keep theirs" \
+    "Zeta Beta Gamma Alpha" "$got"
 
 got=$(jq -r --argjson p "$patch" "
     reduce (\$p | to_entries[]) as \$e (.; .groups[\$e.key].sessions = \$e.value.sessions)
