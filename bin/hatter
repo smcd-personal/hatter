@@ -7251,6 +7251,15 @@ heal_move() {
 # said in HEAL_CLOSE_ERR. A blank tab that is its workspace's only surface (a
 # drop onto empty space) cannot be closed at all, so its workspace is (#336).
 HEAL_CLOSE_ERR=""
+# heal_only_surface <workspace> <surface>: succeed when cmux shows the workspace
+# with exactly that one surface in it.
+heal_only_surface() {
+    local tree
+    tree=$(cmux_json tree --all </dev/null 2>/dev/null) || return 1
+    jq -e --arg w "$1" --arg o "$2" '
+        [.windows[]?.workspaces[]? | select(.id == $w) | .panes[]?.surfaces[]?.id] == [$o]' \
+        <<<"$tree" >/dev/null 2>&1
+}
 heal_close_blank() {
     local win="$1" orphan="$2" ws="$3" err
     HEAL_CLOSE_ERR=""
@@ -7261,9 +7270,10 @@ heal_close_blank() {
     err=$(cmux_change close-surface --force --surface "$orphan" --workspace "$ws" --window "$win" </dev/null 2>&1 >/dev/null) \
         && return 0
     # A drop onto empty space opens a workspace holding only the blank tab, and
-    # cmux never closes a workspace's last surface. Only then is the workspace
-    # the thing to close: it holds nothing else, so nothing goes with it.
-    if [[ "$err" == *"Cannot close the last surface"* ]]; then
+    # cmux never closes a workspace's last surface. The workspace goes only when
+    # a fresh look shows that blank tab is the only surface in it: the error
+    # text alone is not proof, and a workspace with other tabs keeps them.
+    if [[ "$err" == *"Cannot close the last surface"* ]] && heal_only_surface "$ws" "$orphan"; then
         cmux_change close-workspace --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
             && return 0
         cmux_change close-workspace --force --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
@@ -16614,8 +16624,9 @@ A tab dropped into a workspace that is not a tmux session (a local one) has
 no session to move its window into. Its window is still in the session it
 came from, which no longer shows it. cmux draws a window as a new tab when it
 enters a mirrored session, so the window hops out to a temporary session and
-straight back, and then the blank tab is closed. Nothing is closed or
-mirrored again. Only a tab cmux has no terminal for is taken: a local shell,
+straight back, and then the blank tab is closed. When that tab is the only
+thing in the workspace the drop opened, cmux will not close it, so the empty
+workspace is closed instead. Nothing else is closed or mirrored again. Only a tab cmux has no terminal for is taken: a local shell,
 even a quiet one, is left alone, with a note on how to do it by hand. A
 session's last window is left alone too, since moving it out would end it.
 
