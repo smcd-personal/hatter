@@ -7248,7 +7248,8 @@ heal_move() {
 # with a live process. So a refused close is retried unpinned and forced. The
 # force is safe only because heal_move closes a tab no session maps: there is
 # no tmux window behind it to kill. A close still refused fails, with what cmux
-# said in HEAL_CLOSE_ERR.
+# said in HEAL_CLOSE_ERR. A blank tab that is its workspace's only surface (a
+# drop onto empty space) cannot be closed at all, so its workspace is (#336).
 HEAL_CLOSE_ERR=""
 heal_close_blank() {
     local win="$1" orphan="$2" ws="$3" err
@@ -7259,6 +7260,15 @@ heal_close_blank() {
     cmux_change tab-action --action unpin --tab "$orphan" --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 || true
     err=$(cmux_change close-surface --force --surface "$orphan" --workspace "$ws" --window "$win" </dev/null 2>&1 >/dev/null) \
         && return 0
+    # A drop onto empty space opens a workspace holding only the blank tab, and
+    # cmux never closes a workspace's last surface. Only then is the workspace
+    # the thing to close: it holds nothing else, so nothing goes with it.
+    if [[ "$err" == *"Cannot close the last surface"* ]]; then
+        cmux_change close-workspace --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
+            && return 0
+        cmux_change close-workspace --force --workspace "$ws" --window "$win" </dev/null >/dev/null 2>&1 \
+            && return 0
+    fi
     HEAL_CLOSE_ERR=$(printf '%s\n' "$err" | grep -m 1 '[^[:space:]]' | tr -d '[:cntrl:]' | cut -c 1-120 || true)
     return 1
 }
