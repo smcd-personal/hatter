@@ -8097,6 +8097,35 @@ find_age() {
     else printf '%dd' $(( d / 86400 )); fi
 }
 
+# find_hl <text> <terms \037-joined>: <text> with every term, case-insensitive
+# and literal, between C_HL and C_HL_OFF (#331). Overlapping or adjacent
+# matches make one run. Plain <text> when colour is off. Give it text with no
+# escapes in it: a term could match inside one. Terms reach awk through the
+# environment: -v would expand backslashes in them.
+find_hl() {
+    if [[ -z "$C_HL" || -z "$2" ]]; then printf '%s' "$1"; return 0; fi
+    HL_TEXT="$1" HL_TERMS="$2" HL_ON="$C_HL" HL_OFF="$C_HL_OFF" awk 'BEGIN {
+        s = ENVIRON["HL_TEXT"]; low = tolower(s); L = length(s)
+        n = split(ENVIRON["HL_TERMS"], t, "\037")
+        for (i = 1; i <= n; i++) {
+            w = tolower(t[i]); m = length(w); if (m == 0) continue
+            pos = 1
+            while ((k = index(substr(low, pos), w)) > 0) {
+                a = pos + k - 1
+                for (j = a; j < a + m; j++) mark[j] = 1
+                pos = a + 1
+            }
+        }
+        on = 0
+        for (c = 1; c <= L; c++) {
+            if (mark[c] && !on) { printf "%s", ENVIRON["HL_ON"]; on = 1 }
+            else if (!mark[c] && on) { printf "%s", ENVIRON["HL_OFF"]; on = 0 }
+            printf "%s", substr(s, c, 1)
+        }
+        if (on) printf "%s", ENVIRON["HL_OFF"]
+    }'
+}
+
 # Put a running session's tab in front: its hat's window, its workspace, the
 # tab for its tmux window. Fails when cmux does not show the session.
 find_focus() {
@@ -8373,19 +8402,23 @@ cmd_find() {
         exit 1
     fi
 
+    # The terms are highlighted in the names, title and snippet (#331): each
+    # piece on its own, after truncation, so no term matches inside an escape.
     local -a rows=()
-    local k=0 di where
+    local k=0 di where hl hname
+    hl=$(printf '%s\037' "${terms[@]}")
     while IFS= read -r line; do
         rows+=("$line"); k=$((k + 1))
         IFS=$'\037' read -r owner di score state mtime session window wid sid cwd name title snip <<<"$line"
+        hname="${name:+ ($(find_hl "$name" "$hl"))}"
         if [[ "$state" == live ]]; then
-            where="$session:$window${name:+ ($name)}"
+            where="$(find_hl "$session" "$hl"):$window$hname"
         else
-            where="${C_DIM}closed${C_R}${session:+  last in $session${name:+ ($name)}}  $(edit_short_path "$cwd" 2>/dev/null || printf '%s' "$cwd")"
+            where="${C_DIM}closed${C_R}${session:+  last in $(find_hl "$session" "$hl")$hname}  $(find_hl "$(edit_short_path "$cwd" 2>/dev/null || printf '%s' "$cwd")" "$hl")"
         fi
         printf '  %2d) %s%s%s  %s  %s%s ago%s\n' "$k" "$C_B" "$owner" "$C_R" "$where" "$C_DIM" "$(find_age "$mtime")" "$C_R"
-        printf '      %s\n' "$(edit_trunc "${title:-(untitled)}" 100)"
-        [[ -z "$snip" ]] || printf '      %s%s%s\n' "$C_DIM" "$(edit_trunc "$snip" 100)" "$C_R"
+        printf '      %s\n' "$(find_hl "$(edit_trunc "${title:-(untitled)}" 100)" "$hl")"
+        [[ -z "$snip" ]] || printf '      %s%s%s\n' "$C_DIM" "$(find_hl "$(edit_trunc "$snip" 100)" "$hl")" "$C_R"
     done < "$tmp/sorted"
     rm -rf "$tmp"
     [[ "$total" -le "$n" ]] || \
@@ -14527,13 +14560,16 @@ colour_setup() {
     if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
         C_DIM=""; C_RULE=$'\033[2m'
         C_B=$'\033[1m'; C_R=$'\033[0m'; C_SEL=$'\033[7m'
+        # A found search term (find, #331): reverse video, ended without a
+        # full reset so the bold or dim around it carries on.
+        C_HL=$'\033[7m'; C_HL_OFF=$'\033[27m'
         C_CY=$'\033[36m'; C_GR=$'\033[32m'; C_YL=$'\033[33m'; C_RD=$'\033[31m'
         # Red against green is the pair colour blindness most often hides, so
         # the safe palette shows good as blue. Red, yellow and blue stay apart
         # under all three common forms, and the terminal theme sets the shade.
         if colorblind_safe; then C_GR=$'\033[34m'; fi
     else
-        C_DIM=""; C_RULE=""; C_B=""; C_R=""; C_SEL=""
+        C_DIM=""; C_RULE=""; C_B=""; C_R=""; C_SEL=""; C_HL=""; C_HL_OFF=""
         C_CY=""; C_GR=""; C_YL=""; C_RD=""
     fi
     glyph_setup
@@ -16683,7 +16719,9 @@ over ssh).
 A running session matches when every term, case-insensitive, appears in its
 title, its last prompt, its tab name or the last 10k characters of its
 conversation (what you and Claude wrote, not tool output). Sessions whose title,
-prompt or tab name has every term come first.
+prompt or tab name has every term come first. At a terminal with colour on,
+the terms are shown in reverse video wherever they appear in the list: tab
+name, title and snippet. NO_COLOR turns that off.
 
   --all        Also search closed sessions changed in the last 7 days, matching
                anywhere in the transcript. Subagent transcripts are skipped.
