@@ -100,6 +100,9 @@ case "$*" in
   # STUB_STUCK, always.
   tab-action*) echo "tab-action $*" >> "$log"; [[ "$*" == *unpin* ]] && touch "$STUB_DIR/unpinned" ;;
   close-surface*)
+    if [[ "${STUB_LASTSURF:-}" ]]; then
+      echo "refused $*" >> "$log"; echo 'Error: invalid_state: Cannot close the last surface' >&2; exit 1
+    fi
     if [[ "${STUB_STUCK:-}" || ( "${STUB_PINNED:-}" && ! -f "$STUB_DIR/unpinned" ) \
           || ( "${STUB_BUSY:-}" && "$*" != *--force* ) ]]; then
       echo "refused $*" >> "$log"; echo 'Error: internal_error: Failed to close surface' >&2; exit 1
@@ -206,6 +209,16 @@ expect "a pinned blank tab: refused, unpinned, then closed" \
     "$(grep -q '^refused .*--surface s-new ' <<<"$log" \
         && grep -q '^tab-action .*--action unpin --tab s-new ' <<<"$log" \
         && grep -A1000 '^tab-action' <<<"$log" | grep -q '^close .*--force .*--surface s-new ' && echo y)"
+# A drop onto empty space leaves a workspace whose only surface is the blank
+# tab (#336): cmux will not close that surface, so the workspace goes. A close
+# refused for another reason must not take the workspace with it.
+log=$(run local-lastsurf unavailable STUB_LOCAL=1 STUB_LASTSURF=1)
+expect "a blank tab that is its workspace's only surface: the workspace is closed" \
+    "$(grep -q '^refused .*--surface s-new ' <<<"$log" \
+        && grep -q '^close-workspace .*--workspace ws-l ' <<<"$log" && echo y)"
+log=$(run lastsurf-shared blank STUB_LASTSURF=1)
+expect "the same refusal in a workspace with another tab: nothing is closed but the blank tab's try" \
+    "$(grep -q '^refused .*--surface s-new ' <<<"$log" && ! grep -q '^close-workspace' <<<"$log" && echo y)"
 log=$(run busy blank STUB_BUSY=1)
 expect "a blank tab cmux takes for a live one: closed by force" \
     "$(grep -q '^refused .*--surface s-new ' <<<"$log" \
