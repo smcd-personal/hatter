@@ -362,6 +362,8 @@ hat_ssh() {
 }
 hat_dir()    { cfg --arg l "$1" '.hats[$l].remote_dir // "$HOME"'; }
 hat_mosh()   { cfg --arg l "$1" '.hats[$l].mosh // false'; }
+# How cmux mirrors the hat: "ssh" unless set, or "et" (EternalTerminal, #243).
+hat_transport() { cfg --arg l "$1" '.hats[$l].transport // "ssh"'; }
 # hat_names lists the hats hatter works on: every loop over hats (sync,
 # restore, autosave, the rack, list) goes through it, so a disabled hat is
 # left alone by all of them, its groups kept as they were (#255).
@@ -472,6 +474,213 @@ access_gate() {
     (( $(access_left "${ai#*$'\t'}") > ACCESS_MARGIN )) && return 0
     warn "the Cloudflare Access login for ${ai#*$'\t'} has lapsed; run: hatter login"
     return 255
+}
+
+# --- EternalTerminal mirrors (#243) ------------------------------------------
+# An ssh mirror is torn down by cmux after about a minute without an answer
+# (a lid close, a flaky network), and rebuilt when the network is back. Over
+# EternalTerminal (et) the same session resumes instead. A hat opts in with
+# `hatter hat set <hat> --et`, since its server needs etserver.
+#
+# cmux reaches et through a broker named in cmux.json, and hatter is that
+# broker: `hatter et-broker <dest> -c <command>`. It is needed because cmux
+# 0.65 passes the command as `-c`, which et 7.x reads as the ssh cipher (its
+# short flags follow OpenSSH); the broker passes `--command`.
+#
+# A hat behind a tunnel sets --et-host <hostname>, a TCP route on the tunnel to
+# the server's etserver. et's own TCP connection has no ProxyCommand, so the
+# broker runs a local `cloudflared access tcp` listener for that hostname and
+# points et at it, while et's ssh handshake still goes through the hat's
+# ProxyCommand. The route should sit behind a Service Auth Access application;
+# the token is read from the keychain (service `hatter-et:<et-host>`, accounts
+# `client-id` and `client-secret`) and reaches cloudflared through its
+# environment, never argv or a file.
+ET_BROKER=hatter-et
+ET_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hatter/et"
+
+# et_bin <name>: the path of et or cloudflared. cmux starts a broker without a
+# login shell's PATH, so Homebrew's directories are tried too.
+ET_BIN_DIRS="${HATTER_ET_BIN_DIRS-/opt/homebrew/bin /usr/local/bin}"
+et_bin() {
+    local d
+    command -v "$1" 2>/dev/null && return 0
+    for d in $ET_BIN_DIRS; do
+        [[ -x "$d/$1" ]] && { printf '%s\n' "$d/$1"; return 0; }
+    done
+    return 1
+}
+
+# et_local_port <et-host>: the local port of that host's listener. Fixed per
+# host, so every mirror of the host shares one listener.
+et_local_port() {
+    local sum
+    sum=$(printf '%s' "$1" | cksum | awk '{print $1}')
+    echo $(( 22100 + sum % 800 ))
+}
+
+# et_broker_command <dest> -c|--command <command>: prints the command cmux wants run.
+et_broker_command() {
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--command) [[ $# -ge 2 ]] || return 1; printf '%s' "$2"; return 0 ;;
+            *) shift ;;
+        esac
+    done
+    return 1
+}
+
+# et_ssh_conf <dest> <alias> <file>: an ssh config holding just <alias>, for
+# et's handshake. Its HostName is the local listener, so the real host goes in
+# HostKeyAlias and in the ProxyCommand, where ssh would have put it for %h.
+et_ssh_conf() {
+    local dest="$1" alias="$2" file="$3" g user host port pc pj hka k v tmp
+    g=$(command ssh -G "$dest" 2>/dev/null </dev/null) || return 1
+    user=$(awk '$1 == "user" {print $2; exit}' <<< "$g")
+    host=$(awk '$1 == "hostname" {print $2; exit}' <<< "$g")
+    port=$(awk '$1 == "port" {print $2; exit}' <<< "$g")
+    hka=$(awk '$1 == "hostkeyalias" {print $2; exit}' <<< "$g")
+    pc=$(sed -n 's/^proxycommand //p' <<< "$g" | head -1)
+    pj=$(sed -n 's/^proxyjump //p' <<< "$g" | head -1)
+    [[ -n "$host" && -n "$user" ]] || return 1
+    [[ "$pc" == none ]] && pc=""
+    [[ "$pj" == none ]] && pj=""
+    # ssh reads this file again and expands its tokens then, so only the ones
+    # that would now mean the alias are filled in, and %% stays %%.
+    if [[ -n "$pc" ]]; then
+        pc="${pc//%%/$'\001'}"; pc="${pc//%h/$host}"; pc="${pc//%n/$host}"
+        pc="${pc//%p/${port:-22}}"; pc="${pc//%r/$user}"; pc="${pc//$'\001'/%%}"
+    elif [[ -n "$pj" ]]; then
+        # HostName is the listener here, so a ProxyJump would reach the jump
+        # host's own localhost: name the real host to it instead.
+        pc="ssh -W $host:${port:-22} $pj"
+    else
+        pc="/usr/bin/nc $host ${port:-22}"
+    fi
+    mkdir -p "$(dirname "$file")" || return 1
+    # Several mirrors of one host connect at once: each writes its own file
+    # and renames it into place, so none reads another's half-written one.
+    tmp=$(mktemp "$file.XXXXXX") || return 1
+    {
+        echo "# Written by hatter et-broker for $dest. Rewritten on every connect."
+        echo "Host $alias"
+        echo "  HostName 127.0.0.1"
+        echo "  User $user"
+        echo "  Port ${port:-22}"
+        echo "  HostKeyAlias ${hka:-$host}"
+        echo "  ProxyCommand $pc"
+        echo "  BatchMode yes"
+        # The settings that say who you are and which hosts you trust; -F
+        # means et's ssh reads nothing else.
+        while read -r k v; do
+            [[ -n "$v" ]] || continue
+            case "$k" in
+                identityfile|certificatefile|identityagent)
+                    printf '  %s "%s"\n' "$k" "$v" ;;
+                identitiesonly) printf '  %s %s\n' "$k" "$v" ;;
+                # Lists: ssh -G prints them space-separated.
+                userknownhostsfile|globalknownhostsfile)
+                    printf '  %s' "$k"; printf ' "%s"' $v; echo ;;
+            esac
+        done <<< "$g"
+    } > "$tmp" && mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+}
+
+# et_listener <et-host> <port>: start the local cloudflared listener for the
+# host unless one is up. It runs in its own session, so cmux tearing down an
+# et process does not take the shared listener with it.
+et_listener() {
+    local eth="$1" port="$2" cf id="" secret="" i pid
+    if pid=$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1) && [[ -n "$pid" ]]; then
+        # Someone listens there already: only this host's listener will do,
+        # or et would reach another server through it.
+        ps -o args= -p "$pid" 2>/dev/null | grep -q -- "--hostname $eth --url 127.0.0.1:$port" && return 0
+        echo "hatter et-broker: port $port, kept for $eth, is taken by another program (pid $pid)" >&2
+        return 1
+    fi
+    cf=$(et_bin cloudflared) || { echo "hatter et-broker: cloudflared is not installed" >&2; return 1; }
+    id=$(security find-generic-password -s "hatter-et:$eth" -a client-id -w 2>/dev/null) || id=""
+    secret=$(security find-generic-password -s "hatter-et:$eth" -a client-secret -w 2>/dev/null) || secret=""
+    if [[ -z "$id" || -z "$secret" ]]; then
+        echo "hatter et-broker: no Access service token for $eth in the keychain (service hatter-et:$eth); trying without one" >&2
+    fi
+    mkdir -p "$ET_DIR"
+    TUNNEL_SERVICE_TOKEN_ID="$id" TUNNEL_SERVICE_TOKEN_SECRET="$secret" \
+        perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' \
+        "$cf" access tcp --hostname "$eth" --url "127.0.0.1:$port" \
+        >> "$ET_DIR/listener-$eth.log" 2>&1 < /dev/null &
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    echo "hatter et-broker: the listener for $eth did not come up on port $port (log: $ET_DIR/listener-$eth.log)" >&2
+    return 1
+}
+
+# hatter et-broker <dest> -c <command>: what cmux runs for an et hat. Its
+# stdout is the control stream, so nothing here may write to it.
+cmd_et_broker() {
+    local dest="${1:-}" rcmd et eths eth n port alias
+    if [[ -z "$dest" ]] || ! rcmd=$(et_broker_command "$@"); then
+        echo "usage: hatter et-broker <user@host> -c <command>" >&2
+        return 2
+    fi
+    et=$(et_bin et) || { echo "hatter et-broker: et is not installed" >&2; return 1; }
+    # Every et hat on the destination must agree on the route: a tunnel hat
+    # reached without its tunnel would fail, or reach the wrong place.
+    if ! eths=$(cfg -c --arg d "$dest" '[.hats[] | select(.ssh == $d and .transport == "et") | .et_host // ""] | unique'); then
+        echo "hatter et-broker: could not read hatter's config ($CONFIG)" >&2
+        return 1
+    fi
+    n=$(jq -r length <<< "$eths")
+    if [[ "$n" -gt 1 ]]; then
+        echo "hatter et-broker: the et hats on $dest name different --et-host values ($(jq -r 'map(if . == "" then "none" else . end) | join(", ")' <<< "$eths")); give them one" >&2
+        return 1
+    fi
+    eth=$(jq -r '.[0] // ""' <<< "$eths")
+    if [[ -z "$eth" ]]; then
+        exec "$et" --no-persist --command "$rcmd" -- "$dest"
+    fi
+    port=$(et_local_port "$eth")
+    et_listener "$eth" "$port" || return 1
+    alias="hatter-et-$(printf '%s' "$dest" | tr -c 'A-Za-z0-9.-' '-')"
+    et_ssh_conf "$dest" "$alias" "$ET_DIR/ssh-$alias.conf" \
+        || { echo "hatter et-broker: could not read the ssh settings of $dest" >&2; return 1; }
+    exec "$et" -F "$ET_DIR/ssh-$alias.conf" --port "$port" --no-persist --command "$rcmd" -- "$alias"
+}
+
+# et_broker_ready: cmux.json names hatter as the et broker, written if not.
+# Fails, saying why, when et is not installed here or cmux.json can't be
+# edited; the caller then mirrors over ssh.
+et_broker_ready() {
+    local f="$CMUX_SETTINGS_FILE" self want tmp ok
+    et_bin et >/dev/null || { warn "et is not installed here (brew install et); mirroring over ssh"; return 1; }
+    self=$(cd "$(dirname "$HATTER_SELF")" && pwd)/$(basename "$HATTER_SELF")
+    want=$(jq -nc --arg e "$self" --arg a et-broker '{executable: $e, arguments: [$a]}')
+    [[ -e "$f" ]] || { mkdir -p "$(dirname "$f")" && echo '{}' > "$f"; } \
+        || { warn "could not create $f; mirroring over ssh"; return 1; }
+    # Read first: a file jq can't read is left alone, not backed up again on
+    # every mirror. Compared as JSON, so a re-saved file in another key order
+    # still matches.
+    ok=$(jq --arg b "$ET_BROKER" --argjson w "$want" '(.remoteTmux.brokers[$b] // null) == $w' "$f" 2>/dev/null) \
+        || { warn "could not read $f as JSON, so cmux has no et broker; mirroring over ssh"; return 1; }
+    [[ "$ok" == true ]] && return 0
+    cp -p "$f" "$f.$(date +%Y%m%d-%H%M%S).hatter.bak" 2>/dev/null \
+        || { warn "could not back up $f; mirroring over ssh"; return 1; }
+    tmp=$(mktemp "${TMPDIR:-/tmp}/hatter-cmux-json.XXXXXX") || return 1
+    # Written back through the file, as cmux_order_check does, so a symlinked
+    # cmux.json stays one.
+    if jq --arg b "$ET_BROKER" --argjson w "$want" \
+          '.remoteTmux = ((if (.remoteTmux | type) == "object" then .remoteTmux else {} end)
+                          | .brokers = ((.brokers // {}) + {($b): $w}))' "$f" > "$tmp" 2>/dev/null \
+       && [[ -s "$tmp" ]] && cat "$tmp" > "$f"; then
+        rm -f "$tmp"
+        info "Named hatter as cmux's et broker ($ET_BROKER) in $f"
+        return 0
+    fi
+    rm -f "$tmp"
+    warn "could not add the et broker to $f; mirroring over ssh"
+    return 1
 }
 
 # hatter access-proxy <cloudflared> access ssh --hostname %h (#196): a prefix
@@ -2129,16 +2338,20 @@ cmux_group_to_top() {
 
 mirror_hat() {
     # mirror_hat <hat> <window> [session] - mirrors the hat's host into <window>
-    local hat="$1" win="$2" session="${3:-}" host
+    local hat="$1" win="$2" session="${3:-}" host et=""
     host=$(hat_ssh "$hat")
     # cmux runs its own ssh, which the ssh() gate never sees.
     access_gate "$host" || die "not mirroring hat '$hat' until the Cloudflare Access login is renewed"
-    info "Mirroring $host into the '$hat' window"
+    # An et hat mirrors through hatter's et broker (#243), or over ssh when
+    # et can't be used here.
+    [[ "$(hat_transport "$hat")" == et ]] && et_broker_ready && et=1
+    info "Mirroring $host into the '$hat' window${et:+ over et}"
     # One session, on a host cmux already mirrors: the remote.tmux.mirror RPC
     # takes a window, so focus stays where it is (#324). Only then: with no
     # live connection, cmux may need to ask for a password or a key touch, and
-    # only ssh-tmux has a terminal to ask in.
-    if [[ -n "$session" ]] && host_mirrored "$hat" "$host" \
+    # only ssh-tmux has a terminal to ask in. Not for et: the RPC takes no
+    # transport, so ssh-tmux is the one call known to use et.
+    if [[ -z "$et" && -n "$session" ]] && host_mirrored "$hat" "$host" \
         && cmux_change rpc remote.tmux.mirror \
             "$(jq -nc --arg h "$host" --arg s "$session" --arg w "$win" \
                 '{host: $h, session: $s, window_id: $w}')" 2>/dev/null \
@@ -2147,7 +2360,11 @@ mirror_hat() {
     fi
     # ssh-tmux has no --window: it mirrors into the focused window.
     cmux_change focus-window --window "$win" >/dev/null 2>&1 || true
-    cmux_change ssh-tmux "$host" --no-focus >/dev/null
+    if [[ -n "$et" ]]; then
+        cmux_change ssh-tmux "$host" --transport et --broker "$ET_BROKER" --no-focus >/dev/null
+    else
+        cmux_change ssh-tmux "$host" --no-focus >/dev/null
+    fi
 }
 
 # host_mirrored <hat> <host>: cmux has a live mirror of one of the hat's
@@ -10066,6 +10283,29 @@ hat_enable() {
     return "$rc"
 }
 
+# hat_set_et <hat> <et|ssh|""> <host|-|"">: the hat's mirror transport and
+# its et route (#243). Empty leaves a setting as it is; "-" clears the host.
+hat_set_et() {
+    local hat="$1" mode="$2" eth="$3"
+    if [[ "$mode" == et ]]; then
+        jq_write --arg l "$hat" '.hats[$l].transport = "et"'
+    elif [[ "$mode" == ssh ]]; then
+        jq_write --arg l "$hat" '.hats[$l] |= del(.transport)'
+    fi
+    if [[ "$eth" == - ]]; then
+        jq_write --arg l "$hat" '.hats[$l] |= del(.et_host)'
+    elif [[ -n "$eth" ]]; then
+        jq_write --arg l "$hat" --arg h "$eth" '.hats[$l].et_host = $h'
+    fi
+    [[ -n "$mode$eth" ]] || return 0
+    if [[ "$(hat_transport "$hat")" == et ]]; then
+        local h; h=$(cfg --arg l "$hat" '.hats[$l].et_host // empty')
+        info "Hat '$hat' mirrors over et${h:+ through $h}; its server needs etserver (see: hatter help hat). The next restore uses it."
+    else
+        info "Hat '$hat' mirrors over ssh"
+    fi
+}
+
 cmd_hat() {
     local sub="${1:-list}"; shift || true
     case "$sub" in
@@ -10075,10 +10315,11 @@ cmd_hat() {
                    + (if .value.disabled then "  DISABLED" else "" end)
                    + (if .value.default_group then "  default group: \(.value.default_group)" else "" end)
                    + (if .value.mosh then "  mosh" else "" end)
+                   + (if .value.transport == "et" then "  et" + (if .value.et_host then " via \(.value.et_host)" else "" end) else "" end)
                    + (if .value.launch.kind then "  launches \(.value.launch.kind)" else "" end)'
             ;;
         add|set)
-            local name="${1:-}" ssh_dest="" dir="" defgroup="" mosh="" launch='{}' k v
+            local name="${1:-}" ssh_dest="" dir="" defgroup="" mosh="" etmode="" ethost="" launch='{}' k v
             shift || true
             while [[ $# -gt 0 ]]; do
                 case "$1" in
@@ -10087,6 +10328,12 @@ cmd_hat() {
                     --group) defgroup="$2"; shift 2 ;;
                     --mosh) mosh=true; shift ;;
                     --no-mosh) mosh=false; shift ;;
+                    --et) etmode=et; shift ;;
+                    --no-et) etmode=ssh; shift ;;
+                    --et-host)
+                        [[ $# -ge 2 ]] || die "--et-host needs a hostname (or '' to clear)"
+                        [[ -z "$2" || "$2" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || die "--et-host: '$2' is not a hostname"
+                        ethost="$2"; [[ -n "$ethost" ]] || ethost=-; shift 2 ;;
                     --kind)
                         [[ $# -ge 2 ]] || die "--kind needs one of: $LAUNCH_KINDS (or '' to clear)"
                         [[ -z "$2" ]] || launch_kind_ok "$2" || die "--kind: '$2' is not one of: $LAUNCH_KINDS"
@@ -10100,7 +10347,7 @@ cmd_hat() {
                     *) die "unknown flag: $1" ;;
                 esac
             done
-            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh] [--kind <kind>] [--args <kind>=<args>]"
+            [[ -n "$name" ]] || die "usage: hatter hat add <hat> --ssh user@host [--dir /path] [--group <name>] [--mosh] [--et [--et-host <host>]] [--kind <kind>] [--args <kind>=<args>]"
             # set changes the hat the name means, whatever its case; add makes
             # one, and register_hat refuses a name that differs from an
             # existing hat's only in case.
@@ -10110,12 +10357,13 @@ cmd_hat() {
                 die "'$UNASSIGNED' is hatter's own group, kept for workspaces in no group - pick another default group"
             # Only the transport or the launch settings changing: no need to
             # ask for the rest again.
-            if [[ ( -n "$mosh" || "$launch" != '{}' ) && -z "$ssh_dest$dir$defgroup" ]] \
+            if [[ ( -n "$mosh$etmode$ethost" || "$launch" != '{}' ) && -z "$ssh_dest$dir$defgroup" ]] \
                && hat_exists "$name"; then
                 if [[ -n "$mosh" ]]; then
                     jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
                     info "Hat '$name' attaches with $([[ "$mosh" == true ]] && echo mosh || echo ssh)"
                 fi
+                hat_set_et "$name" "$etmode" "$ethost"
                 hat_set_launch "$name" "$launch"
                 return 0
             fi
@@ -10123,6 +10371,7 @@ cmd_hat() {
             if [[ -n "$mosh" ]]; then
                 jq_write --arg l "$name" --argjson m "$mosh" '.hats[$l].mosh = $m'
             fi
+            hat_set_et "$name" "$etmode" "$ethost"
             hat_set_launch "$name" "$launch"
             if [[ -n "$defgroup" ]]; then
                 group_exists "$defgroup" || register_group "$defgroup" "$name"
@@ -11392,6 +11641,10 @@ max_sessions_advice() {
 
 check_max_sessions() {
     local host="$1" limit live recorded n
+    # Over et each mirror is its own connection, so the cap does not apply
+    # when every hat on the host mirrors over et (#243).
+    [[ "$(cfg --arg h "$host" '[.hats[]? | select(.ssh == $h)] | length > 0 and all(.transport == "et")' 2>/dev/null)" == true ]] \
+        && return 0
     limit=$(remote_sh "$host" "$(remote_maxsessions_sh)" 2>/dev/null | tail -n 1) || limit=""
     [[ -n "$limit" ]] || limit=unknown
     live=$(hat_live_sessions "$host" 2>/dev/null | grep -c .) || live=0
@@ -16900,6 +17153,12 @@ Subcommands:
                                           An empty value clears it. Takes
                                           effect on the server at the next
                                           `hatter provision`.
+                [--et] [--et-host <host>] cmux mirrors the hat over
+                                          EternalTerminal, which resumes after
+                                          a sleep or a network drop where ssh
+                                          is torn down (--no-et turns it off).
+                                          --et-host names a tunnel route to
+                                          the server's etserver. See below.
   rename <old> <new>                      Rename a hat and re-prefix its sessions
   rm <hat>                                Forget a hat (server untouched)
   disable <hat> [--yes] [--no-sync] [--keep-running]
@@ -16910,7 +17169,25 @@ Subcommands:
 
   hatter hat add cloud --ssh you@shell.example.com
   hatter hat set cloud --kind claude --args claude='--permission-mode auto'
+  hatter hat set cloud --et --et-host et.example.com
   hatter hat status
+
+EternalTerminal (--et). cmux tears an ssh mirror down after about a minute
+without an answer, and every workspace on the hat closes and reopens with
+it. Over et the session waits and resumes. It needs, once:
+  - here: et 7.x (brew install et) and, with --et-host, cloudflared.
+  - the server: etserver 7.x listening on 127.0.0.1:2022. With root, the
+    distribution's or upstream's `et` package; mask et.service before the
+    install, since it starts on 0.0.0.0, then set bind_ip = 127.0.0.1 and
+    telemetry = 0 in /etc/et.cfg and enable it.
+  - a server reached only through a tunnel: a TCP route from a hostname of
+    its own (the --et-host) to localhost:2022, behind an Access application
+    whose only policy is Service Auth for one service token. A login policy
+    would open a sign-in page on every reconnect. Put the token in the
+    keychain as service `hatter-et:<et-host>`, accounts client-id and
+    client-secret.
+hatter names itself as cmux's et broker in cmux.json the first time it
+mirrors an et hat. Without et installed here it warns and mirrors over ssh.
 
 Each hat has a colour, shown on its rack icon and on its cmux group headers:
 one of amber, green, cyan, blue, violet, rose, teal or slate, set with
@@ -17372,6 +17649,9 @@ shift || true
 # A ProxyCommand: ssh's own connection is on stdin and stdout, so it runs before
 # anything that might read config, take the lock or print (#196).
 if [[ "$cmd" == access-proxy ]]; then cmd_access_proxy "$@"; exit $?; fi
+# cmux's et broker (#243): its stdout is the control stream, so it too runs
+# before anything that might take the lock or print.
+if [[ "$cmd" == et-broker ]]; then cmd_et_broker "$@"; exit $?; fi
 
 need jq
 seed_config
