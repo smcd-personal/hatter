@@ -166,7 +166,7 @@ grep -q 'more:' <<<"$(find_ --all parser)" && fail "find --all parser: under the
 # directory.
 pty_find() {   # pty_find <keys or ""> <term>...: print the whole terminal output
     local keys="$1"; shift
-    PATH="${PTY_PATH:-$work/bin:$nocmux}" XDG_CONFIG_HOME="${PTY_CFG:-$work/cfg}" NO_COLOR=1 HATTER_BIN="$root/bin/hatter" \
+    PATH="${PTY_PATH:-$work/bin:$nocmux}" XDG_CONFIG_HOME="${PTY_CFG:-$work/cfg}" NO_COLOR="${PTY_NO_COLOR-1}" HATTER_BIN="$root/bin/hatter" \
         python3 -I - "$keys" "${PTY_WAIT_FOR:-jumping to}" "${PTY_DELAY:-0.5}" "$@" <<'PY'
 import os, pty, select, sys, time
 keys, wait_for, delay, terms = sys.argv[1].encode(), sys.argv[2].encode(), float(sys.argv[3]), sys.argv[4:]
@@ -290,6 +290,32 @@ chmod +x "$work/cmuxbin/cmux"
 out=$(CMUX_N="$work/cmux-n" PTY_PATH="$work/cmuxbin:$work/bin:$PATH" pty_find "" billing)
 grep -q 'aborted (switched to another tab)' <<<"$out" || fail "a tab switch did not abort the jump:
 $out"
+
+# --- the terms are highlighted in the list, with colour on (#331) -----------
+# Reverse video around each term, whatever its case, in the title and the
+# snippet; two terms each get their own; a regex character is literal; and
+# with colour off (NO_COLOR, or not a terminal) there are no escapes at all.
+on=$'\033[7m' off=$'\033[27m'
+out=$(PTY_NO_COLOR= PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' --no-go parser)
+case "$out" in *"${on}Parser${off} fixes"*) ;; *) fail "highlight: title term not in reverse video:
+$out" ;; esac
+case "$out" in *"the ${on}parser${off} too"*) ;; *) fail "highlight: snippet term not in reverse video:
+$out" ;; esac
+case "$out" in *"${on}Billing"*|*"${on}main"*) fail "highlight: marked text that is not a term:
+$out" ;; esac
+out=$(PTY_NO_COLOR= PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' --no-go drops trailing)
+case "$out" in *"${on}drops${off} ${on}trailing${off} commas"*) ;; *) fail "highlight: two terms not each marked:
+$out" ;; esac
+out=$(PTY_NO_COLOR= PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' --no-go WORK)
+case "$out" in *"dev-a:2 (${on}work${off})"*) ;; *) fail "highlight: tab name term not in reverse video:
+$out" ;; esac
+out=$(PTY_NO_COLOR= PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' --no-go 'g.')
+case "$out" in *"${on}"*) fail "highlight: a regex term matched as a pattern:
+$out" ;; esac
+out=$(PTY_WAIT_FOR="open which" PTY_DELAY=0.2 pty_find $'\033' --no-go parser)
+case "$out" in *"$on"*) fail "highlight: escapes with NO_COLOR set:
+$out" ;; esac
+case "$(find_ parser)" in *"$on"*) fail "highlight: escapes when not a terminal" ;; esac
 
 # --- --go takes the best match without asking: s2 (title match), attached ----
 # No cmux on the PATH, so it attaches (and, with no terminal, says so).
