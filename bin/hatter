@@ -11971,7 +11971,7 @@ watch_adopt_one() {
     [[ -n "$host" ]] || return 0
     # A mirror of a session that happens to be called "Terminal N" is not a
     # local shell, whatever its title says.
-    if cfg --arg s "$name" --arg m "$made" -e '[.groups[]?.sessions | keys[]?] | index([$s]) or index([$m])' >/dev/null 2>&1 \
+    if cfg --arg s "$name" --arg m "$made" -e '[.groups[]?.sessions | keys_unsorted[]?] | index([$s]) or index([$m])' >/dev/null 2>&1 \
         || cmux_pane_map "$host" "$made" </dev/null | jq -e --arg sf "$(upper "$sf")" \
              '.mirrored == true and any(.panes[]?; (.surface_id | ascii_upcase) == $sf)' >/dev/null 2>&1; then
         return 0
@@ -12025,7 +12025,10 @@ watch_adopt_run() {
     hatter_unlock
     focus_restore
     if [[ -n "$new" && -n "$was_on" && "$(upper "$was_on")" == "$(upper "$id")" ]]; then
-        cmux select-workspace --workspace "$new" --window "$win" >/dev/null 2>&1 </dev/null || true
+        cmux_change select-workspace --workspace "$new" --window "$win" >/dev/null 2>&1 </dev/null || true
+        # This move is meant to stay: the record cmux_change just made would
+        # have the watcher's next restore undo it.
+        [[ -z "$HATTER_FOCUS_FILE" ]] || rm -f "$HATTER_FOCUS_FILE"
     fi
     watch_log "made the new workspace '$name' a tmux session on hat '$hat'${gkey:+, in group '$gkey'}, in place of the local shell cmux opened"
     return 0
