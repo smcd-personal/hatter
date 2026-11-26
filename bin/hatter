@@ -5904,7 +5904,8 @@ PATHBLOCK
 # as its mount point when there was none. So with neither present, create one
 # that loads ~/.profile, which also keeps such a placeholder from appearing;
 # fill in an empty one the same way; and give one with content of its own and
-# no word of ~/.profile the PATH block itself, touching nothing else in it.
+# no word of ~/.profile on a line that is not a comment the PATH block
+# itself, touching nothing else in it.
 ensure_bash_login_path() {
     first=""
     for f in "$HOME/.bash_profile" "$HOME/.bash_login"; do
@@ -5920,7 +5921,8 @@ ensure_bash_login_path() {
 [ -f "$HOME/.profile" ] && . "$HOME/.profile"
 LOADPROFILE
         echo "made $first load ~/.profile"
-    elif ! grep -q '\.profile' "$first" 2>/dev/null; then
+    elif ! grep -v '^[[:space:]]*#' "$first" 2>/dev/null \
+            | grep -Eq '\.profile([^A-Za-z0-9_.]|$)'; then
         ensure_path_in "$first"
     fi
 }
@@ -17601,7 +17603,8 @@ Set up a shell server so its state survives both a reboot and a stray logout:
     to ~/.zprofile for zsh and to ~/.profile otherwise. A login bash skips
     ~/.profile when ~/.bash_profile or ~/.bash_login exists, so with bash
     provision makes an empty one load ~/.profile, gives one with lines of its
-    own that never mention ~/.profile the PATH block instead, and creates a
+    own that never mention ~/.profile outside a comment the PATH block
+    instead, and creates a
     ~/.bash_profile that loads ~/.profile when there is neither.
   - a `tabname` command on the server for naming the tab it is typed in:
       tabname            print this tab's name

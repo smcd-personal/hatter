@@ -70,6 +70,17 @@ grep -qF 'hatter: load ~/.profile' "$h/.bash_profile" && fail "own .bash_profile
 login "own .bash_profile" path-only; twice "own .bash_profile"
 echo "ok: a ~/.bash_profile of the user's own gets the PATH block only"
 
+# Naming ~/.profile only in a comment, or a file that merely starts with
+# that name, does not load it: those get the PATH block too.
+for body in '# see ~/.profile' '. ~/.profile_local'; do
+    newhome; printf '%s\nexport MINE=1\n' "$body" > "$h/.bash_profile"
+    : > "$h/.profile_local"
+    provision
+    grep -qF 'hatter: ~/.local/bin on PATH' "$h/.bash_profile" || fail ".bash_profile with '$body': no PATH block"
+    login ".bash_profile with '$body'" path-only; twice ".bash_profile with '$body'"
+done
+echo "ok: ~/.profile named only in a comment, or as a prefix, gets the PATH block"
+
 # One that already loads ~/.profile: left exactly as it was.
 newhome; printf '. ~/.profile\n' > "$h/.bash_profile"
 provision
