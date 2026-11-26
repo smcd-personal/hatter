@@ -5896,9 +5896,38 @@ PATHBLOCK
     echo "added ~/.local/bin to PATH in $f"
 }
 
+# A login bash reads only the first of ~/.bash_profile, ~/.bash_login and
+# ~/.profile that exists (#342). The block in ~/.profile is lost when either
+# of the others is there and does not load it, and so is everything else
+# ~/.profile loads, usually ~/.bashrc. Nobody has to write one for that: a
+# sandboxed tool run that masks dotfiles leaves an empty ~/.bash_profile behind
+# as its mount point when there was none. So with neither present, create one
+# that loads ~/.profile, which also keeps such a placeholder from appearing;
+# fill in an empty one the same way; and give one with content of its own and
+# no word of ~/.profile the PATH block itself, touching nothing else in it.
+ensure_bash_login_path() {
+    first=""
+    for f in "$HOME/.bash_profile" "$HOME/.bash_login"; do
+        [ -e "$f" ] && { first=$f; break; }
+    done
+    [ -n "$first" ] || first="$HOME/.bash_profile"
+    if grep -qF 'hatter: load ~/.profile' "$first" 2>/dev/null; then
+        return 0
+    fi
+    if [ ! -e "$first" ] || ! grep -qv '^[[:space:]]*\(#.*\)\{0,1\}$' "$first" 2>/dev/null; then
+        cat >> "$first" <<'LOADPROFILE'
+# hatter: load ~/.profile (a login bash reads only this file when it exists)
+[ -f "$HOME/.profile" ] && . "$HOME/.profile"
+LOADPROFILE
+        echo "made $first load ~/.profile"
+    elif ! grep -q '\.profile' "$first" 2>/dev/null; then
+        ensure_path_in "$first"
+    fi
+}
+
 case "$(basename "${SHELL:-/bin/sh}")" in
     zsh)  ensure_path_in "$HOME/.zprofile" ;;
-    bash) ensure_path_in "$HOME/.profile" ;;
+    bash) ensure_path_in "$HOME/.profile"; ensure_bash_login_path ;;
     *)    ensure_path_in "$HOME/.profile" ;;
 esac
 
@@ -17568,6 +17597,12 @@ Set up a shell server so its state survives both a reboot and a stray logout:
       bye session    close the session, and the cmux workspace with it
     `exit 99` does the same thing without the script. 99 rather than 1 because
     bare `exit` returns the last command's status, so 1 would fire by accident.
+    To find it, a login shell needs ~/.local/bin on PATH: provision adds that
+    to ~/.zprofile for zsh and to ~/.profile otherwise. A login bash skips
+    ~/.profile when ~/.bash_profile or ~/.bash_login exists, so with bash
+    provision makes an empty one load ~/.profile, gives one with lines of its
+    own that never mention ~/.profile the PATH block instead, and creates a
+    ~/.bash_profile that loads ~/.profile when there is neither.
   - a `tabname` command on the server for naming the tab it is typed in:
       tabname            print this tab's name
       tabname <name>     rename it (see: hatter help tab)
