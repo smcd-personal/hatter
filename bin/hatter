@@ -1013,11 +1013,19 @@ remember_session() {
     local group="$1" session="$2"
     # Only the groups of the same hat: a group of another hat that happens to
     # record the same name is a different session, on a different server.
+    # A session the group already records keeps its place in the group's
+    # order: a reattach goes through here, and deleting and adding it again
+    # moved it to the end, which the workspace's placing then followed (#341).
     jq_write --arg g "$group" --arg s "$session" '
         (.groups[$g].hat // null) as $h
-        | (first(.groups[] | select((.hat // null) == $h) | .sessions[$s]? // empty) // {windows: []}) as $e
-        | .groups |= map_values(if (.hat // null) == $h and .sessions then del(.sessions[$s]) else . end)
-        | .groups[$g].sessions[$s] = $e
+        | if (.groups[$g].sessions // {}) | has($s) then
+            .groups |= with_entries(if .key != $g and (.value.hat // null) == $h and .value.sessions
+                                    then del(.value.sessions[$s]) else . end)
+          else
+            (first(.groups[] | select((.hat // null) == $h) | .sessions[$s]? // empty) // {windows: []}) as $e
+            | .groups |= map_values(if (.hat // null) == $h and .sessions then del(.sessions[$s]) else . end)
+            | .groups[$g].sessions[$s] = $e
+          end
         | '"$PRUNE_UNASSIGNED"
 }
 
@@ -2166,6 +2174,45 @@ cmux_group_place() {
     [[ "$want" != null && "$at" != null && "$at" != "$want" ]] || return 0
     cmux_group_move "$ref" "$want" \
         || warn "could not put group '$(group_display "$key")' in its saved place"
+    return 0
+}
+
+# cmux_workspace_place <group key> <group ref> <workspace id> <window>: a
+# workspace hatter has just put into a group goes where the config keeps its
+# session among the group's sessions already there: right after the nearest
+# one saved before it, else right before the nearest one saved after it. cmux
+# adds a member right after the group's anchor, so a workspace the watcher
+# reattached came back first in its group, and the next sync saved that
+# (#341). The same as cmux_group_place, one level down. A workspace already in
+# place, or one whose session the group does not record, stays put, and so do
+# members the config does not know.
+cmux_workspace_place() {
+    local key="$1" ref="$2" ws="$3" win="$4" saved groups wsl move
+    saved=$(cfg -c --arg g "$key" '.groups[$g].sessions // {} | keys_unsorted') || return 0
+    groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || return 0
+    wsl=$(cmux_json workspace list --window "$win" 2>/dev/null) || return 0
+    move=$(jq -rn --argjson g "$groups" --argjson w "$wsl" --argjson c "$saved" \
+                  --arg r "$ref" --arg me "$ws" '
+        ([$w.workspaces[]? | {key: .id, value: (.title // "")}] | from_entries) as $title
+        | def rank($id): ($title[$id] // null) as $t
+                         | if $t == null then null else ($c | index($t)) end;
+          (first($g.groups[]? | select(.id == $r)) | .member_workspace_ids // []) as $m
+        | ($m | index($me)) as $at
+        | rank($me) as $ci
+        | if $at == null or $ci == null then empty else
+            [$m[] | select(. != $me) | {id: ., i: rank(.)} | select(.i != null)] as $known
+            | ([$m[:$at][] | rank(.) | select(. != null)] | all(. < $ci)) as $above_ok
+            | ([$m[$at + 1:][] | rank(.) | select(. != null)] | all(. > $ci)) as $below_ok
+            | ([$known[] | select(.i < $ci)] | max_by(.i)) as $before
+            | ([$known[] | select(.i > $ci)] | min_by(.i)) as $after
+            | if $above_ok and $below_ok then empty
+              elif $before != null then "--after\t\($before.id)"
+              elif $after != null then "--before\t\($after.id)"
+              else empty end
+          end' 2>/dev/null) || return 0
+    [[ -n "$move" ]] || return 0
+    cmux_change reorder-workspace --workspace "$ws" "${move%%$'\t'*}" "${move#*$'\t'}" --window "$win" >/dev/null 2>&1 \
+        || warn "could not put a workspace in its saved place in group '$(group_display "$key")'"
     return 0
 }
 
@@ -6166,6 +6213,7 @@ cmd_new() {
 
     cmux_group_add "$gref" "$wref" || die "cmux would not put '$session' into group '$(group_display "$group")'"
     apply_group_style "$group" "$gref"
+    cmux_workspace_place "$group" "$gref" "$wref" "$win"
     [[ "$had_un" == 0 ]] || drop_unassigned_now "$hat" "$win"
     discard_stray_workspace "$win"
     # Without --focus the run ends back where it started, so selecting the new
@@ -10524,7 +10572,9 @@ settle_ungrouped() {
             [[ -n "$ref" ]] || warn "could not create group '$name' in $hat's window"
         else
             while IFS= read -r s; do
-                if cmux_group_add "$ref" "$s"; then done_n=$((done_n + 1))
+                if cmux_group_add "$ref" "$s"; then
+                    done_n=$((done_n + 1))
+                    cmux_workspace_place "$g" "$ref" "$s" "$win"
                 else warn "could not put a workspace into group '$name'"; fi
             done <<<"$ids"
         fi
@@ -10918,9 +10968,22 @@ sync_once() {
                 continue
             fi
             echo "  $hat / $rn / $rs  kept ($place)"
+            # It goes back where the config had it among the sessions this
+            # pass recorded, not at the end: put at the end, a workspace cmux
+            # had let go of moved down its group once sync put it back (#341).
             patch=$(jq -c --arg g "$rg" --arg s "$rs" \
                           --argjson e "$(cfg -c --arg g "$rg" --arg s "$rs" '.groups[$g].sessions[$s]')" \
-                          '.[$g].sessions[$s] = $e' <<<"$patch")
+                          --argjson saved "$(cfg -c --arg g "$rg" '.groups[$g].sessions // {} | keys_unsorted')" '
+                (.[$g].sessions // {} | to_entries) as $en
+                | ($en | map(.key)) as $ks
+                | ($saved | index($s)) as $ci
+                | ([$saved[:$ci][]? | select(. as $k | $ks | index($k))] | last) as $b
+                | ([$saved[($ci // -1) + 1:][]? | select(. as $k | $ks | index($k))] | first) as $a
+                | (if $ci == null then ($en | length)
+                   elif $b != null then ($ks | index($b)) + 1
+                   elif $a != null then ($ks | index($a))
+                   else ($en | length) end) as $i
+                | .[$g].sessions = ($en[:$i] + [{key: $s, value: $e}] + $en[$i:] | from_entries)' <<<"$patch")
         done <<<"$unseen"
 
         # A group the window no longer shows, and that records no session, was
@@ -17423,7 +17486,10 @@ cmux puts a group it makes at the top of the window. So when hatter makes a
 group again (a reattach, `hatter new`, restore, or sync putting a loose
 workspace back), it moves it to its saved place among the hat's groups that
 are in the window. A group cmux no longer shows keeps its place in the saved
-order until then.
+order until then. The same goes one level down: cmux adds a workspace to a
+group right below the group's header, so a workspace hatter puts back into its
+group moves to its saved place among the group's workspaces, and a session
+cmux no longer shows keeps its place in the group's saved order.
 
 Only hats with an open window and a reachable server are touched; the rest are
 left as they are rather than being emptied.
