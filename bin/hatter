@@ -2205,7 +2205,13 @@ cmux_workspace_place() {
             | ([$m[$at + 1:][] | rank(.) | select(. != null)] | all(. > $ci)) as $below_ok
             | ([$known[] | select(.i < $ci)] | max_by(.i)) as $before
             | ([$known[] | select(.i > $ci)] | min_by(.i)) as $after
+            # In place: in saved order with every known member around it, or
+            # right below the nearest saved before it (or, with none, right
+            # above the nearest saved after it), which is where a move would
+            # put it anyway in a group already out of order.
             | if $above_ok and $below_ok then empty
+              elif $before != null and ($m | index($before.id)) == $at - 1 then empty
+              elif $before == null and $after != null and ($m | index($after.id)) == $at + 1 then empty
               elif $before != null then "--after\t\($before.id)"
               elif $after != null then "--before\t\($after.id)"
               else empty end

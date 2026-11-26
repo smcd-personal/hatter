@@ -180,6 +180,16 @@ expect "...and the config keeps the saved order" \
     "$(yes_if [ "$(jq -r '.groups.G.sessions | keys_unsorted | join(" ")' \
                   "$d/home/.config/hatter/config.json")" = "s1 s2 s3" ])"
 
+# A group already out of order: s2 right below s1 is where a move would put
+# it, so no reorder is sent.
+setup scrambled "s1 s2 s3" "s3 s1 s2"
+run_env bash -c "source '$lib'; cmux_workspace_place G g-G ws-s2 W1" >/dev/null 2>&1 || true
+expect "in a scrambled group, one right below its saved predecessor is not moved" \
+    "$(yes_if [ "$(reorders)" = 0 ])"
+setup scrambled2 "s1 s2 s3" "s3 s2 s1"
+run_env bash -c "source '$lib'; cmux_workspace_place G g-G ws-s2 W1" >/dev/null 2>&1 || true
+expect "...but one elsewhere still goes after it" "$(yes_if [ "$(members)" = "anchor s3 s1 s2" ])"
+
 # --- remember_session: a session the group records keeps its place ----------
 cfgorder() { jq -r --arg g "$1" '.groups[$g].sessions | keys_unsorted | join(" ")' "$d/home/.config/hatter/config.json"; }
 setup remember "" ""
@@ -194,6 +204,13 @@ run_env bash -c "source '$lib'; remember_session G s9" > /dev/null 2>&1 || true
 expect "...moves a session from another group of the hat, with its tabs" \
     "$(yes_if [ "$(cfgorder G)/$(cfgorder H)/$(jq -r '.groups.G.sessions.s9.windows[0].name' \
                     "$d/home/.config/hatter/config.json")" = "s1 s2 s3 s4 s9//w9" ])"
+# Recorded in its own group and, by mistake, in another of the hat as well:
+# it keeps its place, and the other group lets go of it.
+jq '.groups.H.sessions.s2 = {windows: []}' "$d/home/.config/hatter/config.json" > "$d/c" \
+    && mv "$d/c" "$d/home/.config/hatter/config.json"
+run_env bash -c "source '$lib'; remember_session G s2" > /dev/null 2>&1 || true
+expect "...drops a session its group records from the hat's other groups" \
+    "$(yes_if [ "$(cfgorder G)/$(cfgorder H)" = "s1 s2 s3 s4 s9/" ])"
 
 # --- sync: a loose workspace goes back into its group, in its place -----------
 setup sync "s1 s2 s3" "s1 s2"
@@ -208,6 +225,13 @@ expect "...in its saved place: s1 s2 s3" "$(yes_if [ "$(members)" = "anchor s1 s
 expect "...and the config keeps the saved order" \
     "$(yes_if [ "$(jq -r '.groups.G.sessions | keys_unsorted | join(" ")' \
                   "$d/home/.config/hatter/config.json")" = "s1 s2 s3" ])"
+
+# Saved first, so nothing saved before it is in the group: it goes before the
+# one saved after it, in the config as in cmux.
+setup sync3 "s1 s2 s3" "s2 s3"
+run_env /bin/bash "$hatter" sync > "$d/out" 2>&1 || true
+expect "sync puts one saved first back first, in cmux and in the config" \
+    "$(yes_if [ "$(members)/$(cfgorder G)" = "anchor s1 s2 s3/s1 s2 s3" ])"
 
 [ "$fails" -eq 0 ] || { echo "$fails failed"; exit 1; }
 echo "all passed"
