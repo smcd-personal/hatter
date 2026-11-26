@@ -111,5 +111,21 @@ reset; tree "$one" | jq -c '.windows[0].id = "W9" | .windows[0].workspaces |= ma
 echo '{"workspaces":[{"id":"NEW","title":"~","custom_title":null}]}' > "$STUB/list"; printf '%s' "$nogroups" > "$STUB/groups"
 expect "one in no hat's window stays" "" "$(one_run)"
 
+expect "a prompt sign is read the same with no UTF-8 locale" used \
+    "$(if printf 'me@mac ~ \xe2\x9d\xaf ls\n' | LC_ALL=C /bin/bash "$hatter" _adopt-blank; then echo blank; else echo used; fi)"
+expect "a ❯ prompt is blank with no UTF-8 locale" blank \
+    "$(if printf 'me@mac ~ \xe2\x9d\xaf \n' | LC_ALL=C /bin/bash "$hatter" _adopt-blank; then echo blank; else echo used; fi)"
+
+# Two hats on one server share the window: only a group says which.
+jq '.hats.ops = {"ssh":"me@dev.example.com"} | .groups.ops = {"hat":"ops","sessions":{"ops-db":{}}}' \
+    "$XDG_CONFIG_HOME/hatter/config.json" > "$work/c" && cp "$XDG_CONFIG_HOME/hatter/config.json" "$work/c0" \
+    && mv "$work/c" "$XDG_CONFIG_HOME/hatter/config.json"
+reset; tree "$one" | jq -c '.windows[0].workspaces += [{"id":"WS-DB","title":"ops-db","panes":[]}]' > "$STUB/tree"
+jq -c '.workspaces += [{"id":"WS-DB","title":"ops-db"}]' "$STUB/list" > "$work/l" && mv "$work/l" "$STUB/list"
+expect "with hats sharing the window, its group decides" "adopt NEW as Terminal 4 on dev into web" "$(one_run)"
+printf '%s' "$nogroups" > "$STUB/groups"
+expect "with hats sharing a server and no group, the window's own hat" "adopt NEW as Terminal 4 on dev" "$(one_run)"
+mv "$work/c0" "$XDG_CONFIG_HOME/hatter/config.json"
+
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"

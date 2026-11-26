@@ -233,5 +233,16 @@ expect "a new Terminal N workspace is noted, and syncs" \
 expect "a window's first, a mirror and a renamed one are not noted" \
     "$(grep -c '^noted' <<<"$out" | grep -qx 1 && echo y)" "$out"
 
+out=$(watch created-odd <<<"$ack
+SLEEP 2
+{\"type\":\"event\",\"name\":\"workspace.created\",\"workspace_id\":\"WS-P\"}
+SLEEP 2
+{\"type\":\"event\",\"name\":\"workspace.created\",\"workspace_id\":\"WS-O\",\"occurred_at\":\"2020-01-01T00:00:00.000Z\",\"payload\":{\"title\":\"Terminal 4\",\"custom_title\":null,\"tab_count\":4}}
+SLEEP 2")
+expect "a created event with no payload still syncs" \
+    "$(sed -n 4p <<<"$out" | grep -qx 'sync' && echo y)" "$out"
+expect "a replayed old Terminal N is not noted" \
+    "$(grep -q '^noted' <<<"$out" || echo y)" "$out"
+
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"

@@ -11623,7 +11623,9 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 #                           workspace, titled "Terminal N", in a window that
 #                           already had others (#339); the layout changed too.
 #                           A window's first workspace is not one: that is a
-#                           new window's placeholder.
+#                           new window's placeholder. Nor is one replayed
+#                           from more than a minute ago (the cursor), which
+#                           nobody has just added.
 #   sync                    the layout changed
 # and "eof" once the stream ends. Heartbeats are asked for and dropped here:
 # they keep a stream whose reader has gone from outliving it for long.
@@ -11682,9 +11684,12 @@ WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try f
             then "user" else "lost" end) as $k
          | .sel[$w] = false
          | .out = "closed\t\(($e.payload | objects | .title) // "" | tostring | gsub("[\t\n\r]"; " "))\t\($k)"
-       elif $e.name == "workspace.created" and ($e.payload | objects | .custom_title) == null
-            and (($e.payload | objects | .title) // "" | tostring | test("^Terminal [0-9]+$"))
-            and ((($e.payload | objects | .tab_count) // 0) | tonumber? // 0) > 1
+       elif $e.name == "workspace.created"
+            and ((($e.payload | objects) // {}) as $p
+                 | ($p.custom_title == null)
+                   and (($p.title // "") | tostring | test("^Terminal [0-9]+$"))
+                   and ((($p.tab_count // 0) | tonumber? // 0) > 1))
+            and ((($e | at) // now) > (now - 60))
          then .out = "created\t\($e.workspace_id // $e.payload.workspace_id? // "")\t\($e.payload.title)"
        elif (($e.name // "") | tostring | test("^(workspace[.](created|closed|reordered)|surface[.](created|closed))$"))
          then .out = "sync"
@@ -11858,7 +11863,6 @@ watch_sync() {
 # takes the "<hat>-" prefix, as for any new workspace (hat_new_name).
 WATCH_ADOPT_AFTER=10
 WATCH_ADOPT_GIVEUP=300    # a hatter command holding the config this long: let it be
-WATCH_ADOPT_CAP=120       # wall clock for the `hatter new` it runs
 WATCH_ADOPT_PENDING=""    # workspace TAB title cmux created it with TAB when seen
 
 # adopt_plan <tree> <workspace list> <groups> <workspace id> <created title>
@@ -11895,19 +11899,22 @@ adopt_screen_blank() {
     lines=$(printf '%s\n' "$1" | grep '[^[:space:]]' || true)
     [[ -z "$lines" ]] && return 0
     [[ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" == 1 ]] || return 1
-    printf '%s\n' "$lines" | grep -qE '[%$#>❯»➜][[:space:]]*$'
+    # Alternation, not a bracket: the watcher may run with no UTF-8 locale,
+    # where a bracket would take each byte of ❯ for a prompt sign of its own.
+    printf '%s\n' "$lines" | grep -qE '(%|[$]|#|>|❯|»|➜)[[:space:]]*$'
 }
 
 # adopt_hat <window> <cmux group name>: the hat a window is, preferring the
 # one whose group the workspace sits in when hats share a window. Empty when
-# the window is no hat's.
+# the window is no hat's, or when hats share it and no group says which.
 adopt_hat() {
-    local win="$1" gname="$2" hat first="" k
+    local win="$1" gname="$2" hat first="" k n=0
     cmux_snapshot
     while IFS= read -r hat; do
         [[ -n "$hat" ]] || continue
         [[ "$(find_hat_window "$hat")" == "$win" ]] || continue
         [[ -n "$first" ]] || first=$hat
+        n=$((n + 1))
         if [[ -n "$gname" ]]; then
             k=$(cfg --arg h "$hat" --arg n "$gname" 'first(.groups | to_entries[]
                 | select(.value.hat == $h and ((.value.name // .key) == $n)) | .key) // empty')
@@ -11915,6 +11922,9 @@ adopt_hat() {
         fi
     done < <(hat_names)
     cmux_snapshot_drop
+    # Hats sharing the window, and no group of theirs to say which: guessing
+    # could put the session on the wrong server.
+    [[ "$n" -le 1 ]] || return 0
     printf '%s' "$first"
 }
 
@@ -11942,8 +11952,14 @@ watch_adopt() {
         done <<<"$due"
         return 0
     fi
+    local rc
     while IFS=$'\t' read -r id made seen; do
-        [[ -z "$id" ]] || watch_adopt_one "$id" "$made"
+        [[ -n "$id" ]] || continue
+        rc=0; watch_adopt_one "$id" "$made" || rc=$?
+        # 3: the config lock was taken meanwhile; look again next round.
+        if [[ "$rc" == 3 ]] && (( now - seen < WATCH_ADOPT_GIVEUP )); then
+            WATCH_ADOPT_PENDING+="$id"$'\t'"$made"$'\t'"$seen"$'\n'
+        fi
     done <<<"$due"
     return 0
 }
@@ -11992,17 +12008,18 @@ watch_adopt_one() {
         echo "adopt $id as $name on $hat${gkey:+ into $gkey}"
         return 0
     fi
-    watch_adopt_run "$id" "$win" "$hat" "$name" "$gkey"
+    watch_adopt_run "$id" "$win" "$hat" "$name" "$gkey" "$made"
 }
 
-# watch_adopt_run <local workspace> <window> <hat> <session> <group key or empty>
+# watch_adopt_run <local workspace> <window> <hat> <session> <group key or empty> <made>
+# Returns 3 when another hatter holds the config, so the caller can retry.
 # Under the config lock, as watch_reattach runs it: `hatter new` in a
 # subshell, then the new workspace to the local one's place, then the local
 # one closed. Focus goes back where it was, or to the new workspace when it
 # was on the local one.
 watch_adopt_run() {
-    local id="$1" win="$2" hat="$3" name="$4" gkey="$5" was_on="" err rc=0 new=""
-    hatter_lock 20 || { watch_log "another hatter command is running; left '$name' a local shell"; return 0; }
+    local id="$1" win="$2" hat="$3" name="$4" gkey="$5" made="${6:-}" was_on="" err rc=0 new="" tree verdict sf screen
+    hatter_lock 2 || return 3
     was_on=$(focus_now 2>/dev/null | cut -d '|' -f 2) || was_on=""
     err=$( ( cmd_new "$name" --hat "$hat" ${gkey:+--group "$gkey"} ) 2>&1 >/dev/null </dev/null ) || rc=$?
     if [[ "$rc" != 0 ]]; then
@@ -12020,6 +12037,27 @@ watch_adopt_run() {
     # new one out of the group `hatter new` put it in.
     if [[ -n "$new" && -n "$gkey" ]]; then
         cmux_change reorder-workspace --workspace "$new" --before "$id" --window "$win" >/dev/null 2>&1 </dev/null || true
+    fi
+    # The close is forced, so look again first: `hatter new` takes seconds,
+    # and the user may have started using the local shell meanwhile. And
+    # with no new workspace to show for it, the local one stays too.
+    verdict=""
+    if [[ -n "$new" ]] && tree=$(cmux_json tree --all 2>/dev/null </dev/null); then
+        IFS=$'\t' read -r verdict _ sf _ <<<"$(adopt_plan "$tree" '{}' '{}' "$id" "$made")"
+        if [[ "$verdict" == go ]]; then
+            screen=$(cmux read-screen --surface "$sf" --workspace "$id" --window "$win" </dev/null 2>/dev/null) \
+                && adopt_screen_blank "$screen" || verdict=used
+        fi
+    fi
+    if [[ "$verdict" != go ]]; then
+        hatter_unlock
+        focus_restore
+        if [[ -z "$new" ]]; then
+            watch_log "made '$name' a tmux session on hat '$hat', but no workspace for it appeared; left the local shell open"
+        else
+            watch_log "made '$name' a tmux session on hat '$hat'; left the local shell open beside it, as it is in use now"
+        fi
+        return 0
     fi
     cmux_change close-workspace --force --workspace "$id" --window "$win" >/dev/null 2>&1 </dev/null || true
     hatter_unlock
@@ -13538,8 +13576,12 @@ watch_stream() {
                     sync=1 ;;
                 created$'\t'*)
                     IFS=$'\t' read -r kind w sf <<<"$line"
-                    [[ -z "$w" ]] || WATCH_ADOPT_PENDING+="$w"$'\t'"$sf"$'\t'"$(date +%s)"$'\n'
-                    [[ -z "${HATTER_WATCH_DRY:-}" || -z "$w" ]] || echo "noted $w ($sf)"
+                    # Both, or neither: tab is whitespace to read, so an empty
+                    # id would shift the title into its place.
+                    if [[ -n "$w" && -n "$sf" ]]; then
+                        WATCH_ADOPT_PENDING+="$w"$'\t'"$sf"$'\t'"$(date +%s)"$'\n'
+                        [[ -z "${HATTER_WATCH_DRY:-}" ]] || echo "noted $w ($sf)"
+                    fi
                     sync=1 ;;
                 sync) sync=1 ;;
                 eof) break ;;
