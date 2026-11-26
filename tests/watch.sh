@@ -216,5 +216,22 @@ expect "a killed watcher leaves no fifo behind" \
     "$([[ -z "$(ls -A "$d/tmp")" ]] && echo y)" "$(ls -la "$d/tmp")"
 [[ -z "$left" ]] || kill $left 2>/dev/null || true
 
+# cmux's New Workspace (#339): a "Terminal N" with no custom title, in a window
+# that had others, is noted for the new-workspace check; anything else that
+# is created only syncs.
+made() { printf '{"type":"event","name":"workspace.created","workspace_id":"%s","payload":{"title":"%s","custom_title":%s,"tab_count":%s}}\n' "$@"; }
+out=$(watch created <<<"$ack
+SLEEP 2
+$(made WS-N 'Terminal 4' null 4)
+SLEEP 2
+$(made WS-1 'Terminal 1' null 1)
+$(made WS-T dev-api null 4)
+$(made WS-C 'Terminal 5' '"notes"' 4)
+SLEEP 2")
+expect "a new Terminal N workspace is noted, and syncs" \
+    "$(sed -n 4,5p <<<"$out" | tr '\n' ' ' | grep -qx 'noted WS-N (Terminal 4) sync ' && echo y)" "$out"
+expect "a window's first, a mirror and a renamed one are not noted" \
+    "$(grep -c '^noted' <<<"$out" | grep -qx 1 && echo y)" "$out"
+
 [[ "$fails" == 0 ]] || { echo "$fails failed"; exit 1; }
 echo "all passed"

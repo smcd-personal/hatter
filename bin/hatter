@@ -11618,6 +11618,12 @@ WATCH_MAX_WAIT=5     # but never hold an action longer than this
 #                           (drop events carry no window id)
 #   closed<TAB>title<TAB>user|lost   a workspace closed; the layout changed too.
 #                           Its title is the tmux session it mirrored.
+#   created<TAB>workspace<TAB>title
+#                           cmux's own New Workspace made a local shell
+#                           workspace, titled "Terminal N", in a window that
+#                           already had others (#339); the layout changed too.
+#                           A window's first workspace is not one: that is a
+#                           new window's placeholder.
 #   sync                    the layout changed
 # and "eof" once the stream ends. Heartbeats are asked for and dropped here:
 # they keep a stream whose reader has gone from outliving it for long.
@@ -11676,6 +11682,10 @@ WATCH_JQ='def at: (.occurred_at // "" | tostring | sub("[.][0-9]+"; "") | (try f
             then "user" else "lost" end) as $k
          | .sel[$w] = false
          | .out = "closed\t\(($e.payload | objects | .title) // "" | tostring | gsub("[\t\n\r]"; " "))\t\($k)"
+       elif $e.name == "workspace.created" and ($e.payload | objects | .custom_title) == null
+            and (($e.payload | objects | .title) // "" | tostring | test("^Terminal [0-9]+$"))
+            and ((($e.payload | objects | .tab_count) // 0) | tonumber? // 0) > 1
+         then .out = "created\t\($e.workspace_id // $e.payload.workspace_id? // "")\t\($e.payload.title)"
        elif (($e.name // "") | tostring | test("^(workspace[.](created|closed|reordered)|surface[.](created|closed))$"))
          then .out = "sync"
        else . end;
@@ -11822,6 +11832,203 @@ watch_sync() {
         [[ -z "$h" ]] || watch_log "closed the snooze box from $h: snoozed tabs stay hidden"
     done < <(hide_snooze_box)
     autosave_sync watch
+}
+
+# ------------------------------------------- a new workspace is a remote one
+#
+# A workspace added from cmux's own New Workspace is a local shell on the Mac,
+# titled "Terminal N". In a hat's window that is almost never what was meant
+# (#339): the window is there for the hat's server. So the watcher notes each
+# one cmux creates (WATCH_JQ's "created"), and WATCH_ADOPT_AFTER seconds later,
+# if it is still a local shell nobody has used, makes it a tmux session on the
+# hat's server: `hatter new` with the workspace's name, in its cmux group and
+# at its place, then closes the local one. The user stays on the new one if
+# they were on the old.
+#
+# "Nobody has used" is strict: one pane, one terminal tab, and that tab shows
+# a shell prompt and nothing else. A typed command that ran leaves more on
+# screen, or leaves the prompt line not ending in a prompt sign, and the
+# workspace stays local. So does one in a window that is no hat's, a group's
+# anchor, and anything cmux mirrors.
+#
+# The name is the workspace's custom title when the user already gave it one,
+# else the "Terminal N" cmux gave it. Renaming it later in cmux's sidebar is
+# fine: cmux renames a mirrored workspace's tmux session with it, and sync
+# moves the config entry to the new name. A name already taken on the server
+# takes the "<hat>-" prefix, as for any new workspace (hat_new_name).
+WATCH_ADOPT_AFTER=10
+WATCH_ADOPT_GIVEUP=300    # a hatter command holding the config this long: let it be
+WATCH_ADOPT_CAP=120       # wall clock for the `hatter new` it runs
+WATCH_ADOPT_PENDING=""    # workspace TAB title cmux created it with TAB when seen
+
+# adopt_plan <tree> <workspace list> <groups> <workspace id> <created title>
+# Whether a workspace cmux created may become a remote one, from cmux alone:
+# <tree> is `tree --all`, <workspace list> and <groups> are `workspace list`
+# and `workspace-group list` of the window holding it. Prints one line:
+#   skip<TAB>why
+#   go<TAB>window<TAB>surface<TAB>name<TAB>group name, or empty
+adopt_plan() {
+    jq -rn --argjson t "$1" --argjson l "$2" --argjson g "$3" --arg id "$(upper "$4")" --arg made "$5" '
+        def up: tostring | ascii_upcase;
+        (first($t.windows[]? as $w | $w.workspaces[]? | select((.id | up) == $id) | {w: $w.id, ws: .}) // null) as $f
+        | if $f == null then "skip\tit is gone"
+          else
+            ($f.ws | [.panes[]?]) as $p
+            | ($p | map(.surfaces[]?)) as $s
+            | (first($l.workspaces[]? | select((.id | up) == $id)) // {}) as $e
+            | ([$g.groups[]? | .anchor_workspace_id // empty | up] | index([$id])) as $anchor
+            | (first($g.groups[]? | select([.member_workspace_ids[]? | up] | index([$id])) | .name) // "") as $group
+            | (($e.custom_title // "") | tostring) as $custom
+            | if $anchor != null then "skip\tit is a group anchor"
+              elif ($p | length) != 1 then "skip\tit has \($p | length) panes"
+              elif ($s | length) != 1 then "skip\tit has \($s | length) tabs"
+              elif ($s[0].type // "terminal") != "terminal" then "skip\tits tab is not a terminal"
+              else ["go", $f.w, $s[0].id, (if $custom != "" then $custom else $made end), $group] | join("\t")
+              end
+          end' 2>/dev/null || printf 'skip\tcmux could not say\n'
+}
+
+# adopt_screen_blank <screen>: the tab shows a shell prompt and nothing more.
+# Nothing at all counts too: there is nothing on it to lose.
+adopt_screen_blank() {
+    local lines
+    lines=$(printf '%s\n' "$1" | grep '[^[:space:]]' || true)
+    [[ -z "$lines" ]] && return 0
+    [[ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" == 1 ]] || return 1
+    printf '%s\n' "$lines" | grep -qE '[%$#>❯»➜][[:space:]]*$'
+}
+
+# adopt_hat <window> <cmux group name>: the hat a window is, preferring the
+# one whose group the workspace sits in when hats share a window. Empty when
+# the window is no hat's.
+adopt_hat() {
+    local win="$1" gname="$2" hat first="" k
+    cmux_snapshot
+    while IFS= read -r hat; do
+        [[ -n "$hat" ]] || continue
+        [[ "$(find_hat_window "$hat")" == "$win" ]] || continue
+        [[ -n "$first" ]] || first=$hat
+        if [[ -n "$gname" ]]; then
+            k=$(cfg --arg h "$hat" --arg n "$gname" 'first(.groups | to_entries[]
+                | select(.value.hat == $h and ((.value.name // .key) == $n)) | .key) // empty')
+            [[ -z "$k" ]] || { cmux_snapshot_drop; printf '%s' "$hat"; return 0; }
+        fi
+    done < <(hat_names)
+    cmux_snapshot_drop
+    printf '%s' "$first"
+}
+
+watch_adopt() {
+    [[ -n "$WATCH_ADOPT_PENDING" ]] || return 0
+    local now keep="" due="" id made seen
+    now=$(date +%s)
+    while IFS=$'\t' read -r id made seen; do
+        [[ -n "$id" ]] || continue
+        if (( now - seen >= WATCH_ADOPT_AFTER )); then due+="$id"$'\t'"$made"$'\t'"$seen"$'\n'
+        else keep+="$id"$'\t'"$made"$'\t'"$seen"$'\n'; fi
+    done <<<"$WATCH_ADOPT_PENDING"
+    WATCH_ADOPT_PENDING=$keep
+    [[ -n "$due" ]] || return 0
+    # A hatter command holds the config, and may be what made it: look again
+    # next round, for a while.
+    if [[ -d "$LOCK_DIR" ]]; then
+        while IFS=$'\t' read -r id made seen; do
+            [[ -n "$id" ]] || continue
+            if (( now - seen < WATCH_ADOPT_GIVEUP )); then
+                WATCH_ADOPT_PENDING+="$id"$'\t'"$made"$'\t'"$seen"$'\n'
+            else
+                watch_log "left '$made' a local shell: another hatter command held the config for ${WATCH_ADOPT_GIVEUP}s"
+            fi
+        done <<<"$due"
+        return 0
+    fi
+    while IFS=$'\t' read -r id made seen; do
+        [[ -z "$id" ]] || watch_adopt_one "$id" "$made"
+    done <<<"$due"
+    return 0
+}
+
+# watch_adopt_one <workspace id> <title cmux created it with>
+watch_adopt_one() {
+    local id="$1" made="$2" tree list groups plan verdict win sf name gname hat host gkey="" screen rc
+    tree=$(cmux_json tree --all 2>/dev/null) || return 0
+    win=$(tree_workspace_window "$tree" "$id")
+    [[ -n "$win" ]] || return 0
+    list=$(cmux_json workspace list --window "$win" 2>/dev/null) || list='{}'
+    groups=$(cmux_json workspace-group list --window "$win" 2>/dev/null) || groups='{}'
+    [[ "$list" == "{"* ]] || list='{}'
+    [[ "$groups" == "{"* ]] || groups='{}'
+    plan=$(adopt_plan "$tree" "$list" "$groups" "$id" "$made")
+    IFS=$'\t' read -r verdict win sf name gname <<<"$plan"
+    if [[ "$verdict" != go ]]; then
+        [[ "$win" == "it is gone" || "$win" == "it is a group anchor" ]] \
+            || watch_log "left '$made' a local shell: $win"
+        return 0
+    fi
+    hat=$(adopt_hat "$win" "$gname")
+    [[ -n "$hat" ]] || return 0
+    host=$(hat_ssh "$hat")
+    [[ -n "$host" ]] || return 0
+    # A mirror of a session that happens to be called "Terminal N" is not a
+    # local shell, whatever its title says.
+    if cfg --arg s "$name" --arg m "$made" -e '[.groups[]?.sessions | keys[]?] | index([$s]) or index([$m])' >/dev/null 2>&1 \
+        || cmux_pane_map "$host" "$made" </dev/null | jq -e --arg sf "$(upper "$sf")" \
+             '.mirrored == true and any(.panes[]?; (.surface_id | ascii_upcase) == $sf)' >/dev/null 2>&1; then
+        return 0
+    fi
+    rc=0
+    screen=$(cmux read-screen --surface "$sf" --workspace "$id" --window "$win" </dev/null 2>/dev/null) || rc=$?
+    if [[ "$rc" != 0 ]] || ! adopt_screen_blank "$screen"; then
+        watch_log "left '$name' a local shell: its tab is in use"
+        return 0
+    fi
+    if [[ -n "$gname" ]]; then
+        gkey=$(cfg --arg h "$hat" --arg n "$gname" 'first(.groups | to_entries[]
+            | select(.value.hat == $h and ((.value.name // .key) == $n) and (.value.managed | not)) | .key) // empty')
+    fi
+    name=$(hat_new_name "$hat" "$(tmux_session_name "$name")" 2>/dev/null) || return 0
+    [[ -n "$name" ]] || return 0
+    if [[ -n "${HATTER_WATCH_DRY:-}" ]]; then
+        echo "adopt $id as $name on $hat${gkey:+ into $gkey}"
+        return 0
+    fi
+    watch_adopt_run "$id" "$win" "$hat" "$name" "$gkey"
+}
+
+# watch_adopt_run <local workspace> <window> <hat> <session> <group key or empty>
+# Under the config lock, as watch_reattach runs it: `hatter new` in a
+# subshell, then the new workspace to the local one's place, then the local
+# one closed. Focus goes back where it was, or to the new workspace when it
+# was on the local one.
+watch_adopt_run() {
+    local id="$1" win="$2" hat="$3" name="$4" gkey="$5" was_on="" err rc=0 new=""
+    hatter_lock 20 || { watch_log "another hatter command is running; left '$name' a local shell"; return 0; }
+    was_on=$(focus_now 2>/dev/null | cut -d '|' -f 2) || was_on=""
+    err=$( ( cmd_new "$name" --hat "$hat" ${gkey:+--group "$gkey"} ) 2>&1 >/dev/null </dev/null ) || rc=$?
+    if [[ "$rc" != 0 ]]; then
+        err=$(printf '%s\n' "$err" | grep -m 1 '^error:' | cut -c 1-160 || true)
+        watch_log "could not make '$name' a tmux session on hat '$hat'${err:+: ${err#error: }}; left it a local shell"
+        hatter_unlock
+        focus_restore
+        return 0
+    fi
+    # By title, but not the local one: it can carry the same name.
+    new=$(cmux_json workspace list --window "$win" 2>/dev/null </dev/null \
+        | jq -r --arg t "$name" --arg id "$(upper "$id")" \
+            'first(.workspaces[]? | select(.title == $t and ((.id | ascii_upcase) != $id)) | .id) // empty' 2>/dev/null || true)
+    # Only within the group it was in: anywhere else, a move could take the
+    # new one out of the group `hatter new` put it in.
+    if [[ -n "$new" && -n "$gkey" ]]; then
+        cmux_change reorder-workspace --workspace "$new" --before "$id" --window "$win" >/dev/null 2>&1 </dev/null || true
+    fi
+    cmux_change close-workspace --force --workspace "$id" --window "$win" >/dev/null 2>&1 </dev/null || true
+    hatter_unlock
+    focus_restore
+    if [[ -n "$new" && -n "$was_on" && "$(upper "$was_on")" == "$(upper "$id")" ]]; then
+        cmux select-workspace --workspace "$new" --window "$win" >/dev/null 2>&1 </dev/null || true
+    fi
+    watch_log "made the new workspace '$name' a tmux session on hat '$hat'${gkey:+, in group '$gkey'}, in place of the local shell cmux opened"
+    return 0
 }
 
 # Installing hatter replaces the file. A watcher that keeps running would keep
@@ -13264,6 +13471,7 @@ watch_act() {
     watch_signin
     watch_ready
     watch_working
+    watch_adopt
     # A reattach that is due again (#229) is a close to look at, like one
     # that just came in.
     local retry=0
@@ -13324,6 +13532,11 @@ watch_stream() {
                     sync=1 ;;
                 closed$'\t'*)
                     closes+="${line#closed?}"$'\n'
+                    sync=1 ;;
+                created$'\t'*)
+                    IFS=$'\t' read -r kind w sf <<<"$line"
+                    [[ -z "$w" ]] || WATCH_ADOPT_PENDING+="$w"$'\t'"$sf"$'\t'"$(date +%s)"$'\n'
+                    [[ -z "${HATTER_WATCH_DRY:-}" || -z "$w" ]] || echo "noted $w ($sf)"
                     sync=1 ;;
                 sync) sync=1 ;;
                 eof) break ;;
@@ -16251,8 +16464,9 @@ Snapshots of config.json, kept separately from git.
                      restore), sync from the live client, snapshot, then back
                      up if due (what the timer runs)
   watch              Follow cmux events: move a dragged tab the moment it is
-                     dropped, sync a second after any layout change, and say
-                     when a closed workspace's tmux session still runs
+                     dropped, sync a second after any layout change, make a
+                     new local workspace in a hat window a remote one, and
+                     say when a closed workspace's tmux session still runs
                      (what the watcher runs; stays in the foreground)
   now                Snapshot only, no sync
   list               Show the checkpoints and the rolling save
@@ -16267,6 +16481,17 @@ The watcher reacts at once but only to what cmux reports: renames and group
 changes send no event, so the timer still catches those within a minute, and
 anything that happened while the watcher was down. It restarts itself when
 hatter is reinstalled. Log: ~/.config/hatter/autosave/watch.log
+
+A workspace you add with cmux's own New Workspace is a local shell on the Mac.
+In a hat's window the watcher takes it for a new remote workspace: 10 seconds
+after cmux makes it, if it is still one pane with one terminal tab showing only
+a shell prompt, it becomes a tmux session on the hat's server, as `hatter new`
+would make it, in the same group and place, and the local shell closes. You
+stay on it if you were on it. The session takes the name you gave the
+workspace, or cmux's "Terminal N" if you have not named it yet; rename it in
+cmux's sidebar whenever you like, and the tmux session and the config follow.
+A workspace you have already typed a command in stays local, and so does one
+in a window that is no hat's. The log says which.
 
 When cmux closes the workspace of a recorded session and the tmux session
 still runs on its server, the watcher looks at who closed it. cmux closes a
@@ -17468,7 +17693,7 @@ seed_config
 # so on a phone, or any machine that only reaches its hats, it opens the
 # attach picker instead.
 case "$cmd" in
-    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|state|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan|_leftover-plan) ;;
+    provision|creds|cred|credential|credentials|backup|autosave|tab|hat|login|attach|find|ps|state|key|resize|shortcuts|rm|remove|help|-h|--help|_drag-plan|_leftover-plan|_adopt-plan|_adopt-blank) ;;
     "") if ! command -v cmux >/dev/null 2>&1; then
             if [[ -t 0 && -t 1 ]]; then cmd=attach; else usage_main; exit 0; fi
         fi ;;
@@ -17481,7 +17706,7 @@ trap 'hatter_on_exit $?' EXIT
 case "$cmd" in
     # attach ends in exec, which skips the EXIT trap that would unlock.
     # sync takes the lock itself, only for its final write.
-    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|state|resize|shortcuts|sync|_drag-plan|_leftover-plan|_drag-heal|snooze|unsnooze|snoozed|hibernated|wake) ;;
+    rack|edit|list|ls|help|""|-h|--help|autosave|attach|find|ps|state|resize|shortcuts|sync|_drag-plan|_leftover-plan|_drag-heal|_adopt-plan|_adopt-blank|_adopt-one|snooze|unsnooze|snoozed|hibernated|wake) ;;
     *) hatter_lock 20 || die "another hatter is writing the config - try again in a moment" ;;
 esac
 
@@ -17548,6 +17773,10 @@ case "$cmd" in
     # Not for people: the dragged-tab planner, and the healer, for the tests.
     _drag-plan) drag_plan ;;
     _leftover-plan) leftover_plan ;;
+    # The new-workspace check's pieces (#339), for the tests.
+    _adopt-plan) adopt_plan "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" ;;
+    _adopt-blank) adopt_screen_blank "$(cat)" ;;
+    _adopt-one) watch_adopt_one "${1:-}" "${2:-}" ;;
     _drag-heal) heal_dragged_tabs "${1:-}" "${2:-report}" "${3:-}" "${4:-}" ;;
     restore)   cmd_restore "$@" ;;
 
