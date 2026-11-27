@@ -11951,9 +11951,10 @@ watch_sync() {
 # they were on the old.
 #
 # "Nobody has used" is strict: one pane, one terminal tab, and that tab shows
-# a shell prompt and nothing else. A typed command that ran leaves more on
-# screen, or leaves the prompt line not ending in a prompt sign, and the
-# workspace stays local. So does one in a window that is no hat's, a group's
+# a shell prompt and at most what the shell printed before it, such as macOS's
+# "Last login" line (adopt_screen_blank). A typed command that ran leaves its
+# prompt line above the new one, or leaves the prompt line not ending in a
+# prompt sign, and the workspace stays local. So does one in a window that is no hat's, a group's
 # anchor, and anything cmux mirrors.
 #
 # The name is the workspace's custom title when the user already gave it one,
@@ -11992,16 +11993,43 @@ adopt_plan() {
           end' 2>/dev/null || printf 'skip\tcmux could not say\n'
 }
 
-# adopt_screen_blank <screen>: the tab shows a shell prompt and nothing more.
-# Nothing at all counts too: there is nothing on it to lose.
+# adopt_screen_blank <screen>: the tab shows a shell prompt, waiting, and
+# nothing typed at it before. Nothing at all counts too: there is nothing on
+# it to lose.
+#
+# A shell can print before its first prompt: macOS login(1) prints "Last
+# login: ..." on every new terminal, macOS bash nags about zsh, a profile can
+# greet (#345). That start-up text is up to ADOPT_PREAMBLE_MAX lines above
+# the prompt, and none of them starts the way the prompt does: a command run
+# at the prompt leaves its prompt line above the new one, and that line starts
+# with the same user@host or directory, or holds a prompt sign with a command
+# after it. More lines than that is output, perhaps long enough to have
+# scrolled its prompt line away, so the tab is in use.
+ADOPT_PREAMBLE_MAX=3
 adopt_screen_blank() {
-    local lines
+    local lines last head line n
     lines=$(printf '%s\n' "$1" | grep '[^[:space:]]' || true)
     [[ -z "$lines" ]] && return 0
-    [[ "$(printf '%s\n' "$lines" | wc -l | tr -d ' ')" == 1 ]] || return 1
+    n=$(printf '%s\n' "$lines" | wc -l | tr -d ' ')
+    (( n - 1 <= ADOPT_PREAMBLE_MAX )) || return 1
+    last=$(printf '%s\n' "$lines" | tail -n 1)
     # Alternation, not a bracket: the watcher may run with no UTF-8 locale,
     # where a bracket would take each byte of ❯ for a prompt sign of its own.
-    printf '%s\n' "$lines" | grep -qE '(%|[$]|#|>|❯|»|➜)[[:space:]]*$'
+    printf '%s\n' "$last" | grep -qE '(%|[$]|#|>|❯|»|➜)[[:space:]]*$' || return 1
+    (( n > 1 )) || return 0
+    # The prompt's first word: "me@mac" of "me@mac ~ %" and of "me@mac:~$".
+    last=${last#"${last%%[![:space:]]*}"}
+    head=${last%%[[:space:]:]*}
+    [[ -n "$head" ]] || head=$last
+    while IFS= read -r line; do
+        line=${line#"${line%%[![:space:]]*}"}
+        [[ "$line" != "$head"* ]] || return 1
+        # A prompt that has changed since, as a cd changes "~ ❯" to "/tmp ❯",
+        # still shows a prompt sign with a command after it. Start-up text
+        # that happens to look like one stays local: the safe way to be wrong.
+        ! printf '%s\n' "$line" | grep -qE '(%|[$]|#|>|❯|»|➜)[[:space:]]+[^[:space:]]' || return 1
+    done < <(printf '%s\n' "$lines" | sed '$d')
+    return 0
 }
 
 # adopt_hat <window> <cmux group name>: the hat a window is, preferring the
@@ -16630,7 +16658,8 @@ hatter is reinstalled. Log: ~/.config/hatter/autosave/watch.log
 A workspace you add with cmux's own New Workspace is a local shell on the Mac.
 In a hat's window the watcher takes it for a new remote workspace: 10 seconds
 after cmux makes it, if it is still one pane with one terminal tab showing only
-a shell prompt, it becomes a tmux session on the hat's server, as `hatter new`
+a shell prompt (and whatever the shell printed before it, such as "Last
+login"), it becomes a tmux session on the hat's server, as `hatter new`
 would make it, in the same group and place, and the local shell closes. You
 stay on it if you were on it. The session takes the name you gave the
 workspace, or cmux's "Terminal N" if you have not named it yet; rename it in
