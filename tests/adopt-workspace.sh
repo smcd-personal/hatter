@@ -86,6 +86,25 @@ expect "a bare bash prompt is blank" blank "$(blank $'\nme@mac:~$')"
 expect "an empty screen is blank" blank "$(blank $'\n \n')"
 expect "a command still running is not" used "$(blank $'me@mac ~ % sleep 100')"
 expect "a command that printed is not" used "$(blank $'me@mac ~ % ls\nfoo bar\nme@mac ~ % ')"
+# What the shell prints before its first prompt is not use (#345).
+expect "macOS's Last login line above a prompt is blank" blank \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\nme@mac ~ % \n\n')"
+expect "macOS bash's zsh notice above a prompt is blank" blank \
+    "$(blank $'\nThe default interactive shell is now zsh.\nTo update your account to use zsh, please run `chsh -s /bin/zsh`.\nFor more details, please visit https://support.apple.com/kb/HT208050.\nbash-3.2$ ')"
+expect "a command run under the Last login line is not" used \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\nme@mac ~ % ls\nfoo bar\nme@mac ~ % ')"
+expect "a command with no output under the Last login line is not" used \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\nme@mac ~ % true\nme@mac ~ % ')"
+expect "a cd that changed the prompt is not" used "$(blank $'~ \xe2\x9d\xaf cd /tmp\n/tmp \xe2\x9d\xaf ')"
+expect "a cd under a user@host prompt is not" used "$(blank $'me@mac:~$ cd /tmp\nme@mac:/tmp$ ')"
+expect "start-up text with no prompt after it is not" used "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\n')"
+expect "a command at a two-line prompt is not" used \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\n~\n\xe2\x9d\xaf true\n~\n\xe2\x9d\xaf ')"
+expect "a fresh two-line prompt under Last login is blank" blank \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\n~\n\xe2\x9d\xaf ')"
+expect "a command at a timestamped prompt is not" used "$(blank $'[10:01] me ~ % true\n[10:02] me ~ % ')"
+expect "more than a few lines above the prompt is output" used \
+    "$(blank $'a\nb\nc\nd\nme@mac ~ % ')"
 
 # The whole decision, against the stub.
 one_run() { /bin/bash "$hatter" _adopt-one NEW 'Terminal 4' 2>&1 | grep -v '^==> ' || true; }
@@ -102,6 +121,8 @@ reset; printf '%s' "$nogroups" > "$STUB/groups"
 expect "outside a group, hatter new picks the group" "adopt NEW as Terminal 4 on dev" "$(one_run)"
 reset; printf 'me@mac ~ %% make\nbuilding\n' > "$STUB/screen"
 expect "one in use stays, and says so" "watch: left 'Terminal 4' a local shell: its tab is in use" "$(one_run | sed -E 's/^[0-9-]+ [0-9:]+ //')"
+reset; printf 'Last login: Thu Nov 26 21:18:48 on ttys000\nme@mac ~ %% \n' > "$STUB/screen"
+expect "a fresh macOS tab with its Last login line is adopted" "adopt NEW as Terminal 4 on dev into web" "$(one_run)"
 reset; echo '{"mirrored":true,"panes":[{"surface_id":"s-new"}]}' > "$STUB/map"
 expect "a mirror titled Terminal N stays" "" "$(one_run)"
 reset; jq '.groups["web"].sessions["Terminal 4"] = {}' "$XDG_CONFIG_HOME/hatter/config.json" > "$work/c" && cp "$XDG_CONFIG_HOME/hatter/config.json" "$work/c0" && mv "$work/c" "$XDG_CONFIG_HOME/hatter/config.json"
