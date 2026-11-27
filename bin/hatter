@@ -11954,8 +11954,10 @@ watch_sync() {
 # a shell prompt and at most what the shell printed before it, such as macOS's
 # "Last login" line (adopt_screen_blank). A typed command that ran leaves its
 # prompt line above the new one, or leaves the prompt line not ending in a
-# prompt sign, and the workspace stays local. So does one in a window that is no hat's, a group's
-# anchor, and anything cmux mirrors.
+# prompt sign, and the workspace stays local. So does one in a window that is
+# no hat's, a group's anchor, and anything cmux mirrors. What it cannot tell
+# from start-up text is a short output under a cleared screen (`clear; ls`):
+# the preamble cap and the 10 seconds after creation keep that rare.
 #
 # The name is the workspace's custom title when the user already gave it one,
 # else the "Terminal N" cmux gave it. Renaming it later in cmux's sidebar is

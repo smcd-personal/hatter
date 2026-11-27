@@ -98,6 +98,11 @@ expect "a command with no output under the Last login line is not" used \
 expect "a cd that changed the prompt is not" used "$(blank $'~ \xe2\x9d\xaf cd /tmp\n/tmp \xe2\x9d\xaf ')"
 expect "a cd under a user@host prompt is not" used "$(blank $'me@mac:~$ cd /tmp\nme@mac:/tmp$ ')"
 expect "start-up text with no prompt after it is not" used "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\n')"
+expect "a command at a two-line prompt is not" used \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\n~\n\xe2\x9d\xaf true\n~\n\xe2\x9d\xaf ')"
+expect "a fresh two-line prompt under Last login is blank" blank \
+    "$(blank $'Last login: Thu Nov 26 21:18:48 on ttys000\n~\n\xe2\x9d\xaf ')"
+expect "a command at a timestamped prompt is not" used "$(blank $'[10:01] me ~ % true\n[10:02] me ~ % ')"
 expect "more than a few lines above the prompt is output" used \
     "$(blank $'a\nb\nc\nd\nme@mac ~ % ')"
 
